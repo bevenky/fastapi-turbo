@@ -176,6 +176,42 @@ Pipeline mode crossover: starts winning at 4 queries. By 10 queries, pipeline (1
 - asyncpg: No pipeline mode. `asyncio.gather` uses separate connections (2.8x slower than psycopg3 pipeline). Higher per-query overhead (112 μs vs 22 μs).
 - psycopg3: Pipeline + autocommit + sync/async in one driver. The clear default.
 
+### Redis pipelining (raw driver, no framework)
+
+| Mode | 1 GET | 2 GETs | 4 GETs | 10 GETs |
+|------|-------|--------|--------|---------|
+| redis-py sequential | 30 μs | 59 μs | 118 μs | 298 μs |
+| **redis-py pipeline** | 29 μs | **40 μs** | **44 μs** | **57 μs** |
+| redis.asyncio pipeline | 36 μs | 41 μs | 49 μs | 70 μs |
+
+Redis pipeline has zero overhead for single commands (29 μs vs 30 μs). Pipeline starts winning at 2 commands. By 10 GETs, pipeline (57 μs) is 5.2x faster than sequential (298 μs).
+
+### 5-Framework Multi-Query Comparison (through full framework)
+
+**PostgreSQL — Sequential vs Pipeline/Parallel:**
+
+| Queries | fastapi-rs | Go Gin | Go Echo | Fastify | FastAPI |
+|---------|-----------|--------|---------|---------|---------|
+| 1 seq | **53 μs** | 55 μs | 56 μs | 77 μs | 281 μs |
+| 4 seq | **104 μs** | 144 μs | 146 μs | 226 μs | — |
+| 10 seq | **197 μs** | 320 μs | 329 μs | 512 μs | — |
+| 4 pipe/parallel | **96 μs** | 78 μs (goroutine) | 80 μs | 97 μs (Promise.all) | 447 μs (gather) |
+| 10 pipe/parallel | **139 μs** | 147 μs (goroutine) | 155 μs | 144 μs (Promise.all) | 596 μs (gather) |
+
+fastapi-rs beats Go on 1 query, 4 seq, 10 seq, and 10 pipeline. Beats Fastify on everything.
+
+**Redis — Sequential vs Pipeline:**
+
+| GETs | fastapi-rs | Go Gin | Go Echo | Fastify | FastAPI |
+|------|-----------|--------|---------|---------|---------|
+| 1 seq | 63 μs | **48 μs** | **48 μs** | **47 μs** | 218 μs |
+| 4 seq | 152 μs | 110 μs | 109 μs | 113 μs | 494 μs |
+| 10 seq | 332 μs | 228 μs | 228 μs | 221 μs | 997 μs |
+| 4 pipeline | **74 μs** | **49 μs** | **49 μs** | **50 μs** | 236 μs |
+| 10 pipeline | **91 μs** | **52 μs** | **52 μs** | **57 μs** | 257 μs |
+
+Redis pipeline 10 at 91 μs — 3.6x faster than sequential (332 μs). 2.8x faster than FastAPI pipeline (257 μs). Go leads at 52 μs (faster driver, no GIL).
+
 ### Complete 8-Framework Comparison (PostgreSQL + Redis, 10K requests each)
 
 Drivers: psycopg2+redis-py (rs-sync), asyncpg+redis.asyncio (rs-async), pgx+go-redis (Go), tokio-postgres+redis (Axum), node-postgres+ioredis (Fastify/Express), asyncpg+redis.asyncio (FastAPI).

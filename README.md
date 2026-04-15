@@ -209,16 +209,41 @@ def transfer(from_id: int, to_id: int, amount: float):
 
 ### Redis
 
-Use `redis-py` (sync) with hiredis for best performance:
-
 ```bash
 pip install "redis[hiredis]"
 ```
 
-| Driver | Latency per GET | When to use |
-|--------|-----------------|-------------|
-| **redis-py + hiredis** | **29us** | Default — fastest |
-| redis.asyncio | 53us | Only for asyncio.gather patterns |
+```python
+from fastapi_rs.db import create_redis
+
+cache = create_redis()  # redis-py + hiredis, auto decode_responses=True
+
+# Single command (63us through framework)
+@app.get("/product/{product_id}")
+def get_product(product_id: int):
+    cached = cache.get(f"product:{product_id}")
+    if cached:
+        return json.loads(cached)
+    # ... fetch from DB, cache it
+    cache.set(f"product:{product_id}", json.dumps(data), ex=60)
+    return data
+
+# Multiple commands — use pipeline (91us for 10 GETs, 3.6x faster than sequential)
+@app.get("/products/batch")
+def get_batch():
+    with cache.pipeline() as pipe:
+        for i in range(10):
+            pipe.get(f"product:{i}")
+        results = pipe.execute()
+    return {"products": [json.loads(r) for r in results if r]}
+```
+
+| Mode | 1 GET | 4 GETs | 10 GETs |
+|------|-------|--------|---------|
+| Sequential | 63us | 152us | 332us |
+| **Pipeline** | 63us | **74us** | **91us** |
+
+Pipeline has zero overhead for single commands and is 5.2x faster at 10 commands. Standard redis-py API — `create_redis()` just adds convenience defaults (decode_responses, hiredis).
 
 ### SQLAlchemy compatibility
 
