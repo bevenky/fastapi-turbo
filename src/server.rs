@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any as CorsAny, CorsLayer};
+use tower_http::services::ServeDir;
 
 use crate::router::{build_router, RouteInfo};
 
@@ -49,7 +50,7 @@ const REDOC_HTML: &str = r#"<!DOCTYPE html>
 ///
 /// This function blocks until the server shuts down (Ctrl-C).
 #[pyfunction]
-#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None))]
+#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![]))]
 pub fn run_server(
     py: Python<'_>,
     routes: Vec<RouteInfo>,
@@ -60,6 +61,7 @@ pub fn run_server(
     docs_url: Option<String>,
     redoc_url: Option<String>,
     openapi_url: Option<String>,
+    static_mounts: Vec<(String, String)>,
 ) -> PyResult<()> {
     // Parse middleware config while we still have the GIL
     let mw_configs = parse_middleware_configs(py, &middlewares)?;
@@ -130,6 +132,11 @@ pub fn run_server(
                 }
             }
 
+            // Mount static file directories
+            for (prefix, directory) in &static_mounts {
+                router = router.nest_service(prefix, ServeDir::new(directory));
+            }
+
             let app = apply_middlewares(router, &mw_configs);
 
             let addr = format!("{host}:{port}");
@@ -176,6 +183,10 @@ enum MiddlewareConfig {
         expose_headers: Vec<String>,
     },
     Gzip,
+    TrustedHost {
+        allowed_hosts: Vec<String>,
+    },
+    HttpsRedirect,
 }
 
 /// Parse Python middleware dicts into Rust structs while the GIL is held.
@@ -242,6 +253,16 @@ fn parse_middleware_configs(
             "gzip" | "compress" => {
                 configs.push(MiddlewareConfig::Gzip);
             }
+            "trustedhost" => {
+                let allowed_hosts: Vec<String> = dict
+                    .get_item("allowed_hosts")?
+                    .map(|v| v.extract().unwrap_or_default())
+                    .unwrap_or_else(|| vec!["*".to_string()]);
+                configs.push(MiddlewareConfig::TrustedHost { allowed_hosts });
+            }
+            "httpsredirect" => {
+                configs.push(MiddlewareConfig::HttpsRedirect);
+            }
             other => {
                 eprintln!("fastapi-rs: unknown middleware type '{other}', skipping");
             }
@@ -284,6 +305,88 @@ fn apply_middlewares(
             }
             MiddlewareConfig::Gzip => {
                 app = app.layer(CompressionLayer::new());
+            }
+            MiddlewareConfig::TrustedHost { allowed_hosts } => {
+                let hosts = allowed_hosts.clone();
+                app = app.layer(axum::middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                    let hosts = hosts.clone();
+                    async move {
+                        // If wildcard, allow all
+                        if hosts.iter().any(|h| h == "*") {
+                            return next.run(req).await;
+                        }
+
+                        let host_header = req
+                            .headers()
+                            .get(axum::http::header::HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+
+                        // Strip port from host
+                        let host_name = if host_header.contains(':') {
+                            host_header.split(':').next().unwrap_or("")
+                        } else {
+                            host_header
+                        }.to_lowercase();
+
+                        let is_valid = hosts.iter().any(|pattern| {
+                            let pattern = pattern.to_lowercase();
+                            if pattern == host_name {
+                                return true;
+                            }
+                            // Wildcard subdomain matching: "*.example.com"
+                            if let Some(suffix) = pattern.strip_prefix('*') {
+                                return host_name.ends_with(&suffix);
+                            }
+                            false
+                        });
+
+                        if is_valid {
+                            next.run(req).await
+                        } else {
+                            axum::http::Response::builder()
+                                .status(axum::http::StatusCode::BAD_REQUEST)
+                                .body(axum::body::Body::from("Invalid host header"))
+                                .unwrap()
+                        }
+                    }
+                }));
+            }
+            MiddlewareConfig::HttpsRedirect => {
+                app = app.layer(axum::middleware::from_fn(|req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                    async move {
+                        // Check X-Forwarded-Proto header or URI scheme
+                        let is_https = req
+                            .headers()
+                            .get("x-forwarded-proto")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.eq_ignore_ascii_case("https"))
+                            .unwrap_or_else(|| {
+                                req.uri().scheme_str().map(|s| s.eq_ignore_ascii_case("https")).unwrap_or(false)
+                            });
+
+                        if is_https {
+                            return next.run(req).await;
+                        }
+
+                        // Build the redirect URL
+                        let host = req
+                            .headers()
+                            .get(axum::http::header::HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("localhost");
+                        let path_and_query = req.uri().path_and_query()
+                            .map(|pq| pq.as_str())
+                            .unwrap_or("/");
+                        let redirect_url = format!("https://{host}{path_and_query}");
+
+                        axum::http::Response::builder()
+                            .status(axum::http::StatusCode::TEMPORARY_REDIRECT)
+                            .header(axum::http::header::LOCATION, redirect_url)
+                            .body(axum::body::Body::empty())
+                            .unwrap()
+                    }
+                }));
             }
         }
     }

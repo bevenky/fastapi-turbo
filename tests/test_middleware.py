@@ -283,3 +283,158 @@ def test_build_middleware_config():
 
     assert config[2]["type"] == "cors"
     assert config[2]["allow_origins"] == ["http://x.com"]
+
+
+def test_build_middleware_config_trustedhost():
+    """_build_middleware_config handles TrustedHostMiddleware."""
+    from fastapi_rs import FastAPI
+    from fastapi_rs.middleware.trustedhost import TrustedHostMiddleware
+
+    app = FastAPI()
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["example.com", "*.example.com"])
+
+    config = app._build_middleware_config()
+    assert len(config) == 1
+    assert config[0]["type"] == "trustedhost"
+    assert config[0]["allowed_hosts"] == ["example.com", "*.example.com"]
+
+
+def test_build_middleware_config_httpsredirect():
+    """_build_middleware_config handles HTTPSRedirectMiddleware."""
+    from fastapi_rs import FastAPI
+    from fastapi_rs.middleware.httpsredirect import HTTPSRedirectMiddleware
+
+    app = FastAPI()
+    app.add_middleware(HTTPSRedirectMiddleware)
+
+    config = app._build_middleware_config()
+    assert len(config) == 1
+    assert config[0]["type"] == "httpsredirect"
+
+
+# ── Static file serving (Rust ServeDir) ────────────────────────────
+
+
+def test_static_files_rust(server_app, tmp_path):
+    """Static files are served via Rust ServeDir."""
+    static_dir = tmp_path / "static_content"
+    static_dir.mkdir()
+    (static_dir / "test.txt").write_text("hello static")
+    (static_dir / "data.json").write_text('{"key": "value"}')
+
+    url = server_app(f"""
+        from fastapi_rs import FastAPI
+        from fastapi_rs.staticfiles import StaticFiles
+        app = FastAPI()
+        app.mount("/static", StaticFiles(directory="{static_dir}"))
+
+        @app.get("/hello")
+        def hello():
+            return {{"message": "hello"}}
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+    # Static text file
+    r = httpx.get(f"{url}/static/test.txt")
+    assert r.status_code == 200
+    assert r.text == "hello static"
+
+    # Static JSON file
+    r = httpx.get(f"{url}/static/data.json")
+    assert r.status_code == 200
+    assert r.json() == {"key": "value"}
+
+    # Regular route still works
+    r = httpx.get(f"{url}/hello")
+    assert r.status_code == 200
+    assert r.json() == {"message": "hello"}
+
+    # Non-existent static file returns 404
+    r = httpx.get(f"{url}/static/nonexistent.txt")
+    assert r.status_code == 404
+
+
+# ── TrustedHost middleware (Rust Tower layer) ──────────────────────
+
+
+def test_trustedhost_middleware_allowed(server_app):
+    """TrustedHostMiddleware allows requests with valid Host header."""
+    url = server_app("""
+        from fastapi_rs import FastAPI
+        from fastapi_rs.middleware.trustedhost import TrustedHostMiddleware
+        app = FastAPI()
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1"])
+
+        @app.get("/hello")
+        def hello():
+            return {"message": "hello"}
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+    r = httpx.get(f"{url}/hello")
+    assert r.status_code == 200
+    assert r.json() == {"message": "hello"}
+
+
+def test_trustedhost_middleware_blocked(server_app):
+    """TrustedHostMiddleware rejects requests with invalid Host header."""
+    url = server_app("""
+        from fastapi_rs import FastAPI
+        from fastapi_rs.middleware.trustedhost import TrustedHostMiddleware
+        app = FastAPI()
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=["trusted.com"])
+
+        @app.get("/hello")
+        def hello():
+            return {"message": "hello"}
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+    r = httpx.get(f"{url}/hello", headers={"host": "evil.com"})
+    assert r.status_code == 400
+
+
+def test_trustedhost_middleware_wildcard(server_app):
+    """TrustedHostMiddleware with wildcard allows all hosts."""
+    url = server_app("""
+        from fastapi_rs import FastAPI
+        from fastapi_rs.middleware.trustedhost import TrustedHostMiddleware
+        app = FastAPI()
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+
+        @app.get("/hello")
+        def hello():
+            return {"message": "hello"}
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+    r = httpx.get(f"{url}/hello", headers={"host": "anything.com"})
+    assert r.status_code == 200
+
+
+# ── HTTPSRedirect middleware (Rust Tower layer) ────────────────────
+
+
+def test_httpsredirect_middleware(server_app):
+    """HTTPSRedirectMiddleware redirects HTTP to HTTPS."""
+    url = server_app("""
+        from fastapi_rs import FastAPI
+        from fastapi_rs.middleware.httpsredirect import HTTPSRedirectMiddleware
+        app = FastAPI()
+        app.add_middleware(HTTPSRedirectMiddleware)
+
+        @app.get("/hello")
+        def hello():
+            return {"message": "hello"}
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+    # Without X-Forwarded-Proto: https, should get a redirect
+    r = httpx.get(f"{url}/hello", follow_redirects=False)
+    assert r.status_code == 307
+    assert r.headers["location"].startswith("https://")
+
+    # With X-Forwarded-Proto: https, should pass through
+    r = httpx.get(f"{url}/hello", headers={"x-forwarded-proto": "https"})
+    assert r.status_code == 200
+    assert r.json() == {"message": "hello"}

@@ -22,7 +22,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 bytes = "1"
 http = "1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "compression-full"] }
+tower-http = { version = "0.6", features = ["cors", "compression-full", "fs", "validate-request", "set-header"] }
 
 [profile.release]
 lto = "thin"

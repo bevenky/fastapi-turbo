@@ -319,11 +319,21 @@ class FastAPI:
 
     def _build_middleware_config(self) -> list[dict[str, Any]]:
         """Convert the middleware stack into dicts the Rust core can consume."""
+        from fastapi_rs.middleware.trustedhost import TrustedHostMiddleware
+        from fastapi_rs.middleware.httpsredirect import HTTPSRedirectMiddleware
+
         config: list[dict[str, Any]] = []
         for cls, kwargs in self._middleware_stack:
             if isinstance(cls, str):
                 # String shorthand: app.add_middleware("cors", allow_origins=["*"])
                 config.append({"type": cls, **kwargs})
+            elif isinstance(cls, type) and issubclass(cls, TrustedHostMiddleware):
+                config.append({
+                    "type": "trustedhost",
+                    "allowed_hosts": kwargs.get("allowed_hosts", ["*"]),
+                })
+            elif isinstance(cls, type) and issubclass(cls, HTTPSRedirectMiddleware):
+                config.append({"type": "httpsredirect"})
             elif hasattr(cls, "_fastapi_rs_middleware_type"):
                 # Jamun middleware class with a known Tower mapping
                 config.append({"type": cls._fastapi_rs_middleware_type, **kwargs})
@@ -705,6 +715,13 @@ class FastAPI:
             openapi_json = json.dumps(openapi_schema)
 
         middleware_config = self._build_middleware_config()
+
+        # Collect static file mounts for Rust-side ServeDir
+        static_mounts = []
+        for mount_path, mounted_app, _name in self._mounts:
+            if hasattr(mounted_app, 'directory') and mounted_app.directory:
+                static_mounts.append((mount_path, str(mounted_app.directory)))
+
         run_server(
             route_infos,
             host,
@@ -714,4 +731,5 @@ class FastAPI:
             self.docs_url,
             self.redoc_url,
             self.openapi_url,
+            static_mounts,
         )
