@@ -240,10 +240,10 @@ def get_batch():
 
 | Mode | 1 GET | 4 GETs | 10 GETs |
 |------|-------|--------|---------|
-| Sequential | 63us | 152us | 332us |
-| **Pipeline** | 63us | **74us** | **91us** |
+| Sequential | 58us | 152us | 332us |
+| **Pipeline + hiredis** | 58us | **70us** | **80us** |
 
-Pipeline has zero overhead for single commands and is 5.2x faster at 10 commands. Standard redis-py API — `create_redis()` just adds convenience defaults (decode_responses, hiredis).
+Pipeline has zero overhead for single commands and is 4.2x faster at 10 commands. hiredis (C parser) is auto-detected when installed — adds 10-18% speed. `create_redis()` sets decode_responses=True by default.
 
 ### SQLAlchemy compatibility
 
@@ -277,7 +277,7 @@ with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
 - **Pipeline Redis** when running 2+ commands: `with cache.pipeline() as p: [p.get(k) for k in keys]; p.execute()`
 - **Use `create_pool()`** from `fastapi_rs.db` — enables autocommit by default (saves 5μs per request)
 - **Use `create_redis()`** from `fastapi_rs.db` — enables hiredis + decode_responses by default
-- **Use hiredis** for Redis: `pip install "redis[hiredis]"` — C parser, 10% faster
+- **Install hiredis** for Redis: `pip install "redis[hiredis]"` — C response parser, 18% faster pipelines (auto-detected by redis-py)
 - **Disable autocommit** only when you need transactions: `create_pool(dsn, autocommit=False)`
 
 ## Development
