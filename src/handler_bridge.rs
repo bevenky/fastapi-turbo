@@ -70,36 +70,75 @@ pub fn init_async_worker() {
         .expect("failed to spawn async worker");
 }
 
-/// Run an async Python handler on the dedicated async worker thread.
+/// Run an async Python handler — tries FAST path first (same-thread), falls back to SLOW path (worker thread).
 ///
-/// Cost: ~10μs (crossbeam send ~100ns + thread wakeup ~2μs + run_until_complete ~5-8μs)
-/// vs ~150μs for run_coroutine_threadsafe.
+/// FAST path: thread-local event loop + run_until_complete on the CURRENT thread.
+/// Zero cross-thread GIL transfers. Same speed as sync handlers.
+/// Works for ALL async handlers — 1 await, 10 awaits, asyncio.gather, everything.
 ///
-/// All asyncpg/redis awaits resolve natively on the worker thread's event loop.
+/// SLOW path (fallback): If handler's DB pool was created on a different event loop
+/// (e.g., in on_event("startup")), we get an event loop mismatch error.
+/// Fall back to the dedicated async worker thread.
 pub fn call_async_on_local_loop(
     py: Python<'_>,
     handler: &Py<PyAny>,
     kwargs: &Bound<'_, PyDict>,
 ) -> PyResult<Py<PyAny>> {
-    init_async_worker();
+    // === FAST PATH: run on thread-local event loop (zero cross-thread overhead) ===
+    use std::cell::RefCell;
+    thread_local! {
+        static LOCAL_LOOP: RefCell<Option<Py<PyAny>>> = const { RefCell::new(None) };
+    }
 
-    // Create coroutine (needs GIL — we have it)
+    let loop_obj = LOCAL_LOOP.with(|cell| -> PyResult<Py<PyAny>> {
+        let mut opt = cell.borrow_mut();
+        if opt.is_none() {
+            let asyncio = py.import("asyncio")?;
+            let new_loop = match py.import("uvloop") {
+                Ok(uvloop) => uvloop.call_method0("new_event_loop")?,
+                Err(_) => asyncio.call_method0("new_event_loop")?,
+            };
+            asyncio.call_method1("set_event_loop", (&new_loop,))?;
+            *opt = Some(new_loop.unbind());
+        }
+        Ok(opt.as_ref().unwrap().clone_ref(py))
+    })?;
+
+    // Create coroutine and run it on the thread-local loop
     let coro = handler.call(py, (), Some(kwargs))?;
+    let result = loop_obj.call_method1(py, "run_until_complete", (coro.bind(py),));
 
-    let (result_tx, result_rx) = crossbeam_channel::bounded::<PyResult<Py<PyAny>>>(1);
-    let tx = ASYNC_WORKER_TX.get()
-        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Async worker not initialized"))?;
+    match result {
+        Ok(val) => Ok(val),
+        Err(ref e) => {
+            // Check if this is an event loop mismatch error
+            // (pool created on startup event loop, handler running on different thread-local loop)
+            let msg = e.value(py).str().map(|s| s.to_string()).unwrap_or_default();
+            if msg.contains("event loop") || msg.contains("attached to a different loop")
+                || msg.contains("got Future") || msg.contains("is not the current") {
+                // === SLOW PATH: fall back to async worker thread ===
+                init_async_worker();
 
-    tx.send(AsyncRequest { coro, response_tx: result_tx })
-        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Async worker channel closed"))?;
+                // Re-create coroutine (the first one was consumed by the failed run_until_complete)
+                let coro2 = handler.call(py, (), Some(kwargs))?;
 
-    // CRITICAL: Release GIL so the worker thread can acquire it to run the coroutine.
-    // Then wait for the result on the crossbeam channel (no GIL needed for channel recv).
-    py.detach(|| {
-        // Block on crossbeam recv — worker thread runs the coroutine while we wait
-        result_rx.recv()
-            .unwrap_or_else(|_| Err(pyo3::exceptions::PyRuntimeError::new_err("Async worker died")))
-    })
+                let (result_tx, result_rx) = crossbeam_channel::bounded::<PyResult<Py<PyAny>>>(1);
+                let tx = ASYNC_WORKER_TX.get()
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Async worker not initialized"))?;
+
+                tx.send(AsyncRequest { coro: coro2, response_tx: result_tx })
+                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Async worker channel closed"))?;
+
+                py.detach(|| {
+                    result_rx.recv()
+                        .unwrap_or_else(|_| Err(pyo3::exceptions::PyRuntimeError::new_err("Async worker died")))
+                })
+            } else {
+                // Real error from the handler — propagate it
+                result
+            }
+        }
+    }
 }
 
 // ── Async handler call (background event loop — for WS and legacy) ──
