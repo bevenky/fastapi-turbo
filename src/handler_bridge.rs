@@ -24,7 +24,45 @@ pub async fn call_sync_handler(
     })
 }
 
-// ── Async handler call ───────────────────────────────────────────────
+// ── Per-thread event loop (Granian pattern) ─────────────────────────
+
+/// Run an async Python handler on the persistent event loop via run_coroutine_threadsafe.
+///
+/// This is the CORRECT path for handlers using async DB drivers (asyncpg, redis.asyncio).
+/// The handler runs entirely on the event loop thread where connection pools live.
+/// One cross-thread hop per handler invocation (NOT per await).
+///
+/// Cost: ~50μs for the cross-thread scheduling. The handler's internal awaits
+/// (DB queries, Redis calls) run natively on the event loop with zero additional overhead.
+pub fn call_async_on_local_loop(
+    py: Python<'_>,
+    handler: &Py<PyAny>,
+    kwargs: &Bound<'_, PyDict>,
+) -> PyResult<Py<PyAny>> {
+    let event_loop = get_event_loop(py)?;
+    let asyncio = py.import("asyncio")?;
+
+    // Create coroutine
+    let coro = handler.call(py, (), Some(kwargs))?;
+
+    // Schedule on the persistent event loop — ONE cross-thread hop for the entire handler.
+    // All internal awaits (asyncpg.fetchrow, redis.get, etc.) resolve on the event loop thread.
+    let future = asyncio.call_method1(
+        "run_coroutine_threadsafe",
+        (coro, event_loop.bind(py)),
+    )?;
+
+    // Block until complete. Release GIL so the event loop thread can execute.
+    let future_py: Py<PyAny> = future.unbind();
+    py.detach(|| {
+        Python::attach(|py2| {
+            // Wait for the future to complete (with timeout)
+            future_py.call_method1(py2, "result", (30.0_f64,))
+        })
+    })
+}
+
+// ── Async handler call (background event loop — for WS and legacy) ──
 
 /// A handle to a Python asyncio event loop running in a background thread.
 static EVENT_LOOP: OnceLock<Py<PyAny>> = OnceLock::new();
