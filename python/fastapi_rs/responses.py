@@ -91,6 +91,34 @@ class StreamingResponse(Response):
             self.headers.setdefault("content-type", self.media_type)
 
 
+class ORJSONResponse(Response):
+    """JSON response using orjson for serialization (with stdlib json fallback)."""
+
+    media_type = "application/json"
+
+    def render(self, content) -> bytes:
+        try:
+            import orjson
+            return orjson.dumps(content)
+        except ImportError:
+            import json
+            return json.dumps(content, ensure_ascii=False).encode("utf-8")
+
+
+class UJSONResponse(Response):
+    """JSON response using ujson for serialization (with stdlib json fallback)."""
+
+    media_type = "application/json"
+
+    def render(self, content) -> bytes:
+        try:
+            import ujson
+            return ujson.dumps(content, ensure_ascii=False).encode("utf-8")
+        except ImportError:
+            import json
+            return json.dumps(content, ensure_ascii=False).encode("utf-8")
+
+
 class FileResponse(Response):
     """Serve a file from disk."""
 

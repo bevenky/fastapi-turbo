@@ -131,44 +131,21 @@ def _build() -> dict[str, types.ModuleType]:
     modules["starlette.middleware.httpsredirect"] = starlette_middleware_hr
 
     # ── starlette.middleware.base ──────────────────────────────────
-    # BaseHTTPMiddleware placeholder
+    import fastapi_rs.middleware.base as _base
     starlette_middleware_base = _mod("starlette.middleware.base")
-
-    class BaseHTTPMiddleware:
-        """Placeholder for Starlette BaseHTTPMiddleware."""
-        def __init__(self, app=None, dispatch=None):
-            self.app = app
-            self.dispatch = dispatch
-
-    starlette_middleware_base.BaseHTTPMiddleware = BaseHTTPMiddleware  # type: ignore[attr-defined]
+    starlette_middleware_base.BaseHTTPMiddleware = _base.BaseHTTPMiddleware  # type: ignore[attr-defined]
     modules["starlette.middleware.base"] = starlette_middleware_base
 
     # ── starlette.staticfiles ──────────────────────────────────────
+    import fastapi_rs.staticfiles as _staticfiles
     starlette_staticfiles = _mod("starlette.staticfiles")
-
-    class StaticFiles:
-        """Placeholder for StaticFiles (not yet implemented)."""
-        def __init__(self, *, directory=None, packages=None, html=False, check_dir=True):
-            self.directory = directory
-            self.packages = packages
-            self.html = html
-            self.check_dir = check_dir
-
-    starlette_staticfiles.StaticFiles = StaticFiles  # type: ignore[attr-defined]
+    starlette_staticfiles.StaticFiles = _staticfiles.StaticFiles  # type: ignore[attr-defined]
     modules["starlette.staticfiles"] = starlette_staticfiles
 
     # ── starlette.templating ───────────────────────────────────────
+    import fastapi_rs.templating as _templating
     starlette_templating = _mod("starlette.templating")
-
-    class Jinja2Templates:
-        """Placeholder for Jinja2Templates (not yet implemented)."""
-        def __init__(self, directory=None, **kwargs):
-            self.directory = directory
-
-        def TemplateResponse(self, name, context, **kwargs):
-            raise NotImplementedError("Jinja2Templates not yet implemented in fastapi-rs")
-
-    starlette_templating.Jinja2Templates = Jinja2Templates  # type: ignore[attr-defined]
+    starlette_templating.Jinja2Templates = _templating.Jinja2Templates  # type: ignore[attr-defined]
     modules["starlette.templating"] = starlette_templating
 
     # ── starlette.testclient ───────────────────────────────────────

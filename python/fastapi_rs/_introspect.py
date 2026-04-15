@@ -12,7 +12,7 @@ import typing
 from typing import Any, get_type_hints
 
 from fastapi_rs.dependencies import Depends
-from fastapi_rs.param_functions import _ParamMarker, Header
+from fastapi_rs.param_functions import _ParamMarker, Body, Header
 
 # Pattern to extract {param_name} from path strings like "/users/{user_id}/posts/{post_id}"
 _PATH_PARAM_RE = re.compile(r"\{(\w+)\}")
@@ -100,6 +100,11 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             required = default is inspect.Parameter.empty
             default_val = None if required else default
 
+        # Track embed flag for body params
+        embed = False
+        if marker is not None and isinstance(marker, Body):
+            embed = getattr(marker, "embed", False)
+
         params.append(
             {
                 "name": name,
@@ -109,8 +114,12 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
                 "default_value": default_val,
                 "model_class": model_class,
                 "alias": alias,
+                "_embed": embed,
             }
         )
+
+    # Post-processing: handle multiple body params and Body(embed=True)
+    params = _maybe_embed_body_params(params, endpoint)
 
     return params
 
@@ -257,3 +266,66 @@ def _is_body_type(annotation) -> bool:
         pass
 
     return False
+
+
+def _maybe_embed_body_params(params: list[dict[str, Any]], endpoint) -> list[dict[str, Any]]:
+    """Handle multiple body parameters and Body(embed=True).
+
+    When there are multiple body params, or any body param uses embed=True,
+    the expected JSON body wraps each param under its name:
+        {"item": {...}, "user": {...}}
+
+    We create a wrapper Pydantic model that represents this combined body,
+    and replace all individual body params with a single body param. The
+    handler is then wrapped to unpack the combined model into the original
+    params.
+    """
+    body_params = [p for p in params if p["kind"] == "body"]
+    if not body_params:
+        return params
+
+    # Check if any body param has embed=True
+    has_embed = any(p.get("_embed") for p in body_params)
+
+    # If single body param without embed, no transformation needed
+    if len(body_params) == 1 and not has_embed:
+        return params
+
+    # Need to embed: create a wrapper model
+    from pydantic import create_model
+
+    field_definitions = {}
+    for bp in body_params:
+        model_cls = bp.get("model_class")
+        if model_cls is not None:
+            if bp["required"]:
+                field_definitions[bp["name"]] = (model_cls, ...)
+            else:
+                field_definitions[bp["name"]] = (model_cls, bp["default_value"])
+        else:
+            # Non-model body params (plain types with Body marker)
+            type_map = {"int": int, "float": float, "bool": bool, "str": str}
+            py_type = type_map.get(bp["type_hint"], Any)
+            if bp["required"]:
+                field_definitions[bp["name"]] = (py_type, ...)
+            else:
+                field_definitions[bp["name"]] = (py_type, bp["default_value"])
+
+    CombinedBody = create_model("_CombinedBody", **field_definitions)
+
+    # Build the new params list: keep non-body params, replace body params
+    # with a single combined body param named "_combined_body"
+    new_params = [p for p in params if p["kind"] != "body"]
+    new_params.append({
+        "name": "_combined_body",
+        "kind": "body",
+        "type_hint": "model",
+        "required": True,
+        "default_value": None,
+        "model_class": CombinedBody,
+        "alias": None,
+        "_embed": False,
+        "_body_param_names": [bp["name"] for bp in body_params],
+    })
+
+    return new_params

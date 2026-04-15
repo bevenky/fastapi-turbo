@@ -5,6 +5,11 @@ from __future__ import annotations
 from typing import Any, Callable, Sequence
 
 
+def _default_generate_unique_id(route: "APIRoute", method: str) -> str:
+    """Default function to generate a unique operation ID for OpenAPI."""
+    return f"{route.name}_{method.lower()}"
+
+
 class APIRoute:
     """Metadata for a single registered route."""
 
@@ -15,6 +20,11 @@ class APIRoute:
         *,
         methods: list[str] | None = None,
         response_model: Any = None,
+        response_model_include: set | None = None,
+        response_model_exclude: set | None = None,
+        response_model_exclude_unset: bool = False,
+        response_model_exclude_defaults: bool = False,
+        response_model_exclude_none: bool = False,
         status_code: int | None = None,
         tags: list[str] | None = None,
         summary: str | None = None,
@@ -22,6 +32,7 @@ class APIRoute:
         name: str | None = None,
         deprecated: bool = False,
         operation_id: str | None = None,
+        generate_unique_id_function: Callable | None = None,
         dependencies: Sequence | None = None,
         **kwargs: Any,
     ):
@@ -29,14 +40,27 @@ class APIRoute:
         self.endpoint = endpoint
         self.methods = [m.upper() for m in (methods or ["GET"])]
         self.response_model = response_model
+        self.response_model_include = response_model_include
+        self.response_model_exclude = response_model_exclude
+        self.response_model_exclude_unset = response_model_exclude_unset
+        self.response_model_exclude_defaults = response_model_exclude_defaults
+        self.response_model_exclude_none = response_model_exclude_none
         self.status_code = status_code
         self.tags = tags or []
         self.summary = summary
         self.description = description
         self.name = name or endpoint.__name__
         self.deprecated = deprecated
-        self.operation_id = operation_id
         self.dependencies = list(dependencies or [])
+
+        # Generate operation_id using the provided function or explicit value
+        if operation_id is not None:
+            self.operation_id = operation_id
+        elif generate_unique_id_function is not None:
+            self.operation_id = generate_unique_id_function(self, self.methods[0] if self.methods else "get")
+        else:
+            self.operation_id = None
+        self.generate_unique_id_function = generate_unique_id_function
 
 
 class APIRouter:
@@ -105,6 +129,9 @@ class APIRouter:
 
     def head(self, path: str, **kwargs: Any):
         return self._method_decorator("HEAD", path, **kwargs)
+
+    def trace(self, path: str, **kwargs: Any):
+        return self._method_decorator("TRACE", path, **kwargs)
 
     # ------------------------------------------------------------------
     # WebSocket routes

@@ -27,3 +27,12 @@ class WebSocketException(Exception):
         self.code = code
         self.reason = reason
         super().__init__(reason)
+
+
+class WebSocketDisconnect(Exception):
+    """Raised when a WebSocket connection is disconnected."""
+
+    def __init__(self, code: int = 1000, reason: str | None = None):
+        self.code = code
+        self.reason = reason
+        super().__init__(f"WebSocket disconnected with code {code}")

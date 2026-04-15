@@ -14,7 +14,7 @@ pub async fn call_sync_handler(
     kwargs: HashMap<String, Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     tokio::task::block_in_place(|| {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let py_kwargs = PyDict::new(py);
             for (key, value) in &kwargs {
                 let _ = py_kwargs.set_item(key, value.bind(py));
@@ -37,7 +37,7 @@ pub fn get_event_loop_pub(py: Python<'_>) -> PyResult<Py<PyAny>> {
 /// Get or create the shared Python asyncio event loop.
 fn get_event_loop(py: Python<'_>) -> PyResult<Py<PyAny>> {
     let loop_obj = EVENT_LOOP.get_or_init(|| {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let asyncio = py.import("asyncio").expect("failed to import asyncio");
             let event_loop = asyncio
                 .call_method0("new_event_loop")
@@ -48,7 +48,7 @@ fn get_event_loop(py: Python<'_>) -> PyResult<Py<PyAny>> {
             std::thread::Builder::new()
                 .name("fastapi-rs-asyncio".to_string())
                 .spawn(move || {
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         let loop_bound = loop_for_thread.bind(py);
                         loop_bound
                             .call_method0("run_forever")
@@ -88,7 +88,7 @@ pub async fn call_async_handler(
     }
 
     let fast = tokio::task::block_in_place(|| {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let py_kwargs = PyDict::new(py);
             for (key, value) in &kwargs {
                 let _ = py_kwargs.set_item(key, value.bind(py));
@@ -156,7 +156,7 @@ async fn call_async_via_event_loop(
 ) -> PyResult<Py<PyAny>> {
     let (tx, rx) = tokio::sync::oneshot::channel::<PyResult<Py<PyAny>>>();
 
-    Python::with_gil(|py| -> PyResult<()> {
+    Python::attach(|py| -> PyResult<()> {
         let event_loop = get_event_loop(py)?;
 
         // Build kwargs dict

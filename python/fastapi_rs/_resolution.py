@@ -42,7 +42,7 @@ def _make_sync_wrapper(async_func):
     return _sync_caller
 
 
-def build_resolution_plan(endpoint, path: str) -> list[dict[str, Any]]:
+def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str, Any]]:
     """Build a flat, topologically-sorted execution plan for a route handler.
 
     Returns a flat list of steps (extractions first, then dep calls in topo order).
@@ -58,6 +58,12 @@ def build_resolution_plan(endpoint, path: str) -> list[dict[str, Any]]:
         - is_generator_dep: whether the callable uses yield
         - dep_input_map: list of (dep_param_name, source_result_key) tuples
         - use_cache: whether to cache this dep's result
+
+    Parameters
+    ----------
+    extra_deps : list, optional
+        Additional Depends markers from app/router/route-level dependencies.
+        These are resolved but not passed as handler params.
     """
     top_params = introspect_endpoint(endpoint, path)
 
@@ -151,6 +157,14 @@ def build_resolution_plan(endpoint, path: str) -> list[dict[str, Any]]:
 
         return result_key
 
+    # Process extra (global/router/route-level) dependencies first (P0 fix #6)
+    # These are resolved but NOT passed as handler params.
+    if extra_deps:
+        for i, dep_marker in enumerate(extra_deps):
+            if isinstance(dep_marker, Depends):
+                dep_name = f"_global_dep_{i}_{id(dep_marker.dependency)}"
+                _resolve_dep(dep_name, dep_marker, is_top_level=True)
+
     # Process top-level handler params
     handler_param_names: set[str] = set()
 
@@ -169,5 +183,10 @@ def build_resolution_plan(endpoint, path: str) -> list[dict[str, Any]]:
     # Mark handler params
     for step in plan:
         step["_is_handler_param"] = step["name"] in handler_param_names
+
+    # Store original dep callable for override lookup
+    for step in plan:
+        if step["kind"] == "dependency":
+            step["_original_dep_callable"] = step.get("dep_callable")
 
     return plan

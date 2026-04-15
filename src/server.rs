@@ -65,7 +65,7 @@ pub fn run_server(
     let mw_configs = parse_middleware_configs(py, &middlewares)?;
 
     // Release the GIL for the entire duration of the blocking server run.
-    py.allow_threads(|| {
+    py.detach(|| {
         let rt = Runtime::new().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "Failed to create tokio runtime: {e}"

@@ -295,7 +295,7 @@ pub fn pyobj_to_serde(py: Python<'_>, obj: &Bound<'_, PyAny>) -> serde_json::Val
 }
 
 /// Convert a `serde_json::Value` into a Python object.
-pub fn serde_to_pyobj(py: Python<'_>, val: &serde_json::Value) -> PyObject {
+pub fn serde_to_pyobj(py: Python<'_>, val: &serde_json::Value) -> Py<PyAny> {
     match val {
         serde_json::Value::Null => py.None(),
         serde_json::Value::Bool(b) => PyBool::new(py, *b).to_owned().into_any().unbind(),

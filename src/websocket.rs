@@ -29,9 +29,9 @@ impl ChannelAwaitable {
     /// Blocks on crossbeam channel with GIL released. Returns the message
     /// and raises StopIteration (which is how Python iterators signal completion
     /// to the await machinery).
-    fn __next__(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let rx = self.rx.clone();
-        let msg = py.allow_threads(|| {
+        let msg = py.detach(|| {
             rx.recv().map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("WebSocket closed"))
         })?;
         // Raise StopIteration with the message as the value — this is how
@@ -65,7 +65,7 @@ impl PyWebSocket {
     /// Blocking receive for sync handlers (direct crossbeam recv).
     fn receive_text(&self, py: Python<'_>) -> PyResult<String> {
         let rx = self.rx.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             rx.recv().map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("WebSocket closed"))
         })
     }
@@ -140,7 +140,7 @@ pub async fn handle_ws_connection(
 
     let py_ws = PyWebSocket { tx: tx_out, rx: cb_rx };
 
-    let ws_obj = Python::with_gil(|py| {
+    let ws_obj = Python::attach(|py| {
         let ws_cell = Py::new(py, py_ws).expect("PyWebSocket");
         let ws_mod = py.import("fastapi_rs.websockets").expect("websockets");
         let ws_cls = ws_mod.getattr("WebSocket").expect("WebSocket");

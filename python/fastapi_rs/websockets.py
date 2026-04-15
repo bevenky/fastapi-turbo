@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from fastapi_rs.exceptions import WebSocketDisconnect
+
 
 class WebSocket:
     """Wraps the Rust PyWebSocket for FastAPI/Starlette compatibility."""
@@ -46,7 +48,10 @@ class WebSocket:
         # Use ChannelAwaitable — blocks directly on crossbeam channel,
         # zero asyncio scheduling, zero pipe syscalls.
         # The __next__ method releases the GIL and blocks on the channel.
-        return await self._ws.receive_text_async()
+        try:
+            return await self._ws.receive_text_async()
+        except RuntimeError as e:
+            raise WebSocketDisconnect(code=1000, reason=str(e)) from e
 
     async def receive_bytes(self) -> bytes:
         text = await self.receive_text()
@@ -61,11 +66,37 @@ class WebSocket:
         if self._ws is not None:
             self._ws.close(code)
 
+    # -- Async iterators --
+
+    async def iter_text(self):
+        """Async generator that yields text messages until disconnect."""
+        while True:
+            try:
+                yield await self.receive_text()
+            except (RuntimeError, WebSocketDisconnect):
+                return
+
+    async def iter_bytes(self):
+        """Async generator that yields bytes messages until disconnect."""
+        while True:
+            try:
+                yield await self.receive_bytes()
+            except (RuntimeError, WebSocketDisconnect):
+                return
+
+    async def iter_json(self, mode: str = "text"):
+        """Async generator that yields parsed JSON messages until disconnect."""
+        while True:
+            try:
+                yield await self.receive_json(mode=mode)
+            except (RuntimeError, WebSocketDisconnect):
+                return
+
     def __aiter__(self):
         return self
 
     async def __anext__(self) -> str:
         try:
             return await self.receive_text()
-        except (RuntimeError, Exception):
+        except (RuntimeError, WebSocketDisconnect):
             raise StopAsyncIteration

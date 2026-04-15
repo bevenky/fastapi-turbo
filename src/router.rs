@@ -51,7 +51,7 @@ pub struct ParamInfo {
 
 impl Clone for ParamInfo {
     fn clone(&self) -> Self {
-        Python::with_gil(|py| ParamInfo {
+        Python::attach(|py| ParamInfo {
             name: self.name.clone(),
             kind: self.kind.clone(),
             type_hint: self.type_hint.clone(),
@@ -119,7 +119,7 @@ pub struct RouteInfo {
 
 impl Clone for RouteInfo {
     fn clone(&self) -> Self {
-        Python::with_gil(|py| RouteInfo {
+        Python::attach(|py| RouteInfo {
             path: self.path.clone(),
             methods: self.methods.clone(),
             handler: self.handler.clone_ref(py),
@@ -200,7 +200,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> Router {
 
         if route.is_websocket {
             let ws_state = Arc::new(WsRouteState {
-                handler: Python::with_gil(|py| route.handler.clone_ref(py)),
+                handler: Python::attach(|py| route.handler.clone_ref(py)),
                 is_async: route.is_async,
             });
             router = router.route(
@@ -208,7 +208,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> Router {
                 any(move |ws: WebSocketUpgrade| {
                     let state = ws_state.clone();
                     async move {
-                        let h = Python::with_gil(|py| state.handler.clone_ref(py));
+                        let h = Python::attach(|py| state.handler.clone_ref(py));
                         let is_a = state.is_async;
                         ws.on_upgrade(move |socket| handle_ws_connection(socket, h, is_a))
                     }
@@ -223,7 +223,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> Router {
         let has_dep = route.params.iter().any(|p| p.kind == "dependency");
         let has_any = !route.params.is_empty();
 
-        let state = Python::with_gil(|py| {
+        let state = Python::attach(|py| {
             // Pre-cache pydantic validators at startup (saves ~0.3μs getattr per POST request)
             let mut params = route.params.clone();
             for param in &mut params {
@@ -338,7 +338,7 @@ async fn handle_request(
     if !state.is_async && !state.has_dep_params {
         // Ultra-fast path: zero-param handlers — no block_in_place, no PyDict, just GIL + call
         if !state.has_any_params {
-            return Python::with_gil(|py| {
+            return Python::attach(|py| {
                 match state.handler.call0(py) {
                     Ok(py_result) => py_to_response(py, py_result.bind(py)),
                     Err(py_err) => pyerr_to_response(py, &py_err),
@@ -348,7 +348,7 @@ async fn handle_request(
 
         // Sync handler with params — use block_in_place for GIL-safe concurrency
         return tokio::task::block_in_place(|| {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let body_json_opt = if state.has_body_params { body_json.as_ref() } else { None };
                 let kwargs = match extract_params_to_pydict(
                     py, &state.params, &path_map, &query_params,
@@ -370,7 +370,7 @@ async fn handle_request(
     // For each async callable, use coro.send(None) to try synchronous completion.
     // Only fall back to the event loop if a coroutine truly suspends.
     let mut resp = tokio::task::block_in_place(|| {
-        Python::with_gil(|py| -> Response {
+        Python::attach(|py| -> Response {
             let mut resolved: HashMap<String, Py<PyAny>> = HashMap::new();
             let mut dep_cache: HashMap<u64, String> = HashMap::new();
 
@@ -461,7 +461,7 @@ async fn handle_request(
     // Check if the unified path signaled that an event loop is needed
     if resp.status() == StatusCode::from_u16(599).unwrap() {
         // Fall back to event-loop-based async execution
-        let handler_kwargs: HashMap<String, Py<PyAny>> = Python::with_gil(|py| {
+        let handler_kwargs: HashMap<String, Py<PyAny>> = Python::attach(|py| {
             let mut hk = HashMap::new();
             // Re-extract all params (we lost them in the unified path)
             // This is the slow path — only triggers for truly async handlers (asyncio.sleep etc.)
@@ -483,10 +483,10 @@ async fn handle_request(
             hk
         });
 
-        let handler = Python::with_gil(|py| state.handler.clone_ref(py));
+        let handler = Python::attach(|py| state.handler.clone_ref(py));
         return match call_async_handler(handler, handler_kwargs).await {
-            Ok(py_result) => Python::with_gil(|py| py_to_response(py, py_result.bind(py))),
-            Err(py_err) => Python::with_gil(|py| pyerr_to_response(py, &py_err)),
+            Ok(py_result) => Python::attach(|py| py_to_response(py, py_result.bind(py))),
+            Err(py_err) => Python::attach(|py| pyerr_to_response(py, &py_err)),
         };
     }
 

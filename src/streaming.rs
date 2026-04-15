@@ -47,7 +47,7 @@ pub fn create_streaming_response(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> Res
     // Spawn a blocking task that iterates the Python generator and pushes
     // chunks through the channel.
     tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let iter_obj = iterator.bind(py);
 
             // Try to detect async iterator (__aiter__ + __anext__)

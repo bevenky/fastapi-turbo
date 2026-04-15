@@ -16,6 +16,11 @@ def generate_openapi_schema(
     description: str,
     routes: list[dict[str, Any]],
     openapi_url: str = "/openapi.json",
+    servers: list[dict[str, Any]] | None = None,
+    terms_of_service: str | None = None,
+    contact: dict[str, Any] | None = None,
+    license_info: dict[str, Any] | None = None,
+    openapi_tags: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Generate an OpenAPI 3.1.0 schema dict from collected route metadata."""
     schema: dict[str, Any] = {
@@ -29,11 +34,27 @@ def generate_openapi_schema(
 
     if description:
         schema["info"]["description"] = description
+    if terms_of_service:
+        schema["info"]["termsOfService"] = terms_of_service
+    if contact:
+        schema["info"]["contact"] = contact
+    if license_info:
+        schema["info"]["license"] = license_info
+
+    if servers:
+        schema["servers"] = servers
+
+    if openapi_tags:
+        schema["tags"] = openapi_tags
 
     components_schemas: dict[str, Any] = {}
+    security_schemes: dict[str, Any] = {}
 
     for route in routes:
         path = route["path"]
+
+        # Collect security schemes from route dependencies
+        _collect_security_schemes(route, security_schemes)
 
         for method in route["methods"]:
             operation = _build_operation(route, method.lower())
@@ -42,8 +63,13 @@ def generate_openapi_schema(
             # Collect Pydantic model schemas into components
             _collect_schemas(route, components_schemas)
 
+    components: dict[str, Any] = {}
     if components_schemas:
-        schema["components"] = {"schemas": components_schemas}
+        components["schemas"] = components_schemas
+    if security_schemes:
+        components["securitySchemes"] = security_schemes
+    if components:
+        schema["components"] = components
 
     return schema
 
@@ -134,6 +160,34 @@ def _collect_schemas(
         if "$defs" in json_schema:
             for name, defn in json_schema["$defs"].items():
                 schemas.setdefault(name, defn)
+
+
+def _collect_security_schemes(
+    route: dict[str, Any], security_schemes: dict[str, Any]
+) -> None:
+    """Extract security schemes from route dependency parameters.
+
+    Checks both ``params`` and ``_all_params`` (the latter preserves
+    dependency params even after handler compilation strips them).
+    """
+    # Use _all_params if available (it includes dep params before compilation),
+    # falling back to params.
+    all_params = route.get("_all_params", route.get("params", []))
+    for param in all_params:
+        dep_callable = param.get("dep_callable")
+        if dep_callable is None:
+            # Also check the original dep callable
+            dep_callable = param.get("_original_dep_callable")
+        if dep_callable is None:
+            continue
+
+        # Security schemes are instances of classes with a .model dict
+        # (OAuth2PasswordBearer, HTTPBearer, HTTPBasic, APIKeyHeader, etc.)
+        obj = dep_callable
+        if hasattr(obj, "model") and isinstance(obj.model, dict):
+            scheme_name = getattr(obj, "scheme_name", None) or type(obj).__name__
+            if scheme_name not in security_schemes:
+                security_schemes[scheme_name] = obj.model
 
 
 def _type_hint_to_schema(type_hint: str) -> dict[str, Any]:

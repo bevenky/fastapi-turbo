@@ -74,6 +74,10 @@ class Cookie(_ParamMarker):
 class Body(_ParamMarker):
     _kind = "body"
 
+    def __init__(self, default=..., *, embed: bool = False, **kwargs):
+        super().__init__(default, **kwargs)
+        self.embed = embed
+
 
 class Form(_ParamMarker):
     _kind = "form"
