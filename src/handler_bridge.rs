@@ -39,7 +39,7 @@ unsafe impl Send for AsyncRequest {}
 static ASYNC_WORKER_TX: OnceLock<crossbeam_channel::Sender<AsyncRequest>> = OnceLock::new();
 
 /// Initialize the dedicated async worker thread.
-/// Uses crossbeam channel + run_until_complete with uvloop.
+/// Uses crossbeam + run_until_complete with uvloop.
 pub fn init_async_worker() {
     if ASYNC_WORKER_TX.get().is_some() {
         return;
