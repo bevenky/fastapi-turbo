@@ -269,6 +269,17 @@ with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
     rows = conn.execute(text("SELECT * FROM users")).fetchall()
 ```
 
+### Performance tips
+
+- **Use `def` handlers** (not `async def`) for DB-heavy endpoints — sync is 2-3x faster than async for sequential queries
+- **Use psycopg3** (not psycopg2 or asyncpg) — pipeline + autocommit + fastest sync driver
+- **Pipeline Postgres** when running 4+ queries: `with conn.pipeline(): results = [conn.execute(q) for q in queries]`
+- **Pipeline Redis** when running 2+ commands: `with cache.pipeline() as p: [p.get(k) for k in keys]; p.execute()`
+- **Use `create_pool()`** from `fastapi_rs.db` — enables autocommit by default (saves 5μs per request)
+- **Use `create_redis()`** from `fastapi_rs.db` — enables hiredis + decode_responses by default
+- **Use hiredis** for Redis: `pip install "redis[hiredis]"` — C parser, 10% faster
+- **Disable autocommit** only when you need transactions: `create_pool(dsn, autocommit=False)`
+
 ## Development
 
 ```bash
