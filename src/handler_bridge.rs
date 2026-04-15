@@ -39,11 +39,10 @@ unsafe impl Send for AsyncRequest {}
 static ASYNC_WORKER_TX: OnceLock<crossbeam_channel::Sender<AsyncRequest>> = OnceLock::new();
 
 /// Initialize the dedicated async worker thread.
-/// This thread owns an asyncio event loop and processes handlers via run_until_complete().
-/// Called once at module init.
+/// Uses crossbeam channel + run_until_complete with uvloop.
 pub fn init_async_worker() {
     if ASYNC_WORKER_TX.get().is_some() {
-        return; // Already initialized
+        return;
     }
 
     let (tx, rx) = crossbeam_channel::unbounded::<AsyncRequest>();
@@ -52,27 +51,17 @@ pub fn init_async_worker() {
     std::thread::Builder::new()
         .name("fastapi-rs-async-worker".to_string())
         .spawn(move || {
-            // Acquire GIL once for the entire worker lifetime
             Python::attach(|py| {
-                // Use uvloop if available (2-3x faster than standard asyncio event loop)
                 let asyncio = py.import("asyncio").expect("asyncio");
                 let loop_obj = match py.import("uvloop") {
-                    Ok(uvloop) => {
-                        let lp = uvloop.call_method0("new_event_loop").expect("uvloop.new_event_loop");
-                        lp
-                    }
-                    Err(_) => asyncio.call_method0("new_event_loop").expect("new_event_loop"),
+                    Ok(uvloop) => uvloop.call_method0("new_event_loop").expect("uvloop"),
+                    Err(_) => asyncio.call_method0("new_event_loop").expect("asyncio loop"),
                 };
                 asyncio.call_method1("set_event_loop", (&loop_obj,)).expect("set_event_loop");
 
                 loop {
-                    // Release GIL while waiting for a request on the channel
-                    let req = py.detach(|| {
-                        rx.recv().ok()
-                    });
+                    let req = py.detach(|| rx.recv().ok());
                     let Some(req) = req else { break };
-
-                    // GIL is re-acquired here — run the coroutine
                     let result = loop_obj.call_method1("run_until_complete", (req.coro.bind(py),));
                     let _ = req.response_tx.send(result.map(|r| r.unbind()));
                 }
