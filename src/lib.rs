@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod config;
+mod db_pool;
 mod handler_bridge;
 mod responses;
 mod router;
@@ -31,5 +32,6 @@ fn _fastapi_rs_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<router::ParamInfo>()?;
     m.add_class::<websocket::PyWebSocket>()?;
     m.add_class::<websocket::ChannelAwaitable>()?;
+    m.add_class::<db_pool::PyPool>()?;
     Ok(())
 }

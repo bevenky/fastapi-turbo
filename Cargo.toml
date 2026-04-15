@@ -20,6 +20,9 @@ crossbeam-channel = "0.5"
 fastwebsockets = { version = "0.8", features = ["upgrade"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 bytes = "1"
+tokio-postgres = "0.7"
+bb8 = "0.9"
+bb8-postgres = "0.9"
 http = "1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "compression-full", "fs", "validate-request", "set-header"] }
