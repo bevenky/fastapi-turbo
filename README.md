@@ -129,6 +129,66 @@ To disable this and use both FastAPI and fastapi-rs side by side, set `FASTAPI_R
 - Startup/shutdown lifecycle events stored but not yet fired
 - Generator (yield) dependencies: cleanup not yet guaranteed
 
+## Database Performance Tips
+
+fastapi-rs supports both sync and async handlers. For database-heavy applications, the choice of driver and handler style has a significant impact on performance.
+
+### Recommended: sync handlers with psycopg3
+
+```python
+from fastapi_rs import FastAPI
+import psycopg
+from psycopg_pool import ConnectionPool
+
+app = FastAPI()
+pool = ConnectionPool("dbname=mydb user=myuser", min_size=5, max_size=20)
+
+@app.get("/users/{user_id}")
+def get_user(user_id: int):
+    with pool.connection() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = %s", (user_id,)).fetchone()
+    return dict(row)
+```
+
+Sync handlers run on `block_in_place` — tokio migrates other tasks to other workers while this thread blocks on the DB call. This is the same pattern Go uses with goroutines. No event loop overhead.
+
+### Async with psycopg3 (when you need parallel I/O)
+
+```python
+@app.get("/dashboard")
+async def dashboard(user_id: int):
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        user = (await conn.execute("SELECT * FROM users WHERE id = %s", (user_id,))).fetchone()
+        orders = (await conn.execute("SELECT * FROM orders WHERE user_id = %s", (user_id,))).fetchone()
+    return {"user": dict(user), "orders": dict(orders)}
+```
+
+Use `async def` when your handler needs to do multiple I/O operations concurrently (e.g., `asyncio.gather`). fastapi-rs uses uvloop automatically for faster async scheduling.
+
+### Driver performance comparison
+
+| Driver | Mode | Latency per query | When to use |
+|--------|------|-------------------|-------------|
+| **psycopg3** | sync | **46 us** | Default choice — fastest |
+| psycopg2 | sync | 48 us | Legacy, widely compatible |
+| psycopg3 | async | 82 us | Parallel I/O within handler |
+| asyncpg | async | 147 us | Avoid — 3x slower than psycopg3 sync |
+| SQLAlchemy Core | sync | 117 us | When you need ORM features |
+
+### Redis
+
+| Driver | Mode | Latency per GET | When to use |
+|--------|------|-----------------|-------------|
+| **redis-py** | sync | **28 us** | Default — fastest |
+| redis.asyncio | async | 53 us | Only for parallel I/O |
+
+### Why sync is faster
+
+asyncio's `run_until_complete` adds ~29us of event loop overhead per call, even for trivial coroutines. For sequential database operations (the common case), this overhead is pure waste. Sync drivers make direct socket calls with zero event loop overhead.
+
+fastapi-rs handles concurrency through tokio's multi-threaded runtime — each sync handler blocks one tokio worker thread, while other workers continue serving requests. This matches Go's goroutine model.
+
 ## Development
 
 ```bash
