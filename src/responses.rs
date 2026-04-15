@@ -7,39 +7,21 @@ use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyNone, PyString};
 /// Checks are ordered by frequency: dict (most common) first, then special types.
 pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
     // dict or list -> JSON (MOST COMMON — check first, skip attr lookups)
-    if let Ok(dict) = obj.downcast::<PyDict>() {
-        let len = dict.len();
-        let json_str = if len > 4 {
-            // Large dicts: try orjson.dumps (C-level traversal, faster for complex nested objects)
-            if let Ok(orjson) = py.import("orjson") {
-                if let Ok(bytes) = orjson.call_method1("dumps", (dict,)) {
-                    if let Ok(b) = bytes.extract::<Vec<u8>>() {
-                        unsafe { String::from_utf8_unchecked(b) }
-                    } else { let mut buf = String::with_capacity(256); write_dict_json(py, dict, &mut buf); buf }
-                } else { let mut buf = String::with_capacity(256); write_dict_json(py, dict, &mut buf); buf }
-            } else { let mut buf = String::with_capacity(256); write_dict_json(py, dict, &mut buf); buf }
-        } else {
-            // Small dicts: Rust direct writer (avoids Python call overhead)
-            let mut buf = String::with_capacity(128);
-            write_dict_json(py, dict, &mut buf);
-            buf
-        };
-        return (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            json_str,
-        )
-            .into_response();
-    }
-    if let Ok(list) = obj.downcast::<PyList>() {
-        // Lists: try orjson first (better for nested structures)
+    // Always use orjson when available (5-7x faster than alternatives at all sizes)
+    if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() {
         let json_str = if let Ok(orjson) = py.import("orjson") {
-            if let Ok(bytes) = orjson.call_method1("dumps", (list,)) {
+            if let Ok(bytes) = orjson.call_method1("dumps", (obj,)) {
                 if let Ok(b) = bytes.extract::<Vec<u8>>() {
                     unsafe { String::from_utf8_unchecked(b) }
-                } else { let mut buf = String::with_capacity(256); write_list_json(py, list, &mut buf); buf }
-            } else { let mut buf = String::with_capacity(256); write_list_json(py, list, &mut buf); buf }
-        } else { let mut buf = String::with_capacity(256); write_list_json(py, list, &mut buf); buf };
+                } else {
+                    fallback_json(py, obj)
+                }
+            } else {
+                fallback_json(py, obj)
+            }
+        } else {
+            fallback_json(py, obj)
+        };
         return (
             StatusCode::OK,
             [("content-type", "application/json")],
@@ -172,6 +154,22 @@ pub fn pyerr_to_response(py: Python<'_>, err: &PyErr) -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+/// Fallback JSON serialization when orjson is not available.
+fn fallback_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> String {
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut buf = String::with_capacity(128);
+        write_dict_json(py, dict, &mut buf);
+        buf
+    } else if let Ok(list) = obj.downcast::<PyList>() {
+        let mut buf = String::with_capacity(128);
+        write_list_json(py, list, &mut buf);
+        buf
+    } else {
+        let value = pyobj_to_serde(py, obj);
+        serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
+    }
 }
 
 // ── Direct PyDict → JSON writer (zero intermediate allocations) ──────
