@@ -7,24 +7,43 @@ use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyNone, PyString};
 /// Checks are ordered by frequency: dict (most common) first, then special types.
 pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
     // dict or list -> JSON (MOST COMMON — check first, skip attr lookups)
-    // Uses direct PyDict→JSON writer — NO intermediate serde_json::Value allocation
     if let Ok(dict) = obj.downcast::<PyDict>() {
-        let mut buf = String::with_capacity(128);
-        write_dict_json(py, dict, &mut buf);
+        let len = dict.len();
+        let json_str = if len > 4 {
+            // Large dicts: try orjson.dumps (C-level traversal, faster for complex nested objects)
+            if let Ok(orjson) = py.import("orjson") {
+                if let Ok(bytes) = orjson.call_method1("dumps", (dict,)) {
+                    if let Ok(b) = bytes.extract::<Vec<u8>>() {
+                        unsafe { String::from_utf8_unchecked(b) }
+                    } else { let mut buf = String::with_capacity(256); write_dict_json(py, dict, &mut buf); buf }
+                } else { let mut buf = String::with_capacity(256); write_dict_json(py, dict, &mut buf); buf }
+            } else { let mut buf = String::with_capacity(256); write_dict_json(py, dict, &mut buf); buf }
+        } else {
+            // Small dicts: Rust direct writer (avoids Python call overhead)
+            let mut buf = String::with_capacity(128);
+            write_dict_json(py, dict, &mut buf);
+            buf
+        };
         return (
             StatusCode::OK,
             [("content-type", "application/json")],
-            buf,
+            json_str,
         )
             .into_response();
     }
     if let Ok(list) = obj.downcast::<PyList>() {
-        let mut buf = String::with_capacity(128);
-        write_list_json(py, list, &mut buf);
+        // Lists: try orjson first (better for nested structures)
+        let json_str = if let Ok(orjson) = py.import("orjson") {
+            if let Ok(bytes) = orjson.call_method1("dumps", (list,)) {
+                if let Ok(b) = bytes.extract::<Vec<u8>>() {
+                    unsafe { String::from_utf8_unchecked(b) }
+                } else { let mut buf = String::with_capacity(256); write_list_json(py, list, &mut buf); buf }
+            } else { let mut buf = String::with_capacity(256); write_list_json(py, list, &mut buf); buf }
+        } else { let mut buf = String::with_capacity(256); write_list_json(py, list, &mut buf); buf };
         return (
             StatusCode::OK,
             [("content-type", "application/json")],
-            buf,
+            json_str,
         )
             .into_response();
     }

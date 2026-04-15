@@ -27,7 +27,27 @@ def _apply_response_model(
     """Filter a handler result through a response_model Pydantic class."""
     if response_model is None or result is None:
         return result
+
+    has_filters = include is not None or exclude is not None or exclude_unset or exclude_defaults or exclude_none
+
     try:
+        if isinstance(result, dict):
+            if not has_filters:
+                # Fast path: validate only (no dump round-trip needed)
+                # Just strip extra fields by keeping only model fields
+                model_fields = response_model.model_fields
+                return {k: v for k, v in result.items() if k in model_fields}
+            validated = response_model.model_validate(result)
+        elif hasattr(result, "model_dump"):
+            if not has_filters and type(result) is response_model:
+                # Already the right type — just dump
+                return result.model_dump()
+            validated = response_model.model_validate(
+                result.model_dump() if hasattr(result, "model_dump") else result
+            )
+        else:
+            return result
+
         dump_kwargs = {}
         if include is not None:
             dump_kwargs["include"] = include
@@ -39,11 +59,7 @@ def _apply_response_model(
             dump_kwargs["exclude_defaults"] = True
         if exclude_none:
             dump_kwargs["exclude_none"] = True
-
-        if isinstance(result, dict):
-            return response_model.model_validate(result).model_dump(**dump_kwargs)
-        elif hasattr(result, "model_dump"):
-            return response_model.model_validate(result.model_dump()).model_dump(**dump_kwargs)
+        return validated.model_dump(**dump_kwargs)
     except Exception:
         pass
     return result
