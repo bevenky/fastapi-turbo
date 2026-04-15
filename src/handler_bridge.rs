@@ -54,8 +54,15 @@ pub fn init_async_worker() {
         .spawn(move || {
             // Acquire GIL once for the entire worker lifetime
             Python::attach(|py| {
+                // Use uvloop if available (2-3x faster than standard asyncio event loop)
                 let asyncio = py.import("asyncio").expect("asyncio");
-                let loop_obj = asyncio.call_method0("new_event_loop").expect("new_event_loop");
+                let loop_obj = match py.import("uvloop") {
+                    Ok(uvloop) => {
+                        let lp = uvloop.call_method0("new_event_loop").expect("uvloop.new_event_loop");
+                        lp
+                    }
+                    Err(_) => asyncio.call_method0("new_event_loop").expect("new_event_loop"),
+                };
                 asyncio.call_method1("set_event_loop", (&loop_obj,)).expect("set_event_loop");
 
                 loop {
@@ -121,9 +128,10 @@ fn get_event_loop(py: Python<'_>) -> PyResult<Py<PyAny>> {
     let loop_obj = EVENT_LOOP.get_or_init(|| {
         Python::attach(|py| {
             let asyncio = py.import("asyncio").expect("failed to import asyncio");
-            let event_loop = asyncio
-                .call_method0("new_event_loop")
-                .expect("failed to create event loop");
+            let event_loop = match py.import("uvloop") {
+                Ok(uvloop) => uvloop.call_method0("new_event_loop").expect("uvloop.new_event_loop"),
+                Err(_) => asyncio.call_method0("new_event_loop").expect("new_event_loop"),
+            };
             let loop_py: Py<PyAny> = event_loop.unbind();
 
             let loop_for_thread = loop_py.clone_ref(py);
