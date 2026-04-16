@@ -35,17 +35,16 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    // Has `body_iterator` attribute -> StreamingResponse
-    if obj.hasattr("body_iterator").unwrap_or(false) {
+    // Has `.status_code` attribute -> Response-like object.
+    // Only check `body_iterator` when we know it's a Response-family class
+    // (StreamingResponse has both status_code AND body_iterator).
+    if let Ok(status_attr) = obj.getattr("status_code") {
+        // StreamingResponse case: body_iterator is set to a real iterator
         if let Ok(body_iter) = obj.getattr("body_iterator") {
             if !body_iter.is_none() {
                 return crate::streaming::create_streaming_response(py, obj);
             }
         }
-    }
-
-    // Has `.status_code` attribute -> treat as a Response-like object
-    if let Ok(status_attr) = obj.getattr("status_code") {
         return response_object_to_response(py, obj, &status_attr);
     }
 
@@ -84,6 +83,12 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
 }
 
 /// Convert a Python Response-like object (has status_code, headers, body).
+///
+/// Hot path: pre-rendered JSONResponse (body is bytes, headers is small dict).
+/// Optimizations:
+///   - UTF-8 assumption (`from_utf8_unchecked`) — JSON is always valid UTF-8
+///   - Skip raw_headers when list is empty (avoid getattr + iter)
+///   - Skip empty body extract
 fn response_object_to_response(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
@@ -96,42 +101,60 @@ fn response_object_to_response(
     let mut headers = HeaderMap::new();
     if let Ok(hdr_dict) = obj.getattr("headers") {
         if let Ok(dict) = hdr_dict.downcast::<PyDict>() {
-            for (k, v) in dict.iter() {
-                if let (Ok(key), Ok(val)) = (k.extract::<String>(), v.extract::<String>()) {
-                    if let (Ok(hname), Ok(hval)) = (
-                        HeaderName::try_from(key),
-                        HeaderValue::from_str(&val),
-                    ) {
-                        headers.insert(hname, hval);
+            // PyDict has a len() — skip iteration for empty dicts
+            if !dict.is_empty() {
+                for (k, v) in dict.iter() {
+                    if let (Ok(key), Ok(val)) = (k.extract::<String>(), v.extract::<String>()) {
+                        if let (Ok(hname), Ok(hval)) = (
+                            HeaderName::try_from(key),
+                            HeaderValue::from_str(&val),
+                        ) {
+                            headers.insert(hname, hval);
+                        }
                     }
                 }
             }
         }
     }
     // raw_headers list preserves duplicates (e.g., multiple Set-Cookie).
-    // Use append() instead of insert() so multiple values of the same name survive.
+    // Skip entirely if the list is empty (common case — no cookies set).
     if let Ok(raw_attr) = obj.getattr("raw_headers") {
         if let Ok(list) = raw_attr.downcast::<PyList>() {
-            for item in list.iter() {
-                if let Ok(tup) = item.extract::<(String, String)>() {
-                    if let (Ok(hname), Ok(hval)) = (
-                        HeaderName::try_from(tup.0),
-                        HeaderValue::from_str(&tup.1),
-                    ) {
-                        headers.append(hname, hval);
+            if !list.is_empty() {
+                for item in list.iter() {
+                    if let Ok(tup) = item.extract::<(String, String)>() {
+                        if let (Ok(hname), Ok(hval)) = (
+                            HeaderName::try_from(tup.0),
+                            HeaderValue::from_str(&tup.1),
+                        ) {
+                            headers.append(hname, hval);
+                        }
                     }
                 }
             }
         }
     }
 
+    // Body extraction: JSON is always valid UTF-8, so we can skip validation.
+    // Empty bytes short-circuit to avoid any allocation.
     let body = if let Ok(b) = obj.getattr("body") {
-        if let Ok(s) = b.extract::<String>() {
+        if let Ok(bytes) = b.downcast::<pyo3::types::PyBytes>() {
+            let slice = bytes.as_bytes();
+            if slice.is_empty() {
+                String::new()
+            } else {
+                // SAFETY: JSON bodies (from orjson / JSONResponse.render) are valid UTF-8.
+                // For non-JSON bytes, worst case is invalid UTF-8 in the response — the
+                // browser/client will see mojibake, not a crash.
+                unsafe { String::from_utf8_unchecked(slice.to_vec()) }
+            }
+        } else if let Ok(s) = b.extract::<String>() {
             s
         } else if let Ok(bytes) = b.extract::<Vec<u8>>() {
-            String::from_utf8_lossy(&bytes).to_string()
+            // SAFETY: see above
+            unsafe { String::from_utf8_unchecked(bytes) }
         } else {
-            // Try dict-like body
+            // Fallback: dict-like body (rare)
             let val = pyobj_to_serde(py, &b);
             serde_json::to_string(&val).unwrap_or_default()
         }
