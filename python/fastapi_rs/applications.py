@@ -15,6 +15,20 @@ from fastapi_rs._resolution import build_resolution_plan, _make_sync_wrapper
 from fastapi_rs.routing import APIRouter
 
 
+class URLPath(str):
+    """Starlette-compatible URLPath — a str subclass with make_absolute_url()."""
+
+    def __new__(cls, path: str, protocol: str = "", host: str = ""):
+        instance = super().__new__(cls, path)
+        instance.protocol = protocol
+        instance.host = host
+        return instance
+
+    def make_absolute_url(self, base_url) -> str:
+        base = str(base_url).rstrip("/")
+        return base + str(self)
+
+
 def _apply_response_model(
     result,
     response_model,
@@ -904,19 +918,21 @@ class FastAPI:
     # URL building
     # ------------------------------------------------------------------
 
-    def url_path_for(self, name: str, /, **path_params: Any) -> str:
+    def url_path_for(self, name: str, /, **path_params: Any) -> "URLPath":
         """Return the URL path for a named route, filling in path_params.
 
         Matches Starlette/FastAPI's behavior: looks up routes by their `name`
         (endpoint function name by default) and substitutes {param}
         placeholders.  Prepends root_path if configured.
+
+        Returns a URLPath (str subclass) matching Starlette's return type,
+        so callers can use `.make_absolute_url(base_url=...)`.
         """
         from urllib.parse import quote
 
         for route in self._collect_all_routes():
             if route.get("handler_name") == name:
                 path = route["path"]
-                # Substitute {param} and {param:converter} placeholders
                 import re
 
                 def _sub(match: re.Match) -> str:
@@ -924,14 +940,14 @@ class FastAPI:
                     if pname not in path_params:
                         raise KeyError(f"Missing path param {pname!r} for route {name!r}")
                     val = path_params[pname]
-                    # `path` converter should not URL-encode slashes
                     if ":path" in match.group(0):
                         return str(val)
                     return quote(str(val), safe="")
 
                 filled = re.sub(r"\{([^}]+)\}", _sub, path)
                 root = getattr(self, "root_path", "") or ""
-                return root.rstrip("/") + filled if root else filled
+                full = root.rstrip("/") + filled if root else filled
+                return URLPath(full)
 
         raise LookupError(f"No route named {name!r}")
 
@@ -943,12 +959,16 @@ class FastAPI:
         """Return the OpenAPI schema dict (cached after first call)."""
         if not hasattr(self, "_openapi_schema"):
             route_dicts = self._collect_all_routes()
+            # Add root_path to servers if configured (matches run_server() behavior)
+            effective_servers = self.servers
+            if self.root_path and self.root_path_in_servers and not effective_servers:
+                effective_servers = [{"url": self.root_path}]
             self._openapi_schema = generate_openapi_schema(
                 title=self.title,
                 version=self.version,
                 description=self.description,
                 routes=route_dicts,
-                servers=self.servers,
+                servers=effective_servers,
                 terms_of_service=self.terms_of_service,
                 contact=self.contact,
                 license_info=self.license_info,

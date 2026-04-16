@@ -74,8 +74,10 @@ class Cookie(_ParamMarker):
 class Body(_ParamMarker):
     _kind = "body"
 
-    def __init__(self, default=..., *, embed: bool = False, media_type: str = "application/json", **kwargs):
+    def __init__(self, default=..., *, embed: bool | None = None, media_type: str = "application/json", **kwargs):
         super().__init__(default, **kwargs)
+        # None means "auto-detect" (embed if multiple body params, else not).
+        # Matches FastAPI's Body(embed=...) default.
         self.embed = embed
         self.media_type = media_type
 

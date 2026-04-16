@@ -30,3 +30,28 @@ class Depends:
 
     def __repr__(self) -> str:
         return f"Depends({self.dependency!r}, use_cache={self.use_cache})"
+
+
+class Security(Depends):
+    """Security dependency — a Depends() variant that carries OAuth2 scopes.
+
+    Usage::
+
+        from fastapi_rs import Security
+        from fastapi_rs.security import OAuth2PasswordBearer
+
+        oauth2 = OAuth2PasswordBearer(tokenUrl="token")
+
+        @app.get("/me")
+        async def me(token: str = Security(oauth2, scopes=["me"])):
+            ...
+
+    Matches FastAPI's ``fastapi.Security`` class exactly.
+    """
+
+    def __init__(self, dependency=None, *, scopes=None, use_cache: bool = True):
+        super().__init__(dependency, use_cache=use_cache)
+        self.scopes = list(scopes) if scopes else []
+
+    def __repr__(self) -> str:
+        return f"Security({self.dependency!r}, scopes={self.scopes!r}, use_cache={self.use_cache})"

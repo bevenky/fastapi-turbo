@@ -84,7 +84,7 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi.BackgroundTasks = _background.BackgroundTasks  # type: ignore[attr-defined]
 
     # Security (commonly imported from top-level too)
-    fastapi.Security = _dependencies.Depends  # type: ignore[attr-defined]  # Security is an alias for Depends in practice
+    fastapi.Security = _dependencies.Security  # type: ignore[attr-defined]
 
     # Encoders
     fastapi.encoders = None  # will be set below  # type: ignore[attr-defined]
@@ -135,6 +135,7 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_security.OAuth2PasswordBearer = _security.OAuth2PasswordBearer  # type: ignore[attr-defined]
     fastapi_security.OAuth2PasswordRequestForm = _security.OAuth2PasswordRequestForm  # type: ignore[attr-defined]
     fastapi_security.HTTPBearer = _security.HTTPBearer  # type: ignore[attr-defined]
+    fastapi_security.HTTPDigest = _security.HTTPDigest  # type: ignore[attr-defined]
     fastapi_security.HTTPBasic = _security.HTTPBasic  # type: ignore[attr-defined]
     fastapi_security.HTTPBasicCredentials = _security.HTTPBasicCredentials  # type: ignore[attr-defined]
     fastapi_security.HTTPAuthorizationCredentials = _security.HTTPAuthorizationCredentials  # type: ignore[attr-defined]

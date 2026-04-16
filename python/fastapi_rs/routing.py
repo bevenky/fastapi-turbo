@@ -32,7 +32,7 @@ class APIRoute:
         response_description: str = "Successful Response",
         responses: dict | None = None,
         name: str | None = None,
-        deprecated: bool = False,
+        deprecated: bool | None = None,
         operation_id: str | None = None,
         generate_unique_id_function: Callable | None = None,
         dependencies: Sequence | None = None,
@@ -59,7 +59,7 @@ class APIRoute:
         self.response_description = response_description
         self.responses = responses or {}
         self.name = name or endpoint.__name__
-        self.deprecated = deprecated
+        self.deprecated = bool(deprecated) if deprecated is not None else False
         self.dependencies = list(dependencies or [])
         self.response_class = response_class
         self.include_in_schema = include_in_schema

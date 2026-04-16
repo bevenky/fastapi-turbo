@@ -46,7 +46,6 @@ class Response:
         self,
         key: str,
         value: str = "",
-        *,
         max_age: int | None = None,
         expires: Any = None,
         path: str | None = "/",
@@ -54,8 +53,12 @@ class Response:
         secure: bool = False,
         httponly: bool = False,
         samesite: str | None = "lax",
+        partitioned: bool = False,
     ) -> None:
-        """Set a Set-Cookie header on this response (Starlette-compatible)."""
+        """Set a Set-Cookie header on this response (Starlette-compatible signature).
+
+        All parameters are positional-or-keyword to match Starlette exactly.
+        """
         parts: list[str] = [f"{key}={value}"]
         if max_age is not None:
             parts.append(f"Max-Age={int(max_age)}")
@@ -74,25 +77,31 @@ class Response:
             parts.append("HttpOnly")
         if samesite is not None:
             parts.append(f"SameSite={samesite.capitalize()}")
+        if partitioned:
+            parts.append("Partitioned")
         cookie_str = "; ".join(parts)
         self.raw_headers.append(("set-cookie", cookie_str))
 
     def delete_cookie(
         self,
         key: str,
-        path: str | None = "/",
+        path: str = "/",
         domain: str | None = None,
-        *,
         secure: bool = False,
         httponly: bool = False,
         samesite: str | None = "lax",
     ) -> None:
-        """Clear a cookie by setting max_age=0 (Starlette-compatible)."""
+        """Clear a cookie by setting max_age=0 (Starlette-compatible signature)."""
         self.set_cookie(
-            key=key, value="",
-            max_age=0, expires=0,
-            path=path, domain=domain,
-            secure=secure, httponly=httponly, samesite=samesite,
+            key,
+            "",
+            0,      # max_age
+            0,      # expires
+            path,
+            domain,
+            secure,
+            httponly,
+            samesite,
         )
 
 

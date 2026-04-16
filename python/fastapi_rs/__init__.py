@@ -3,7 +3,7 @@
 from fastapi_rs._fastapi_rs_core import core_version, rust_hello
 from fastapi_rs.applications import FastAPI
 from fastapi_rs.background import BackgroundTasks
-from fastapi_rs.dependencies import Depends
+from fastapi_rs.dependencies import Depends, Security
 from fastapi_rs.encoders import jsonable_encoder
 from fastapi_rs.exceptions import HTTPException, RequestValidationError, WebSocketDisconnect, WebSocketException
 from fastapi_rs.param_functions import Body, Cookie, File, Form, Header, Path, Query, UploadFile
@@ -40,6 +40,7 @@ __version__ = "0.1.0"
 __all__ = [
     "FastAPI",
     "Depends",
+    "Security",
     "APIRouter",
     "APIRoute",
     "Request",

@@ -491,11 +491,11 @@ class TestBodyEmbed:
         b = Body(embed=True)
         assert b.embed is True
 
-    def test_body_embed_default_false(self):
-        """Body marker defaults embed to False."""
+    def test_body_embed_default_none(self):
+        """Body marker defaults embed to None (FastAPI-compatible — means auto-detect)."""
         from fastapi_rs.param_functions import Body
         b = Body()
-        assert b.embed is False
+        assert b.embed is None
 
     def test_embed_single_body_introspection(self):
         """Single body param with embed=True is combined."""
