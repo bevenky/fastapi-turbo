@@ -33,7 +33,7 @@ from fastapi_rs.security import (
     OAuth2PasswordRequestForm,
     SecurityScopes,
 )
-from fastapi_rs.websockets import WebSocket
+from fastapi_rs.websockets import WebSocket, WebSocketState
 from fastapi_rs import status
 
 __version__ = "0.1.0"
@@ -45,6 +45,7 @@ __all__ = [
     "APIRoute",
     "Request",
     "WebSocket",
+    "WebSocketState",
     "Response",
     "JSONResponse",
     "ORJSONResponse",

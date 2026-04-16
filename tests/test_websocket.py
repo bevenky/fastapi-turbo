@@ -186,3 +186,134 @@ def test_websocket_with_http_routes(server_app):
             assert response == "ws: test"
 
     asyncio.run(_test())
+
+
+# ── Phase 1: binary + state + Pipecat-compat tests ──────────────────
+
+
+def test_websocket_binary_preserved(server_app):
+    """Binary frames must be preserved byte-exact (no UTF-8 coercion)."""
+    import websockets
+
+    url = server_app("""
+        from fastapi_rs import FastAPI, WebSocket
+        app = FastAPI()
+
+        @app.websocket("/ws")
+        async def ws_handler(websocket: WebSocket):
+            await websocket.accept()
+            data = await websocket.receive_bytes()
+            await websocket.send_bytes(data)
+            await websocket.close()
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+
+    ws_url = url.replace("http://", "ws://") + "/ws"
+    payload = bytes([0x00, 0x01, 0xff, 0xfe, 0x80, 0x81]) + b"opus_audio_data" * 10
+
+    async def _test():
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(payload)
+            response = await ws.recv()
+            assert isinstance(response, bytes)
+            assert response == payload
+
+    asyncio.run(_test())
+
+
+def test_websocket_receive_dict(server_app):
+    """ws.receive() returns ASGI-style dict (Pipecat's hot path)."""
+    import websockets
+
+    url = server_app("""
+        from fastapi_rs import FastAPI, WebSocket
+        app = FastAPI()
+
+        @app.websocket("/ws")
+        async def ws_handler(websocket: WebSocket):
+            await websocket.accept()
+            msg = await websocket.receive()
+            assert msg["type"] == "websocket.receive"
+            if msg.get("bytes") is not None:
+                await websocket.send_bytes(b"got-bytes:" + msg["bytes"])
+            elif msg.get("text") is not None:
+                await websocket.send_text(f"got-text:{msg['text']}")
+            await websocket.close()
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+
+    ws_url = url.replace("http://", "ws://") + "/ws"
+
+    async def _text():
+        async with websockets.connect(ws_url) as ws:
+            await ws.send("hello")
+            r = await ws.recv()
+            assert r == "got-text:hello"
+
+    async def _bytes():
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(b"\x00\xff\x01")
+            r = await ws.recv()
+            assert isinstance(r, bytes)
+            assert r == b"got-bytes:\x00\xff\x01"
+
+    asyncio.run(_text())
+    asyncio.run(_bytes())
+
+
+def test_websocket_state_tracking(server_app):
+    """application_state matches Starlette's WebSocketState."""
+    import websockets
+
+    url = server_app("""
+        from fastapi_rs import FastAPI, WebSocket, WebSocketState
+        app = FastAPI()
+
+        @app.websocket("/ws")
+        async def ws_handler(websocket: WebSocket):
+            before = int(websocket.application_state)
+            await websocket.accept()
+            after = int(websocket.application_state)
+            await websocket.send_text(f"{before},{after}")
+            try:
+                await websocket.receive_text()
+            except Exception:
+                pass
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+
+    ws_url = url.replace("http://", "ws://") + "/ws"
+
+    async def _test():
+        async with websockets.connect(ws_url) as ws:
+            response = await ws.recv()
+            before, after = response.split(",")
+            assert int(before) == 0  # CONNECTING
+            assert int(after) == 1  # CONNECTED
+
+    asyncio.run(_test())
+
+
+def test_websocket_state_enum_values():
+    """WebSocketState enum values match Starlette's."""
+    from fastapi_rs import WebSocketState
+
+    assert int(WebSocketState.CONNECTING) == 0
+    assert int(WebSocketState.CONNECTED) == 1
+    assert int(WebSocketState.DISCONNECTED) == 2
+    assert int(WebSocketState.RESPONSE) == 3
+
+
+def test_starlette_websockets_import_shim():
+    """`from starlette.websockets import WebSocketState` must work via the shim."""
+    import fastapi_rs  # noqa: F401
+
+    from starlette.websockets import WebSocket, WebSocketState, WebSocketDisconnect
+
+    assert WebSocketState is not None
+    assert int(WebSocketState.DISCONNECTED) == 2
+    assert WebSocket is not None
+    assert WebSocketDisconnect is not None

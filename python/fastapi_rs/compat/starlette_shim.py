@@ -73,6 +73,8 @@ def _build() -> dict[str, types.ModuleType]:
     # ── starlette.websockets ───────────────────────────────────────
     starlette_websockets = _mod("starlette.websockets")
     starlette_websockets.WebSocket = _websockets.WebSocket  # type: ignore[attr-defined]
+    starlette_websockets.WebSocketState = _websockets.WebSocketState  # type: ignore[attr-defined]
+    starlette_websockets.WebSocketDisconnect = _exceptions.WebSocketDisconnect  # type: ignore[attr-defined]
     starlette_websockets.WebSocketException = _exceptions.WebSocketException  # type: ignore[attr-defined]
     modules["starlette.websockets"] = starlette_websockets
 
