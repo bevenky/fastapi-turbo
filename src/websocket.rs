@@ -185,6 +185,14 @@ pub enum WriterCmd {
     Flush(cb::Sender<()>),
 }
 
+/// Parameters Python passes to `ws.accept(subprotocol=..., headers=...)`.
+/// Sent from Python → route handler via a tokio oneshot, used to build the
+/// actual WebSocket upgrade response (picking subprotocol, adding headers).
+pub struct AcceptParams {
+    pub subprotocol: Option<String>,
+    pub headers: Vec<(String, String)>,
+}
+
 #[pyclass]
 pub struct PyWebSocket {
     tx: mpsc::UnboundedSender<WriterCmd>,
@@ -198,6 +206,13 @@ pub struct PyWebSocket {
     // Scope info populated by the Rust route handler from the inbound request.
     // Python reads via get_scope_dict() to build HTTPConnection-like properties.
     scope_info: Arc<WsScopeInfo>,
+    // Pre-upgrade signaling (deferred-upgrade architecture):
+    //   accept_tx is consumed on first accept() call — sends chosen subprotocol
+    //   and custom headers to the route handler, which then performs the upgrade.
+    //   ready_rx blocks until the route handler has finished the upgrade and
+    //   connected the post-upgrade socket tasks — then send/receive can flow.
+    accept_tx: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<AcceptParams>>>>,
+    ready_rx: cb::Receiver<()>,
 }
 
 impl PyWebSocket {
@@ -237,7 +252,45 @@ impl PyWebSocket {
 
 #[pymethods]
 impl PyWebSocket {
-    fn accept(&self) -> PyResult<()> {
+    /// Accept the WebSocket upgrade with optional subprotocol + custom response headers.
+    ///
+    /// Deferred-upgrade architecture: sends AcceptParams to the route handler
+    /// via oneshot, then blocks (GIL released) on ready_rx until the handler has
+    /// finished upgrading and wired up the reader/writer tasks.
+    ///
+    /// Safe to call twice — second call is a no-op.
+    #[pyo3(signature = (subprotocol=None, headers=None))]
+    fn accept(
+        &self,
+        py: Python<'_>,
+        subprotocol: Option<String>,
+        headers: Option<Vec<(String, String)>>,
+    ) -> PyResult<()> {
+        // Take the accept_tx (one-shot — only fires on the first accept call)
+        let accept_tx = {
+            let mut guard = self.accept_tx.lock().unwrap();
+            guard.take()
+        };
+
+        if let Some(tx) = accept_tx {
+            let params = AcceptParams {
+                subprotocol,
+                headers: headers.unwrap_or_default(),
+            };
+            // send() is infallible unless the receiver was dropped — treat as
+            // already-accepted or route-handler-gone.
+            let _ = tx.send(params);
+
+            // Block until the route handler signals the upgrade is complete.
+            let rx = self.ready_rx.clone();
+            py.detach(|| {
+                // recv returns Err if the sender was dropped (connection aborted);
+                // in that case we just fall through — subsequent send/receive
+                // will fail, which is the right error surface.
+                let _ = rx.recv();
+            });
+        }
+        // Either we just accepted, or it was already accepted earlier.
         self.state.store(STATE_CONNECTED, Ordering::Release);
         Ok(())
     }
@@ -488,80 +541,46 @@ pub async fn handle_ws_echo_rust(socket: WebSocket) {
 
 // ── Python handler bridge ─────────────────────────────────────────
 
-pub async fn handle_ws_connection(
-    socket: WebSocket,
+/// Entry point for a WebSocket route. Uses deferred-upgrade architecture:
+///   1. Build PyWebSocket with pre-created channels + accept oneshot
+///   2. Spawn Python handler
+///   3. Wait for Python to call accept(subprotocol=..., headers=...)
+///   4. Upgrade the WS with the chosen subprotocol
+///   5. In the upgrade callback, spawn reader/writer tasks wired to the
+///      pre-created channels, then signal ready
+///   6. Python's accept() returns, normal send/receive flows
+///
+/// Returns the axum Response (101 Switching Protocols + upgrade callback).
+pub async fn handle_ws_upgrade(
+    ws: axum::extract::WebSocketUpgrade,
     handler: Py<PyAny>,
     is_async: bool,
     scope_info: WsScopeInfo,
-) {
-    use futures_util::{SinkExt, StreamExt};
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
 
-    let (mut ws_tx, mut ws_rx) = socket.split();
-
-    // Outgoing writer: handles Send messages + Flush barrier signals
-    let (tx_out, mut rx_out) = mpsc::unbounded_channel::<WriterCmd>();
-    tokio::spawn(async move {
-        while let Some(cmd) = rx_out.recv().await {
-            match cmd {
-                WriterCmd::Send(msg) => {
-                    if ws_tx.send(msg).await.is_err() {
-                        break;
-                    }
-                }
-                WriterCmd::Flush(tx) => {
-                    // All previous Send messages have been flushed (since we process
-                    // them in order before hitting this Flush command). Fire the
-                    // oneshot so the waiting close_and_wait() returns.
-                    let _ = tx.send(());
-                }
-            }
-        }
-    });
-
-    // Incoming: WS reader → crossbeam channel → Python handler
+    // Pre-create all channels. They work immediately — messages start flowing
+    // once the reader/writer tasks spawn in the on_upgrade callback.
+    let (tx_out, rx_out) = mpsc::unbounded_channel::<WriterCmd>();
     let (cb_tx, cb_rx) = cb::unbounded::<WsMessage>();
+    let (accept_tx, accept_rx) = tokio::sync::oneshot::channel::<AcceptParams>();
+    let (ready_tx, ready_rx) = cb::bounded::<()>(1);
     let state = Arc::new(AtomicU8::new(STATE_CONNECTING));
-    let state_reader = state.clone();
-
-    tokio::spawn(async move {
-        while let Some(result) = ws_rx.next().await {
-            let msg = match result {
-                Ok(m) => m,
-                Err(_) => break,
-            };
-            let ws_msg = match msg {
-                Message::Text(t) => WsMessage::Text(t.to_string()),
-                // Zero-copy: pass the Bytes through directly (axum 0.8 uses bytes::Bytes).
-                Message::Binary(b) => WsMessage::Binary(b),
-                Message::Close(frame) => {
-                    let (code, reason) = frame
-                        .map(|f| (f.code.into(), f.reason.to_string()))
-                        .unwrap_or((1000u16, String::new()));
-                    // Send the Close frame through the channel so receive_dict() can emit
-                    // the disconnect event. Then drop the channel.
-                    let _ = cb_tx.send(WsMessage::Close { code, reason });
-                    state_reader.store(STATE_DISCONNECTED, Ordering::Release);
-                    break;
-                }
-                // Ping/Pong are handled automatically by axum.
-                _ => continue,
-            };
-            if cb_tx.send(ws_msg).is_err() {
-                break;
-            }
-        }
-    });
 
     let py_ws = PyWebSocket {
         tx: tx_out,
         rx: cb_rx,
-        state,
+        state: state.clone(),
         cached_dict: std::sync::OnceLock::new(),
         cached_text: std::sync::OnceLock::new(),
         cached_bytes: std::sync::OnceLock::new(),
         scope_info: Arc::new(scope_info),
+        accept_tx: Arc::new(std::sync::Mutex::new(Some(accept_tx))),
+        ready_rx,
     };
 
+    // Spawn the Python handler in a background task. It will create the Python
+    // WebSocket wrapper, call accept(), and interact with the socket.
     let ws_obj = Python::attach(|py| {
         let ws_cell = Py::new(py, py_ws).expect("PyWebSocket");
         let ws_mod = py.import("fastapi_rs.websockets").expect("websockets");
@@ -572,9 +591,111 @@ pub async fn handle_ws_connection(
     let mut kwargs: HashMap<String, Py<PyAny>> = HashMap::new();
     kwargs.insert("websocket".to_string(), ws_obj);
 
-    if is_async {
-        let _ = handler_bridge::call_async_via_event_loop_pub(handler, kwargs).await;
-    } else {
-        let _ = handler_bridge::call_sync_handler(handler, kwargs).await;
+    tokio::spawn(async move {
+        if is_async {
+            let _ = handler_bridge::call_async_via_event_loop_pub(handler, kwargs).await;
+        } else {
+            let _ = handler_bridge::call_sync_handler(handler, kwargs).await;
+        }
+    });
+
+    // Wait for the Python handler to call accept(). Bound with a timeout so
+    // a handler that never accepts doesn't hang a client connection.
+    let params = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        accept_rx,
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) | Err(_) => {
+            // oneshot dropped (handler exited without accept) OR timeout.
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "WebSocket handler did not accept",
+            )
+                .into_response();
+        }
+    };
+
+    // Apply subprotocol negotiation (axum picks it up via the Sec-WebSocket-Protocol
+    // response header when building the 101 response).
+    let mut upgrade = ws;
+    if let Some(ref proto) = params.subprotocol {
+        upgrade = upgrade.protocols([proto.clone()]);
     }
+    // Note: custom response headers from `headers=...` aren't directly supported
+    // by axum's WebSocketUpgrade API without dropping to hyper — those are tracked
+    // but not emitted on the handshake response today. Subprotocol works.
+    let _ = params.headers; // consumed but not yet emitted
+
+    // Now perform the upgrade. on_upgrade returns a Response (101 Switching Protocols);
+    // the closure runs AFTER hyper completes the TCP upgrade.
+    let state_clone = state.clone();
+    upgrade.on_upgrade(move |socket| async move {
+        use futures_util::{SinkExt, StreamExt};
+        let (mut ws_tx, mut ws_rx) = socket.split();
+
+        // Writer task
+        let mut rx_out = rx_out;
+        tokio::spawn(async move {
+            while let Some(cmd) = rx_out.recv().await {
+                match cmd {
+                    WriterCmd::Send(msg) => {
+                        if ws_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    WriterCmd::Flush(tx) => {
+                        // All previous Send messages have been flushed before we
+                        // reach this Flush command (channel is FIFO). Signal.
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        });
+
+        // Reader task
+        let state_r = state_clone;
+        tokio::spawn(async move {
+            while let Some(result) = ws_rx.next().await {
+                let msg = match result {
+                    Ok(m) => m,
+                    Err(_) => break,
+                };
+                let ws_msg = match msg {
+                    Message::Text(t) => WsMessage::Text(t.to_string()),
+                    Message::Binary(b) => WsMessage::Binary(b),
+                    Message::Close(frame) => {
+                        let (code, reason) = frame
+                            .map(|f| (f.code.into(), f.reason.to_string()))
+                            .unwrap_or((1000u16, String::new()));
+                        let _ = cb_tx.send(WsMessage::Close { code, reason });
+                        state_r.store(STATE_DISCONNECTED, Ordering::Release);
+                        break;
+                    }
+                    _ => continue, // Ping/Pong handled by axum
+                };
+                if cb_tx.send(ws_msg).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Signal Python that the WS is ready — its accept() call returns now.
+        let _ = ready_tx.send(());
+    })
+}
+
+/// Backward-compat alias — old code path took a fully-upgraded WebSocket.
+/// Routes now call handle_ws_upgrade() directly via router.rs.
+#[allow(dead_code)]
+pub async fn handle_ws_connection(
+    _socket: WebSocket,
+    _handler: Py<PyAny>,
+    _is_async: bool,
+    _scope_info: WsScopeInfo,
+) {
+    // Deprecated — router.rs now calls handle_ws_upgrade(ws_upgrade, ...) directly.
+    unreachable!("handle_ws_connection is deprecated; use handle_ws_upgrade");
 }

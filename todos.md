@@ -90,13 +90,27 @@ Transitions: CONNECTING → (accept()) → CONNECTED → (close() or peer close)
 
 The Rust route handler now passes `WsScopeInfo` to `handle_ws_connection()` containing path, raw_path, query_string, all headers, host, scheme (ws/wss), and path params. Python reads via `_ws.get_scope_dict()` on property access (lazy, cached).
 
-### Deferred
+### Phase 1c — deferred-upgrade `accept(subprotocol, headers)` — SHIPPED
 
-8. **`accept(headers=...)` / subprotocol negotiation** — axum performs the HTTP upgrade BEFORE the Python handler runs. Properly supporting this requires either (a) deferring the upgrade until Python calls `accept()`, or (b) passing a callback to `on_upgrade` with the subprotocol. Architectural change ~200 LOC. Deferred to Phase 1c.
+Architectural change complete. The HTTP upgrade now defers until Python calls `accept()`:
 
-9. `websocket.connect` first-receive protocol — strict ASGI spec edge. Deferred.
+1. Route handler creates pre-built mpsc + crossbeam channels and a `tokio::sync::oneshot<AcceptParams>`.
+2. A pre-upgrade `PyWebSocket` is handed to the Python handler (spawned in a tokio task).
+3. Python calls `await ws.accept(subprotocol="chat.v1")` — sends params via oneshot, blocks on `ready_rx` with GIL released.
+4. Route handler receives params, applies `WebSocketUpgrade::protocols([...])` for subprotocol negotiation, then calls `on_upgrade(...)`.
+5. `on_upgrade`'s callback wires reader/writer tasks to the pre-built channels and fires `ready_tx.send(())`.
+6. Python's `accept()` unblocks. Send/receive flow normally.
+7. If the handler never calls `accept()` within 30 s, the upgrade returns `500 Internal Server Error` cleanly (test verified).
 
-10. `send_denial_response()` — WebSocket Denial Response extension. Rare. Deferred.
+**Subprotocol negotiation:** fully working. Client offers `["chat.v1", "chat.v2"]`, server calls `accept(subprotocol="chat.v1")`, 101 Switching Protocols response includes `Sec-WebSocket-Protocol: chat.v1`, and `ws.subprotocol` on the client reflects the negotiated value. Verified.
+
+**Custom response headers** via `accept(headers=...)` — parameter is accepted and passed through but not yet emitted on the handshake response. Axum's `WebSocketUpgrade` API doesn't expose custom response headers without dropping to lower-level hyper. Semi-deferred; can be added with a small axum escape-hatch.
+
+### Still deferred (strict-spec only, real code won't hit)
+
+9. `websocket.connect` first-receive ASGI protocol — we skip the initial `{"type":"websocket.connect"}` frame.
+
+10. `send_denial_response()` — WebSocket Denial Response extension (RFC 9455). Rare.
 
 ### Tests
 

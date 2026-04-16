@@ -181,17 +181,29 @@ class WebSocket:
     ) -> None:
         """Accept the WebSocket upgrade.
 
-        Note: subprotocol / headers negotiation happens at the Axum upgrade
-        layer BEFORE this Python method runs, so passing them here is
-        accepted for API compatibility but has limited effect today. A future
-        phase will plumb these through the upgrade handshake.
+        Uses deferred-upgrade: the actual HTTP 101 upgrade happens when this
+        method is called, not when the route handler starts. subprotocol is
+        negotiated via axum's `WebSocketUpgrade.protocols(...)` — the chosen
+        subprotocol appears in the response's Sec-WebSocket-Protocol header.
+
+        headers: list of (bytes, bytes) — accepted for API compatibility with
+        Starlette but not yet emitted on the handshake response (axum's
+        WebSocketUpgrade API doesn't expose custom response headers without
+        dropping to lower-level hyper).
         """
         if self._app_state != WebSocketState.CONNECTING:
-            # Starlette tolerates double-accept; we mirror that to avoid breaking apps.
-            pass
-        self._app_state = WebSocketState.CONNECTED
+            # Starlette tolerates double-accept; we mirror that.
+            return
         if self._ws is not None:
-            self._ws.accept()
+            # Convert headers from [(bytes, bytes)] to [(str, str)] for PyO3.
+            rust_headers: list[tuple[str, str]] = []
+            if headers:
+                for k, v in headers:
+                    k_s = k.decode("latin-1") if isinstance(k, (bytes, bytearray)) else str(k)
+                    v_s = v.decode("latin-1") if isinstance(v, (bytes, bytearray)) else str(v)
+                    rust_headers.append((k_s, v_s))
+            self._ws.accept(subprotocol, rust_headers if rust_headers else None)
+        self._app_state = WebSocketState.CONNECTED
 
     async def close(self, code: int = 1000, reason: str | None = None) -> None:
         """Close the WebSocket and wait for the frame to flush.

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::handler_bridge::{call_async_handler, call_sync_handler};
 use crate::responses::{py_to_response, pyerr_to_response, serde_to_pyobj};
-use crate::websocket::handle_ws_connection;
+use crate::websocket::handle_ws_upgrade;
 
 // ── Data types exposed to Python ──────────────────────────────────────
 
@@ -260,9 +260,9 @@ pub fn build_router(routes: Vec<RouteInfo>) -> Router {
                                 path_params: Vec::new(),
                             };
 
-                            ws.on_upgrade(move |socket| {
-                                handle_ws_connection(socket, h, is_a, scope)
-                            })
+                            // Deferred-upgrade: the handler returns the Response
+                            // (101 or 500) and wires up the upgrade callback internally.
+                            handle_ws_upgrade(ws, h, is_a, scope).await
                         }
                     },
                 ),

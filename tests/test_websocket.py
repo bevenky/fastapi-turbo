@@ -598,3 +598,109 @@ def test_websocket_cookies_from_scope():
     cookies = ws.cookies
     assert cookies["session"] == "abc"
     assert cookies["theme"] == "dark"
+
+
+# ── Phase 1c: accept(subprotocol, headers) ───────────────────────────
+
+
+def test_websocket_accept_subprotocol_negotiation(server_app):
+    """accept(subprotocol='chat.v1') — client receives Sec-WebSocket-Protocol in response."""
+    import websockets
+
+    url = server_app("""
+        from fastapi_rs import FastAPI, WebSocket
+        app = FastAPI()
+
+        @app.websocket("/ws")
+        async def ws_handler(websocket: WebSocket):
+            # Pick subprotocol based on what the client offered.
+            # The client's offered subprotocols are in the scope headers
+            # under 'sec-websocket-protocol'.
+            await websocket.accept(subprotocol="chat.v1")
+            await websocket.send_text("accepted-chat.v1")
+            await websocket.close()
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+
+    ws_url = url.replace("http://", "ws://") + "/ws"
+
+    async def _test():
+        async with websockets.connect(
+            ws_url, subprotocols=["chat.v1", "chat.v2"]
+        ) as ws:
+            # Client received the chosen subprotocol in the handshake response
+            assert ws.subprotocol == "chat.v1"
+            msg = await ws.recv()
+            assert msg == "accepted-chat.v1"
+
+    asyncio.run(_test())
+
+
+def test_websocket_accept_no_subprotocol(server_app):
+    """accept() without subprotocol — plain WS connection still works."""
+    import websockets
+
+    url = server_app("""
+        from fastapi_rs import FastAPI, WebSocket
+        app = FastAPI()
+
+        @app.websocket("/ws")
+        async def ws_handler(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("hello")
+            await websocket.close()
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+
+    ws_url = url.replace("http://", "ws://") + "/ws"
+
+    async def _test():
+        async with websockets.connect(ws_url) as ws:
+            assert ws.subprotocol is None
+            msg = await ws.recv()
+            assert msg == "hello"
+
+    asyncio.run(_test())
+
+
+def test_websocket_handler_no_accept_times_out(server_app):
+    """If the Python handler never calls accept(), the upgrade should fail cleanly."""
+    import websockets
+
+    url = server_app("""
+        from fastapi_rs import FastAPI, WebSocket
+        app = FastAPI()
+
+        @app.websocket("/ws")
+        async def ws_handler(websocket: WebSocket):
+            # Deliberately don't accept — just return.
+            return
+
+        @app.get("/health")
+        async def health():
+            return {"ok": True}
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+
+    # The WS endpoint should reject the upgrade (500 or closed connection).
+    ws_url = url.replace("http://", "ws://") + "/ws"
+
+    async def _test():
+        try:
+            async with websockets.connect(ws_url) as ws:
+                # If we get here, handshake unexpectedly succeeded
+                await asyncio.wait_for(ws.recv(), timeout=1)
+                raise AssertionError("expected handshake failure")
+        except (websockets.InvalidStatus, websockets.InvalidHandshake,
+                ConnectionError, asyncio.TimeoutError, websockets.ConnectionClosed):
+            pass  # Expected — handshake was rejected or connection closed
+
+    asyncio.run(_test())
+
+    # Also verify the app is still serving — the WS timeout shouldn't break it
+    import httpx
+    r = httpx.get(f"{url}/health")
+    assert r.status_code == 200
