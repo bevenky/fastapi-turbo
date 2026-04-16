@@ -343,8 +343,9 @@ Measured per 20 ms audio frame at 48kHz→16kHz mono:
 | **Resampling** (soxr) | `audio/resamplers/soxr_stream_resampler.py:83-101` | **450-900 μs** | Every frame needing rate conversion |
 | **`asyncio.sleep` pacing** | `transports/websocket/fastapi.py:518-528` | ~20 ms jitter | Every output frame |
 | **Background audio mixing** (NumPy) | `audio/mixers/soundfile_mixer.py:170-195` | **62-100 μs** | Every output frame when mixer on |
-| **Silero VAD** (ONNX inference) | `audio/vad/silero.py:199-226` | **5-15 ms** | Every 512 samples (~32ms) |
-| **Opus/G.711 codec** | N/A in Pipecat — user layer | N/A | N/A |
+| **G.711 μ-law/A-law encode/decode** | `audio/utils.py:14` | **BROKEN on Py 3.13+** | Every telephony frame (100/s) |
+| **Recording (user + bot buffers)** | `processors/audio/audio_buffer_processor.py:100-312` | ~10-100 μs/frame, **all RAM** | Every frame |
+| **Opus codec** | N/A in Pipecat — user layer | N/A | N/A |
 
 ### Phase 2 modules (proposed)
 
@@ -442,38 +443,114 @@ mixed = mix_saturating(voice_pcm, background_pcm, volume=0.3)  # ~5-10 μs
 
 ---
 
-#### E. `fastapi_rs.audio.vad` — Rust ONNX Silero VAD binding
+#### E. `fastapi_rs.audio.codec` — G.711 μ-law/A-law **[CRITICAL for Python 3.13+]**
 
-**Problem:** Pipecat's Silero VAD runs `self._model(audio_float32, sample_rate)` (Python onnxruntime), taking 5-15 ms per 512-sample analysis. This is the BIGGEST per-call cost in the audio path.
+**Problem:** Pipecat's G.711 encoding/decoding calls `audioop.ulaw2lin` / `audioop.lin2ulaw` / `audioop.alaw2lin` / `audioop.lin2alaw` at `pipecat/audio/utils.py:14`. **The `audioop` module was removed from Python 3.13 stdlib** (deprecated in 3.11, gone in 3.13). **Pipecat is literally broken on Python 3.13+** — `import audioop` raises `ModuleNotFoundError` the moment you import any telephony serializer (Twilio, Plivo, Telnyx, Exotel, Vonage).
 
-**Solution:** Use the `ort` (ONNX Runtime) Rust crate. Same underlying model/ONNX runtime, but without Python GIL contention and no numpy → float32 allocation per call.
+**This is a crisis for every Pipecat user on Python 3.13+**. Current workarounds: (1) downgrade to 3.12, (2) install third-party `pyaudioop` and monkey-patch Pipecat, (3) fork Pipecat.
+
+**Hot path usage (every 20 ms telephony frame, 100+ calls/sec per connection):**
+- `pipecat/serializers/twilio.py:154,252` — encode/decode on every outbound/inbound frame
+- `pipecat/serializers/plivo.py:124,225` — same
+- `pipecat/serializers/telnyx.py:138-256` — PCMU *and* PCMA (A-law for European telecom)
+
+**Solution:** Pure-Rust G.711 codec with 256-byte lookup tables. ~100 lines of Rust total. Same table lookups audioop uses (both just implement ITU G.711).
 
 ```python
-from fastapi_rs.audio.vad import SileroVAD
+from fastapi_rs.audio.codec import Mulaw, Alaw
 
-vad = SileroVAD(sample_rate=16000, model_path="silero_vad.onnx")
-confidence = vad.process(pcm_bytes)  # ~3-8 ms (vs 5-15 ms Python-side)
+# Decode 8-bit μ-law (160 bytes / 20ms @ 8kHz) → 16-bit PCM (320 bytes)
+pcm = Mulaw.decode(ulaw_bytes)     # ~1 μs (table lookup)
+
+# Encode 16-bit PCM → 8-bit μ-law
+ulaw = Mulaw.encode(pcm_bytes)     # ~1 μs
+
+# Same API for A-law (European telephony)
+pcm = Alaw.decode(alaw_bytes)
+alaw = Alaw.encode(pcm_bytes)
 ```
 
-**Pipecat integration:** Subclass `VADAnalyzer`. Users pass our VAD via `SileroVADAnalyzerFactory`. Modest Pipecat PR needed, or users wire it manually.
+**Pipecat integration:** Monkey-patch `pipecat/audio/utils.py` imports or subclass the serializers. Either way, zero Pipecat PR needed — users can install `fastapi-rs` and do:
 
-**Cost today:** 5-15 ms/call → **3-8 ms**. **~2x speedup.**
+```python
+# At app startup — unbreak Pipecat on Python 3.13+
+import fastapi_rs.audio.codec as _codec
+import sys, types
+_shim = types.ModuleType("audioop")
+_shim.ulaw2lin = lambda b, w: _codec.Mulaw.decode(b)
+_shim.lin2ulaw = lambda b, w: _codec.Mulaw.encode(b)
+_shim.alaw2lin = lambda b, w: _codec.Alaw.decode(b)
+_shim.lin2alaw = lambda b, w: _codec.Alaw.encode(b)
+sys.modules["audioop"] = _shim
+```
 
-**Caveat:** ONNX inference itself is the bottleneck — Rust wrapper just removes the Python overhead. Not a massive win unless we also support quantized models.
+**Cost today:** broken (ImportError) on Python 3.13+. With Rust codec: **~1 μs/frame**, faster than the C audioop it replaces (no Python boundary overhead on the loop path).
 
-**Complexity:** Medium-high. ~200 lines Rust (model loading, state management) + 60 Python. ONNX model file shipped separately.
+**Complexity:** Low. G.711 μ-law and A-law are both 256-byte table lookups, well-documented in ITU-T G.711. ~100 lines Rust + ~40 lines Python binding.
 
 ---
 
-### Phase 2 priority order
+#### F. `fastapi_rs.audio.record` — streaming WAV/Opus recorder
 
-Biggest win per LOC: **A (WAV) → D (Mixer) → C (Pacer) → B (Resample) → E (VAD)**.
+**Problem:** Pipecat's `AudioBufferProcessor` buffers **the entire call** in memory (`bytearray`), then dispatches via `on_audio_data` / `on_track_audio_data` event handlers at call end. Users must implement their own WAV/Opus writing. For long calls, memory grows unbounded. No streaming-to-disk option built in.
 
-Recommendation: Ship A (wav) + C (pacer) first. Those two alone unlock a dramatically faster voice-agent path in pure Python FastAPI code:
-- WAV wrap: 1000 μs → 5 μs (reclaims 5% of per-frame budget)
-- Pacer: replaces the chokepoint asyncio.sleep with precise tokio timing
+**Observed:**
+- `pipecat/processors/audio/audio_buffer_processor.py:100-101` — `self._user_audio_buffer = bytearray()` / `self._bot_audio_buffer = bytearray()`
+- `pipecat/processors/audio/audio_buffer_processor.py:285-312` — dual-track recording (user + bot separately or interleaved stereo)
+- Call end: `merge_audio_buffers()` calls numpy ops to mix mono or `np.column_stack` to interleave stereo. O(n) at call end.
+- **No disk streaming.** 1 hour of 16 kHz mono PCM = ~115 MB sitting in memory per call.
 
-D (mixer) and B (resample) are solid follow-ups. E (VAD) has limited upside without model quantization.
+**Solution:** A streaming recorder that writes frames as they arrive:
+
+```python
+from fastapi_rs.audio.record import Recorder
+
+# Streaming WAV — header written on first frame, data appended, finalized on close
+rec = Recorder.wav("call.wav", sample_rate=16000, channels=2)
+
+# Dual-track (user L, bot R) — writes interleaved stereo frames
+rec.write_stereo(user_pcm_frame, bot_pcm_frame)  # ~5 μs
+
+await rec.close()  # finalizes WAV header with final data size
+
+# Or Opus (compressed) for long-term storage
+rec = Recorder.opus("call.opus", sample_rate=16000, channels=2, bitrate=64000)
+rec.write_stereo(user_pcm_frame, bot_pcm_frame)  # ~500 μs (opus encode)
+await rec.close()
+```
+
+**Pipecat integration:** Users replace `AudioBufferProcessor` with a thin wrapper that forwards to `Recorder`. OR subscribe to the on_audio_data event and pipe frames to Recorder incrementally (not done today — Pipecat only fires the event at end).
+
+**Cost today:**
+- Memory: **~115 MB per hour of mono 16 kHz** buffered in process RAM
+- Finalization: O(n) numpy mix/interleave at call end (~10-100 ms for a 1-hour call)
+- **No disk streaming at all**
+
+**With `fastapi_rs.audio.record`:**
+- Memory: **<64 KB bounded buffer** (write-through)
+- Per frame: ~5 μs for WAV, ~500 μs for Opus encode
+- Finalization: write WAV header length field (~1 μs) — no O(n) copy
+
+**Crates:** `hound` for WAV (pure Rust, streaming-friendly), `opus` for Opus (libopus FFI).
+
+**Complexity:** Medium. ~200 lines Rust + ~80 Python. WAV is trivial. Opus needs system libopus or bundle it.
+
+---
+
+### Phase 2 priority order (updated)
+
+Ranked by blast radius:
+
+1. **E. `.codec` (G.711 μ-law/A-law)** — **CRITICAL.** Pipecat is broken on Python 3.13+ without this. Every telephony user needs it today. Smallest module (~100 LOC Rust), biggest unlock.
+2. **A. `.wav` (WavStreamer)** — 100× speedup on WAV header generation, trivial LOC.
+3. **F. `.record` (streaming recorder)** — Memory fix + missing feature in Pipecat. Medium complexity.
+4. **B. `.resample` (libsamplerate/speexdsp)** — 3× speedup, medium LOC.
+5. **C. `.pacer` (tokio interval)** — precision win, low LOC.
+6. **D. `.mixer` (SIMD saturating add)** — 10× speedup, low LOC.
+
+**Dropped from scope:** Rust ONNX Silero VAD — out of scope per user direction. ONNX inference itself is the real cost (unchanged by a Rust wrapper), and users can plug any VAD via Pipecat's existing `VADAnalyzer` interface. We don't gain enough to justify shipping/maintaining a `.vad` module.
+
+**Recommendation:** Ship E (codec) first — it unblocks Python 3.13+ for all telephony users TODAY. A (wav) + F (record) follow as complementary voice-agent primitives. B/C/D when needed.
 
 ---
 
