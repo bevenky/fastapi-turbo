@@ -125,7 +125,7 @@ impl PyPool {
 
     /// Execute a query and return a single row as a dict.
     /// Returns None if no rows found.
-    fn query_one(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyList>>) -> PyResult<PyObject> {
+    fn query_one(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyList>>) -> PyResult<Py<PyAny>> {
         let pool = self.pool.clone();
         let sql = sql.to_string();
         let param_values = extract_params(py, params)?;
@@ -150,7 +150,7 @@ impl PyPool {
     }
 
     /// Execute a query and return all rows as a list of dicts.
-    fn query(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyList>>) -> PyResult<PyObject> {
+    fn query(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyList>>) -> PyResult<Py<PyAny>> {
         let pool = self.pool.clone();
         let sql = sql.to_string();
         let param_values = extract_params(py, params)?;
@@ -179,7 +179,7 @@ impl PyPool {
     /// Each query is a tuple of (sql, params_list).
     /// This is the equivalent of Go goroutines — all queries run simultaneously
     /// on the tokio runtime with zero Python/GIL overhead during execution.
-    fn gather(&self, py: Python<'_>, queries: &Bound<'_, PyList>) -> PyResult<PyObject> {
+    fn gather(&self, py: Python<'_>, queries: &Bound<'_, PyList>) -> PyResult<Py<PyAny>> {
         let pool = self.pool.clone();
 
         // Extract all queries and params while we have the GIL
