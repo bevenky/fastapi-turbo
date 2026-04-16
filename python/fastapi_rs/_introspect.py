@@ -102,8 +102,25 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
 
         # Track embed flag for body params
         embed = False
+        media_type_override = None
         if marker is not None and isinstance(marker, Body):
             embed = getattr(marker, "embed", False)
+            media_type_override = getattr(marker, "media_type", None)
+
+        # Propagate example/examples/description from markers for OpenAPI
+        example_val = None
+        examples_val = None
+        title_val = None
+        description_val = None
+        include_in_schema_val = True
+        deprecated_val = None
+        if marker is not None:
+            example_val = getattr(marker, "example", None)
+            examples_val = getattr(marker, "examples", None)
+            title_val = getattr(marker, "title", None)
+            description_val = getattr(marker, "description", None)
+            include_in_schema_val = getattr(marker, "include_in_schema", True)
+            deprecated_val = getattr(marker, "deprecated", None)
 
         params.append(
             {
@@ -115,6 +132,13 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
                 "model_class": model_class,
                 "alias": alias,
                 "_embed": embed,
+                "media_type": media_type_override,
+                "example": example_val,
+                "examples": examples_val,
+                "title": title_val,
+                "description": description_val,
+                "include_in_schema": include_in_schema_val,
+                "deprecated": deprecated_val,
             }
         )
 

@@ -65,6 +65,20 @@ def _apply_response_model(
     return result
 
 
+def _wrap_response_class(result, response_class):
+    """Wrap a bare handler result (dict/list/str/etc.) in a response_class.
+
+    If the handler already returned a Response instance, leave it alone
+    (Starlette semantics: user-returned Response always wins).
+    """
+    if response_class is None or result is None:
+        return result
+    # If result is already a Response-like object, don't double-wrap
+    if hasattr(result, "status_code") and hasattr(result, "body"):
+        return result
+    return response_class(content=result)
+
+
 def _try_compile_handler(
     endpoint,
     params,
@@ -75,6 +89,7 @@ def _try_compile_handler(
     response_model_exclude_unset=False,
     response_model_exclude_defaults=False,
     response_model_exclude_none=False,
+    response_class=None,
 ):
     """Compile deps + handler into a SINGLE Python function (1 PyO3 call instead of N+1).
 
@@ -92,25 +107,40 @@ def _try_compile_handler(
     _rm_exclude_unset = response_model_exclude_unset
     _rm_exclude_defaults = response_model_exclude_defaults
     _rm_exclude_none = response_model_exclude_none
+    _response_class = response_class
 
     dep_steps = [p for p in params if p["kind"] == "dependency"]
+    _has_exc_handlers = app is not None and bool(getattr(app, "exception_handlers", None))
     if not dep_steps:
-        if response_model is not None:
-            # Even without deps, we may need response_model filtering
+        if response_model is not None or _response_class is not None or _has_exc_handlers:
+            # Even without deps, we may need response_model filtering or response_class wrapping
             handler_param_names = {p["name"] for p in params if p.get("_is_handler_param")}
             handler_func = endpoint
             if asyncio.iscoroutinefunction(handler_func):
                 handler_func = _make_sync_wrapper(handler_func)
 
+            _app_ref = app
+
             def _compiled_no_deps(**kwargs):
-                result = handler_func(**{k: kwargs[k] for k in handler_param_names if k in kwargs})
-                return _apply_response_model(
-                    result, response_model,
-                    include=_rm_include, exclude=_rm_exclude,
-                    exclude_unset=_rm_exclude_unset,
-                    exclude_defaults=_rm_exclude_defaults,
-                    exclude_none=_rm_exclude_none,
-                )
+                try:
+                    result = handler_func(**{k: kwargs[k] for k in handler_param_names if k in kwargs})
+                except Exception as exc:
+                    if _app_ref is not None and _app_ref.exception_handlers:
+                        handler_result = _app_ref._invoke_exception_handler(exc)
+                        if handler_result is not None:
+                            return handler_result
+                    raise
+                if response_model is not None:
+                    result = _apply_response_model(
+                        result, response_model,
+                        include=_rm_include, exclude=_rm_exclude,
+                        exclude_unset=_rm_exclude_unset,
+                        exclude_defaults=_rm_exclude_defaults,
+                        exclude_none=_rm_exclude_none,
+                    )
+                if _response_class is not None:
+                    result = _wrap_response_class(result, _response_class)
+                return result
 
             return _compiled_no_deps
         return None
@@ -174,7 +204,15 @@ def _try_compile_handler(
                 cache[func_id] = result
 
         try:
-            result = handler_func(**{k: resolved[k] for k in handler_param_names if k in resolved})
+            try:
+                result = handler_func(**{k: resolved[k] for k in handler_param_names if k in resolved})
+            except Exception as exc:
+                # Route through app's exception_handlers if one is registered
+                if _app is not None and _app.exception_handlers:
+                    handler_result = _app._invoke_exception_handler(exc)
+                    if handler_result is not None:
+                        return handler_result
+                raise
             # Apply response_model filtering (P0 fix #5)
             if response_model is not None:
                 result = _apply_response_model(
@@ -184,6 +222,9 @@ def _try_compile_handler(
                     exclude_defaults=_rm_exclude_defaults,
                     exclude_none=_rm_exclude_none,
                 )
+            # Wrap in response_class if set
+            if _response_class is not None:
+                result = _wrap_response_class(result, _response_class)
             return result
         finally:
             # Clean up generator deps in reverse order (P0 fix #4)
@@ -194,6 +235,143 @@ def _try_compile_handler(
                     pass
 
     return _compiled
+
+
+# Imports hoisted to module-level for the hot path (used by wrapped endpoints)
+from fastapi_rs.requests import Request as _Request
+from fastapi_rs.responses import JSONResponse as _JSONResponse
+
+
+def _wrap_with_http_middlewares(endpoint, middlewares, app):
+    """Wrap a route endpoint with a chain of @app.middleware("http") functions.
+
+    FAST PATH: Drive the async middleware chain SYNCHRONOUSLY via coro.send(None).
+    Most HTTP middlewares only `await call_next(request)` — they don't do real I/O.
+    By making call_next an `async def` that returns immediately, the middleware's
+    coroutine completes in one send() call, avoiding the expensive Rust async path
+    (saves ~50μs per request).
+
+    Falls back to the normal async path only if a middleware actually suspends
+    on real I/O (rare in HTTP middleware — logging, header mangling, etc.).
+    """
+    if not middlewares:
+        return endpoint
+
+    is_async_endpoint = asyncio.iscoroutinefunction(endpoint)
+
+    # Shared scope — recycled per request (shallow copy cheap)
+    def _make_scope(kwargs):
+        return {"type": "http", "app": app, "_handler_kwargs": kwargs}
+
+    def _call_handler_sync(kwargs):
+        """Run the underlying handler, returning a Response-normalized value."""
+        if is_async_endpoint:
+            coro = endpoint(**kwargs)
+            try:
+                coro.send(None)
+                # Suspended — fall back
+                coro.close()
+                raise _MiddlewareSuspendedError()
+            except StopIteration as e:
+                result = e.value
+        else:
+            result = endpoint(**kwargs)
+        # Normalize bare dict/list to a Response so middleware can mutate headers
+        if result is None or hasattr(result, "status_code"):
+            return result
+        if isinstance(result, (dict, list)):
+            return _JSONResponse(content=result)
+        return result
+
+    # Build a chain of sync callables. Each one drives its middleware via
+    # coro.send(None) and returns the result. The innermost one calls the handler.
+    def _make_runner(idx: int):
+        """Return a function that runs middleware[idx] around the inner chain."""
+        if idx >= len(middlewares):
+            return None
+        mw = middlewares[idx]
+        inner = _make_runner(idx + 1)
+
+        def _run_chain(request, kwargs):
+            # Build a call_next that resolves synchronously via the next runner
+            # (or the handler if we're at the end of the chain).
+            async def call_next(_req=None):
+                if inner is None:
+                    return _call_handler_sync(kwargs)
+                return inner(request, kwargs)
+
+            if asyncio.iscoroutinefunction(mw):
+                coro = mw(request, call_next)
+                try:
+                    coro.send(None)
+                    # Middleware actually suspended on something other than our call_next.
+                    # That shouldn't happen for typical HTTP middleware, but handle it.
+                    coro.close()
+                    raise _MiddlewareSuspendedError()
+                except StopIteration as e:
+                    return e.value
+            else:
+                # Sync middleware (rare)
+                return mw(request, call_next)
+
+        return _run_chain
+
+    runner = _make_runner(0)
+
+    def wrapped_sync(**kwargs):
+        request = _Request(_make_scope(kwargs))
+        try:
+            return runner(request, kwargs)
+        except _MiddlewareSuspendedError:
+            # Fallback: drive everything through a fresh event loop
+            return _drive_async_fallback(endpoint, middlewares, app, kwargs, is_async_endpoint)
+
+    return wrapped_sync
+
+
+class _MiddlewareSuspendedError(Exception):
+    """Internal: raised when sync-driving fails because a middleware suspends."""
+    pass
+
+
+def _drive_async_fallback(endpoint, middlewares, app, kwargs, is_async_endpoint):
+    """Fallback: run the whole middleware chain on a real asyncio event loop.
+
+    Used when a middleware suspends on real I/O (e.g., httpx call inside).
+    """
+    async def _chain():
+        request = _Request({"type": "http", "app": app, "_handler_kwargs": kwargs})
+
+        async def call_handler():
+            if is_async_endpoint:
+                result = await endpoint(**kwargs)
+            else:
+                result = endpoint(**kwargs)
+            if result is None or hasattr(result, "status_code"):
+                return result
+            if isinstance(result, (dict, list)):
+                return _JSONResponse(content=result)
+            return result
+
+        async def build(idx):
+            if idx >= len(middlewares):
+                return await call_handler()
+            mw = middlewares[idx]
+
+            async def call_next(_req=None):
+                return await build(idx + 1)
+
+            if asyncio.iscoroutinefunction(mw):
+                return await mw(request, call_next)
+            return mw(request, call_next)
+
+        return await build(0)
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_chain())
+    finally:
+        loop.close()
 
 
 def _collect_dependencies_from_markers(dependencies):
@@ -237,6 +415,9 @@ class FastAPI:
         openapi_tags: list[dict[str, Any]] | None = None,
         lifespan=None,
         dependencies: Sequence | None = None,
+        root_path: str = "",
+        root_path_in_servers: bool = True,
+        exception_handlers: dict | None = None,
         **kwargs: Any,
     ):
         self.title = title
@@ -251,6 +432,10 @@ class FastAPI:
         self.license_info = license_info
         self.openapi_tags = openapi_tags
         self.lifespan = lifespan
+        self.root_path = root_path
+        self.root_path_in_servers = root_path_in_servers
+        # Map of exception class (or int status code) -> handler callable
+        self.exception_handlers: dict = dict(exception_handlers or {})
 
         self.router = APIRouter()
         self.state = SimpleNamespace()
@@ -258,6 +443,9 @@ class FastAPI:
         self.dependencies: list = list(dependencies or [])
 
         self._middleware_stack: list[tuple[type, dict[str, Any]]] = []
+        # @app.middleware("http") registered middlewares — Python-side HTTP middlewares
+        # that wrap each user route handler.
+        self._http_middlewares: list[Callable] = []
         self._on_startup: list[Callable] = []
         self._on_shutdown: list[Callable] = []
         self._included_routers: list[tuple[APIRouter, str, list[str]]] = []
@@ -333,6 +521,28 @@ class FastAPI:
     def add_middleware(self, middleware_cls, **kwargs: Any) -> None:
         self._middleware_stack.append((middleware_cls, kwargs))
 
+    def middleware(self, middleware_type: str):
+        """Decorator to register a Python HTTP middleware (Starlette-compatible).
+
+        Usage:
+            @app.middleware("http")
+            async def add_custom_header(request, call_next):
+                response = await call_next(request)
+                response.headers["x-custom"] = "value"
+                return response
+
+        Only middleware_type="http" is supported. The middleware wraps each
+        user route handler (doesn't intercept Rust-native endpoints like /_ping).
+        """
+        if middleware_type != "http":
+            raise ValueError(f"Unsupported middleware type: {middleware_type!r}; only 'http' is supported")
+
+        def decorator(func: Callable) -> Callable:
+            self._http_middlewares.append(func)
+            return func
+
+        return decorator
+
     def _build_middleware_config(self) -> list[dict[str, Any]]:
         """Convert the middleware stack into dicts the Rust core can consume."""
         from fastapi_rs.middleware.trustedhost import TrustedHostMiddleware
@@ -371,6 +581,88 @@ class FastAPI:
             return func
 
         return decorator
+
+    # ------------------------------------------------------------------
+    # Exception handlers
+    # ------------------------------------------------------------------
+
+    def exception_handler(self, exc_class_or_status_code):
+        """Register a handler for an exception class or HTTP status code.
+
+        Usage:
+            @app.exception_handler(HTTPException)
+            async def handle(request, exc):
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
+            @app.exception_handler(404)
+            async def handle_404(request, exc):
+                return JSONResponse({"detail": "Not Found"}, status_code=404)
+        """
+
+        def decorator(func: Callable) -> Callable:
+            self.exception_handlers[exc_class_or_status_code] = func
+            return func
+
+        return decorator
+
+    def add_exception_handler(self, exc_class_or_status_code, handler: Callable) -> None:
+        """Imperative form of @app.exception_handler()."""
+        self.exception_handlers[exc_class_or_status_code] = handler
+
+    def _lookup_exception_handler(self, exc: BaseException) -> Callable | None:
+        """Look up a handler by exact class, then by MRO, then by status code.
+
+        Matches Starlette's resolution order.
+        """
+        # Exact class first
+        cls = type(exc)
+        if cls in self.exception_handlers:
+            return self.exception_handlers[cls]
+        # Walk MRO (parent classes)
+        for parent in cls.__mro__[1:]:
+            if parent in self.exception_handlers:
+                return self.exception_handlers[parent]
+        # Status code match (for HTTPException subclasses)
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int) and status_code in self.exception_handlers:
+            return self.exception_handlers[status_code]
+        return None
+
+    def _invoke_exception_handler(self, exc: BaseException):
+        """Run a registered exception handler and return its Response-like result.
+
+        Returns None if no handler is found. The caller is responsible for
+        falling back to the default FastAPI error response.
+        """
+        handler = self._lookup_exception_handler(exc)
+        if handler is None:
+            return None
+        # Build a minimal Request stub — handlers typically only use it for introspection
+        from fastapi_rs.requests import Request
+        request = Request({"type": "http", "app": self})
+        try:
+            if asyncio.iscoroutinefunction(handler):
+                # Drive the coroutine via the send(None) trick (works for handlers
+                # that don't actually suspend). Fall back to a new event loop otherwise.
+                coro = handler(request, exc)
+                try:
+                    coro.send(None)
+                except StopIteration as e:
+                    return e.value
+                # Coroutine suspended — need a real event loop
+                coro.close()
+                coro = handler(request, exc)
+                try:
+                    loop = asyncio.new_event_loop()
+                    try:
+                        return loop.run_until_complete(coro)
+                    finally:
+                        loop.close()
+                except Exception:
+                    return None
+            return handler(request, exc)
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Route collection & introspection
@@ -453,6 +745,7 @@ class FastAPI:
             rm_exclude_unset = getattr(route, "response_model_exclude_unset", False)
             rm_exclude_defaults = getattr(route, "response_model_exclude_defaults", False)
             rm_exclude_none = getattr(route, "response_model_exclude_none", False)
+            response_class = getattr(route, "response_class", None)
 
             rm_kwargs = dict(
                 response_model_include=rm_include,
@@ -460,6 +753,7 @@ class FastAPI:
                 response_model_exclude_unset=rm_exclude_unset,
                 response_model_exclude_defaults=rm_exclude_defaults,
                 response_model_exclude_none=rm_exclude_none,
+                response_class=response_class,
             )
 
             # KEY OPTIMIZATION: Compile deps + handler into a SINGLE Python function.
@@ -485,8 +779,8 @@ class FastAPI:
                         from fastapi_rs._resolution import _make_sync_wrapper
                         endpoint = _make_sync_wrapper(endpoint)
                         is_async = False
-            elif response_model is not None:
-                # No deps but has response_model -- wrap handler to apply it (P0 fix #5)
+            elif response_model is not None or response_class is not None or self.exception_handlers:
+                # No deps but has response_model/response_class/exception_handlers -- wrap handler
                 compiled = _try_compile_handler(
                     endpoint, params, app=self, response_model=response_model,
                     **rm_kwargs,
@@ -531,6 +825,13 @@ class FastAPI:
                     endpoint = _unwrap_combined_sync
                     is_async = False
 
+            # Apply @app.middleware("http") chain around the endpoint.
+            # The wrapper drives the chain SYNCHRONOUSLY (via coro.send) so we
+            # stay on the fast Rust sync path — same perf as an unwrapped route.
+            if self._http_middlewares:
+                endpoint = _wrap_with_http_middlewares(endpoint, self._http_middlewares, self)
+                is_async = False
+
             collected.append(
                 {
                     "path": full_path,
@@ -542,6 +843,19 @@ class FastAPI:
                     "params": params,
                     "_all_params": all_params_for_openapi,
                     "is_websocket": False,
+                    # OpenAPI metadata
+                    "status_code": route.status_code or 200,
+                    "summary": route.summary,
+                    "description": route.description,
+                    "response_description": getattr(route, "response_description", "Successful Response"),
+                    "responses": getattr(route, "responses", {}),
+                    "response_model": response_model,
+                    "deprecated": route.deprecated,
+                    "operation_id": route.operation_id,
+                    "include_in_schema": getattr(route, "include_in_schema", True),
+                    "openapi_extra": getattr(route, "openapi_extra", {}),
+                    "security": getattr(route, "security", None),
+                    "callbacks": getattr(route, "callbacks", []),
                 }
             )
 
@@ -585,6 +899,41 @@ class FastAPI:
                 )
 
         return all_routes
+
+    # ------------------------------------------------------------------
+    # URL building
+    # ------------------------------------------------------------------
+
+    def url_path_for(self, name: str, /, **path_params: Any) -> str:
+        """Return the URL path for a named route, filling in path_params.
+
+        Matches Starlette/FastAPI's behavior: looks up routes by their `name`
+        (endpoint function name by default) and substitutes {param}
+        placeholders.  Prepends root_path if configured.
+        """
+        from urllib.parse import quote
+
+        for route in self._collect_all_routes():
+            if route.get("handler_name") == name:
+                path = route["path"]
+                # Substitute {param} and {param:converter} placeholders
+                import re
+
+                def _sub(match: re.Match) -> str:
+                    pname = match.group(1).split(":")[0]
+                    if pname not in path_params:
+                        raise KeyError(f"Missing path param {pname!r} for route {name!r}")
+                    val = path_params[pname]
+                    # `path` converter should not URL-encode slashes
+                    if ":path" in match.group(0):
+                        return str(val)
+                    return quote(str(val), safe="")
+
+                filled = re.sub(r"\{([^}]+)\}", _sub, path)
+                root = getattr(self, "root_path", "") or ""
+                return root.rstrip("/") + filled if root else filled
+
+        raise LookupError(f"No route named {name!r}")
 
     # ------------------------------------------------------------------
     # OpenAPI schema
@@ -717,12 +1066,16 @@ class FastAPI:
         openapi_json: str | None = None
         if self.openapi_url is not None:
             http_routes = [r for r in route_dicts if not r.get("is_websocket")]
+            # Auto-add root_path to servers if configured
+            effective_servers = self.servers
+            if self.root_path and self.root_path_in_servers and not effective_servers:
+                effective_servers = [{"url": self.root_path}]
             openapi_schema = generate_openapi_schema(
                 title=self.title,
                 version=self.version,
                 description=self.description,
                 routes=http_routes,
-                servers=self.servers,
+                servers=effective_servers,
                 terms_of_service=self.terms_of_service,
                 contact=self.contact,
                 license_info=self.license_info,
@@ -748,4 +1101,5 @@ class FastAPI:
             self.redoc_url,
             self.openapi_url,
             static_mounts,
+            self.root_path or None,
         )

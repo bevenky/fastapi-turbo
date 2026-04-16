@@ -29,11 +29,18 @@ class APIRoute:
         tags: list[str] | None = None,
         summary: str | None = None,
         description: str | None = None,
+        response_description: str = "Successful Response",
+        responses: dict | None = None,
         name: str | None = None,
         deprecated: bool = False,
         operation_id: str | None = None,
         generate_unique_id_function: Callable | None = None,
         dependencies: Sequence | None = None,
+        response_class: Any = None,
+        include_in_schema: bool = True,
+        openapi_extra: dict | None = None,
+        security: list | None = None,
+        callbacks: list | None = None,
         **kwargs: Any,
     ):
         self.path = path
@@ -49,9 +56,16 @@ class APIRoute:
         self.tags = tags or []
         self.summary = summary
         self.description = description
+        self.response_description = response_description
+        self.responses = responses or {}
         self.name = name or endpoint.__name__
         self.deprecated = deprecated
         self.dependencies = list(dependencies or [])
+        self.response_class = response_class
+        self.include_in_schema = include_in_schema
+        self.openapi_extra = openapi_extra or {}
+        self.security = security  # None = auto-derive; [] = disable; non-empty = override
+        self.callbacks = callbacks or []
 
         # Generate operation_id using the provided function or explicit value
         if operation_id is not None:

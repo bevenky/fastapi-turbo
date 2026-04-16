@@ -166,10 +166,15 @@ DEFAULT_LIMITS = Limits()
 
 
 class Headers(dict):
-    """Case-insensitive headers dict (httpx-compatible)."""
+    """Case-insensitive headers dict (httpx-compatible).
+
+    Preserves multiple values for headers with the same name (e.g., Set-Cookie)
+    via an internal raw_list. Use multi_items() or get_list() to see duplicates.
+    """
 
     def __init__(self, raw: Mapping | Sequence | None = None):
         super().__init__()
+        self._raw_list: list[tuple[str, str]] = []
         if raw is None:
             return
         if isinstance(raw, Mapping):
@@ -177,10 +182,28 @@ class Headers(dict):
                 self[k] = v
         elif isinstance(raw, (list, tuple)):
             for k, v in raw:
-                self[k] = v
+                lower = k.lower()
+                self._raw_list.append((lower, str(v)))
+                # For dict access, last write wins — but raw_list preserves all
+                super().__setitem__(lower, str(v))
 
     def __setitem__(self, key, value):
-        super().__setitem__(key.lower(), str(value))
+        lower = key.lower()
+        super().__setitem__(lower, str(value))
+        # Keep raw_list in sync
+        self._raw_list = [(k, v) for (k, v) in self._raw_list if k != lower]
+        self._raw_list.append((lower, str(value)))
+
+    def multi_items(self) -> list[tuple[str, str]]:
+        return list(self._raw_list) if self._raw_list else list(self.items())
+
+    def get_list(self, key: str) -> list[str]:
+        """Return all values for a header name (preserves duplicates)."""
+        key_lower = key.lower()
+        if self._raw_list:
+            return [v for (k, v) in self._raw_list if k == key_lower]
+        val = self.get(key_lower)
+        return [val] if val is not None else []
 
     def __getitem__(self, key):
         return super().__getitem__(key.lower())
@@ -201,7 +224,9 @@ class Headers(dict):
     def _from_raw(cls, raw_list: list[tuple[str, str]]) -> Headers:
         h = cls()
         for k, v in raw_list:
-            dict.__setitem__(h, k.lower(), v)
+            lower = k.lower()
+            dict.__setitem__(h, lower, v)
+            h._raw_list.append((lower, v))
         return h
 
 

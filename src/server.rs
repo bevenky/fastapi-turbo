@@ -50,7 +50,7 @@ const REDOC_HTML: &str = r#"<!DOCTYPE html>
 ///
 /// This function blocks until the server shuts down (Ctrl-C).
 #[pyfunction]
-#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![]))]
+#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![], root_path=None))]
 pub fn run_server(
     py: Python<'_>,
     routes: Vec<RouteInfo>,
@@ -62,6 +62,7 @@ pub fn run_server(
     redoc_url: Option<String>,
     openapi_url: Option<String>,
     static_mounts: Vec<(String, String)>,
+    root_path: Option<String>,
 ) -> PyResult<()> {
     // Parse middleware config while we still have the GIL
     let mw_configs = parse_middleware_configs(py, &middlewares)?;
@@ -136,6 +137,17 @@ pub fn run_server(
             for (prefix, directory) in &static_mounts {
                 router = router.nest_service(prefix, ServeDir::new(directory));
             }
+
+            // Nest the entire app under root_path if specified (reverse proxy support)
+            let router = if let Some(ref prefix) = root_path {
+                if !prefix.is_empty() && prefix != "/" {
+                    axum::Router::new().nest(prefix, router)
+                } else {
+                    router
+                }
+            } else {
+                router
+            };
 
             let app = apply_middlewares(router, &mw_configs);
 

@@ -108,6 +108,22 @@ fn response_object_to_response(
             }
         }
     }
+    // raw_headers list preserves duplicates (e.g., multiple Set-Cookie).
+    // Use append() instead of insert() so multiple values of the same name survive.
+    if let Ok(raw_attr) = obj.getattr("raw_headers") {
+        if let Ok(list) = raw_attr.downcast::<PyList>() {
+            for item in list.iter() {
+                if let Ok(tup) = item.extract::<(String, String)>() {
+                    if let (Ok(hname), Ok(hval)) = (
+                        HeaderName::try_from(tup.0),
+                        HeaderValue::from_str(&tup.1),
+                    ) {
+                        headers.append(hname, hval);
+                    }
+                }
+            }
+        }
+    }
 
     let body = if let Ok(b) = obj.getattr("body") {
         if let Ok(s) = b.extract::<String>() {

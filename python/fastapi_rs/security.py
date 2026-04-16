@@ -155,6 +155,42 @@ class HTTPBearer:
         return None
 
 
+class HTTPDigest:
+    """HTTP Digest authentication scheme.
+
+    Extracts a ``Digest`` Authorization header and returns
+    ``HTTPAuthorizationCredentials``.  This matches FastAPI's behavior —
+    it does NOT implement the full RFC 7616 challenge/response handshake.
+    """
+
+    def __init__(
+        self,
+        *,
+        scheme_name: str | None = None,
+        description: str | None = None,
+        auto_error: bool = True,
+    ):
+        self.scheme_name = scheme_name or self.__class__.__name__
+        self.description = description
+        self.auto_error = auto_error
+        self.model = {
+            "type": "http",
+            "scheme": "digest",
+        }
+        if description:
+            self.model["description"] = description
+
+    async def __call__(self, authorization: str | None = None, **kwargs) -> HTTPAuthorizationCredentials | None:
+        if authorization and authorization.lower().startswith("digest "):
+            return HTTPAuthorizationCredentials(
+                scheme="Digest",
+                credentials=authorization[7:],
+            )
+        if self.auto_error:
+            raise HTTPException(status_code=403, detail="Not authenticated")
+        return None
+
+
 class HTTPBasic:
     """HTTP Basic authentication scheme."""
 

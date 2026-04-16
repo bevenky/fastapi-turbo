@@ -74,9 +74,10 @@ class Cookie(_ParamMarker):
 class Body(_ParamMarker):
     _kind = "body"
 
-    def __init__(self, default=..., *, embed: bool = False, **kwargs):
+    def __init__(self, default=..., *, embed: bool = False, media_type: str = "application/json", **kwargs):
         super().__init__(default, **kwargs)
         self.embed = embed
+        self.media_type = media_type
 
 
 class Form(_ParamMarker):

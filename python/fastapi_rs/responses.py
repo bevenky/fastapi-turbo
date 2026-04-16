@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import email.utils
 import os
+from typing import Any
 
 
 class Response:
@@ -20,6 +22,9 @@ class Response:
     ):
         self.status_code = status_code
         self.headers: dict[str, str] = dict(headers or {})
+        # raw_headers preserves duplicate keys (needed for multiple Set-Cookie).
+        # Rust side reads this list with header.append() instead of insert().
+        self.raw_headers: list[tuple[str, str]] = []
         self.background = background
 
         if media_type is not None:
@@ -36,6 +41,59 @@ class Response:
         if isinstance(content, bytes):
             return content
         return content.encode("utf-8")
+
+    def set_cookie(
+        self,
+        key: str,
+        value: str = "",
+        *,
+        max_age: int | None = None,
+        expires: Any = None,
+        path: str | None = "/",
+        domain: str | None = None,
+        secure: bool = False,
+        httponly: bool = False,
+        samesite: str | None = "lax",
+    ) -> None:
+        """Set a Set-Cookie header on this response (Starlette-compatible)."""
+        parts: list[str] = [f"{key}={value}"]
+        if max_age is not None:
+            parts.append(f"Max-Age={int(max_age)}")
+        if expires is not None:
+            if isinstance(expires, (int, float)):
+                parts.append(f"Expires={email.utils.formatdate(float(expires), usegmt=True)}")
+            else:
+                parts.append(f"Expires={expires}")
+        if path is not None:
+            parts.append(f"Path={path}")
+        if domain is not None:
+            parts.append(f"Domain={domain}")
+        if secure:
+            parts.append("Secure")
+        if httponly:
+            parts.append("HttpOnly")
+        if samesite is not None:
+            parts.append(f"SameSite={samesite.capitalize()}")
+        cookie_str = "; ".join(parts)
+        self.raw_headers.append(("set-cookie", cookie_str))
+
+    def delete_cookie(
+        self,
+        key: str,
+        path: str | None = "/",
+        domain: str | None = None,
+        *,
+        secure: bool = False,
+        httponly: bool = False,
+        samesite: str | None = "lax",
+    ) -> None:
+        """Clear a cookie by setting max_age=0 (Starlette-compatible)."""
+        self.set_cookie(
+            key=key, value="",
+            max_age=0, expires=0,
+            path=path, domain=domain,
+            secure=secure, httponly=httponly, samesite=samesite,
+        )
 
 
 class JSONResponse(Response):
@@ -83,6 +141,7 @@ class StreamingResponse(Response):
         self.body_iterator = content
         self.status_code = status_code
         self.headers: dict[str, str] = dict(headers or {})
+        self.raw_headers: list[tuple[str, str]] = []
         self.media_type = media_type
         self.background = background
         self.body = b""  # placeholder — Rust handles streaming

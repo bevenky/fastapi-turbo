@@ -92,6 +92,15 @@ class Request:
     def app(self):
         return self._scope.get("app")
 
+    def url_for(self, name: str, /, **path_params: Any) -> URL:
+        """Return the full URL for a named route (includes scheme and host)."""
+        app = self.app
+        if app is None or not hasattr(app, "url_path_for"):
+            raise RuntimeError("Request.url_for requires request.app with url_path_for")
+        path = app.url_path_for(name, **path_params)
+        base = str(self.base_url).rstrip("/")
+        return URL(base + path)
+
     async def body(self) -> bytes:
         if self._body is not None:
             return self._body
