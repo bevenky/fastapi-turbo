@@ -113,29 +113,53 @@ def _maybe_print_debug_traceback(app, exc):
     traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
 
 
-def _model_has_aliases(model_cls) -> bool:
-    """True if any Pydantic field declares alias / serialization_alias.
+def _model_needs_full_dump(model_cls) -> bool:
+    """True if the model has aliases, computed fields, or custom serializers.
 
-    Cached per model class on the class itself so we pay the introspection
-    cost once, not per request.
+    When any of these are present, the 'strip extra keys' fast path is unsafe —
+    we must go through model_validate + model_dump so Pydantic can:
+      - rename fields via alias / serialization_alias
+      - include computed_field properties in output
+      - run field_serializer / model_serializer hooks
+
+    Cached per class on the class itself — paid once per model, not per request.
     """
-    cached = getattr(model_cls, "__fastapi_rs_has_aliases__", None)
+    cached = getattr(model_cls, "__fastapi_rs_needs_full_dump__", None)
     if cached is not None:
         return cached
-    has = False
+    needs = False
+    # Field-level aliases
     fields = getattr(model_cls, "model_fields", None) or {}
     for finfo in fields.values():
         if getattr(finfo, "alias", None) is not None:
-            has = True
+            needs = True
             break
         if getattr(finfo, "serialization_alias", None) is not None:
-            has = True
+            needs = True
             break
+    # Computed fields (Pydantic v2 @computed_field)
+    if not needs:
+        computed = getattr(model_cls, "model_computed_fields", None)
+        if computed:
+            needs = True
+    # Custom serializers (field_serializer / model_serializer) — Pydantic v2
+    # stores these in __pydantic_decorators__.
+    if not needs:
+        decorators = getattr(model_cls, "__pydantic_decorators__", None)
+        if decorators is not None:
+            if getattr(decorators, "field_serializers", None):
+                needs = True
+            elif getattr(decorators, "model_serializers", None):
+                needs = True
     try:
-        model_cls.__fastapi_rs_has_aliases__ = has
+        model_cls.__fastapi_rs_needs_full_dump__ = needs
     except Exception:
         pass
-    return has
+    return needs
+
+
+# Back-compat alias for existing callers
+_model_has_aliases = _model_needs_full_dump
 
 
 def _wrap_response_class(result, response_class):
@@ -380,12 +404,18 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
                     return _call_handler_sync(kwargs)
                 return inner(request, kwargs)
 
-            if asyncio.iscoroutinefunction(mw):
+            # Detect async callable: either a bare async def, or a class
+            # instance with async __call__ (e.g., SessionMiddleware).
+            is_async_mw = (
+                asyncio.iscoroutinefunction(mw)
+                or asyncio.iscoroutinefunction(getattr(mw, "__call__", None))
+            )
+            if is_async_mw:
                 coro = mw(request, call_next)
                 try:
                     coro.send(None)
-                    # Middleware actually suspended on something other than our call_next.
-                    # That shouldn't happen for typical HTTP middleware, but handle it.
+                    # Middleware suspended on real I/O (e.g., async DB call).
+                    # Fall back to the full event-loop path.
                     coro.close()
                     raise _MiddlewareSuspendedError()
                 except StopIteration as e:
@@ -608,6 +638,24 @@ class FastAPI:
     # ------------------------------------------------------------------
 
     def add_middleware(self, middleware_cls, **kwargs: Any) -> None:
+        """Register a middleware class.
+
+        Python-side middleware classes (marked with
+        _fastapi_rs_middleware_type starting with 'python_http_') are
+        instantiated and added to the @app.middleware('http') chain.
+        Everything else goes to the Tower-backed middleware stack for
+        Rust-side processing.
+        """
+        mw_type = getattr(middleware_cls, "_fastapi_rs_middleware_type", None)
+        if mw_type and mw_type.startswith("python_http_"):
+            # Python-side HTTP middleware — instantiate and add to the per-handler chain
+            try:
+                instance = middleware_cls(app=self, **kwargs)
+            except TypeError:
+                # Starlette-style middlewares may not accept `app` kwarg
+                instance = middleware_cls(**kwargs)
+            self._http_middlewares.append(instance)
+            return
         self._middleware_stack.append((middleware_cls, kwargs))
 
     def middleware(self, middleware_type: str):

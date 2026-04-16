@@ -138,6 +138,29 @@ def _build() -> dict[str, types.ModuleType]:
     starlette_middleware_base.BaseHTTPMiddleware = _base.BaseHTTPMiddleware  # type: ignore[attr-defined]
     modules["starlette.middleware.base"] = starlette_middleware_base
 
+    # ── starlette.middleware.sessions ──────────────────────────────
+    import fastapi_rs.middleware.sessions as _sessions
+    starlette_sessions = _mod("starlette.middleware.sessions")
+    starlette_sessions.SessionMiddleware = _sessions.SessionMiddleware  # type: ignore[attr-defined]
+    modules["starlette.middleware.sessions"] = starlette_sessions
+
+    # ── starlette.authentication ───────────────────────────────────
+    import fastapi_rs.authentication as _auth
+    starlette_auth = _mod("starlette.authentication")
+    starlette_auth.AuthenticationBackend = _auth.AuthenticationBackend  # type: ignore[attr-defined]
+    starlette_auth.AuthenticationError = _auth.AuthenticationError  # type: ignore[attr-defined]
+    starlette_auth.AuthCredentials = _auth.AuthCredentials  # type: ignore[attr-defined]
+    starlette_auth.BaseUser = _auth.BaseUser  # type: ignore[attr-defined]
+    starlette_auth.SimpleUser = _auth.SimpleUser  # type: ignore[attr-defined]
+    starlette_auth.UnauthenticatedUser = _auth.UnauthenticatedUser  # type: ignore[attr-defined]
+    starlette_auth.requires = _auth.requires  # type: ignore[attr-defined]
+    modules["starlette.authentication"] = starlette_auth
+
+    # ── starlette.middleware.authentication ────────────────────────
+    starlette_auth_mw = _mod("starlette.middleware.authentication")
+    starlette_auth_mw.AuthenticationMiddleware = _auth.AuthenticationMiddleware  # type: ignore[attr-defined]
+    modules["starlette.middleware.authentication"] = starlette_auth_mw
+
     # ── starlette.staticfiles ──────────────────────────────────────
     import fastapi_rs.staticfiles as _staticfiles
     starlette_staticfiles = _mod("starlette.staticfiles")

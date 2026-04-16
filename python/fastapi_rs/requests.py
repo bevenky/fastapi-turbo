@@ -92,6 +92,39 @@ class Request:
     def app(self):
         return self._scope.get("app")
 
+    @property
+    def user(self):
+        """Authenticated user (populated by AuthenticationMiddleware).
+
+        Matches Starlette's Request.user: returns None until an auth backend
+        sets scope['user']. When no user is authenticated, returns an
+        UnauthenticatedUser-like sentinel that evaluates falsy.
+        """
+        from fastapi_rs.authentication import UnauthenticatedUser
+
+        return self._scope.get("user") or UnauthenticatedUser()
+
+    @property
+    def auth(self):
+        """AuthCredentials (populated by AuthenticationMiddleware).
+
+        Matches Starlette's Request.auth: returns an object exposing .scopes
+        (list[str]). Returns empty AuthCredentials when no auth middleware ran.
+        """
+        from fastapi_rs.authentication import AuthCredentials
+
+        return self._scope.get("auth") or AuthCredentials()
+
+    @property
+    def session(self):
+        """Session dict (populated by SessionMiddleware).
+
+        Returns {} if SessionMiddleware isn't installed — matches Starlette
+        if session cookie missing; real Starlette raises AssertionError if
+        SessionMiddleware is fully absent. We're permissive.
+        """
+        return self._scope.setdefault("session", {})
+
     def url_for(self, name: str, /, **path_params: Any) -> URL:
         """Return the full URL for a named route (includes scheme and host)."""
         app = self.app
@@ -121,6 +154,42 @@ class Request:
         else:
             self._body = b""
         return self._body
+
+    async def stream(self):
+        """Async iterator yielding request body in chunks.
+
+        Matches Starlette's Request.stream() — useful for large bodies where
+        you don't want to buffer the whole thing in memory. Each chunk is a
+        bytes object; the iterator ends when the body is fully read.
+
+        Note: calling stream() consumes the body. Subsequent body()/json()/
+        form() calls will return what stream already yielded.
+        """
+        if self._body is not None:
+            # Body already buffered — yield once and done
+            yield self._body
+            yield b""
+            return
+        body = self._scope.get("_body", b"")
+        if body:
+            self._body = body
+            yield body
+            yield b""
+            return
+        if self._receive is None:
+            yield b""
+            return
+        chunks: list[bytes] = []
+        while True:
+            message = await self._receive()
+            body_chunk = message.get("body", b"")
+            if body_chunk:
+                chunks.append(body_chunk)
+                yield body_chunk
+            if not message.get("more_body", False):
+                break
+        self._body = b"".join(chunks)
+        yield b""  # Sentinel: Starlette ends streams with an empty chunk
 
     async def json(self) -> Any:
         if self._json is not None:

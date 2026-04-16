@@ -18,35 +18,25 @@ Standard FastAPI code hits these and breaks or silently misbehaves.
 
 ### P1 — common features
 
-4. **`SessionMiddleware`** — session cookie helper. ~80 LOC.
+4. **ASGI middleware bridge** — Sentry, OpenTelemetry, Prometheus middleware can't be installed today (we only accept Tower middleware). ~150 LOC.
 
-5. **`AuthenticationMiddleware`** — `request.auth` / `request.user` population. ~50 LOC (paired with `request.auth`/`request.user` properties on Request, ~15 LOC).
-
-6. **ASGI middleware bridge** — Sentry, OpenTelemetry, Prometheus middleware can't be installed today (we only accept Tower middleware). ~150 LOC.
-
-7. **`OAuth2ClientCredentials` + `OpenIdConnect`** security schemes. ~90 LOC.
-
-8. **Pydantic v2 decorators on response_model**: `computed_field`, `field_serializer`, `model_serializer`, `model_validator` — not exercised in our response path. ~120 LOC.
-
-9. **`request.stream()`** — read request body in chunks. ~30 LOC.
-
-10. **Custom response headers on `accept(headers=...)`** — axum's `WebSocketUpgrade` doesn't expose them; needs hyper-level escape hatch. ~60 LOC.
+5. **Custom response headers on `accept(headers=...)`** — axum's `WebSocketUpgrade` doesn't expose them; needs hyper-level escape hatch. ~60 LOC.
 
 ### P2 — less common
 
-11. TestClient WebSocket support (`client.websocket_connect(...)`).
-12. `AsyncClient` / `ASGITransport` for async tests.
-13. `HEAD` auto-handling from `GET` routes.
-14. `OPTIONS` auto-generation for CORS preflight.
-15. `405 Method Not Allowed` (currently returns 404 on wrong method).
-16. Request size limits enforcement.
-17. `redirect_slashes` parameter.
-18. `dataclass` / `TypedDict` / `msgspec.Struct` as response models.
-19. Per-route `servers` / `external_docs`.
-20. `webhooks=` app parameter + OpenAPI webhooks section.
-21. Multipart range responses (206 multipart).
-22. Custom `APIRoute` via `route_class`.
-23. `operation_id` uniqueness checks.
+6. TestClient WebSocket support (`client.websocket_connect(...)`).
+7. `AsyncClient` / `ASGITransport` for async tests.
+8. `HEAD` auto-handling from `GET` routes.
+9. `OPTIONS` auto-generation for CORS preflight.
+10. `405 Method Not Allowed` (currently returns 404 on wrong method).
+11. Request size limits enforcement.
+12. `redirect_slashes` parameter.
+13. `dataclass` / `TypedDict` / `msgspec.Struct` as response models.
+14. Per-route `servers` / `external_docs`.
+15. `webhooks=` app parameter + OpenAPI webhooks section.
+16. Multipart range responses (206 multipart).
+17. Custom `APIRoute` via `route_class`.
+18. `operation_id` uniqueness checks.
 
 ---
 

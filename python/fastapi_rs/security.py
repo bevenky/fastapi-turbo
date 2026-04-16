@@ -328,3 +328,141 @@ class SecurityScopes:
     def __init__(self, scopes: list[str] | None = None):
         self.scopes = scopes or []
         self.scope_str = " ".join(self.scopes)
+
+
+# ── OAuth2 additional flows ─────────────────────────────────────────
+
+
+class OAuth2ClientCredentials:
+    """OAuth2 client-credentials flow (server-to-server auth).
+
+    The OAuth2 flow where a client authenticates with its own credentials
+    (no user) to get an access token. Common for microservice-to-microservice
+    auth and background job authentication.
+
+    Usage::
+
+        oauth2 = OAuth2ClientCredentials(tokenUrl="/token")
+
+        @app.get("/svc")
+        async def svc(token: str = Depends(oauth2)):
+            ...
+    """
+
+    def __init__(
+        self,
+        tokenUrl: str,
+        scheme_name: str | None = None,
+        scopes: dict[str, str] | None = None,
+        description: str | None = None,
+        auto_error: bool = True,
+    ):
+        self.tokenUrl = tokenUrl
+        self.scheme_name = scheme_name or self.__class__.__name__
+        self.scopes = scopes or {}
+        self.description = description
+        self.auto_error = auto_error
+        self.model = {
+            "type": "oauth2",
+            "flows": {
+                "clientCredentials": {
+                    "tokenUrl": tokenUrl,
+                    "scopes": self.scopes,
+                }
+            },
+        }
+        if description:
+            self.model["description"] = description
+
+    async def __call__(self, authorization: str | None = None, **kwargs) -> str | None:
+        if authorization and authorization.startswith("Bearer "):
+            return authorization[7:]
+        if self.auto_error:
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return None
+
+
+class OAuth2AuthorizationCodeBearer:
+    """OAuth2 authorization-code flow (user-delegated auth)."""
+
+    def __init__(
+        self,
+        authorizationUrl: str,
+        tokenUrl: str,
+        refreshUrl: str | None = None,
+        scheme_name: str | None = None,
+        scopes: dict[str, str] | None = None,
+        description: str | None = None,
+        auto_error: bool = True,
+    ):
+        self.authorizationUrl = authorizationUrl
+        self.tokenUrl = tokenUrl
+        self.refreshUrl = refreshUrl
+        self.scheme_name = scheme_name or self.__class__.__name__
+        self.scopes = scopes or {}
+        self.description = description
+        self.auto_error = auto_error
+        flow: dict = {
+            "authorizationUrl": authorizationUrl,
+            "tokenUrl": tokenUrl,
+            "scopes": self.scopes,
+        }
+        if refreshUrl:
+            flow["refreshUrl"] = refreshUrl
+        self.model = {
+            "type": "oauth2",
+            "flows": {"authorizationCode": flow},
+        }
+        if description:
+            self.model["description"] = description
+
+    async def __call__(self, authorization: str | None = None, **kwargs) -> str | None:
+        if authorization and authorization.startswith("Bearer "):
+            return authorization[7:]
+        if self.auto_error:
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return None
+
+
+# ── OpenID Connect ─────────────────────────────────────────────────
+
+
+class OpenIdConnect:
+    """OpenID Connect discovery-URL based auth scheme."""
+
+    def __init__(
+        self,
+        *,
+        openIdConnectUrl: str,
+        scheme_name: str | None = None,
+        description: str | None = None,
+        auto_error: bool = True,
+    ):
+        self.openIdConnectUrl = openIdConnectUrl
+        self.scheme_name = scheme_name or self.__class__.__name__
+        self.description = description
+        self.auto_error = auto_error
+        self.model = {
+            "type": "openIdConnect",
+            "openIdConnectUrl": openIdConnectUrl,
+        }
+        if description:
+            self.model["description"] = description
+
+    async def __call__(self, authorization: str | None = None, **kwargs) -> str | None:
+        if authorization:
+            # User presents an OIDC id_token (typically in Authorization: Bearer ...)
+            if authorization.startswith("Bearer "):
+                return authorization[7:]
+            return authorization
+        if self.auto_error:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        return None

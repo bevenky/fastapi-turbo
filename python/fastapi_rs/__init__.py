@@ -29,12 +29,16 @@ from fastapi_rs.security import (
     HTTPAuthorizationCredentials,
     HTTPBearer,
     HTTPDigest,
+    OAuth2AuthorizationCodeBearer,
+    OAuth2ClientCredentials,
     OAuth2PasswordBearer,
     OAuth2PasswordRequestForm,
+    OpenIdConnect,
     SecurityScopes,
 )
 from fastapi_rs.websockets import WebSocket, WebSocketState
 from fastapi_rs import status
+from fastapi_rs import authentication  # noqa: F401 (re-exported via module)
 
 __version__ = "0.1.0"
 __all__ = [
@@ -70,6 +74,9 @@ __all__ = [
     "BackgroundTasks",
     "OAuth2PasswordBearer",
     "OAuth2PasswordRequestForm",
+    "OAuth2ClientCredentials",
+    "OAuth2AuthorizationCodeBearer",
+    "OpenIdConnect",
     "HTTPBearer",
     "HTTPDigest",
     "HTTPBasic",
