@@ -8,57 +8,45 @@ Open work only. Shipped items are deleted after completion.
 
 Standard FastAPI code hits these and breaks or silently misbehaves.
 
-### P0 — quick wins (small LOC, high blast radius)
-
-1. **`response_model_by_alias` + Pydantic `Field(alias=...)`** — responses ignore field aliases. Breaks every API using Pydantic aliases. Fix: accept `response_model_by_alias: bool = True` on routes, thread through `_apply_response_model`, call `model_dump(by_alias=...)`. Expose `pydantic.Field` from shim. ~80 LOC.
-
-2. **`default_response_class`** at `FastAPI()`, `APIRouter()`, and route decorator level. Can't make `ORJSONResponse` the app default today. ~30 LOC.
-
-3. **`FastAPI(responses=...)`** — app-level default response schemas (404/500 shapes applied to all routes). ~15 LOC.
-
-4. **`FastAPI(debug=...)`** — debug tracebacks on 500. ~5 LOC.
-
-5. **`ORJSONResponse` actually using orjson** — currently falls back to `json`. ~15 LOC.
-
 ### P0 — large
 
-6. **File uploads** — `UploadFile` is a stub, `File(...)` marker not wired, multipart body parsing missing. Blocks the whole file-upload category of apps. ~250 LOC (Rust multipart parser + Python interface).
+1. **File uploads** — `UploadFile` is a stub, `File(...)` marker not wired, multipart body parsing missing. Blocks the whole file-upload category of apps. ~250 LOC (Rust multipart parser + Python interface).
 
-7. **`FileResponse` + `Range: bytes=...` header support** — no way to return a file with proper content-type, no video/resumable download support. ~180 LOC.
+2. **`FileResponse` + `Range: bytes=...` header support** — no way to return a file with proper content-type, no video/resumable download support. ~180 LOC.
 
-8. **`StaticFiles` mount serving files at scale** — mount helper exists but isn't wired. ~100 LOC.
+3. **`StaticFiles` mount serving files at scale** — mount helper exists but isn't wired. ~100 LOC.
 
 ### P1 — common features
 
-9. **`SessionMiddleware`** — session cookie helper. ~80 LOC.
+4. **`SessionMiddleware`** — session cookie helper. ~80 LOC.
 
-10. **`AuthenticationMiddleware`** — `request.auth` / `request.user` population. ~50 LOC (paired with `request.auth`/`request.user` properties on Request, ~15 LOC).
+5. **`AuthenticationMiddleware`** — `request.auth` / `request.user` population. ~50 LOC (paired with `request.auth`/`request.user` properties on Request, ~15 LOC).
 
-11. **ASGI middleware bridge** — Sentry, OpenTelemetry, Prometheus middleware can't be installed today (we only accept Tower middleware). ~150 LOC.
+6. **ASGI middleware bridge** — Sentry, OpenTelemetry, Prometheus middleware can't be installed today (we only accept Tower middleware). ~150 LOC.
 
-12. **`OAuth2ClientCredentials` + `OpenIdConnect`** security schemes. ~90 LOC.
+7. **`OAuth2ClientCredentials` + `OpenIdConnect`** security schemes. ~90 LOC.
 
-13. **Pydantic v2 decorators on response_model**: `computed_field`, `field_serializer`, `model_serializer`, `model_validator` — not exercised in our response path. ~120 LOC.
+8. **Pydantic v2 decorators on response_model**: `computed_field`, `field_serializer`, `model_serializer`, `model_validator` — not exercised in our response path. ~120 LOC.
 
-14. **`request.stream()`** — read request body in chunks. ~30 LOC.
+9. **`request.stream()`** — read request body in chunks. ~30 LOC.
 
-15. **Custom response headers on `accept(headers=...)`** — axum's `WebSocketUpgrade` doesn't expose them; needs hyper-level escape hatch. ~60 LOC.
+10. **Custom response headers on `accept(headers=...)`** — axum's `WebSocketUpgrade` doesn't expose them; needs hyper-level escape hatch. ~60 LOC.
 
 ### P2 — less common
 
-16. TestClient WebSocket support (`client.websocket_connect(...)`).
-17. `AsyncClient` / `ASGITransport` for async tests.
-18. `HEAD` auto-handling from `GET` routes.
-19. `OPTIONS` auto-generation for CORS preflight.
-20. `405 Method Not Allowed` (currently returns 404 on wrong method).
-21. Request size limits enforcement.
-22. `redirect_slashes` parameter.
-23. `dataclass` / `TypedDict` / `msgspec.Struct` as response models.
-24. Per-route `servers` / `external_docs`.
-25. `webhooks=` app parameter + OpenAPI webhooks section.
-26. Multipart range responses (206 multipart).
-27. Custom `APIRoute` via `route_class`.
-28. `operation_id` uniqueness checks.
+11. TestClient WebSocket support (`client.websocket_connect(...)`).
+12. `AsyncClient` / `ASGITransport` for async tests.
+13. `HEAD` auto-handling from `GET` routes.
+14. `OPTIONS` auto-generation for CORS preflight.
+15. `405 Method Not Allowed` (currently returns 404 on wrong method).
+16. Request size limits enforcement.
+17. `redirect_slashes` parameter.
+18. `dataclass` / `TypedDict` / `msgspec.Struct` as response models.
+19. Per-route `servers` / `external_docs`.
+20. `webhooks=` app parameter + OpenAPI webhooks section.
+21. Multipart range responses (206 multipart).
+22. Custom `APIRoute` via `route_class`.
+23. `operation_id` uniqueness checks.
 
 ---
 

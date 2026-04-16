@@ -106,14 +106,20 @@ class Response:
 
 
 class JSONResponse(Response):
-    """JSON response using orjson for serialization."""
+    """JSON response. Uses orjson when available, else stdlib json.
+
+    orjson is roughly 5× faster than stdlib json but is an optional dependency.
+    """
 
     media_type = "application/json"
 
     def render(self, content) -> bytes:
-        import orjson
-
-        return orjson.dumps(content)
+        try:
+            import orjson
+            return orjson.dumps(content)
+        except ImportError:
+            import json
+            return json.dumps(content, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 class HTMLResponse(Response):

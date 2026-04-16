@@ -25,6 +25,7 @@ class APIRoute:
         response_model_exclude_unset: bool = False,
         response_model_exclude_defaults: bool = False,
         response_model_exclude_none: bool = False,
+        response_model_by_alias: bool = True,
         status_code: int | None = None,
         tags: list[str] | None = None,
         summary: str | None = None,
@@ -52,6 +53,7 @@ class APIRoute:
         self.response_model_exclude_unset = response_model_exclude_unset
         self.response_model_exclude_defaults = response_model_exclude_defaults
         self.response_model_exclude_none = response_model_exclude_none
+        self.response_model_by_alias = response_model_by_alias
         self.status_code = status_code
         self.tags = tags or []
         self.summary = summary
@@ -86,6 +88,10 @@ class APIRouter:
         prefix: str = "",
         tags: list[str] | None = None,
         dependencies: Sequence | None = None,
+        default_response_class: Any = None,
+        responses: dict | None = None,
+        deprecated: bool | None = None,
+        include_in_schema: bool = True,
         **kwargs: Any,
     ):
         self.routes: list[APIRoute] = []
@@ -93,6 +99,10 @@ class APIRouter:
         self.prefix = prefix
         self.tags = tags or []
         self.dependencies = list(dependencies or [])
+        self.default_response_class = default_response_class
+        self.responses = responses or {}
+        self.deprecated = deprecated
+        self.include_in_schema = include_in_schema
 
     # ------------------------------------------------------------------
     # Core registration

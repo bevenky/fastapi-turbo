@@ -37,24 +37,39 @@ def _apply_response_model(
     exclude_unset=False,
     exclude_defaults=False,
     exclude_none=False,
+    by_alias=True,
 ):
-    """Filter a handler result through a response_model Pydantic class."""
+    """Filter a handler result through a response_model Pydantic class.
+
+    by_alias=True (FastAPI default) — honor Pydantic Field(alias=...) and
+    Field(serialization_alias=...) in output. Critical for APIs that use
+    aliased fields (camelCase over snake_case, etc.).
+    """
     if response_model is None or result is None:
         return result
 
-    has_filters = include is not None or exclude is not None or exclude_unset or exclude_defaults or exclude_none
+    has_filters = (
+        include is not None
+        or exclude is not None
+        or exclude_unset
+        or exclude_defaults
+        or exclude_none
+        or by_alias is False
+    )
 
     try:
+        # Always go through model_validate + model_dump when by_alias matters —
+        # we can't take the fast "strip extra keys" path because field names
+        # differ from aliases.
+        fast_path_ok = not has_filters and not _model_has_aliases(response_model)
+
         if isinstance(result, dict):
-            if not has_filters:
-                # Fast path: validate only (no dump round-trip needed)
-                # Just strip extra fields by keeping only model fields
+            if fast_path_ok:
                 model_fields = response_model.model_fields
                 return {k: v for k, v in result.items() if k in model_fields}
             validated = response_model.model_validate(result)
         elif hasattr(result, "model_dump"):
-            if not has_filters and type(result) is response_model:
-                # Already the right type — just dump
+            if fast_path_ok and type(result) is response_model:
                 return result.model_dump()
             validated = response_model.model_validate(
                 result.model_dump() if hasattr(result, "model_dump") else result
@@ -62,7 +77,7 @@ def _apply_response_model(
         else:
             return result
 
-        dump_kwargs = {}
+        dump_kwargs = {"by_alias": by_alias}
         if include is not None:
             dump_kwargs["include"] = include
         if exclude is not None:
@@ -77,6 +92,50 @@ def _apply_response_model(
     except Exception:
         pass
     return result
+
+
+def _maybe_print_debug_traceback(app, exc):
+    """When app.debug is True, print the full traceback to stderr before
+    the exception is routed to a handler. Matches FastAPI's ``debug=True``
+    developer-ergonomics behavior.
+
+    HTTPException is never traceback-printed — those are normal control flow.
+    """
+    if app is None or not getattr(app, "debug", False):
+        return
+    try:
+        from fastapi_rs.exceptions import HTTPException
+        if isinstance(exc, HTTPException):
+            return
+    except Exception:
+        pass
+    import sys, traceback
+    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+
+
+def _model_has_aliases(model_cls) -> bool:
+    """True if any Pydantic field declares alias / serialization_alias.
+
+    Cached per model class on the class itself so we pay the introspection
+    cost once, not per request.
+    """
+    cached = getattr(model_cls, "__fastapi_rs_has_aliases__", None)
+    if cached is not None:
+        return cached
+    has = False
+    fields = getattr(model_cls, "model_fields", None) or {}
+    for finfo in fields.values():
+        if getattr(finfo, "alias", None) is not None:
+            has = True
+            break
+        if getattr(finfo, "serialization_alias", None) is not None:
+            has = True
+            break
+    try:
+        model_cls.__fastapi_rs_has_aliases__ = has
+    except Exception:
+        pass
+    return has
 
 
 def _wrap_response_class(result, response_class):
@@ -103,6 +162,7 @@ def _try_compile_handler(
     response_model_exclude_unset=False,
     response_model_exclude_defaults=False,
     response_model_exclude_none=False,
+    response_model_by_alias=True,
     response_class=None,
 ):
     """Compile deps + handler into a SINGLE Python function (1 PyO3 call instead of N+1).
@@ -121,12 +181,14 @@ def _try_compile_handler(
     _rm_exclude_unset = response_model_exclude_unset
     _rm_exclude_defaults = response_model_exclude_defaults
     _rm_exclude_none = response_model_exclude_none
+    _rm_by_alias = response_model_by_alias
     _response_class = response_class
 
     dep_steps = [p for p in params if p["kind"] == "dependency"]
     _has_exc_handlers = app is not None and bool(getattr(app, "exception_handlers", None))
+    _debug_on = app is not None and bool(getattr(app, "debug", False))
     if not dep_steps:
-        if response_model is not None or _response_class is not None or _has_exc_handlers:
+        if response_model is not None or _response_class is not None or _has_exc_handlers or _debug_on:
             # Even without deps, we may need response_model filtering or response_class wrapping
             handler_param_names = {p["name"] for p in params if p.get("_is_handler_param")}
             handler_func = endpoint
@@ -139,6 +201,7 @@ def _try_compile_handler(
                 try:
                     result = handler_func(**{k: kwargs[k] for k in handler_param_names if k in kwargs})
                 except Exception as exc:
+                    _maybe_print_debug_traceback(_app_ref, exc)
                     if _app_ref is not None and _app_ref.exception_handlers:
                         handler_result = _app_ref._invoke_exception_handler(exc)
                         if handler_result is not None:
@@ -151,6 +214,7 @@ def _try_compile_handler(
                         exclude_unset=_rm_exclude_unset,
                         exclude_defaults=_rm_exclude_defaults,
                         exclude_none=_rm_exclude_none,
+                        by_alias=_rm_by_alias,
                     )
                 if _response_class is not None:
                     result = _wrap_response_class(result, _response_class)
@@ -221,6 +285,8 @@ def _try_compile_handler(
             try:
                 result = handler_func(**{k: resolved[k] for k in handler_param_names if k in resolved})
             except Exception as exc:
+                # In debug mode, surface the full traceback on non-HTTPException errors.
+                _maybe_print_debug_traceback(_app, exc)
                 # Route through app's exception_handlers if one is registered
                 if _app is not None and _app.exception_handlers:
                     handler_result = _app._invoke_exception_handler(exc)
@@ -432,6 +498,9 @@ class FastAPI:
         root_path: str = "",
         root_path_in_servers: bool = True,
         exception_handlers: dict | None = None,
+        default_response_class: Any = None,
+        responses: dict | None = None,
+        debug: bool = False,
         **kwargs: Any,
     ):
         self.title = title
@@ -450,6 +519,12 @@ class FastAPI:
         self.root_path_in_servers = root_path_in_servers
         # Map of exception class (or int status code) -> handler callable
         self.exception_handlers: dict = dict(exception_handlers or {})
+        # Default response class applied app-wide when routes/routers don't override
+        self.default_response_class = default_response_class
+        # App-level default responses merged into every route's OpenAPI entry
+        self.responses: dict = dict(responses or {})
+        # When True, 500 responses include Python traceback (dev only)
+        self.debug: bool = bool(debug)
 
         self.router = APIRouter()
         self.state = SimpleNamespace()
@@ -759,7 +834,13 @@ class FastAPI:
             rm_exclude_unset = getattr(route, "response_model_exclude_unset", False)
             rm_exclude_defaults = getattr(route, "response_model_exclude_defaults", False)
             rm_exclude_none = getattr(route, "response_model_exclude_none", False)
+            rm_by_alias = getattr(route, "response_model_by_alias", True)
             response_class = getattr(route, "response_class", None)
+            # Cascade default_response_class: route → router → app
+            if response_class is None:
+                response_class = getattr(router, "default_response_class", None)
+            if response_class is None:
+                response_class = getattr(self, "default_response_class", None)
 
             rm_kwargs = dict(
                 response_model_include=rm_include,
@@ -767,6 +848,7 @@ class FastAPI:
                 response_model_exclude_unset=rm_exclude_unset,
                 response_model_exclude_defaults=rm_exclude_defaults,
                 response_model_exclude_none=rm_exclude_none,
+                response_model_by_alias=rm_by_alias,
                 response_class=response_class,
             )
 
@@ -793,7 +875,7 @@ class FastAPI:
                         from fastapi_rs._resolution import _make_sync_wrapper
                         endpoint = _make_sync_wrapper(endpoint)
                         is_async = False
-            elif response_model is not None or response_class is not None or self.exception_handlers:
+            elif response_model is not None or response_class is not None or self.exception_handlers or self.debug:
                 # No deps but has response_model/response_class/exception_handlers -- wrap handler
                 compiled = _try_compile_handler(
                     endpoint, params, app=self, response_model=response_model,
@@ -862,7 +944,12 @@ class FastAPI:
                     "summary": route.summary,
                     "description": route.description,
                     "response_description": getattr(route, "response_description", "Successful Response"),
-                    "responses": getattr(route, "responses", {}),
+                    # Merge: app defaults → router defaults → route (route wins on conflicts)
+                    "responses": {
+                        **self.responses,
+                        **getattr(router, "responses", {}),
+                        **getattr(route, "responses", {}),
+                    },
                     "response_model": response_model,
                     "deprecated": route.deprecated,
                     "operation_id": route.operation_id,
