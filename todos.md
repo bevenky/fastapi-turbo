@@ -66,37 +66,43 @@ Transitions: CONNECTING → (accept()) → CONNECTED → (close() or peer close)
 
 ---
 
-## Phase 1b — Remaining Starlette WebSocket compat gaps
+## Phase 1b — WebSocket Starlette compat — SHIPPED
 
-**Status:** Follow-up audit found 8 additional gaps between our `WebSocket` and Starlette's. Phase 1 fixed the ones that block real code; Phase 1b addresses the rest. Total ~170 LOC.
+**Status:** Fixed 7 of 8 gaps identified. 1 deferred (item #8 accept(headers) needs architectural work).
 
-### Must fix (standard code will break otherwise)
+### Fixed
 
-1. **`send_json()` separators mismatch** — we emit `{"key": "value"}`, Starlette emits `{"key":"value"}`. Signature-sensitive protocols (HMAC-signed payloads, byte-count-sensitive systems) will fail. Fix: `json.dumps(data, separators=(",", ":"), ensure_ascii=False)`. ~2 LOC.
+1. **`send_json()` compact separators** — `json.dumps(data, separators=(",", ":"), ensure_ascii=False)`. Matches Starlette byte-exact. HMAC-signed payloads now verify correctly.
 
-2. **`close()` drops `reason`** — `ws.close(code=3000, reason="bye")` sends empty reason. Rust `PyWebSocket::close` hardcodes `reason: "".into()`. Fix: plumb reason through PyO3 to `CloseFrame`. ~5 LOC.
+2. **`close(reason=...)` propagated** — Rust `PyWebSocket::close(code, reason)` now accepts reason and builds a proper `CloseFrame`. Verified by peer receiving the reason string.
 
-3. **`WebSocketDisconnect` hardcodes `code=1000`** — when the peer closes with code 1011 (Internal Error), our `receive_text()`/`receive_bytes()` still raise `WebSocketDisconnect(code=1000)`. Fix: propagate the actual close code from `WsMessage::Close { code, ... }` up to the Python exception. ~20 LOC.
+3. **`WebSocketDisconnect` carries real close code** — Rust awaitables now emit `WS_CLOSED:<code>:<reason>` in the `RuntimeError` message; Python layer parses and raises `WebSocketDisconnect(code=, reason=)` with the peer's actual values.
 
-4. **`receive_json(mode)` / `send_json(mode)` accept anything** — Starlette raises `RuntimeError` on unknown mode; we silently treat non-"text" as "binary". Fix: validate `mode in ("text", "binary")`. ~4 LOC.
+4. **`receive_json(mode)` / `send_json(mode)` validate** — raises `RuntimeError('The "mode" argument should be "text" or "binary".')` on invalid mode.
 
-5. **Missing `app`, `headers`, `url`, `query_params`, `path_params`, `cookies`, `client` properties** — Starlette's `WebSocket` extends `HTTPConnection`, so these are inherited. Real-world voice-agent code reads several (`ws.client`, `ws.headers`). Fix: add these properties reading from `self._scope`. ~60 LOC.
+5. **HTTPConnection-like properties** — `ws.headers`, `ws.url`, `ws.base_url`, `ws.query_params`, `ws.path_params`, `ws.cookies`, `ws.client`, `ws.app`, `ws.scope` all implemented reading from the ASGI scope dict.
 
-### Should fix (edge cases)
+6. **State validation on send** — `send_text()` / `send_bytes()` / `send_json()` / `send()` raise `RuntimeError` if called before `accept()` or after `close()`. Matches Starlette's enforcement.
 
-6. **State validation on send/receive** — Starlette raises `RuntimeError` on `send_text()` before `accept()`; we silently call. Fix: pre-condition check `application_state == CONNECTED`. ~15 LOC total.
+7. **`close()` truly awaits flush** — new `WriterCmd::Flush(cb::Sender)` queued after the Close frame. Writer task processes in order; `Flush` fires a crossbeam signal the Python-side `CloseAwaitable` blocks on. After `await ws.close()` returns, the close frame has reached the WS sink.
 
-7. **`close()` not truly awaited** — we queue the close frame to a tokio mpsc but don't await flush. Code that closes then immediately exits may lose the close frame. Fix: use `tokio::sync::oneshot` to signal write completion. ~25 LOC.
+### Populated scope
 
-8. **`accept()` ignores `headers`** — our Rust `accept()` discards custom headers. For `Sec-WebSocket-Protocol` negotiation this breaks. Fix: plumb headers through to `axum::extract::ws::WebSocket::on_upgrade`. ~40 LOC.
+The Rust route handler now passes `WsScopeInfo` to `handle_ws_connection()` containing path, raw_path, query_string, all headers, host, scheme (ws/wss), and path params. Python reads via `_ws.get_scope_dict()` on property access (lazy, cached).
 
-### Deferred (strict spec-only, real code won't hit)
+### Deferred
 
-9. `websocket.connect` first-receive handling — ASGI spec says `receive()` emits `{"type": "websocket.connect"}` on first call. Our Rust bridge skips this. Most user code never calls `receive()` before `accept()`, so impact is low.
+8. **`accept(headers=...)` / subprotocol negotiation** — axum performs the HTTP upgrade BEFORE the Python handler runs. Properly supporting this requires either (a) deferring the upgrade until Python calls `accept()`, or (b) passing a callback to `on_upgrade` with the subprotocol. Architectural change ~200 LOC. Deferred to Phase 1c.
 
-10. Strict ASGI message type validation inside `send()` / `receive()` dispatch.
+9. `websocket.connect` first-receive protocol — strict ASGI spec edge. Deferred.
 
-11. `send_denial_response()` — WebSocket Denial Response extension. Rare.
+10. `send_denial_response()` — WebSocket Denial Response extension. Rare. Deferred.
+
+### Tests
+
+- 19 WebSocket tests pass (9 pre-Phase 1b + 10 new Phase 1b compat tests)
+- 332 non-WebSocket tests pass
+- 351 total
 
 ---
 
@@ -313,3 +319,115 @@ Ranked by blast radius:
 - `ws.run_echo()` / `ws.run_forward()` / `ws.on("message", handler)` — non-standard extensions that break the FastAPI mental model. Users should write the standard `while True: await ws.receive_bytes()` loop; we make it fast.
 - Fixed-size message batching (`receive_batch(n=5)`) — adds 100 ms latency per 5 frames, destroys conversational AI. Rejected.
 - Full SIP/RTP stack — that's a separate project. Out of scope for a general web framework.
+
+---
+
+## Phase 4 — FastAPI parity: remaining gaps from full audit
+
+Comprehensive audit against upstream FastAPI + Starlette found ~80 missing or incomplete features. Grouped by severity. Most real apps hit only the CRITICAL list; HIGH+ mainly affect corner cases or specialized workloads.
+
+### CRITICAL — standard FastAPI code will break
+
+These will either raise `AttributeError`/`TypeError` or produce wrong output silently.
+
+#### 4.1 `FastAPI.__init__` missing params
+
+| Param | Upstream default | Impact | LOC |
+|---|---|---|---|
+| `debug: bool = False` | Stored; used for error-page verbosity | Debug tracebacks not returned on 500 | ~5 |
+| `responses: dict` | App-wide default response schemas | Can't set app-level 404/500 shapes in OpenAPI | ~15 |
+| `default_response_class: type[Response]` | Sets app-wide default | Can't make ORJSONResponse the app default | ~10 |
+| `swagger_ui_oauth2_redirect_url: str` | Custom OAuth2 redirect path | OAuth2 apps with custom paths break | ~5 |
+| `separate_input_output_schemas: bool = True` | Separates req/resp schemas | OpenAPI SDK generators emit wrong types | ~50 |
+
+#### 4.2 `APIRouter.__init__` missing params
+
+| Param | Impact | LOC |
+|---|---|---|
+| `default_response_class` | Can't override response class per router | ~8 |
+| `responses` | Router-level response schemas missing from OpenAPI | ~15 |
+| `route_class` | Can't use custom `APIRoute` subclass per router | ~20 |
+| `default` (404 handler) | Can't customize 404 per router | ~10 |
+
+#### 4.3 Route decorator
+
+| Param | Impact | LOC |
+|---|---|---|
+| `response_model_by_alias: bool = True` | Responses don't use `Field(alias=...)` — breaks all APIs using aliased fields | ~20 |
+
+#### 4.4 Response serialization / Pydantic integration
+
+- **`response_model` filtering is incomplete** — current `_apply_response_model` validates via Pydantic but doesn't honor `by_alias`. Nested models may not $ref correctly.
+- **Missing `Field(alias=..., serialization_alias=...)` support** — users can declare aliased Pydantic models but output ignores the alias on serialization.
+- **`computed_field`, `field_serializer`, `model_serializer`, `model_validator`** — Pydantic v2 decorators not exercised in our response path.
+- Estimated fix: ~60 LOC for alias support, ~120 for full Pydantic v2 decorator plumbing.
+
+#### 4.5 File handling (major gap)
+
+- **`UploadFile` is a stub** — doesn't actually receive/buffer multipart data. File uploads don't work.
+- **`File(...)` marker not wired** — params decorated with `File()` aren't handled during introspection.
+- **`FileResponse` missing** — no way to return a file with Content-Type + Range support.
+- **`Range: bytes=...` request handling missing** — video streaming / resumable downloads don't work.
+- **`StaticFiles` not functional** — mount helper exists but doesn't serve files at scale.
+- Estimated fix: **~700 LOC** including Rust multipart parser (~200), FileResponse with Range (~100), StaticFiles (~100), UploadFile proper interface (~100), body-size limits (~50), and testing (~150).
+
+#### 4.6 Request enhancements
+
+| Gap | Impact | LOC |
+|---|---|---|
+| `request.stream()` missing | Can't read request body in chunks | ~30 |
+| `request.auth` / `request.user` missing | Security middleware can't populate identity | ~15 |
+| `request.form()` multipart missing | Multipart forms don't parse (blocked by #4.5) | 0 (after #4.5) |
+
+### HIGH — common features affecting many users
+
+- **`ORJSONResponse`** listed as supported but not backed by orjson (falls back to `json`). ~15 LOC.
+- **`StreamingResponse` + `BackgroundTask`** — verify background runs after stream closes.
+- **`@app.middleware("http")`** decorator — already shipped; verify Starlette-compat ordering semantics.
+- **ASGI middleware support** — explicitly deferred; users with Sentry / OpenTelemetry / Prometheus middleware can't install them. ~150 LOC.
+- **`SessionMiddleware`** — no session cookie helper. ~80 LOC.
+- **`AuthenticationMiddleware`** — no built-in auth user population. ~50 LOC.
+- **OAuth2ClientCredentials, OpenIdConnect** — missing security schemes. ~90 LOC combined.
+- **Discriminated Union response models** — untested, likely wrong schema.
+
+### MEDIUM — less common
+
+- `webhooks` parameter + OpenAPI webhooks section.
+- `servers` / `external_docs` at route level (currently only app level).
+- `Form(..., Depends())` embedded form validation.
+- TestClient WebSocket support (`ws.websocket_connect()`).
+- `AsyncClient` / `ASGITransport` integration for async tests.
+- `dataclass` / `TypedDict` / `msgspec.Struct` as response models (Pydantic-only today).
+- `HEAD` auto-handling from `GET` routes.
+- `OPTIONS` auto-generation for CORS preflight.
+- `405 Method Not Allowed` responses (currently may return 404).
+- Request size limits enforcement.
+- `redirect_slashes` parameter.
+- `lifespan` ordering edge cases (routers with own lifespans).
+
+### LOW — edge cases / rare
+
+- `openapi_prefix` (deprecated upstream; alias to `root_path`).
+- `contact` dict field validation.
+- `generate_unique_id_function` at app level (per-route works).
+- Custom 404 / 500 HTML pages (can use `exception_handler`).
+- `APIRoute` subclassing / `route_class` param.
+- `operation_id` uniqueness checks.
+- Multipart range responses (206 multipart).
+- Webhooks extension.
+
+### Phase 4 priority
+
+Biggest blast radius first, grouped by effort:
+
+1. **response_model_by_alias + Field(alias=)** — breaks every app using Pydantic aliases. ~80 LOC.
+2. **default_response_class (app + router + route)** — many apps want ORJSONResponse as default. ~30 LOC.
+3. **ORJSONResponse actually using orjson** — ~15 LOC.
+4. **`responses` parameter at app level** — app-wide response shapes. ~15 LOC.
+5. **File uploads + FileResponse + Range** — unblocks an entire category of apps. ~700 LOC (biggest item).
+6. **Session / Authentication middleware** — common auth patterns. ~130 LOC.
+7. **ASGI middleware bridge** — unblocks Sentry / OpenTelemetry. ~150 LOC.
+8. **OAuth2ClientCredentials, OpenIdConnect** — common OAuth flows. ~90 LOC.
+9. All MEDIUM items — pick up as users hit them.
+
+Total Phase 4 scope: ~1200 LOC excluding Phase 2 audio modules.

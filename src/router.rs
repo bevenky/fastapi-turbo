@@ -205,14 +205,67 @@ pub fn build_router(routes: Vec<RouteInfo>) -> Router {
             });
             router = router.route(
                 &axum_path,
-                any(move |ws: WebSocketUpgrade| {
-                    let state = ws_state.clone();
-                    async move {
-                        let h = Python::attach(|py| state.handler.clone_ref(py));
-                        let is_a = state.is_async;
-                        ws.on_upgrade(move |socket| handle_ws_connection(socket, h, is_a))
-                    }
-                }),
+                any(
+                    move |ws: WebSocketUpgrade,
+                          req_parts: axum::http::request::Parts| {
+                        let state = ws_state.clone();
+                        async move {
+                            let h = Python::attach(|py| state.handler.clone_ref(py));
+                            let is_a = state.is_async;
+
+                            // Populate scope info from the upgrade request
+                            let uri = &req_parts.uri;
+                            let path = uri.path().to_string();
+                            let raw_path = path.as_bytes().to_vec();
+                            let query_string = uri
+                                .query()
+                                .map(|q| q.as_bytes().to_vec())
+                                .unwrap_or_default();
+                            let headers: Vec<(String, String)> = req_parts
+                                .headers
+                                .iter()
+                                .map(|(k, v)| {
+                                    (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned())
+                                })
+                                .collect();
+                            let host = req_parts
+                                .headers
+                                .get("host")
+                                .and_then(|h| h.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let scheme = if req_parts
+                                .headers
+                                .get("x-forwarded-proto")
+                                .map(|v| v.to_str().unwrap_or("") == "https")
+                                .unwrap_or(false)
+                            {
+                                "wss"
+                            } else {
+                                "ws"
+                            }
+                            .to_string();
+                            // ConnectInfo requires into_make_service_with_connect_info —
+                            // fall back to None for now. Users can read X-Forwarded-For from headers.
+                            let client: Option<(String, u16)> = None;
+
+                            let scope = crate::websocket::WsScopeInfo {
+                                path,
+                                raw_path,
+                                query_string,
+                                headers,
+                                client,
+                                scheme,
+                                host,
+                                path_params: Vec::new(),
+                            };
+
+                            ws.on_upgrade(move |socket| {
+                                handle_ws_connection(socket, h, is_a, scope)
+                            })
+                        }
+                    },
+                ),
             );
             continue;
         }

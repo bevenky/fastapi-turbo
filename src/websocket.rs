@@ -11,13 +11,27 @@ use axum::extract::ws::{Message, WebSocket};
 use bytes::Bytes;
 use crossbeam_channel as cb;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::handler_bridge;
+
+/// Metadata about the inbound WebSocket upgrade request — populated by the
+/// Rust route handler before the upgrade, used to build the Python scope dict.
+#[derive(Default)]
+pub struct WsScopeInfo {
+    pub path: String,
+    pub raw_path: Vec<u8>,
+    pub query_string: Vec<u8>,
+    pub headers: Vec<(String, String)>,     // all headers, lowercased
+    pub client: Option<(String, u16)>,
+    pub scheme: String,                     // "ws" or "wss"
+    pub host: String,
+    pub path_params: Vec<(String, String)>, // matched route path params
+}
 
 // ── WebSocket state (matches Starlette's WebSocketState) ───────────
 // These values MUST match python/fastapi_rs/websockets.py::WebSocketState.
@@ -104,7 +118,8 @@ impl TextAwaitable {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
 
     /// Returns str directly — fast path for receive_text().
-    /// On Close, raises RuntimeError (matches old behavior; Python layer converts to WebSocketDisconnect).
+    /// On Close, raises RuntimeError with message "WS_CLOSED:<code>:<reason>"
+    /// so the Python layer can extract the real close code.
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let rx = self.rx.clone();
         let state = self.state.clone();
@@ -118,9 +133,11 @@ impl TextAwaitable {
                     ))?
                     .into_pyobject(py)?.into_any().unbind()
             }
-            WsMessage::Close { .. } => {
+            WsMessage::Close { code, reason } => {
                 self.state.store(STATE_DISCONNECTED, Ordering::Release);
-                return Err(pyo3::exceptions::PyRuntimeError::new_err("WebSocket closed"));
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("WS_CLOSED:{code}:{reason}")
+                ));
             }
         };
         Err(pyo3::exceptions::PyStopIteration::new_err(value))
@@ -140,6 +157,7 @@ impl BytesAwaitable {
 
     /// Returns bytes directly — fast path for receive_bytes().
     /// Zero-copy from axum's Bytes → PyBytes (one allocation for the PyBytes).
+    /// On Close, raises RuntimeError with message "WS_CLOSED:<code>:<reason>".
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let rx = self.rx.clone();
         let state = self.state.clone();
@@ -147,9 +165,11 @@ impl BytesAwaitable {
         let value: Py<PyAny> = match msg {
             WsMessage::Binary(b) => PyBytes::new(py, &b).into_any().unbind(),
             WsMessage::Text(s) => PyBytes::new(py, s.as_bytes()).into_any().unbind(),
-            WsMessage::Close { .. } => {
+            WsMessage::Close { code, reason } => {
                 self.state.store(STATE_DISCONNECTED, Ordering::Release);
-                return Err(pyo3::exceptions::PyRuntimeError::new_err("WebSocket closed"));
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("WS_CLOSED:{code}:{reason}")
+                ));
             }
         };
         Err(pyo3::exceptions::PyStopIteration::new_err(value))
@@ -158,9 +178,16 @@ impl BytesAwaitable {
 
 // ── PyWebSocket: the Rust-side WS handle exposed to Python ─────────
 
+/// Command sent to the WS writer task.
+/// `Flush` causes the writer to signal the crossbeam sender — used by `close()` to truly await.
+pub enum WriterCmd {
+    Send(Message),
+    Flush(cb::Sender<()>),
+}
+
 #[pyclass]
 pub struct PyWebSocket {
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::UnboundedSender<WriterCmd>,
     rx: cb::Receiver<WsMessage>,
     state: Arc<AtomicU8>,
     // Three cached awaitables — one per return-type (dict / text / bytes).
@@ -168,6 +195,9 @@ pub struct PyWebSocket {
     cached_dict: std::sync::OnceLock<Py<ChannelAwaitable>>,
     cached_text: std::sync::OnceLock<Py<TextAwaitable>>,
     cached_bytes: std::sync::OnceLock<Py<BytesAwaitable>>,
+    // Scope info populated by the Rust route handler from the inbound request.
+    // Python reads via get_scope_dict() to build HTTPConnection-like properties.
+    scope_info: Arc<WsScopeInfo>,
 }
 
 impl PyWebSocket {
@@ -227,7 +257,7 @@ impl PyWebSocket {
 
     fn send_text(&self, data: String) -> PyResult<()> {
         self.tx
-            .send(Message::Text(data.into()))
+            .send(WriterCmd::Send(Message::Text(data.into())))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("WS send: {e}")))
     }
 
@@ -236,8 +266,45 @@ impl PyWebSocket {
         let slice = data.as_bytes();
         let owned = Bytes::copy_from_slice(slice);
         self.tx
-            .send(Message::Binary(owned))
+            .send(WriterCmd::Send(Message::Binary(owned)))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("WS send: {e}")))
+    }
+
+    /// Build the ASGI-style scope dict on demand. Called by Python properties
+    /// like ws.headers, ws.url, ws.client, ws.query_params.
+    fn get_scope_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item(pyo3::intern!(py, "type"), pyo3::intern!(py, "websocket"))?;
+        dict.set_item(pyo3::intern!(py, "scheme"), self.scope_info.scheme.as_str())?;
+        dict.set_item(pyo3::intern!(py, "path"), self.scope_info.path.as_str())?;
+        dict.set_item(pyo3::intern!(py, "raw_path"), PyBytes::new(py, &self.scope_info.raw_path))?;
+        dict.set_item(pyo3::intern!(py, "query_string"), PyBytes::new(py, &self.scope_info.query_string))?;
+        dict.set_item(pyo3::intern!(py, "http_version"), "1.1")?;
+
+        // Headers as a list of (bytes, bytes) tuples — matches ASGI spec.
+        let headers_list = PyList::empty(py);
+        for (k, v) in &self.scope_info.headers {
+            let tup = (PyBytes::new(py, k.as_bytes()), PyBytes::new(py, v.as_bytes()));
+            headers_list.append(tup)?;
+        }
+        dict.set_item(pyo3::intern!(py, "headers"), headers_list)?;
+
+        // Client address
+        if let Some((host, port)) = &self.scope_info.client {
+            dict.set_item(pyo3::intern!(py, "client"), (host.as_str(), *port))?;
+        } else {
+            dict.set_item(pyo3::intern!(py, "client"), py.None())?;
+        }
+        dict.set_item(pyo3::intern!(py, "server"), (self.scope_info.host.as_str(), 0u16))?;
+
+        // Path params (matched from Axum routing)
+        let params_dict = PyDict::new(py);
+        for (k, v) in &self.scope_info.path_params {
+            params_dict.set_item(k.as_str(), v.as_str())?;
+        }
+        dict.set_item(pyo3::intern!(py, "path_params"), params_dict)?;
+
+        Ok(dict)
     }
 
     // ── Sync receive (blocking with GIL released) ──────────────────
@@ -340,14 +407,64 @@ impl PyWebSocket {
         self.get_bytes_awaitable(py)
     }
 
-    #[pyo3(signature = (code=None))]
-    fn close(&self, code: Option<u16>) -> PyResult<()> {
-        let _ = self.tx.send(Message::Close(Some(axum::extract::ws::CloseFrame {
-            code: code.unwrap_or(1000),
-            reason: "".into(),
-        })));
+    /// Queue a Close frame with optional code + reason.
+    /// Does NOT await flush — the frame may still be in the tokio mpsc when this returns.
+    /// Use close_and_wait() for true "close + flushed" semantics.
+    #[pyo3(signature = (code=None, reason=None))]
+    fn close(&self, code: Option<u16>, reason: Option<String>) -> PyResult<()> {
+        let _ = self.tx.send(WriterCmd::Send(Message::Close(Some(
+            axum::extract::ws::CloseFrame {
+                code: code.unwrap_or(1000),
+                reason: reason.unwrap_or_default().into(),
+            },
+        ))));
         self.state.store(STATE_DISCONNECTED, Ordering::Release);
         Ok(())
+    }
+
+    /// Returns a Python awaitable that resolves when the writer has flushed the
+    /// Close frame to the underlying WS sink. The caller should already have
+    /// called close() (or this method auto-sends one).
+    #[pyo3(signature = (code=None, reason=None))]
+    fn close_and_wait(&self, py: Python<'_>, code: Option<u16>, reason: Option<String>) -> PyResult<Py<CloseAwaitable>> {
+        // Queue the close frame
+        let _ = self.tx.send(WriterCmd::Send(Message::Close(Some(
+            axum::extract::ws::CloseFrame {
+                code: code.unwrap_or(1000),
+                reason: reason.unwrap_or_default().into(),
+            },
+        ))));
+        // Queue a flush signal — the writer drains all prior Sends before firing.
+        let (tx, rx) = cb::bounded::<()>(1);
+        let _ = self.tx.send(WriterCmd::Flush(tx));
+        self.state.store(STATE_DISCONNECTED, Ordering::Release);
+
+        Py::new(py, CloseAwaitable { rx })
+    }
+}
+
+// ── CloseAwaitable: await for close flush ──────────────────────────
+
+/// Custom awaitable that blocks on a crossbeam channel (GIL released).
+/// Returned by close_and_wait().
+#[pyclass]
+pub struct CloseAwaitable {
+    rx: cb::Receiver<()>,
+}
+
+#[pymethods]
+impl CloseAwaitable {
+    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let rx = self.rx.clone();
+        py.detach(|| {
+            // Block until the writer signals flush (or errors out — in which case
+            // we silently succeed; connection is already closed).
+            let _ = rx.recv();
+        });
+        Err(pyo3::exceptions::PyStopIteration::new_err(py.None()))
     }
 }
 
@@ -371,17 +488,32 @@ pub async fn handle_ws_echo_rust(socket: WebSocket) {
 
 // ── Python handler bridge ─────────────────────────────────────────
 
-pub async fn handle_ws_connection(socket: WebSocket, handler: Py<PyAny>, is_async: bool) {
+pub async fn handle_ws_connection(
+    socket: WebSocket,
+    handler: Py<PyAny>,
+    is_async: bool,
+    scope_info: WsScopeInfo,
+) {
     use futures_util::{SinkExt, StreamExt};
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Outgoing: Python → tokio channel → WS writer
-    let (tx_out, mut rx_out) = mpsc::unbounded_channel::<Message>();
+    // Outgoing writer: handles Send messages + Flush barrier signals
+    let (tx_out, mut rx_out) = mpsc::unbounded_channel::<WriterCmd>();
     tokio::spawn(async move {
-        while let Some(msg) = rx_out.recv().await {
-            if ws_tx.send(msg).await.is_err() {
-                break;
+        while let Some(cmd) = rx_out.recv().await {
+            match cmd {
+                WriterCmd::Send(msg) => {
+                    if ws_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                WriterCmd::Flush(tx) => {
+                    // All previous Send messages have been flushed (since we process
+                    // them in order before hitting this Flush command). Fire the
+                    // oneshot so the waiting close_and_wait() returns.
+                    let _ = tx.send(());
+                }
             }
         }
     });
@@ -427,6 +559,7 @@ pub async fn handle_ws_connection(socket: WebSocket, handler: Py<PyAny>, is_asyn
         cached_dict: std::sync::OnceLock::new(),
         cached_text: std::sync::OnceLock::new(),
         cached_bytes: std::sync::OnceLock::new(),
+        scope_info: Arc::new(scope_info),
     };
 
     let ws_obj = Python::attach(|py| {

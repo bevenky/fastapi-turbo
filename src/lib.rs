@@ -35,6 +35,7 @@ fn _fastapi_rs_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<websocket::ChannelAwaitable>()?;
     m.add_class::<websocket::TextAwaitable>()?;
     m.add_class::<websocket::BytesAwaitable>()?;
+    m.add_class::<websocket::CloseAwaitable>()?;
     m.add_class::<db_pool::PyPool>()?;
     m.add_class::<http_client::RustTransport>()?;
     m.add_class::<http_client::RawResponse>()?;
