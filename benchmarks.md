@@ -208,9 +208,9 @@ fastapi-rs beats Go on 1 query, 4 seq, 10 seq, and 10 pipeline. Beats Fastify on
 | 4 seq | 152 μs | 110 μs | 109 μs | 113 μs | 494 μs |
 | 10 seq | 332 μs | 228 μs | 228 μs | 221 μs | 997 μs |
 | 4 pipeline | **74 μs** | **49 μs** | **49 μs** | **50 μs** | 236 μs |
-| 10 pipeline | **91 μs** | **52 μs** | **52 μs** | **57 μs** | 257 μs |
+| 10 pipeline | **80 μs** | **52 μs** | **52 μs** | **57 μs** | 257 μs |
 
-Redis pipeline 10 at 91 μs — 3.6x faster than sequential (332 μs). 2.8x faster than FastAPI pipeline (257 μs). Go leads at 52 μs (faster driver, no GIL).
+Redis pipeline 10 at 80 μs (with hiredis) — 4.2x faster than sequential (332 μs). 3.2x faster than FastAPI pipeline (257 μs). Go leads at 52 μs (faster driver, no GIL).
 
 ### Complete 8-Framework Comparison (PostgreSQL + Redis, 10K requests each)
 
@@ -273,6 +273,71 @@ fastapi-rs supports both patterns. Sync handlers with `block_in_place` work like
 | PostgreSQL | psycopg2 | **38 μs** | asyncpg | 148 μs | 3.9x |
 | MySQL | pymysql | **48 μs** | aiomysql | 142 μs | 3.0x |
 | MongoDB | pymongo | **64 μs** | motor | 178 μs | 2.8x |
+
+---
+
+## Outbound HTTP Client Benchmark (reqwest-based)
+
+`fastapi_rs.http.Client` — httpx-compatible Python API backed by Rust `reqwest`. Target: uvicorn ASGI server on localhost.
+
+### Single request latency
+
+| Client | p50 | min | p99 |
+|--------|-----|-----|-----|
+| Go `net/http` | 108 μs | 87 μs | 131 μs |
+| Node.js `undici` | 101 μs | 78 μs | 137 μs |
+| Python `http.client` (stdlib) | 108 μs | 83 μs | 127 μs |
+| **fastapi_rs.http** | **136 μs** | **112 μs** | 156 μs |
+| httpx | 244 μs | 199 μs | 316 μs |
+| requests | 383 μs | 342 μs | 590 μs |
+
+fastapi_rs.http is **2.2x faster than httpx** and **3.4x faster than requests** with the same feature set (HTTP/2, TLS, cookies, redirects, auth, compression, proxy).
+
+### Parallel requests — `gather()` vs ThreadPool vs async gather
+
+Time to complete N parallel GETs:
+
+| Parallel | Go goroutines | Node undici | **fastapi_rs gather** | httpx ThreadPool | httpx async |
+|----------|--------------|-------------|----------------------|-----------------|-------------|
+| x2 | 166 μs | 156 μs | 216 μs | 399 μs | 1,065 μs |
+| x4 | 277 μs | 266 μs | **310 μs** | 742 μs | 2,577 μs |
+| x10 | 547 μs | 530 μs | **622 μs** | 1,838 μs | 6,994 μs |
+| x20 | 987 μs | 938 μs | **1,068 μs** | 3,567 μs | 15,590 μs |
+
+**Per-request latency** (amortized):
+
+| Parallel | Go | Node | **fastapi_rs** | httpx ThreadPool | httpx async |
+|----------|-----|------|---------------|------------------|-------------|
+| x10 | 55 μs | 53 μs | **62 μs** | 184 μs | 699 μs |
+| x20 | 49 μs | 47 μs | **53 μs** | 178 μs | 779 μs |
+
+`gather()` runs N concurrent requests on a Rust tokio runtime with ONE GIL release. Results:
+- **3x faster than httpx ThreadPool** at x20
+- **13x faster than httpx async gather** at x20
+- **Within 15% of Go goroutines and Node Promise.all** across all parallelism levels
+
+### Architecture
+
+```
+Python Client (httpx-compatible API)
+    │
+    ├─ auth flow (generator pattern, for token refresh / challenge-response)
+    ├─ cookie jar, redirect following, event hooks
+    └─ Rust transport (PyO3 #[pyclass])
+              │ py.detach() — GIL released during I/O
+              ▼
+       thread-local tokio current_thread runtime
+              │ (zero cross-thread scheduling)
+              ▼
+          reqwest ─── hyper ─── rustls
+```
+
+Key design decisions:
+- **Thread-local `current_thread` tokio runtime** — eliminates cross-thread scheduling overhead (~10 μs saved vs multi-thread runtime)
+- **Python logic + Rust transport** (same split as httpx + httpcore) — auth/cookies/redirects in Python, I/O in Rust
+- **Fast path in Python** — bypasses `build_request`/`send` ceremony for simple calls with no auth/hooks/cookies/redirects (~12 μs saved)
+- **One reqwest client, shared via `Arc`** — connection pool reused across all requests
+- **Leaked runtimes** — never dropped at interpreter shutdown, avoids tokio destructor races
 
 ---
 
