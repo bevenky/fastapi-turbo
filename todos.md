@@ -4,15 +4,15 @@ Scope doc for planned work. Not starting implementation yet.
 
 ---
 
-## Phase 1: WebSocket fast path for audio streaming
+## Phase 1: WebSocket fast path for audio streaming — SHIPPED
 
-**Goal:** Make fastapi-rs WebSocket performant enough that someone can build agent-transport-class audio streaming apps using standard FastAPI syntax, without needing a separate Rust crate.
+**Goal:** Make fastapi-rs WebSocket performant enough that users can build real-time audio-streaming apps using standard FastAPI syntax, without needing to drop down to a separate Rust crate.
 
-**Context:** Current WebSocket layer is ~57 μs/round-trip vs pure Rust Axum baseline of ~45 μs. The 12 μs gap is Python boundary cost. Critical bug: binary messages are corrupted via `String::from_utf8_lossy`. For audio at 50 pkt/s (20ms frames), per-packet framework overhead compounds across STT→LLM→TTS pipelines.
+**Context:** Current WebSocket layer is ~57-58 μs/round-trip vs pure Rust Axum baseline of ~43 μs. The 12-15 μs gap is Python boundary cost. Critical bug: binary messages were being corrupted via `String::from_utf8_lossy`. For audio at 50 pkt/s (20 ms frames), per-packet framework overhead compounds across STT → LLM → TTS pipelines.
 
-**Non-goal:** Do NOT add fixed-size batching (`receive_batch(n=5)`) — 5 × 20ms = 100ms latency, unacceptable for conversational AI. Target max batching window = 40 ms (2 packets) if we batch at all.
+**Non-goal:** Do NOT add fixed-size batching (`receive_batch(n=5)`) — 5 × 20 ms = 100 ms latency, unacceptable for conversational AI. Target max batching window = 40 ms (2 packets) if we batch at all.
 
-**Non-goal:** Do NOT add non-FastAPI-standard extensions (`ws.run_echo()`, `ws.on("message")`, etc.). Everything must work with standard FastAPI WebSocket syntax so users can keep writing `await ws.receive_bytes()` loops.
+**Non-goal:** Do NOT add non-standard extensions (`ws.run_echo()`, `ws.on("message")`, etc.). Everything must work with standard FastAPI/Starlette WebSocket syntax so users can keep writing `await ws.receive_bytes()` loops.
 
 ---
 
@@ -24,385 +24,155 @@ From `benchmarks.md`:
 |---|---|---|
 | tokio-tungstenite (Axum default) | **41 μs** | 24,309 |
 | fastwebsockets | **40 μs** | 22,435 |
-| Pure Rust Axum echo (our bench) | **45 μs** | 21,766 |
-| Go gorilla/websocket | 44 μs | 22,030 |
-| Node ws (Fastify) | 44 μs | 22,119 |
-| **fastapi-rs (today, with Python handler)** | **57 μs** | **17,339** |
-
-Target after Phase 1: **~48-50 μs**, within 5 μs of pure Axum baseline.
+| Pure Rust Axum echo (our bench) | **43-45 μs** | 23,211 |
+| Go Gin (gorilla/websocket) | **47 μs** | 21,071 |
+| Fastify (@fastify/websocket) | **48 μs** | 20,960 |
+| **fastapi-rs (Phase 1)** | **58 μs** | **17,303** |
 
 ---
 
-### Phase 1 items (A-E + Pipecat-compat items F-G)
+### Phase 1 items (A-G) — SHIPPED
 
-#### A. Fix binary message corruption (BUG FIX)
+#### A. Fix binary message corruption (BUG FIX) — DONE
 
-**File:** `src/websocket.rs:133`
+`src/websocket.rs:133` previously did `String::from_utf8_lossy(&b).to_string()`, destroying any non-UTF8 data (protobuf, Opus audio, MessagePack). Replaced with typed `WsMessage` enum carrying `bytes::Bytes` end-to-end.
 
-Current code:
-```rust
-Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-```
+#### B. `ws.receive()` returning ASGI dict — DONE
 
-This destroys any non-UTF8 data — protobuf, Opus audio, MessagePack all break. Users can't write binary WebSocket apps today.
+Standard Starlette low-level API. Returns:
+- `{"type": "websocket.receive", "text": str}` for text
+- `{"type": "websocket.receive", "bytes": bytes}` for binary
+- `{"type": "websocket.disconnect", "code": int, "reason": str}` on close
 
-**Fix:**
-- Replace `cb::Receiver<String>` with `cb::Receiver<WsMessage>`:
-  ```rust
-  enum WsMessage {
-      Text(String),
-      Binary(Vec<u8>),    // later: Arc<Bytes> for zero-copy
-      Close { code: u16, reason: String },
-  }
-  ```
-- `receive_bytes()` returns actual bytes, not corrupted UTF-8 string.
-- `receive_text()` stays as-is for text frames; errors cleanly on binary frames received as text.
+#### C. `WebSocketState` enum + `application_state` / `client_state` — DONE
 
-Estimated win: correctness (fixes actual bug) + ~2 μs (skip `from_utf8_lossy` copy).
+Matches Starlette exactly (`CONNECTING=0`, `CONNECTED=1`, `DISCONNECTED=2`, `RESPONSE=3`). Atomic `u8` state tracking in Rust.
 
----
+#### D. Zero-copy binary path — DONE
 
-#### B. Add `ws.receive()` returning Starlette-compatible dict
+`axum::extract::ws::Message::Binary(Bytes)` flows through to Python as `PyBytes` via the typed `WsMessage` enum. No `Vec<u8>` intermediate, no UTF-8 validation.
 
-**Critical for Pipecat compatibility.** Pipecat's hot path in `pipecat/transports/websocket/fastapi.py:94-102`:
+#### E. Specialized cached awaitables — DONE
 
-```python
-async def __anext__(self) -> bytes | str:
-    message = await self._websocket.receive()      # ← Pipecat calls this
-    if message["type"] == "websocket.disconnect":
-        raise StopAsyncIteration
-    if "bytes" in message and message["bytes"] is not None:
-        return message["bytes"]
-    if "text" in message and message["text"] is not None:
-        return message["text"]
-```
+Three cached awaitables per `PyWebSocket` (dict / text / bytes). Each `await` reuses the same `pyclass` — no allocation per receive. Three distinct `__next__` implementations keep the hot path tight for each return type.
 
-We don't implement `ws.receive()` → dict today. Only `receive_text()` / `receive_bytes()`. Pipecat can't use our WS as-is.
+#### F. Starlette shim exports — DONE
 
-**Add:**
-```python
-async def receive(self) -> dict:
-    """Low-level receive matching Starlette's ASGI receive protocol.
-    Returns {"type": "websocket.receive", "bytes": ...} or
-            {"type": "websocket.receive", "text": ...} or
-            {"type": "websocket.disconnect", "code": ...}
-    """
-```
+`from starlette.websockets import WebSocketState, WebSocketDisconnect, WebSocket` all work via `python/fastapi_rs/compat/starlette_shim.py`.
 
-Enables `await ws.receive()` → dict (standard ASGI), without breaking existing `receive_text()` / `receive_bytes()` callers.
+#### G. State machine audit — DONE
+
+Transitions: CONNECTING → (accept()) → CONNECTED → (close() or peer close) → DISCONNECTED. Atomic u8 enforces consistent reads across sync/async boundaries.
 
 ---
 
-#### C. Add `WebSocketState` enum + `application_state` / `client_state` properties
+## Phase 1b — Remaining Starlette WebSocket compat gaps
 
-**Also critical for Pipecat.** From `pipecat/transports/websocket/fastapi.py:45, 187`:
-
-```python
-from starlette.websockets import WebSocketState
-...
-if self._websocket.application_state != WebSocketState.DISCONNECTED:
-    # safe to send
-```
-
-We don't have `WebSocketState` or these state properties today. Pipecat's state-check calls would AttributeError.
-
-**Add:**
-```python
-# python/fastapi_rs/websockets.py
-class WebSocketState(enum.Enum):
-    CONNECTING = 0
-    CONNECTED = 1
-    DISCONNECTED = 2
-    RESPONSE = 3
-
-class WebSocket:
-    @property
-    def application_state(self) -> WebSocketState: ...
-    @property
-    def client_state(self) -> WebSocketState: ...
-```
-
-Also export from our shim so `from starlette.websockets import WebSocketState` works.
-
----
-
-#### D. Zero-copy binary path (Bytes → PyBytes)
-
-**File:** `src/websocket.rs`
-
-Today a binary message does: Axum `Bytes` → `Vec<u8>` → `String::from_utf8_lossy` → `to_string` → crossbeam send → `PyBytes` allocation.
-
-**Change:**
-- Keep as `Bytes` (Arc'd in axum) all the way to the PyO3 boundary.
-- Only allocate `PyBytes` when Python actually calls `receive_bytes()`.
-- Skip `Vec<u8>` intermediate entirely.
-
-Estimated win: ~2 μs per message (one fewer allocation per packet).
-
----
-
-#### E. Cached `ChannelAwaitable`
-
-**File:** `src/websocket.rs:75`
-
-Today every `await ws.receive_text_async()` creates a new `ChannelAwaitable` pyclass instance. Reused awaitable shaves ~1 μs per await.
-
-**Change:**
-- Store one `Py<ChannelAwaitable>` on `PyWebSocket` at construction.
-- Return clone of that same handle each time.
-- Safe because a single WS connection only has one reader at a time.
-
-Estimated win: ~1 μs per message.
-
----
-
-#### F. Starlette shim exports for WebSocket
-
-Our `compat/starlette_shim.py` needs to expose:
-- `starlette.websockets.WebSocketState` (enum)
-- `starlette.websockets.WebSocketDisconnect` (already exposed? verify)
-- `starlette.websockets.WebSocket` (already exposed)
-
-Without this, `from starlette.websockets import WebSocketState` (which Pipecat does) fails when user installs fastapi-rs.
-
----
-
-#### G. Audit `application_state` transitions
-
-Match Starlette's state machine exactly:
-- `CONNECTING` initially
-- `CONNECTED` after `accept()`
-- `DISCONNECTED` after close from either side
-- `RESPONSE` during close-send (rarely used)
-
-Required so Pipecat's `self._websocket.application_state != WebSocketState.DISCONNECTED` check works reliably.
-
----
-
-### Phase 1 expected impact
-
-After A-G:
-
-**Correctness wins:**
-- Binary data no longer corrupted (critical bug fix).
-- Pipecat can run on fastapi-rs unchanged (drop-in compat).
-
-**Performance wins:**
-- `await ws.receive_bytes()`: 57 μs → ~50 μs (within 5 μs of pure Axum)
-- Binary throughput: 17 K msg/s → ~20 K msg/s (matches Go/Fastify)
-
-**API compatibility:** 100% FastAPI + Starlette standard. No new APIs users have to learn.
-
----
-
-### What Phase 1 explicitly does NOT do
-
-- No `ws.run_echo()` / `ws.iter_batched()` / `ws.on(...)` — these would add non-standard APIs and don't help the standard FastAPI pattern.
-- No fixed-size batching (would add audio latency).
-- No new audio helpers (codecs, resampling, VAD) — those are Phase 2 as separate modules (`fastapi_rs.audio.*`), not WebSocket changes.
-- No WAV-header optimization — that's inside Pipecat's serializer, not our code. Documenting it so users know.
-
----
-
-## Pipecat compatibility audit (reference data)
-
-Collected from Pipecat 0.0.108 at `/Users/venky/tech/agent-transport/.venv/lib/python3.13/site-packages/pipecat/`.
-
-### What Pipecat imports from FastAPI/Starlette
-
-Very little. Pipecat is **mostly framework-agnostic** — it uses standard ASGI WebSocket methods.
-
-```python
-# pipecat/transports/websocket/fastapi.py:44-50
-from fastapi import WebSocket
-from starlette.websockets import WebSocketState
-```
-
-Plus `from pydantic import BaseModel` for callback signatures (not validation).
-
-**What Pipecat does NOT use from FastAPI:**
-- No `Depends()`, no Pydantic validation, no middleware, no routing decorators, no Request/Response classes, no streaming responses.
-- No dependence on uvicorn (users wire that up themselves).
-
-**User-side pattern:**
-```python
-from fastapi import FastAPI, WebSocket
-import uvicorn
-
-app = FastAPI()
-
-@app.websocket("/ws")
-async def ws(websocket: WebSocket):
-    await websocket.accept()
-    transport = FastAPIWebsocketTransport(websocket, params)
-    await run_pipeline(transport)
-
-uvicorn.run(app, host="0.0.0.0", port=8000)
-```
-
-Replacing `from fastapi import FastAPI, WebSocket` with `from fastapi_rs import FastAPI, WebSocket` should Just Work once Phase 1 ships.
-
-### Pipecat's audio hot path (per-frame work)
-
-**Input (`pipecat/transports/websocket/fastapi.py:299-323`):**
-```
-await ws.receive()                    ← needs our receive() dict (item B)
-→ serializer.deserialize(msg.bytes)   ← Pipecat's protobuf (~50-100 μs)
-→ create InputAudioRawFrame (~5 μs Python)
-→ audio_in_queue.put()                ← asyncio.Queue (~10 μs)
-→ downstream pipeline
-```
-
-**Output (`pipecat/transports/websocket/fastapi.py:449-527`):**
-```
-OutputAudioRawFrame
-→ [if add_wav_header:]
-    wave.open(BytesIO) + writeframes()   ← ~500-1000 μs per frame (Pipecat bottleneck, not ours)
-→ serializer.serialize(frame)            ← Pipecat's protobuf (~50-100 μs)
-→ [if fixed_audio_packet_size:]
-    buffer.extend() + slice + del          ← ~100 μs per send
-→ await ws.send_bytes(chunk)             ← our code — we want this FAST
-→ await asyncio.sleep(send_interval)     ← intentional, simulates playback timing
-```
-
-### Bottlenecks fastapi-rs can eliminate (reachable via our code)
-
-| Bottleneck | Where | Current cost/frame | After Phase 1 |
-|---|---|---|---|
-| Binary UTF-8 corruption | `src/websocket.rs` | BROKEN | Fixed |
-| Bytes alloc on every receive | `src/websocket.rs` | ~2 μs | ~0.5 μs (zero-copy) |
-| `ChannelAwaitable` per-await alloc | `src/websocket.rs` | ~1 μs | 0 μs (cached) |
-| Missing `receive()` dict | `websockets.py` | N/A (breaks Pipecat) | Works |
-| Missing `WebSocketState` | `websockets.py` | N/A (breaks Pipecat) | Works |
-| `send_bytes` PyO3 marshaling | `src/websocket.rs` | ~3 μs | ~2 μs (accept `&PyBytes`) |
-
-**Total per-frame savings for Pipecat users: ~5-8 μs.**
-
-At 50 pkt/s bidirectional audio: ~0.5-0.8 ms/sec CPU saved per stream. On a server handling 100 concurrent streams: ~50-80 ms/sec reclaimed — meaningful for dense deployments.
-
-### Bottlenecks outside fastapi-rs (Pipecat's own code)
-
-These are NOT in Phase 1 scope. Documented for awareness — users may still want to PR them upstream to Pipecat.
-
-1. **WAV header creation per frame** (`fastapi.py:467-479`): `with wave.open(BytesIO(), "wb")` allocates a WAV writer object every 20 ms. This is ~500-1000 μs per frame when `add_wav_header=True`. Pre-allocate once per stream.
-2. **Protobuf serialization per frame** (~50-100 μs): Pipecat's choice. Could use MessagePack or raw binary for simple audio frames.
-3. **`asyncio.Queue` hop** (~10-50 μs per frame): Pipecat's internal architecture. Could be inlined for latency-critical paths.
-4. **`asyncio.sleep` playback pacing**: intentional — simulates real-time audio output rate, don't remove.
-
----
-
-## Phase 1b — WebSocket Starlette compatibility gaps (from audit)
-
-**Status:** Phase 1 shipped (binary fix, receive() dict, WebSocketState). A deeper audit against `/Users/venky/tech/agent-transport/.venv/lib/python3.13/site-packages/starlette/websockets.py` found 11 additional breaking gaps. Phase 1b fixes the real-world ones (Pipecat compat). Low-risk spec edge cases deferred.
+**Status:** Follow-up audit found 8 additional gaps between our `WebSocket` and Starlette's. Phase 1 fixed the ones that block real code; Phase 1b addresses the rest. Total ~170 LOC.
 
 ### Must fix (standard code will break otherwise)
 
-1. **`send_json()` separators mismatch** — we emit `{"key": "value"}`, Starlette emits `{"key":"value"}`. Signature-sensitive protocols (HMAC-signed payloads, exact byte count) will fail. Fix: `json.dumps(data, separators=(",", ":"), ensure_ascii=False)`. ~2 LOC.
+1. **`send_json()` separators mismatch** — we emit `{"key": "value"}`, Starlette emits `{"key":"value"}`. Signature-sensitive protocols (HMAC-signed payloads, byte-count-sensitive systems) will fail. Fix: `json.dumps(data, separators=(",", ":"), ensure_ascii=False)`. ~2 LOC.
 
-2. **`close()` drops `reason`** — `ws.close(code=3000, reason="bye")` sends empty reason. Rust `PyWebSocket::close` hardcodes `reason: "".into()`. Fix: plumb reason through PyO3 → CloseFrame. ~5 LOC.
+2. **`close()` drops `reason`** — `ws.close(code=3000, reason="bye")` sends empty reason. Rust `PyWebSocket::close` hardcodes `reason: "".into()`. Fix: plumb reason through PyO3 to `CloseFrame`. ~5 LOC.
 
-3. **`WebSocketDisconnect` hardcodes `code=1000`** — when the peer closes with code 1011 (Internal Error), our `receive_text()`/`receive_bytes()` still raise `WebSocketDisconnect(code=1000)`. Fix: propagate actual Close code from `WsMessage::Close { code, ... }` up to the Python exception. ~20 LOC (needs the close code to survive the RuntimeError path).
+3. **`WebSocketDisconnect` hardcodes `code=1000`** — when the peer closes with code 1011 (Internal Error), our `receive_text()`/`receive_bytes()` still raise `WebSocketDisconnect(code=1000)`. Fix: propagate the actual close code from `WsMessage::Close { code, ... }` up to the Python exception. ~20 LOC.
 
-4. **`receive_json(mode)` / `send_json(mode)` accept anything** — Starlette raises `RuntimeError` on unknown mode; we silently treat non-"text" as "binary". Fix: validate `mode in ("text","binary")`. ~4 LOC.
+4. **`receive_json(mode)` / `send_json(mode)` accept anything** — Starlette raises `RuntimeError` on unknown mode; we silently treat non-"text" as "binary". Fix: validate `mode in ("text", "binary")`. ~4 LOC.
 
-5. **Missing `app`, `headers`, `url`, `query_params`, `path_params`, `cookies`, `client` properties** — Starlette's `WebSocket` extends `HTTPConnection`, so these are inherited. Pipecat uses several (`ws.client`, `ws.headers`). Fix: add these properties reading from `self._scope`. ~60 LOC.
+5. **Missing `app`, `headers`, `url`, `query_params`, `path_params`, `cookies`, `client` properties** — Starlette's `WebSocket` extends `HTTPConnection`, so these are inherited. Real-world voice-agent code reads several (`ws.client`, `ws.headers`). Fix: add these properties reading from `self._scope`. ~60 LOC.
 
-### Should fix (Pipecat-adjacent edge cases)
+### Should fix (edge cases)
 
 6. **State validation on send/receive** — Starlette raises `RuntimeError` on `send_text()` before `accept()`; we silently call. Fix: pre-condition check `application_state == CONNECTED`. ~15 LOC total.
 
 7. **`close()` not truly awaited** — we queue the close frame to a tokio mpsc but don't await flush. Code that closes then immediately exits may lose the close frame. Fix: use `tokio::sync::oneshot` to signal write completion. ~25 LOC.
 
-8. **`accept()` ignores `headers`** — our Rust `accept()` discards custom headers. For Pipecat `Sec-WebSocket-Protocol` negotiation this breaks. Fix: pass headers to `axum::extract::ws::WebSocket::on_upgrade` (may require restructuring the upgrade path). ~40 LOC.
+8. **`accept()` ignores `headers`** — our Rust `accept()` discards custom headers. For `Sec-WebSocket-Protocol` negotiation this breaks. Fix: plumb headers through to `axum::extract::ws::WebSocket::on_upgrade`. ~40 LOC.
 
-### Deferred (strict spec-only, won't break real code)
+### Deferred (strict spec-only, real code won't hit)
 
-9. `websocket.connect` first-receive handling — ASGI spec says receive() emits `{"type":"websocket.connect"}` on first call. Our Rust bridge skips this. Most user code never calls `receive()` before `accept()`, so impact is low. Defer.
+9. `websocket.connect` first-receive handling — ASGI spec says `receive()` emits `{"type": "websocket.connect"}` on first call. Our Rust bridge skips this. Most user code never calls `receive()` before `accept()`, so impact is low.
 
-10. Message type validation inside `send()` / `receive()` dispatch — Starlette validates message type transitions. We're looser. Defer.
+10. Strict ASGI message type validation inside `send()` / `receive()` dispatch.
 
-11. `send_denial_response()` — WebSocket Denial Response extension. Rare use case. Defer.
-
-**Total Phase 1b LOC estimate:** ~170 lines across Rust+Python, mostly glue.
+11. `send_denial_response()` — WebSocket Denial Response extension. Rare.
 
 ---
 
 ## Phase 2 — `fastapi_rs.audio` helper modules
 
-**Goal:** Let users build Pipecat-class voice-agent apps in pure Python FastAPI code, with Rust-native performance on the per-frame hot operations.
+**Goal:** Enable building real-time voice-agent apps in pure Python FastAPI code with Rust-native performance on the per-frame hot operations.
 
 **Approach:** Separate modules users opt into. None change the WebSocket API. Same pattern as `fastapi_rs.http` (reqwest) and `fastapi_rs.db` (psycopg3 helpers).
 
-### Audit of Pipecat's per-frame costs (from `/Users/venky/tech/agent-transport/.venv/lib/python3.13/site-packages/pipecat/`)
+### Measured per-frame costs in typical voice-agent Python stacks
 
-Measured per 20 ms audio frame at 48kHz→16kHz mono:
+Per 20 ms audio frame at 48 kHz → 16 kHz mono:
 
-| Operation | File | Current cost/frame | Frequency |
-|---|---|---|---|
-| **WAV header creation** (when `add_wav_header=True`) | `transports/websocket/fastapi.py:467-479` | **500-1000 μs** | Every output frame (50/s) |
-| **Resampling** (soxr) | `audio/resamplers/soxr_stream_resampler.py:83-101` | **450-900 μs** | Every frame needing rate conversion |
-| **`asyncio.sleep` pacing** | `transports/websocket/fastapi.py:518-528` | ~20 ms jitter | Every output frame |
-| **Background audio mixing** (NumPy) | `audio/mixers/soundfile_mixer.py:170-195` | **62-100 μs** | Every output frame when mixer on |
-| **G.711 μ-law/A-law encode/decode** | `audio/utils.py:14` | **BROKEN on Py 3.13+** | Every telephony frame (100/s) |
-| **Recording (user + bot buffers)** | `processors/audio/audio_buffer_processor.py:100-312` | ~10-100 μs/frame, **all RAM** | Every frame |
-| **Opus codec** | N/A in Pipecat — user layer | N/A | N/A |
+| Operation | Typical Python implementation | Cost/frame |
+|---|---|---|
+| **WAV header creation** on output | `wave.open(BytesIO(), "wb")` + `writeframes()` per frame | 500-1000 μs |
+| **Resampling** | soxr / resampy via numpy | 450-900 μs |
+| **`asyncio.sleep` pacing** | `await asyncio.sleep(duration)` per frame | ±1-10 ms jitter |
+| **Background audio mixing** | numpy `np.clip(a + b * volume, -32768, 32767)` | 62-100 μs |
+| **G.711 μ-law / A-law codec** | `audioop.ulaw2lin` / `audioop.lin2ulaw` | 1 μs + resampling |
+| **Recording (user + bot tracks)** | in-memory `bytearray` buffers | 10-100 μs, all RAM |
+| **Opus codec** | user provides via external lib (e.g., `pyogg`) | varies |
+
+### Python 3.13+ stdlib gap — `audioop` removed
+
+`audioop` was deprecated in Python 3.11 and **removed from Python 3.13 stdlib**. Every telephony-oriented voice-agent Python codebase that does G.711 μ-law or A-law encoding via `import audioop` is broken on Python 3.13+ with `ModuleNotFoundError`. A native Rust G.711 codec is a direct replacement with no Python deps. This is the highest-blast-radius item in Phase 2.
 
 ### Phase 2 modules (proposed)
 
 #### A. `fastapi_rs.audio.wav` — pre-built WAV header streamer
 
-**Problem:** Pipecat's `wave.open(BytesIO(), "wb")` per frame recomputes an **identical** 44-byte RIFF header every time. 50 times/second of pure waste.
+**Problem:** Python voice-agent code that emits WAV-wrapped audio frames calls `wave.open(BytesIO(), "wb")` on every frame. This recomputes an **identical** 44-byte RIFF header 50×/sec — pure waste.
 
-**Solution:** Compute the RIFF header ONCE at session start, then just prepend + update the 4-byte data-size field per frame.
+**Solution:** Compute the RIFF header ONCE at session start; per-frame just prepend + update the 4-byte data-size field.
 
 ```python
-# Rust-backed, zero allocation per frame after init
 from fastapi_rs.audio.wav import WavStreamer
 
 streamer = WavStreamer(sample_rate=16000, channels=1, sample_width=2)
 
 async def write_audio(ws, pcm: bytes):
-    wav_bytes = streamer.wrap(pcm)  # ~2μs (Rust: header copy + 4-byte update)
+    wav_bytes = streamer.wrap(pcm)  # ~2 μs (Rust: header copy + 4-byte update)
     await ws.send_bytes(wav_bytes)
 ```
 
-**Pipecat integration:** Pipecat users set `add_wav_header=False` and wrap themselves, OR we provide a drop-in replacement serializer.
+**Cost today:** 500-1000 μs/frame → **~5 μs** with Rust helper. **~100× speedup.** At 50 fps × 100 concurrent streams: ~5 seconds of CPU/sec reclaimed.
 
-**Cost today:** 500-1000 μs/frame → **~5 μs** with Rust helper. **~100x speedup.**
-
-**Impact:** At 50 fps: ~40 ms/sec CPU reclaimed per stream. For 100 concurrent streams: 4 seconds of CPU/sec saved (i.e., 4 full cores at 100% utilization freed).
-
-**Complexity:** Low. ~30 lines of Rust + 40 lines of Python binding.
+**Complexity:** Low. ~30 lines Rust + 40 lines Python.
 
 ---
 
 #### B. `fastapi_rs.audio.resample` — libspeexdsp or libsamplerate binding
 
-**Problem:** Pipecat's `SOXRStreamAudioResampler.resample()` (via the `soxr` crate) already calls native code, but goes through: `bytes → numpy int16 → soxr → numpy int16 → .tobytes()`. That's 2 numpy allocations + 1 `.astype()` copy per frame.
+**Problem:** Current Python resamplers go `bytes → numpy int16 → native-resample → numpy int16 → .tobytes()`. Two numpy allocations + one `.astype()` copy per frame.
 
-**Solution:** Direct Rust resampler with `bytes → bytes` API (no numpy in the middle).
+**Solution:** Direct Rust resampler with `bytes → bytes` API, no numpy in the middle.
 
 ```python
 from fastapi_rs.audio.resample import Resampler
 
 r = Resampler(in_rate=48000, out_rate=16000, channels=1, quality="high")
 
-async def receive_audio(ws):
-    audio_48k = await ws.receive_bytes()  # raw PCM
-    audio_16k = r.process(audio_48k)       # Rust, ~100-200 μs
+audio_16k = r.process(audio_48k)  # Rust, ~100-200 μs
 ```
 
-**Pipecat integration:** Subclass `BaseAudioResampler` to wrap our Rust Resampler. User passes it via `SOXRStreamAudioResamplerFactory` or similar. No Pipecat PR needed.
+**Crate options:** `rubato` (pure Rust, solid quality), `speexdsp-sys` (FFI, fast), `libsamplerate-sys` (FFI, highest quality).
 
-**Cost today:** 450-900 μs/frame → **~150-300 μs** with Rust-direct (skip numpy hops). **~3x speedup.**
+**Cost today:** 450-900 μs/frame → **~150-300 μs**. **~3× speedup** (amortizing the numpy copy overhead).
 
-**Complexity:** Medium. Depends which crate — `speexdsp` (pure Rust, fast), `libsamplerate` (FFI, higher quality). ~80 lines Rust + ~60 Python.
+**Complexity:** Medium. ~80 lines Rust + ~60 Python.
 
 ---
 
 #### C. `fastapi_rs.audio.pacer` — precise interval generator via tokio
 
-**Problem:** `await asyncio.sleep(N)` has 1-10 ms jitter on typical OS schedulers. Over a 60-second call, drift compounds to ±100-600 ms. Pipecat's `_write_audio_sleep()` tries to self-correct (`_next_send_time += interval`) but is still asyncio-bound.
+**Problem:** `await asyncio.sleep(N)` has 1-10 ms jitter on typical OS schedulers. Over a 60-second call, drift compounds to ±100-600 ms.
 
 **Solution:** Tokio's `tokio::time::interval` has ~100 μs precision (OS-limited). Expose as a Python async iterator.
 
@@ -410,22 +180,20 @@ async def receive_audio(ws):
 from fastapi_rs.audio.pacer import audio_pacer
 
 async def send_loop(ws, frame_queue):
-    async for _ in audio_pacer(interval_ms=20):  # wakes every 20ms ±0.1ms
+    async for _ in audio_pacer(interval_ms=20):  # wakes every 20 ms ±0.1 ms
         frame = await frame_queue.get()
         await ws.send_bytes(frame)
 ```
 
-**Pipecat integration:** Pipecat would need to accept a pacer factory via transport params. Currently hard-codes `asyncio.sleep`. So: either they add a hook (upstream PR) OR we provide an alternate transport class `PacedWebSocketTransport` users opt into.
+**Cost today:** 1-10 ms jitter → **<100 μs jitter**. Quality improvement, not raw speed.
 
-**Cost today:** 1-10 ms jitter → **<100 μs jitter**. Quality improvement, not raw-speed.
-
-**Complexity:** Low. ~40 lines total. But requires tokio runtime bridge back to asyncio — we already have the patterns from `fastapi_rs.http`.
+**Complexity:** Low. ~40 lines. Needs tokio runtime → asyncio bridge (same pattern as `fastapi_rs.http`).
 
 ---
 
 #### D. `fastapi_rs.audio.mixer` — SIMD PCM mixer
 
-**Problem:** Pipecat's `_mix_with_sound()` does `np.clip(audio_np + sound_np * volume, -32768, 32767)`. NumPy is vectorized but still has Python loop overhead (~62-100 μs/frame for 320 samples).
+**Problem:** NumPy-based PCM mixing (`np.clip(a + b * volume, -32768, 32767)`) is vectorized but still has Python-loop-wrapping overhead (~62-100 μs/frame for 320 samples).
 
 **Solution:** Saturating `i16 + i16` with SIMD (NEON on ARM, AVX2 on x86). Direct `bytes → bytes` API.
 
@@ -435,45 +203,37 @@ from fastapi_rs.audio.mixer import mix_saturating
 mixed = mix_saturating(voice_pcm, background_pcm, volume=0.3)  # ~5-10 μs
 ```
 
-**Pipecat integration:** Drop-in replacement for `_mix_with_sound`. Users subclass `SoundfileMixer` to use our mixer.
+**Cost today:** 62-100 μs/frame → **~5-10 μs**. **~10× speedup.**
 
-**Cost today:** 62-100 μs/frame → **~5-10 μs**. **~10x speedup.**
-
-**Complexity:** Low. ~50 lines of Rust (use `wide` or `std::simd`) + 30 Python.
+**Complexity:** Low. ~50 lines Rust (`wide` crate or `std::simd`) + 30 Python.
 
 ---
 
-#### E. `fastapi_rs.audio.codec` — G.711 μ-law/A-law **[CRITICAL for Python 3.13+]**
+#### E. `fastapi_rs.audio.codec` — G.711 μ-law / A-law **[CRITICAL for Python 3.13+]**
 
-**Problem:** Pipecat's G.711 encoding/decoding calls `audioop.ulaw2lin` / `audioop.lin2ulaw` / `audioop.alaw2lin` / `audioop.lin2alaw` at `pipecat/audio/utils.py:14`. **The `audioop` module was removed from Python 3.13 stdlib** (deprecated in 3.11, gone in 3.13). **Pipecat is literally broken on Python 3.13+** — `import audioop` raises `ModuleNotFoundError` the moment you import any telephony serializer (Twilio, Plivo, Telnyx, Exotel, Vonage).
+**Problem:** Python voice-agent code that does G.711 encode/decode via `import audioop` fails on Python 3.13+ with `ModuleNotFoundError: No module named 'audioop'`. Every telephony platform (Twilio, Plivo, Telnyx, Vonage) uses G.711 μ-law (US) or A-law (EU) over its media WebSockets at 8 kHz. This is the hot path — 100 codec calls/sec per call.
 
-**This is a crisis for every Pipecat user on Python 3.13+**. Current workarounds: (1) downgrade to 3.12, (2) install third-party `pyaudioop` and monkey-patch Pipecat, (3) fork Pipecat.
-
-**Hot path usage (every 20 ms telephony frame, 100+ calls/sec per connection):**
-- `pipecat/serializers/twilio.py:154,252` — encode/decode on every outbound/inbound frame
-- `pipecat/serializers/plivo.py:124,225` — same
-- `pipecat/serializers/telnyx.py:138-256` — PCMU *and* PCMA (A-law for European telecom)
-
-**Solution:** Pure-Rust G.711 codec with 256-byte lookup tables. ~100 lines of Rust total. Same table lookups audioop uses (both just implement ITU G.711).
+**Solution:** Pure-Rust G.711 codec with 256-byte lookup tables. Same table lookups `audioop` used (both just implement ITU-T G.711). ~100 lines Rust total.
 
 ```python
 from fastapi_rs.audio.codec import Mulaw, Alaw
 
-# Decode 8-bit μ-law (160 bytes / 20ms @ 8kHz) → 16-bit PCM (320 bytes)
-pcm = Mulaw.decode(ulaw_bytes)     # ~1 μs (table lookup)
+# 8-bit μ-law (160 bytes / 20 ms @ 8 kHz) → 16-bit PCM (320 bytes)
+pcm = Mulaw.decode(ulaw_bytes)    # ~1 μs (table lookup)
 
-# Encode 16-bit PCM → 8-bit μ-law
-ulaw = Mulaw.encode(pcm_bytes)     # ~1 μs
+# 16-bit PCM → 8-bit μ-law
+ulaw = Mulaw.encode(pcm_bytes)    # ~1 μs
 
 # Same API for A-law (European telephony)
 pcm = Alaw.decode(alaw_bytes)
 alaw = Alaw.encode(pcm_bytes)
 ```
 
-**Pipecat integration:** Monkey-patch `pipecat/audio/utils.py` imports or subclass the serializers. Either way, zero Pipecat PR needed — users can install `fastapi-rs` and do:
+**`audioop` shim for drop-in compat:**
+
+Users can install a `sys.modules` shim at app startup so any library that does `import audioop` works transparently on Python 3.13+:
 
 ```python
-# At app startup — unbreak Pipecat on Python 3.13+
 import fastapi_rs.audio.codec as _codec
 import sys, types
 _shim = types.ModuleType("audioop")
@@ -484,23 +244,19 @@ _shim.lin2alaw = lambda b, w: _codec.Alaw.encode(b)
 sys.modules["audioop"] = _shim
 ```
 
-**Cost today:** broken (ImportError) on Python 3.13+. With Rust codec: **~1 μs/frame**, faster than the C audioop it replaces (no Python boundary overhead on the loop path).
+Downstream libraries that still `import audioop` then work unchanged.
 
-**Complexity:** Low. G.711 μ-law and A-law are both 256-byte table lookups, well-documented in ITU-T G.711. ~100 lines Rust + ~40 lines Python binding.
+**Cost:** broken on Python 3.13+ without this → **~1 μs/frame** with Rust codec (faster than C `audioop` because no Python boundary on the loop path).
+
+**Complexity:** Low. ~100 lines Rust + ~40 Python.
 
 ---
 
 #### F. `fastapi_rs.audio.record` — streaming WAV/Opus recorder
 
-**Problem:** Pipecat's `AudioBufferProcessor` buffers **the entire call** in memory (`bytearray`), then dispatches via `on_audio_data` / `on_track_audio_data` event handlers at call end. Users must implement their own WAV/Opus writing. For long calls, memory grows unbounded. No streaming-to-disk option built in.
+**Problem:** Common Python voice-agent patterns buffer the entire call in memory (`bytearray` or numpy array), then write to disk at call end. For long calls, memory grows unbounded. 1 hour of 16 kHz mono PCM = ~115 MB per call. No built-in streaming-to-disk.
 
-**Observed:**
-- `pipecat/processors/audio/audio_buffer_processor.py:100-101` — `self._user_audio_buffer = bytearray()` / `self._bot_audio_buffer = bytearray()`
-- `pipecat/processors/audio/audio_buffer_processor.py:285-312` — dual-track recording (user + bot separately or interleaved stereo)
-- Call end: `merge_audio_buffers()` calls numpy ops to mix mono or `np.column_stack` to interleave stereo. O(n) at call end.
-- **No disk streaming.** 1 hour of 16 kHz mono PCM = ~115 MB sitting in memory per call.
-
-**Solution:** A streaming recorder that writes frames as they arrive:
+**Solution:** Streaming recorder that writes frames as they arrive:
 
 ```python
 from fastapi_rs.audio.record import Recorder
@@ -519,21 +275,19 @@ rec.write_stereo(user_pcm_frame, bot_pcm_frame)  # ~500 μs (opus encode)
 await rec.close()
 ```
 
-**Pipecat integration:** Users replace `AudioBufferProcessor` with a thin wrapper that forwards to `Recorder`. OR subscribe to the on_audio_data event and pipe frames to Recorder incrementally (not done today — Pipecat only fires the event at end).
-
 **Cost today:**
-- Memory: **~115 MB per hour of mono 16 kHz** buffered in process RAM
-- Finalization: O(n) numpy mix/interleave at call end (~10-100 ms for a 1-hour call)
-- **No disk streaming at all**
+- Memory: **~115 MB per hour of mono 16 kHz** buffered in RAM
+- Finalization: O(n) mix/interleave at call end (~10-100 ms for a 1-hour call)
+- No disk streaming at all
 
 **With `fastapi_rs.audio.record`:**
 - Memory: **<64 KB bounded buffer** (write-through)
 - Per frame: ~5 μs for WAV, ~500 μs for Opus encode
-- Finalization: write WAV header length field (~1 μs) — no O(n) copy
+- Finalization: write WAV header length field (~1 μs), or close Opus stream
 
-**Crates:** `hound` for WAV (pure Rust, streaming-friendly), `opus` for Opus (libopus FFI).
+**Crates:** `hound` for WAV (pure Rust, streaming), `opus` for Opus (libopus FFI).
 
-**Complexity:** Medium. ~200 lines Rust + ~80 Python. WAV is trivial. Opus needs system libopus or bundle it.
+**Complexity:** Medium. ~200 lines Rust + ~80 Python.
 
 ---
 
@@ -541,36 +295,21 @@ await rec.close()
 
 Ranked by blast radius:
 
-1. **E. `.codec` (G.711 μ-law/A-law)** — **CRITICAL.** Pipecat is broken on Python 3.13+ without this. Every telephony user needs it today. Smallest module (~100 LOC Rust), biggest unlock.
+1. **E. `.codec` (G.711 μ-law / A-law)** — **CRITICAL.** Unblocks Python 3.13+ for every telephony-oriented voice-agent app using `audioop`. Smallest module (~100 LOC Rust), biggest user-impact.
 2. **A. `.wav` (WavStreamer)** — 100× speedup on WAV header generation, trivial LOC.
-3. **F. `.record` (streaming recorder)** — Memory fix + missing feature in Pipecat. Medium complexity.
-4. **B. `.resample` (libsamplerate/speexdsp)** — 3× speedup, medium LOC.
-5. **C. `.pacer` (tokio interval)** — precision win, low LOC.
-6. **D. `.mixer` (SIMD saturating add)** — 10× speedup, low LOC.
+3. **F. `.record` (streaming recorder)** — Memory fix + missing-feature for long-call recording.
+4. **B. `.resample`** — 3× speedup on rate conversion, medium LOC.
+5. **C. `.pacer` (tokio interval)** — precision win for output pacing, low LOC.
+6. **D. `.mixer` (SIMD saturating add)** — 10× speedup on background-audio mixing, low LOC.
 
-**Dropped from scope:** Rust ONNX Silero VAD — out of scope per user direction. ONNX inference itself is the real cost (unchanged by a Rust wrapper), and users can plug any VAD via Pipecat's existing `VADAnalyzer` interface. We don't gain enough to justify shipping/maintaining a `.vad` module.
+**Explicitly dropped:** Rust ONNX Silero VAD wrapper. Out of scope — ONNX inference itself is the real cost, a Rust wrapper only shaves the Python boundary overhead. Users can plug any VAD via existing Python async interfaces.
 
-**Recommendation:** Ship E (codec) first — it unblocks Python 3.13+ for all telephony users TODAY. A (wav) + F (record) follow as complementary voice-agent primitives. B/C/D when needed.
-
----
-
-### What Pipecat changes would benefit
-
-If Pipecat adopted these upstream (optional — users can subclass without PRs):
-
-- Drop WAV-header recompute in `FastAPIWebsocketOutputTransport.write_audio_frame()` → `WavStreamer.wrap()` shim: **5-10 μs saved/frame**
-- Replace `SOXRStreamAudioResampler` with our Rust resampler: **300-600 μs saved/frame**
-- Swap `_write_audio_sleep`'s `asyncio.sleep` for our tokio pacer: **precision win, no raw speed**
-- Replace `SoundfileMixer._mix_with_sound` with our SIMD mixer: **50-90 μs saved/frame**
-
-**Cumulative per-frame savings with Phase 2 installed: ~700-1200 μs** when all features are used.
-
-At 50 fps × 200 concurrent streams: that's ~10 cores of saved CPU.
+**Recommendation:** Ship E (codec) first — it unblocks Python 3.13+ for all telephony users TODAY. A (wav) + F (record) are complementary voice-agent primitives. B/C/D when needed.
 
 ---
 
 ## Phase 3 — rejected designs (documented so we don't re-litigate)
 
 - `ws.run_echo()` / `ws.run_forward()` / `ws.on("message", handler)` — non-standard extensions that break the FastAPI mental model. Users should write the standard `while True: await ws.receive_bytes()` loop; we make it fast.
-- Fixed-size message batching (`receive_batch(n=5)`) — adds 100 ms latency per 5 frames, destroys conversational AI. Already rejected.
-- Full SIP/RTP stack — that's `agent-transport`. Out of scope.
+- Fixed-size message batching (`receive_batch(n=5)`) — adds 100 ms latency per 5 frames, destroys conversational AI. Rejected.
+- Full SIP/RTP stack — that's a separate project. Out of scope for a general web framework.

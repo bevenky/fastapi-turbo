@@ -188,7 +188,7 @@ def test_websocket_with_http_routes(server_app):
     asyncio.run(_test())
 
 
-# ── Phase 1: binary + state + Pipecat-compat tests ──────────────────
+# ── Phase 1: binary + state + Starlette-compat tests ──────────────────
 
 
 def test_websocket_binary_preserved(server_app):
@@ -223,7 +223,7 @@ def test_websocket_binary_preserved(server_app):
 
 
 def test_websocket_receive_dict(server_app):
-    """ws.receive() returns ASGI-style dict (Pipecat's hot path)."""
+    """ws.receive() returns ASGI-style dict (Starlette's standard low-level API)."""
     import websockets
 
     url = server_app("""
