@@ -138,6 +138,13 @@ def _build() -> dict[str, types.ModuleType]:
             self.endpoint = endpoint
             self.name = name or endpoint.__name__
     fastapi_routing.APIWebSocketRoute = APIWebSocketRoute  # type: ignore[attr-defined]
+    # request_response — stac-fastapi, fastapi-pagination use this
+    async def request_response(func):
+        """Stub wrapping an endpoint into an ASGI handler."""
+        async def app(scope, receive, send):
+            pass
+        return app
+    fastapi_routing.request_response = request_response  # type: ignore[attr-defined]
     # Mount — Airflow uses `from fastapi.routing import Mount`
     try:
         from fastapi_rs._starlette_compat import Mount as _Mount
@@ -453,6 +460,9 @@ def _build() -> dict[str, types.ModuleType]:
         "Reference", "Discriminator", "XML", "Schema", "Example",
         "Link", "Header", "Tag", "Components", "SecurityScheme",
         "OAuthFlow", "OAuthFlows", "SecurityBase", "Callback", "Webhook",
+        "OAuthFlowImplicit", "OAuthFlowPassword", "OAuthFlowClientCredentials",
+        "OAuthFlowAuthorizationCode", "OAuth2", "OpenIdConnect",
+        "APIKey", "HTTPBase", "HTTPBearer",
     ]
     for _oai_name in _openapi_model_names:
         setattr(fastapi_openapi_models, _oai_name, type(_oai_name, (dict,), {}))

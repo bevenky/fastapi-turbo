@@ -266,6 +266,14 @@ def _build() -> dict[str, types.ModuleType]:
     # ── starlette.schemas ──────────────────────────────────────────
     starlette_schemas = _mod("starlette.schemas")
     starlette_schemas.SchemaGenerator = _sc.SchemaGenerator  # type: ignore[attr-defined]
+    # EndpointInfo — apitally uses this
+    class EndpointInfo:
+        def __init__(self, path="", http_method="", func=None, name=""):
+            self.path = path
+            self.http_method = http_method
+            self.func = func
+            self.name = name
+    starlette_schemas.EndpointInfo = EndpointInfo  # type: ignore[attr-defined]
     modules["starlette.schemas"] = starlette_schemas
 
     # ── starlette.applications ─────────────────────────────────────
