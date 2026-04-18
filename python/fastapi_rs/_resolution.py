@@ -119,7 +119,13 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
                 input_map.append((dp["name"], source_key))
 
         result_key = param_name
-        is_async = asyncio.iscoroutinefunction(dep_func)
+        # A dep can be a bare function OR a callable class instance whose
+        # `__call__` is async (e.g., Starlette's HTTPBearer / OAuth2*
+        # classes). Check both cases.
+        is_async = (
+            inspect.iscoroutinefunction(dep_func)
+            or inspect.iscoroutinefunction(getattr(dep_func, "__call__", None))
+        )
         is_generator = (
             inspect.isgeneratorfunction(dep_func)
             or inspect.isasyncgenfunction(dep_func)
@@ -143,6 +149,10 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
             "model_class": None,
             "alias": None,
             "dep_callable": actual_callable,
+            # Preserve the ORIGINAL dep (e.g., HTTPBearer instance) — the
+            # OpenAPI generator uses this to find `.model` for
+            # securitySchemes, and user dependency_overrides look up by id.
+            "_original_dep_callable": dep_func,
             "dep_callable_id": func_id,
             "is_async_dep": mark_as_async,
             "is_generator_dep": is_generator,
@@ -184,9 +194,12 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
     for step in plan:
         step["_is_handler_param"] = step["name"] in handler_param_names
 
-    # Store original dep callable for override lookup
+    # Store original dep callable for override lookup — only set if the
+    # step didn't already capture the original (e.g. when we wrapped an
+    # async dep in a sync caller, `dep_callable` is the wrapper but the
+    # original was stashed by `_resolve_dep` above).
     for step in plan:
-        if step["kind"] == "dependency":
+        if step["kind"] == "dependency" and "_original_dep_callable" not in step:
             step["_original_dep_callable"] = step.get("dep_callable")
 
     return plan

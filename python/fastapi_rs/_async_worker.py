@@ -1,34 +1,59 @@
-"""Persistent async worker: processes handler coroutines via pipe + asyncio.StreamReader.
+"""Dedicated async worker thread with a continuously-running event loop.
 
-This is 22-47% faster than run_until_complete because it eliminates
-the per-request event loop setup/teardown overhead (~29μs).
+Provides `submit(coro)` which schedules a coroutine on the worker's loop
+and blocks until it completes. The loop runs `run_forever()` so background
+tasks (asyncpg pool housekeeping, redis reconnects) execute naturally.
 
-Architecture:
-  Rust writes 1 byte to pipe → asyncio StreamReader wakes up →
-  worker reads coroutine from shared queue → awaits it → writes result
-  to response pipe → Rust reads result.
-
-For simplicity, we use crossbeam (via the Rust side) for coroutine passing
-and OS pipes for signaling only.
+This is the correct pattern for asyncpg/redis.asyncio compatibility —
+all async I/O runs on ONE event loop, matching uvicorn's architecture.
 """
+from __future__ import annotations
+
 import asyncio
-import os
-import struct
+import threading
+from concurrent.futures import Future
+
+_loop: asyncio.AbstractEventLoop | None = None
+_thread: threading.Thread | None = None
+_ready = threading.Event()
 
 
-async def run_processor(request_queue: asyncio.Queue, loop):
-    """Persistent task: awaits handler coroutines from an asyncio.Queue.
+def init():
+    """Start the worker thread if not already running."""
+    global _loop, _thread
+    if _loop is not None:
+        return
+    _ready.clear()
+    _thread = threading.Thread(target=_run, daemon=True, name="fastapi-rs-async-worker")
+    _thread.start()
+    _ready.wait(timeout=10)
 
-    Called via loop.run_until_complete() — runs forever, processing
-    one request at a time. No per-request Task creation overhead.
+
+def _run():
+    global _loop
+    try:
+        import uvloop
+        _loop = uvloop.new_event_loop()
+    except ImportError:
+        _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+    _ready.set()
+    _loop.run_forever()
+
+
+def submit(coro) -> object:
+    """Schedule coro on the worker's loop and block until done.
+
+    Returns the coroutine's result. Raises if the coroutine raised.
     """
-    while True:
-        item = await request_queue.get()
-        if item is None:
-            return
-        coro, callback = item
-        try:
-            result = await coro
-            callback(result, None)
-        except Exception as e:
-            callback(None, e)
+    if _loop is None:
+        init()
+    future: Future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    return future.result(timeout=30)
+
+
+def get_loop() -> asyncio.AbstractEventLoop:
+    """Return the worker's event loop (init if needed)."""
+    if _loop is None:
+        init()
+    return _loop

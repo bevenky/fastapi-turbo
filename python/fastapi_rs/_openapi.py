@@ -21,6 +21,8 @@ def generate_openapi_schema(
     contact: dict[str, Any] | None = None,
     license_info: dict[str, Any] | None = None,
     openapi_tags: list[dict[str, Any]] | None = None,
+    webhooks: list[dict[str, Any]] | None = None,
+    external_docs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate an OpenAPI 3.1.0 schema dict from collected route metadata."""
     schema: dict[str, Any] = {
@@ -47,6 +49,9 @@ def generate_openapi_schema(
     if openapi_tags:
         schema["tags"] = openapi_tags
 
+    if external_docs:
+        schema["externalDocs"] = external_docs
+
     components_schemas: dict[str, Any] = {}
     security_schemes: dict[str, Any] = {}
 
@@ -66,6 +71,22 @@ def generate_openapi_schema(
 
             # Collect Pydantic model schemas into components
             _collect_schemas(route, components_schemas)
+
+    # Webhooks: top-level OpenAPI 3.1 field. Each webhook is effectively a
+    # path-item object keyed by name rather than URL.
+    if webhooks:
+        wh_dict: dict[str, Any] = {}
+        for wh in webhooks:
+            if not wh.get("include_in_schema", True):
+                continue
+            name = wh.get("name") or wh["path"].lstrip("/")
+            for method in wh["methods"]:
+                op = _build_operation(wh, method.lower())
+                wh_dict.setdefault(name, {})[method.lower()] = op
+            _collect_security_schemes(wh, security_schemes)
+            _collect_schemas(wh, components_schemas)
+        if wh_dict:
+            schema["webhooks"] = wh_dict
 
     components: dict[str, Any] = {}
     if components_schemas:
@@ -150,6 +171,16 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     callbacks = route.get("callbacks") or []
     if callbacks:
         operation["callbacks"] = _build_callbacks(callbacks)
+
+    # Per-operation servers (OpenAPI 3.1)
+    servers = route.get("servers")
+    if servers:
+        operation["servers"] = servers
+
+    # Per-operation externalDocs (OpenAPI 3.1)
+    external_docs = route.get("external_docs")
+    if external_docs:
+        operation["externalDocs"] = external_docs
 
     # Merge in openapi_extra (user's custom OpenAPI fields)
     openapi_extra = route.get("openapi_extra") or {}
@@ -302,12 +333,14 @@ def _collect_security_schemes(
 
     Checks both ``params`` and ``_all_params`` (the latter preserves
     dependency params even after handler compilation strips them).
+    Prefers ``_original_dep_callable`` because ``dep_callable`` is often
+    a sync-wrapper that doesn't carry the original security-scheme's
+    ``.model`` attribute.
     """
     all_params = route.get("_all_params", route.get("params", []))
     for param in all_params:
-        dep_callable = param.get("dep_callable")
-        if dep_callable is None:
-            dep_callable = param.get("_original_dep_callable")
+        # Check original first — sync wrappers hide the .model attribute
+        dep_callable = param.get("_original_dep_callable") or param.get("dep_callable")
         if dep_callable is None:
             continue
 
@@ -324,7 +357,7 @@ def _derive_security_from_deps(route: dict[str, Any]) -> list[dict[str, list[str
     out: list[dict[str, list[str]]] = []
     seen: set[str] = set()
     for param in all_params:
-        dep_callable = param.get("dep_callable") or param.get("_original_dep_callable")
+        dep_callable = param.get("_original_dep_callable") or param.get("dep_callable")
         if dep_callable is None:
             continue
         if hasattr(dep_callable, "model") and isinstance(dep_callable.model, dict):

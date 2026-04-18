@@ -63,6 +63,7 @@ def _apply_response_model(
         # differ from aliases.
         fast_path_ok = not has_filters and not _model_has_aliases(response_model)
 
+        import dataclasses as _dc
         if isinstance(result, dict):
             if fast_path_ok:
                 model_fields = response_model.model_fields
@@ -71,9 +72,26 @@ def _apply_response_model(
         elif hasattr(result, "model_dump"):
             if fast_path_ok and type(result) is response_model:
                 return result.model_dump()
-            validated = response_model.model_validate(
-                result.model_dump() if hasattr(result, "model_dump") else result
-            )
+            # If `result` is ALREADY an instance of response_model, use it
+            # directly — round-tripping via model_dump()+model_validate()
+            # would mark ALL fields as explicitly set, defeating
+            # exclude_unset / exclude_defaults.
+            if type(result) is response_model:
+                validated = result
+            else:
+                validated = response_model.model_validate(
+                    result.model_dump() if hasattr(result, "model_dump") else result
+                )
+        elif _dc.is_dataclass(result) and not isinstance(result, type):
+            # Convert dataclass → dict so Pydantic model_validate can apply
+            # exclude_none / exclude_unset / aliases consistently.
+            as_dict = _dc.asdict(result)
+            if response_model is type(result) or not hasattr(response_model, "model_validate"):
+                # Same dataclass — apply exclude options manually.
+                if exclude_none:
+                    as_dict = {k: v for k, v in as_dict.items() if v is not None}
+                return as_dict
+            validated = response_model.model_validate(as_dict)
         else:
             return result
 
@@ -176,6 +194,31 @@ def _wrap_response_class(result, response_class):
     return response_class(content=result)
 
 
+def _apply_status_code(result, status_code: int):
+    """Apply a route-declared `status_code=N` to the result.
+
+    If the handler already returned a Response (or a Response-like), we
+    set its status_code directly. Otherwise, wrap the bare return value
+    in a JSONResponse with the declared status.
+    """
+    if result is None:
+        # None + declared status_code → empty response with that status.
+        from fastapi_rs.responses import Response as _R
+        return _R(content=b"", status_code=status_code)
+    if hasattr(result, "status_code") and hasattr(result, "body"):
+        # Only override if handler didn't explicitly set a non-200 code.
+        try:
+            current = int(result.status_code)
+            if current == 200:
+                result.status_code = status_code
+        except Exception:
+            pass
+        return result
+    # Bare dict/list/str → wrap as JSONResponse with the declared status.
+    from fastapi_rs.responses import JSONResponse as _J
+    return _J(content=result, status_code=status_code)
+
+
 def _try_compile_handler(
     endpoint,
     params,
@@ -188,6 +231,7 @@ def _try_compile_handler(
     response_model_exclude_none=False,
     response_model_by_alias=True,
     response_class=None,
+    status_code=None,
 ):
     """Compile deps + handler into a SINGLE Python function (1 PyO3 call instead of N+1).
 
@@ -212,18 +256,38 @@ def _try_compile_handler(
     _has_exc_handlers = app is not None and bool(getattr(app, "exception_handlers", None))
     _debug_on = app is not None and bool(getattr(app, "debug", False))
     if not dep_steps:
-        if response_model is not None or _response_class is not None or _has_exc_handlers or _debug_on:
+        if (
+            response_model is not None
+            or _response_class is not None
+            or _has_exc_handlers
+            or _debug_on
+            or status_code is not None
+        ):
             # Even without deps, we may need response_model filtering or response_class wrapping
             handler_param_names = {p["name"] for p in params if p.get("_is_handler_param")}
+            # Build enum coercion map: {param_name: EnumClass} for query/path params
+            _enum_coerce = {
+                p["name"]: p["enum_class"]
+                for p in params
+                if p.get("enum_class") is not None and p.get("_is_handler_param")
+            }
             handler_func = endpoint
-            if asyncio.iscoroutinefunction(handler_func):
+            if inspect.iscoroutinefunction(handler_func):
                 handler_func = _make_sync_wrapper(handler_func)
 
             _app_ref = app
 
             def _compiled_no_deps(**kwargs):
                 try:
-                    result = handler_func(**{k: kwargs[k] for k in handler_param_names if k in kwargs})
+                    filtered = {k: kwargs[k] for k in handler_param_names if k in kwargs}
+                    # Coerce raw strings to Enum types (FastAPI does this automatically)
+                    for _ek, _ecls in _enum_coerce.items():
+                        if _ek in filtered and isinstance(filtered[_ek], str):
+                            try:
+                                filtered[_ek] = _ecls(filtered[_ek])
+                            except (ValueError, KeyError):
+                                pass
+                    result = handler_func(**filtered)
                 except Exception as exc:
                     _maybe_print_debug_traceback(_app_ref, exc)
                     if _app_ref is not None and _app_ref.exception_handlers:
@@ -242,6 +306,8 @@ def _try_compile_handler(
                     )
                 if _response_class is not None:
                     result = _wrap_response_class(result, _response_class)
+                if status_code is not None:
+                    result = _apply_status_code(result, status_code)
                 return result
 
             return _compiled_no_deps
@@ -255,7 +321,7 @@ def _try_compile_handler(
         original_func = dep.get("_original_dep_callable", dep["dep_callable"])
         func = dep["dep_callable"]
         is_generator = dep.get("is_generator_dep", False)
-        if asyncio.iscoroutinefunction(func) and not is_generator:
+        if inspect.iscoroutinefunction(func) and not is_generator:
             func = _make_sync_wrapper(func)
         dep_chain.append((
             dep["name"],
@@ -267,7 +333,7 @@ def _try_compile_handler(
         ))
 
     handler_func = endpoint
-    if asyncio.iscoroutinefunction(handler_func):
+    if inspect.iscoroutinefunction(handler_func):
         handler_func = _make_sync_wrapper(handler_func)
 
     # Capture app reference for override lookup at call time
@@ -278,32 +344,56 @@ def _try_compile_handler(
         cache = {}
         generators_to_cleanup = []
 
-        for name, func, original_func, input_map, func_id, is_generator in dep_chain:
-            # Check dependency_overrides at call time (P0 fix #1)
-            actual_func = func
-            if _app is not None and _app.dependency_overrides:
-                override = _app.dependency_overrides.get(original_func)
-                if override is not None:
-                    actual_func = override
-                    if asyncio.iscoroutinefunction(actual_func):
-                        actual_func = _make_sync_wrapper(actual_func)
+        try:
+            for name, func, original_func, input_map, func_id, is_generator in dep_chain:
+                # Check dependency_overrides at call time (P0 fix #1)
+                actual_func = func
+                if _app is not None and _app.dependency_overrides:
+                    override = _app.dependency_overrides.get(original_func)
+                    if override is not None:
+                        actual_func = override
+                        if inspect.iscoroutinefunction(actual_func):
+                            actual_func = _make_sync_wrapper(actual_func)
 
-            if func_id is not None and func_id in cache:
-                resolved[name] = cache[func_id]
-                continue
-            dk = {pn: resolved[sk] for pn, sk in input_map if sk in resolved}
+                if func_id is not None and func_id in cache:
+                    resolved[name] = cache[func_id]
+                    continue
+                dk = {pn: resolved[sk] for pn, sk in input_map if sk in resolved}
 
-            if is_generator:
-                # Generator dep (yield) support (P0 fix #4)
-                gen = actual_func(**dk)
-                result = next(gen)
-                generators_to_cleanup.append(gen)
-            else:
-                result = actual_func(**dk)
+                if is_generator:
+                    # Generator dep (yield) support — sync generators drive via
+                    # next(); async generators via anext() on a one-shot loop so
+                    # we stay on the same thread as the rest of the handler.
+                    gen = actual_func(**dk)
+                    if inspect.isasyncgen(gen):
+                        import asyncio as _asyncio
+                        loop = _asyncio.new_event_loop()
+                        try:
+                            result = loop.run_until_complete(gen.__anext__())
+                        finally:
+                            # Keep the generator for cleanup AFTER the handler.
+                            # Don't close the loop — we'll reuse it for cleanup.
+                            pass
+                        generators_to_cleanup.append((gen, loop))
+                    else:
+                        result = next(gen)
+                        generators_to_cleanup.append((gen, None))
+                else:
+                    result = actual_func(**dk)
 
-            resolved[name] = result
-            if func_id is not None:
-                cache[func_id] = result
+                resolved[name] = result
+                if func_id is not None:
+                    cache[func_id] = result
+        except Exception as dep_exc:
+            # Dependency raised — route through exception_handlers like
+            # FastAPI/Starlette does. SGLang depends on this (route-level
+            # `dependencies=[Depends(...)]` that raise HTTPException).
+            _maybe_print_debug_traceback(_app, dep_exc)
+            if _app is not None and _app.exception_handlers:
+                handler_result = _app._invoke_exception_handler(dep_exc)
+                if handler_result is not None:
+                    return handler_result
+            raise
 
         try:
             try:
@@ -329,12 +419,23 @@ def _try_compile_handler(
             # Wrap in response_class if set
             if _response_class is not None:
                 result = _wrap_response_class(result, _response_class)
+            if status_code is not None:
+                result = _apply_status_code(result, status_code)
             return result
         finally:
-            # Clean up generator deps in reverse order (P0 fix #4)
-            for gen in reversed(generators_to_cleanup):
+            # Clean up generator deps in reverse order — sync via next(),
+            # async via anext() on the one-shot loop captured earlier.
+            for gen, loop in reversed(generators_to_cleanup):
                 try:
-                    next(gen)
+                    if loop is not None:
+                        try:
+                            loop.run_until_complete(gen.__anext__())
+                        except StopAsyncIteration:
+                            pass
+                        finally:
+                            loop.close()
+                    else:
+                        next(gen)
                 except StopIteration:
                     pass
 
@@ -361,11 +462,19 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
     if not middlewares:
         return endpoint
 
-    is_async_endpoint = asyncio.iscoroutinefunction(endpoint)
+    is_async_endpoint = inspect.iscoroutinefunction(endpoint)
 
     # Shared scope — recycled per request (shallow copy cheap)
     def _make_scope(kwargs):
-        return {"type": "http", "app": app, "_handler_kwargs": kwargs}
+        return {
+            "type": "http",
+            "app": app,
+            "method": kwargs.pop("_request_method", "GET"),
+            "path": kwargs.pop("_request_path", "/"),
+            "query_string": kwargs.pop("_request_query", "").encode(),
+            "headers": kwargs.pop("_request_headers", []),
+            "_handler_kwargs": kwargs,
+        }
 
     def _call_handler_sync(kwargs):
         """Run the underlying handler, returning a Response-normalized value."""
@@ -407,8 +516,8 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
             # Detect async callable: either a bare async def, or a class
             # instance with async __call__ (e.g., SessionMiddleware).
             is_async_mw = (
-                asyncio.iscoroutinefunction(mw)
-                or asyncio.iscoroutinefunction(getattr(mw, "__call__", None))
+                inspect.iscoroutinefunction(mw)
+                or inspect.iscoroutinefunction(getattr(mw, "__call__", None))
             )
             if is_async_mw:
                 coro = mw(request, call_next)
@@ -436,6 +545,7 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
             # Fallback: drive everything through a fresh event loop
             return _drive_async_fallback(endpoint, middlewares, app, kwargs, is_async_endpoint)
 
+    wrapped_sync._has_http_middleware = True
     return wrapped_sync
 
 
@@ -471,7 +581,7 @@ def _drive_async_fallback(endpoint, middlewares, app, kwargs, is_async_endpoint)
             async def call_next(_req=None):
                 return await build(idx + 1)
 
-            if asyncio.iscoroutinefunction(mw):
+            if inspect.iscoroutinefunction(mw):
                 return await mw(request, call_next)
             return mw(request, call_next)
 
@@ -524,6 +634,8 @@ class FastAPI:
         license_info: dict[str, Any] | None = None,
         openapi_tags: list[dict[str, Any]] | None = None,
         lifespan=None,
+        on_startup: Sequence[Callable] | None = None,
+        on_shutdown: Sequence[Callable] | None = None,
         dependencies: Sequence | None = None,
         root_path: str = "",
         root_path_in_servers: bool = True,
@@ -531,6 +643,21 @@ class FastAPI:
         default_response_class: Any = None,
         responses: dict | None = None,
         debug: bool = False,
+        redirect_slashes: bool = True,
+        max_request_size: int | None = None,
+        webhooks: "APIRouter | None" = None,
+        external_docs: dict[str, Any] | None = None,
+        middleware: Sequence | None = None,
+        swagger_ui_oauth2_redirect_url: str | None = "/docs/oauth2-redirect",
+        swagger_ui_init_oauth: dict | None = None,
+        swagger_ui_parameters: dict | None = None,
+        generate_unique_id_function: Callable | None = None,
+        separate_input_output_schemas: bool = True,
+        callbacks: list | None = None,
+        deprecated: bool | None = None,
+        include_in_schema: bool = True,
+        openapi_prefix: str = "",
+        strict_content_type: bool = True,
         **kwargs: Any,
     ):
         self.title = title
@@ -545,8 +672,25 @@ class FastAPI:
         self.license_info = license_info
         self.openapi_tags = openapi_tags
         self.lifespan = lifespan
+        # Handle deprecated openapi_prefix -> root_path alias (Gap 20)
+        if openapi_prefix and not root_path:
+            import warnings
+            warnings.warn(
+                "openapi_prefix has been deprecated in favor of root_path, "
+                "which follows more closely the ASGI spec.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            root_path = openapi_prefix
+        self.openapi_prefix = openapi_prefix
         self.root_path = root_path
         self.root_path_in_servers = root_path_in_servers
+        self.generate_unique_id_function = generate_unique_id_function
+        self.separate_input_output_schemas = separate_input_output_schemas
+        self.callbacks = callbacks or []
+        self.deprecated = deprecated
+        self.include_in_schema = include_in_schema
+        self.strict_content_type = strict_content_type
         # Map of exception class (or int status code) -> handler callable
         self.exception_handlers: dict = dict(exception_handlers or {})
         # Default response class applied app-wide when routes/routers don't override
@@ -555,6 +699,18 @@ class FastAPI:
         self.responses: dict = dict(responses or {})
         # When True, 500 responses include Python traceback (dev only)
         self.debug: bool = bool(debug)
+        # When True (default), a request for /foo/ with a route /foo defined
+        # (or vice-versa) is redirected with 307 to the canonical path.
+        # Matches Starlette's `redirect_slashes` behaviour.
+        self.redirect_slashes: bool = bool(redirect_slashes)
+        # Max request body size in bytes. 413 Payload Too Large beyond this.
+        self.max_request_size: int | None = max_request_size
+        # OpenAPI webhooks — mirrors `app.webhooks` in FastAPI. Use as a
+        # router-like container for webhook definitions that appear under
+        # the top-level `webhooks` field of the OpenAPI schema.
+        self.webhooks: APIRouter = webhooks if webhooks is not None else APIRouter()
+        # Top-level OpenAPI externalDocs
+        self.external_docs: dict[str, Any] | None = external_docs
 
         self.router = APIRouter()
         self.state = SimpleNamespace()
@@ -567,8 +723,27 @@ class FastAPI:
         self._http_middlewares: list[Callable] = []
         self._on_startup: list[Callable] = []
         self._on_shutdown: list[Callable] = []
-        self._included_routers: list[tuple[APIRouter, str, list[str]]] = []
+        self._included_routers: list[tuple[APIRouter, str, list[str], dict]] = []
         self._mounts: list[tuple[str, Any, str | None]] = []
+
+        # Swagger UI customization params
+        self.swagger_ui_oauth2_redirect_url = swagger_ui_oauth2_redirect_url
+        self.swagger_ui_init_oauth = swagger_ui_init_oauth
+        self.swagger_ui_parameters = swagger_ui_parameters
+
+        # on_startup / on_shutdown lists passed via __init__ (Gap 9)
+        if on_startup:
+            self._on_startup.extend(on_startup)
+        if on_shutdown:
+            self._on_shutdown.extend(on_shutdown)
+
+        # middleware= list passed via __init__ (Gap 10)
+        # Each element is a Middleware(cls, **options) namedtuple-like from starlette.
+        if middleware:
+            for m in middleware:
+                cls = m.cls if hasattr(m, "cls") else m[0]
+                kwargs_m = m.kwargs if hasattr(m, "kwargs") else (m[1] if len(m) > 1 else {})
+                self.add_middleware(cls, **kwargs_m)
 
         self.extra = kwargs
 
@@ -600,12 +775,43 @@ class FastAPI:
     def trace(self, path: str, **kwargs: Any):
         return self.router.trace(path, **kwargs)
 
+    def api_route(self, path: str, **kwargs: Any):
+        return self.router.api_route(path, **kwargs)
+
     # ------------------------------------------------------------------
     # WebSocket decorator
     # ------------------------------------------------------------------
 
     def websocket(self, path: str, **kwargs: Any):
         return self.router.websocket(path, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Imperative route registration
+    # ------------------------------------------------------------------
+
+    def add_api_route(self, path: str, endpoint: Callable, **kwargs: Any) -> None:
+        """Imperative form of @app.get / @app.post / etc."""
+        return self.router.add_api_route(path, endpoint, **kwargs)
+
+    def add_api_websocket_route(self, path: str, endpoint: Callable, **kwargs: Any) -> None:
+        """Imperative form of @app.websocket."""
+        return self.router.add_websocket_route(path, endpoint, **kwargs)
+
+    def add_route(self, path: str, route: Callable, **kwargs: Any) -> None:
+        """Starlette-compatible add_route (delegates to add_api_route)."""
+        return self.router.add_api_route(path, route, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Routes property
+    # ------------------------------------------------------------------
+
+    @property
+    def routes(self) -> list:
+        """Return all collected route objects (Starlette/FastAPI compatibility)."""
+        all_routes = list(self.router.routes)
+        for router, _prefix, _tags, _meta in self._included_routers:
+            all_routes.extend(router.routes)
+        return all_routes
 
     # ------------------------------------------------------------------
     # Mount sub-applications
@@ -629,9 +835,25 @@ class FastAPI:
         *,
         prefix: str = "",
         tags: list[str] | None = None,
+        dependencies: Sequence | None = None,
+        responses: dict | None = None,
+        deprecated: bool | None = None,
+        include_in_schema: bool = True,
+        default_response_class: Any = None,
+        callbacks: list | None = None,
+        generate_unique_id_function: Callable | None = None,
     ) -> None:
         """Register a child router for later flattening."""
-        self._included_routers.append((router, prefix, tags or []))
+        include_meta = {
+            "prefix": prefix,
+            "tags": tags or [],
+            "dependencies": list(dependencies or []),
+            "responses": responses or {},
+            "deprecated": deprecated,
+            "include_in_schema": include_in_schema,
+            "default_response_class": default_response_class,
+        }
+        self._included_routers.append((router, prefix, tags or [], include_meta))
 
     # ------------------------------------------------------------------
     # Middleware
@@ -640,22 +862,36 @@ class FastAPI:
     def add_middleware(self, middleware_cls, **kwargs: Any) -> None:
         """Register a middleware class.
 
-        Python-side middleware classes (marked with
-        _fastapi_rs_middleware_type starting with 'python_http_') are
-        instantiated and added to the @app.middleware('http') chain.
-        Everything else goes to the Tower-backed middleware stack for
-        Rust-side processing.
+        Handles three cases:
+        1. Known Rust/Tower middleware (CORS, GZip, etc.) → Rust stack
+        2. Python HTTP middleware (our marker) → per-handler chain
+        3. BaseHTTPMiddleware subclass (Qwen pattern) → converted to
+           @app.middleware("http") callable via its dispatch() method
         """
         mw_type = getattr(middleware_cls, "_fastapi_rs_middleware_type", None)
         if mw_type and mw_type.startswith("python_http_"):
-            # Python-side HTTP middleware — instantiate and add to the per-handler chain
             try:
                 instance = middleware_cls(app=self, **kwargs)
             except TypeError:
-                # Starlette-style middlewares may not accept `app` kwarg
                 instance = middleware_cls(**kwargs)
             self._http_middlewares.append(instance)
             return
+
+        # BaseHTTPMiddleware subclass — Qwen uses this for auth middleware.
+        # Convert to an @app.middleware("http") function by wrapping dispatch().
+        from fastapi_rs.middleware.base import BaseHTTPMiddleware
+        if isinstance(middleware_cls, type) and issubclass(middleware_cls, BaseHTTPMiddleware):
+            try:
+                instance = middleware_cls(app=self, **kwargs)
+            except TypeError:
+                instance = middleware_cls(**kwargs)
+
+            async def _dispatch_wrapper(request, call_next, _inst=instance):
+                return await _inst.dispatch(request, call_next)
+
+            self._http_middlewares.append(_dispatch_wrapper)
+            return
+
         self._middleware_stack.append((middleware_cls, kwargs))
 
     def middleware(self, middleware_type: str):
@@ -778,7 +1014,7 @@ class FastAPI:
         from fastapi_rs.requests import Request
         request = Request({"type": "http", "app": self})
         try:
-            if asyncio.iscoroutinefunction(handler):
+            if inspect.iscoroutinefunction(handler):
                 # Drive the coroutine via the send(None) trick (works for handlers
                 # that don't actually suspend). Fall back to a new event loop otherwise.
                 coro = handler(request, exc)
@@ -805,11 +1041,16 @@ class FastAPI:
     # Route collection & introspection
     # ------------------------------------------------------------------
 
-    def _get_all_dependencies_for_route(self, router: APIRouter, route) -> list:
-        """Merge app-level, router-level, and route-level dependencies (P0 fix #6)."""
+    def _get_all_dependencies_for_route(
+        self, router: APIRouter, route, include_deps: list | None = None,
+    ) -> list:
+        """Merge app-level, include-level, router-level, and route-level dependencies."""
         merged = []
         # App-level dependencies first
         merged.extend(self.dependencies)
+        # include_router()-level dependencies (between app and router)
+        if include_deps:
+            merged.extend(include_deps)
         # Router-level dependencies
         merged.extend(router.dependencies)
         # Route-level dependencies
@@ -821,9 +1062,16 @@ class FastAPI:
         router: APIRouter,
         prefix: str = "",
         extra_tags: list[str] | None = None,
+        include_deps: list | None = None,
+        include_responses: dict | None = None,
+        include_deprecated: bool | None = None,
+        include_in_schema: bool = True,
+        include_default_response_class: Any = None,
     ) -> list[dict[str, Any]]:
         """Recursively flatten a router tree into a list of route dicts."""
         extra_tags = extra_tags or []
+        include_deps = include_deps or []
+        include_responses = include_responses or {}
         collected: list[dict[str, Any]] = []
 
         full_prefix = prefix + router.prefix
@@ -854,8 +1102,8 @@ class FastAPI:
 
             params = introspect_endpoint(route.endpoint, full_path)
 
-            # Merge global/router-level/route-level dependencies (P0 fix #6)
-            merged_deps = self._get_all_dependencies_for_route(router, route)
+            # Merge global/include/router-level/route-level dependencies
+            merged_deps = self._get_all_dependencies_for_route(router, route, include_deps=include_deps)
 
             # Check if any params are dependencies (including merged ones)
             has_deps = any(p["kind"] == "dependency" for p in params) or bool(merged_deps)
@@ -884,9 +1132,11 @@ class FastAPI:
             rm_exclude_none = getattr(route, "response_model_exclude_none", False)
             rm_by_alias = getattr(route, "response_model_by_alias", True)
             response_class = getattr(route, "response_class", None)
-            # Cascade default_response_class: route → router → app
+            # Cascade default_response_class: route → router → include-level → app
             if response_class is None:
                 response_class = getattr(router, "default_response_class", None)
+            if response_class is None and include_default_response_class is not None:
+                response_class = include_default_response_class
             if response_class is None:
                 response_class = getattr(self, "default_response_class", None)
 
@@ -906,6 +1156,7 @@ class FastAPI:
             if has_deps:
                 compiled = _try_compile_handler(
                     endpoint, params, app=self, response_model=response_model,
+                    status_code=route.status_code,
                     **rm_kwargs,
                 )
                 if compiled is not None:
@@ -923,27 +1174,49 @@ class FastAPI:
                         from fastapi_rs._resolution import _make_sync_wrapper
                         endpoint = _make_sync_wrapper(endpoint)
                         is_async = False
-            elif response_model is not None or response_class is not None or self.exception_handlers or self.debug:
-                # No deps but has response_model/response_class/exception_handlers -- wrap handler
+            elif response_model is not None or response_class is not None or route.status_code or self.exception_handlers or self.debug:
+                # No deps but has response_model/response_class/status_code/
+                # exception_handlers — wrap handler via compile.
                 compiled = _try_compile_handler(
                     endpoint, params, app=self, response_model=response_model,
+                    status_code=route.status_code,
                     **rm_kwargs,
                 )
                 if compiled is not None:
                     endpoint = compiled
                     is_async = False
 
-            # Wrap handler when multiple body params are combined
+            # Wrap handler when multiple body params are combined.
+            # CRITICAL ORDERING:
+            #   - Rust sends kwargs containing `_combined_body` (never `item`,
+            #     `user` etc — the individual body params were removed from
+            #     introspection).
+            #   - The unwrap wrapper MUST run BEFORE the compiled handler so
+            #     that by the time the compiled handler receives kwargs, the
+            #     `_combined_body` has been split back into original body
+            #     names. However, the compiled handler's own filtering uses
+            #     handler_param_names which don't include the original body
+            #     names either.
+            #   - Simplest correct flow: unwrap wraps the USER endpoint
+            #     directly, NOT the compiled endpoint. And the unwrap gets
+            #     kwargs from Rust (which include `_combined_body` + non-body
+            #     params like query/path). It splits and calls user handler
+            #     with the original names.
+            #   - Then _compiled_no_deps (if any) wraps the unwrap, but its
+            #     filter check is satisfied because `_combined_body` is now
+            #     in handler_param_names (we marked _is_handler_param=True).
             combined = [p for p in params if p.get("name") == "_combined_body" and p.get("_body_param_names")]
             if combined:
                 body_param_names = combined[0]["_body_param_names"]
-                original_endpoint = endpoint
-                original_is_async = is_async
+                # Use the ORIGINAL user endpoint, not the compiled one — we
+                # unwrap the body first, then call the user's real function.
+                user_endpoint = route.endpoint
+                user_is_async = inspect.iscoroutinefunction(user_endpoint)
 
-                if inspect.iscoroutinefunction(original_endpoint):
+                if user_is_async:
                     async def _unwrap_combined_async(
                         _body_names=body_param_names,
-                        _orig=original_endpoint,
+                        _orig=user_endpoint,
                         **kwargs,
                     ):
                         combined_body = kwargs.pop("_combined_body", None)
@@ -957,7 +1230,7 @@ class FastAPI:
                 else:
                     def _unwrap_combined_sync(
                         _body_names=body_param_names,
-                        _orig=original_endpoint,
+                        _orig=user_endpoint,
                         **kwargs,
                     ):
                         combined_body = kwargs.pop("_combined_body", None)
@@ -992,29 +1265,39 @@ class FastAPI:
                     "summary": route.summary,
                     "description": route.description,
                     "response_description": getattr(route, "response_description", "Successful Response"),
-                    # Merge: app defaults → router defaults → route (route wins on conflicts)
+                    # Merge: app defaults → include-level → router defaults → route (route wins)
                     "responses": {
                         **self.responses,
+                        **include_responses,
                         **getattr(router, "responses", {}),
                         **getattr(route, "responses", {}),
                     },
                     "response_model": response_model,
-                    "deprecated": route.deprecated,
+                    "deprecated": route.deprecated or bool(include_deprecated),
                     "operation_id": route.operation_id,
-                    "include_in_schema": getattr(route, "include_in_schema", True),
+                    "include_in_schema": (
+                        getattr(route, "include_in_schema", True) and include_in_schema
+                    ),
                     "openapi_extra": getattr(route, "openapi_extra", {}),
                     "security": getattr(route, "security", None),
                     "callbacks": getattr(route, "callbacks", []),
+                    "servers": getattr(route, "servers", None),
+                    "external_docs": getattr(route, "external_docs", None),
                 }
             )
 
         # Recurse into child routers
-        for child_router, child_prefix, child_tags in router._included_routers:
+        for child_router, child_prefix, child_tags, child_meta in router._included_routers:
             collected.extend(
                 self._collect_routes_from_router(
                     child_router,
                     prefix=full_prefix + child_prefix,
                     extra_tags=extra_tags + child_tags,
+                    include_deps=child_meta.get("dependencies", []),
+                    include_responses=child_meta.get("responses", {}),
+                    include_deprecated=child_meta.get("deprecated"),
+                    include_in_schema=child_meta.get("include_in_schema", True),
+                    include_default_response_class=child_meta.get("default_response_class"),
                 )
             )
 
@@ -1026,9 +1309,18 @@ class FastAPI:
         all_routes = self._collect_routes_from_router(self.router)
 
         # Routers added via app.include_router(...)
-        for router, prefix, tags in self._included_routers:
+        for router, prefix, tags, meta in self._included_routers:
             all_routes.extend(
-                self._collect_routes_from_router(router, prefix=prefix, extra_tags=tags)
+                self._collect_routes_from_router(
+                    router,
+                    prefix=prefix,
+                    extra_tags=tags,
+                    include_deps=meta.get("dependencies", []),
+                    include_responses=meta.get("responses", {}),
+                    include_deprecated=meta.get("deprecated"),
+                    include_in_schema=meta.get("include_in_schema", True),
+                    include_default_response_class=meta.get("default_response_class"),
+                )
             )
 
         # Mounted sub-applications
@@ -1098,6 +1390,7 @@ class FastAPI:
             effective_servers = self.servers
             if self.root_path and self.root_path_in_servers and not effective_servers:
                 effective_servers = [{"url": self.root_path}]
+            webhook_dicts = self._collect_routes_from_router(self.webhooks)
             self._openapi_schema = generate_openapi_schema(
                 title=self.title,
                 version=self.version,
@@ -1108,6 +1401,8 @@ class FastAPI:
                 contact=self.contact,
                 license_info=self.license_info,
                 openapi_tags=self.openapi_tags,
+                webhooks=webhook_dicts,
+                external_docs=self.external_docs,
             )
         return self._openapi_schema
 
@@ -1118,7 +1413,7 @@ class FastAPI:
     def _run_startup_handlers(self) -> None:
         """Execute all registered startup handlers (P0 fix #2)."""
         for handler in self._on_startup:
-            if asyncio.iscoroutinefunction(handler):
+            if inspect.iscoroutinefunction(handler):
                 asyncio.run(handler())
             else:
                 handler()
@@ -1126,7 +1421,7 @@ class FastAPI:
     def _run_shutdown_handlers(self) -> None:
         """Execute all registered shutdown handlers (P0 fix #2)."""
         for handler in self._on_shutdown:
-            if asyncio.iscoroutinefunction(handler):
+            if inspect.iscoroutinefunction(handler):
                 asyncio.run(handler())
             else:
                 handler()
@@ -1194,6 +1489,7 @@ class FastAPI:
                     type_hint=p["type_hint"],
                     required=p["required"],
                     default_value=p["default_value"],
+                    has_default=p.get("has_default", False),
                     model_class=p.get("model_class"),
                     alias=p.get("alias"),
                     dep_callable=p.get("dep_callable"),
@@ -1202,6 +1498,7 @@ class FastAPI:
                     is_generator_dep=p.get("is_generator_dep", False),
                     dep_input_names=p.get("dep_input_map", []),
                     is_handler_param=p.get("_is_handler_param", True),
+                    scalar_validator=p.get("scalar_validator"),
                 )
                 param_infos.append(pi)
 
@@ -1225,6 +1522,7 @@ class FastAPI:
             effective_servers = self.servers
             if self.root_path and self.root_path_in_servers and not effective_servers:
                 effective_servers = [{"url": self.root_path}]
+            webhook_dicts = self._collect_routes_from_router(self.webhooks)
             openapi_schema = generate_openapi_schema(
                 title=self.title,
                 version=self.version,
@@ -1235,6 +1533,8 @@ class FastAPI:
                 contact=self.contact,
                 license_info=self.license_info,
                 openapi_tags=self.openapi_tags,
+                webhooks=webhook_dicts,
+                external_docs=self.external_docs,
             )
             openapi_json = json.dumps(openapi_schema)
 
@@ -1245,6 +1545,119 @@ class FastAPI:
         for mount_path, mounted_app, _name in self._mounts:
             if hasattr(mounted_app, 'directory') and mounted_app.directory:
                 static_mounts.append((mount_path, str(mounted_app.directory)))
+
+        # Build a tiny not_found_handler callable the Rust 404 fallback
+        # can invoke: takes (method, path), returns (status, body_bytes).
+        # Dispatches to whatever the user registered with
+        # ``@app.exception_handler(404)`` (or HTTPException class).
+        not_found_handler = None
+        from fastapi_rs.exceptions import HTTPException as _HTTPExc
+        _app_self = self
+
+        def _rust_404_handler(method: str, path: str):
+            handler = _app_self.exception_handlers.get(404)
+            if handler is None:
+                handler = _app_self.exception_handlers.get(_HTTPExc)
+            if handler is None:
+                # No custom handler — let Rust emit the default body.
+                return (404, b'{"detail":"Not Found"}')
+            # Build a minimal Request
+            from fastapi_rs.requests import Request
+            req = Request({
+                "type": "http",
+                "method": method,
+                "path": path,
+                "headers": [],
+                "query_string": b"",
+                "path_params": {},
+            })
+            exc = _HTTPExc(status_code=404, detail="Not Found")
+            result = handler(req, exc)
+            # Drive coroutine if returned
+            if inspect.iscoroutine(result):
+                import asyncio as _asyncio
+                loop = _asyncio.new_event_loop()
+                try:
+                    result = loop.run_until_complete(result)
+                finally:
+                    loop.close()
+            # Extract (status, body)
+            status = getattr(result, "status_code", 404)
+            body = getattr(result, "body", None)
+            if body is None:
+                import json as _json
+                body = _json.dumps({"detail": "Not Found"}).encode()
+            elif isinstance(body, str):
+                body = body.encode("utf-8")
+            return (int(status), bytes(body))
+
+        if self.exception_handlers.get(404) is not None or self.exception_handlers.get(_HTTPExc) is not None:
+            not_found_handler = _rust_404_handler
+
+        # Rust-side validation dispatcher: when the user registered
+        # @exception_handler(RequestValidationError), let the Rust validation
+        # error paths route the detail through it.
+        validation_handler = None
+        from fastapi_rs.exceptions import RequestValidationError as _RVE
+        if _RVE in self.exception_handlers:
+            from fastapi_rs.requests import Request as _Req
+            import json as _json
+            _user_handler = self.exception_handlers[_RVE]
+
+            def _rust_validation_handler(detail_json):
+                """Called from Rust on validation failure.
+
+                detail_json is the pre-built FastAPI-style 422 detail list
+                (``{"detail": [...]}``) as a JSON string.
+                """
+                if isinstance(detail_json, (bytes, bytearray)):
+                    detail_json = bytes(detail_json).decode()
+                try:
+                    detail_obj = _json.loads(detail_json)
+                except Exception:
+                    detail_obj = {"detail": detail_json}
+                errors_list = detail_obj.get("detail", [])
+                exc = _RVE(errors_list)
+                req = _Req({
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/",
+                    "headers": [],
+                    "query_string": b"",
+                })
+                res = _user_handler(req, exc)
+                if inspect.iscoroutine(res):
+                    import asyncio as _asyncio
+                    loop = _asyncio.new_event_loop()
+                    try:
+                        res = loop.run_until_complete(res)
+                    finally:
+                        loop.close()
+                status = int(getattr(res, "status_code", 422) or 422)
+                body = getattr(res, "body", None)
+                if body is None:
+                    content = getattr(res, "content", None)
+                    if content is None:
+                        body = _json.dumps(detail_obj).encode()
+                    elif isinstance(content, (bytes, bytearray)):
+                        body = bytes(content)
+                    elif isinstance(content, str):
+                        body = content.encode()
+                    else:
+                        body = _json.dumps(content).encode()
+                elif isinstance(body, str):
+                    body = body.encode()
+                # Pull media_type from the response; default to json
+                ct = getattr(res, "media_type", None) or "application/json"
+                headers = getattr(res, "headers", None)
+                if headers is not None:
+                    for k, v in dict(headers).items():
+                        if k.lower() == "content-type":
+                            ct = v
+                            break
+                return status, bytes(body), ct
+
+            validation_handler = _rust_validation_handler
 
         run_server(
             route_infos,
@@ -1257,4 +1670,231 @@ class FastAPI:
             self.openapi_url,
             static_mounts,
             self.root_path or None,
+            self.redirect_slashes,
+            self.max_request_size,
+            not_found_handler,
+            self,
+            validation_handler,
         )
+
+    # ------------------------------------------------------------------
+    # ASGI __call__ — enables ``uvicorn myapp:app`` compatibility
+    # ------------------------------------------------------------------
+
+    async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
+        """ASGI entry point.
+
+        fastapi-rs uses its own Rust/Axum server, so a full ASGI adapter
+        is not needed.  Instead we:
+
+        1. **lifespan** scope: drive startup/shutdown handlers directly.
+        2. **http** scope: auto-start the Rust server on a free port in a
+           background thread, then proxy every request to it via httpx.
+        3. **websocket** scope: proxy via websockets library.
+
+        This lets ``uvicorn myapp:app`` (and Starlette's TestClient) work
+        out of the box without any code changes.
+        """
+        if scope["type"] == "lifespan":
+            await self._asgi_lifespan(scope, receive, send)
+            return
+
+        if scope["type"] == "http":
+            await self._asgi_ensure_server()
+            await self._asgi_proxy_http(scope, receive, send)
+            return
+
+        if scope["type"] == "websocket":
+            await self._asgi_ensure_server()
+            await self._asgi_proxy_websocket(scope, receive, send)
+            return
+
+    # ── lifespan ──────────────────────────────────────────────────────
+
+    async def _asgi_lifespan(self, scope: dict, receive: Callable, send: Callable) -> None:
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                try:
+                    if self.lifespan:
+                        self._run_lifespan_startup()
+                    self._run_startup_handlers()
+                    await send({"type": "lifespan.startup.complete"})
+                except Exception as exc:
+                    await send({"type": "lifespan.startup.failed", "message": str(exc)})
+                    return
+            elif message["type"] == "lifespan.shutdown":
+                try:
+                    if hasattr(self, "_lifespan_cm") and self._lifespan_cm:
+                        self._run_lifespan_shutdown()
+                    self._run_shutdown_handlers()
+                except Exception:
+                    pass
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    # ── server bootstrap ──────────────────────────────────────────────
+
+    async def _asgi_ensure_server(self) -> None:
+        """Start the Rust server in a background thread if not already running."""
+        if hasattr(self, "_asgi_server_port"):
+            return
+
+        import socket
+        import threading
+        import time
+
+        # Find a free port
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        self._asgi_server_port = port
+
+        # Start server in a daemon thread
+        t = threading.Thread(
+            target=self.run,
+            kwargs={"host": "127.0.0.1", "port": port},
+            daemon=True,
+        )
+        t.start()
+
+        # Wait for server readiness (up to 10 seconds)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._asgi_wait_for_server, port)
+
+    @staticmethod
+    def _asgi_wait_for_server(port: int, timeout: float = 10.0) -> None:
+        import socket
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    return
+            except (ConnectionRefusedError, OSError):
+                time.sleep(0.05)
+        raise RuntimeError(
+            f"fastapi-rs ASGI adapter: Rust server did not start on port {port} "
+            f"within {timeout}s"
+        )
+
+    # ── HTTP proxy ────────────────────────────────────────────────────
+
+    async def _asgi_proxy_http(self, scope: dict, receive: Callable, send: Callable) -> None:
+        import httpx
+
+        # Reconstruct the URL
+        path = scope.get("path", "/")
+        qs = scope.get("query_string", b"")
+        url = f"http://127.0.0.1:{self._asgi_server_port}{path}"
+        if qs:
+            url += f"?{qs.decode('latin-1')}"
+
+        # Reconstruct headers
+        headers_list = scope.get("headers", [])
+        headers = {}
+        for name_bytes, value_bytes in headers_list:
+            name = name_bytes.decode("latin-1") if isinstance(name_bytes, bytes) else name_bytes
+            value = value_bytes.decode("latin-1") if isinstance(value_bytes, bytes) else value_bytes
+            # Skip hop-by-hop headers
+            if name.lower() in ("host", "transfer-encoding"):
+                continue
+            headers[name] = value
+
+        # Read the request body
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+
+        method = scope.get("method", "GET")
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.request(
+                method=method,
+                url=url,
+                headers=headers,
+                content=body,
+                follow_redirects=False,
+            )
+
+        # Send response start
+        resp_headers = [
+            (k.lower().encode("latin-1"), v.encode("latin-1"))
+            for k, v in resp.headers.multi_items()
+            if k.lower() not in ("transfer-encoding",)
+        ]
+        await send({
+            "type": "http.response.start",
+            "status": resp.status_code,
+            "headers": resp_headers,
+        })
+
+        # Send response body
+        await send({
+            "type": "http.response.body",
+            "body": resp.content,
+        })
+
+    # ── WebSocket proxy ───────────────────────────────────────────────
+
+    async def _asgi_proxy_websocket(self, scope: dict, receive: Callable, send: Callable) -> None:
+        """Proxy an ASGI WebSocket connection to the Rust server.
+
+        Falls back to a rejection if the ``websockets`` library is not
+        installed.
+        """
+        try:
+            from websockets.asyncio.client import connect as ws_connect
+        except ImportError:
+            # No websockets library — accept then close with error
+            await send({"type": "websocket.close", "code": 1011})
+            return
+
+        path = scope.get("path", "/")
+        qs = scope.get("query_string", b"")
+        ws_url = f"ws://127.0.0.1:{self._asgi_server_port}{path}"
+        if qs:
+            ws_url += f"?{qs.decode('latin-1')}"
+
+        # Wait for the client to connect
+        message = await receive()
+        if message["type"] != "websocket.connect":
+            return
+
+        try:
+            async with ws_connect(ws_url) as ws:
+                await send({"type": "websocket.accept"})
+
+                async def _forward_client_to_server():
+                    while True:
+                        msg = await receive()
+                        if msg["type"] == "websocket.disconnect":
+                            await ws.close()
+                            return
+                        if "text" in msg:
+                            await ws.send(msg["text"])
+                        elif "bytes" in msg:
+                            await ws.send(msg["bytes"])
+
+                async def _forward_server_to_client():
+                    async for data in ws:
+                        if isinstance(data, str):
+                            await send({"type": "websocket.send", "text": data})
+                        else:
+                            await send({"type": "websocket.send", "bytes": data})
+
+                # Run both directions concurrently
+                await asyncio.gather(
+                    _forward_client_to_server(),
+                    _forward_server_to_client(),
+                    return_exceptions=True,
+                )
+        except Exception:
+            try:
+                await send({"type": "websocket.close", "code": 1011})
+            except Exception:
+                pass

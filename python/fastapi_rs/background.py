@@ -46,3 +46,21 @@ class BackgroundTasks:
 
     async def __call__(self) -> None:
         await self._run()
+
+    def run_sync(self) -> None:
+        """Run all queued tasks synchronously — used by the Rust router
+        after the handler returns. Sync tasks run inline; async tasks get
+        driven to completion via a fresh local event loop.
+        """
+        import asyncio
+        for task in self._tasks:
+            if inspect.iscoroutinefunction(task.func):
+                # Run the coroutine to completion on a one-shot loop.
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(task.func(*task.args, **task.kwargs))
+                finally:
+                    loop.close()
+            else:
+                task.func(*task.args, **task.kwargs)
+        self._tasks.clear()

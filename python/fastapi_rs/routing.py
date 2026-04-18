@@ -42,6 +42,8 @@ class APIRoute:
         openapi_extra: dict | None = None,
         security: list | None = None,
         callbacks: list | None = None,
+        servers: list[dict[str, Any]] | None = None,
+        external_docs: dict[str, Any] | None = None,
         **kwargs: Any,
     ):
         self.path = path
@@ -68,6 +70,9 @@ class APIRoute:
         self.openapi_extra = openapi_extra or {}
         self.security = security  # None = auto-derive; [] = disable; non-empty = override
         self.callbacks = callbacks or []
+        # Per-operation servers / externalDocs (OpenAPI 3.1)
+        self.servers = servers  # None = inherit from app
+        self.external_docs = external_docs
 
         # Generate operation_id using the provided function or explicit value
         if operation_id is not None:
@@ -92,10 +97,13 @@ class APIRouter:
         responses: dict | None = None,
         deprecated: bool | None = None,
         include_in_schema: bool = True,
+        callbacks: list | None = None,
+        generate_unique_id_function: Callable | None = None,
+        route_class: type | None = None,
         **kwargs: Any,
     ):
         self.routes: list[APIRoute] = []
-        self._included_routers: list[tuple[APIRouter, str, list[str]]] = []
+        self._included_routers: list[tuple[APIRouter, str, list[str], dict]] = []
         self.prefix = prefix
         self.tags = tags or []
         self.dependencies = list(dependencies or [])
@@ -103,6 +111,9 @@ class APIRouter:
         self.responses = responses or {}
         self.deprecated = deprecated
         self.include_in_schema = include_in_schema
+        self.callbacks = callbacks or []
+        self.generate_unique_id_function = generate_unique_id_function
+        self.route_class = route_class
 
     # ------------------------------------------------------------------
     # Core registration
@@ -157,6 +168,23 @@ class APIRouter:
     def trace(self, path: str, **kwargs: Any):
         return self._method_decorator("TRACE", path, **kwargs)
 
+    def api_route(
+        self, path: str, *, methods: list[str] | None = None, **kwargs: Any
+    ):
+        """FastAPI multi-method route decorator.
+
+        Used by SGLang::
+
+            @app.api_route("/health", methods=["GET", "POST"])
+            async def health(): ...
+        """
+
+        def decorator(func: Callable) -> Callable:
+            self.add_api_route(path, func, methods=methods, **kwargs)
+            return func
+
+        return decorator
+
     # ------------------------------------------------------------------
     # WebSocket routes
     # ------------------------------------------------------------------
@@ -200,6 +228,22 @@ class APIRouter:
         *,
         prefix: str = "",
         tags: list[str] | None = None,
+        dependencies: Sequence | None = None,
+        responses: dict | None = None,
+        deprecated: bool | None = None,
+        include_in_schema: bool = True,
+        default_response_class: Any = None,
+        callbacks: list | None = None,
+        generate_unique_id_function: Callable | None = None,
     ) -> None:
         """Store a child router for later flattening."""
-        self._included_routers.append((router, prefix, tags or []))
+        include_meta = {
+            "prefix": prefix,
+            "tags": tags or [],
+            "dependencies": list(dependencies or []),
+            "responses": responses or {},
+            "deprecated": deprecated,
+            "include_in_schema": include_in_schema,
+            "default_response_class": default_response_class,
+        }
+        self._included_routers.append((router, prefix, tags or [], include_meta))
