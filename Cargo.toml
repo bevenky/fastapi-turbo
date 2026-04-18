@@ -25,7 +25,11 @@ bb8 = "0.9"
 bb8-postgres = "0.9"
 http = "1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "compression-full", "fs", "validate-request", "set-header"] }
+tower-http = { version = "0.6", features = ["cors", "compression-full", "fs", "validate-request", "set-header", "limit"] }
+multer = "3"
+mime_guess = "2"
+url = "2"
+memchr = "2"
 reqwest = { version = "0.12", default-features = false, features = [
     "cookies", "gzip", "brotli", "deflate", "zstd",
     "socks", "rustls-tls", "http2", "multipart", "stream", "json",
@@ -41,4 +45,4 @@ opt-level = 0
 
 [[bin]]
 name = "fastapi-rs-bench"
-path = "benches/bench_client.rs"
+path = "src/bin/bench_client.rs"

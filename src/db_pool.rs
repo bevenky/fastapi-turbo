@@ -18,7 +18,7 @@
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use std::sync::Arc;
 use tokio::runtime::Handle as TokioHandle;
 use tokio_postgres::types::ToSql;
@@ -64,7 +64,7 @@ fn row_to_pydict(py: Python<'_>, row: &Row) -> PyResult<Py<PyAny>> {
 
 /// Convert a Python value to a tokio-postgres parameter.
 /// Returns a boxed trait object for dynamic dispatch.
-fn py_to_sql(py: Python<'_>, val: &Bound<'_, PyAny>) -> Box<dyn ToSql + Sync + Send> {
+fn py_to_sql(_py: Python<'_>, val: &Bound<'_, PyAny>) -> Box<dyn ToSql + Sync + Send> {
     if let Ok(v) = val.extract::<i32>() {
         Box::new(v)
     } else if let Ok(v) = val.extract::<i64>() {
@@ -185,11 +185,11 @@ impl PyPool {
         // Extract all queries and params while we have the GIL
         let mut query_specs: Vec<(String, Vec<Box<dyn ToSql + Sync + Send>>)> = Vec::new();
         for item in queries.iter() {
-            let tuple = item.downcast::<PyTuple>()?;
+            let tuple = item.cast::<PyTuple>()?;
             let sql: String = tuple.get_item(0)?.extract()?;
             let params = if tuple.len() > 1 {
                 let param_list = tuple.get_item(1)?;
-                if let Ok(list) = param_list.downcast::<PyList>() {
+                if let Ok(list) = param_list.cast::<PyList>() {
                     list.iter().map(|v| py_to_sql(py, &v)).collect()
                 } else {
                     vec![]

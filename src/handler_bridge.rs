@@ -38,36 +38,37 @@ unsafe impl Send for AsyncRequest {}
 /// Channel for sending async requests to the dedicated Python worker thread.
 static ASYNC_WORKER_TX: OnceLock<crossbeam_channel::Sender<AsyncRequest>> = OnceLock::new();
 
-/// Initialize the dedicated async worker thread.
-/// Uses crossbeam + run_until_complete with uvloop.
+/// Cached reference to the Python `_async_worker.submit` function.
+static ASYNC_SUBMIT: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// Initialize the async worker (Python-managed thread with `run_forever()`).
 pub fn init_async_worker() {
-    if ASYNC_WORKER_TX.get().is_some() {
+    if ASYNC_SUBMIT.get().is_some() {
         return;
     }
+    // Dummy TX for backward compat
+    let (tx, _rx) = crossbeam_channel::unbounded::<AsyncRequest>();
+    let _ = ASYNC_WORKER_TX.set(tx);
 
-    let (tx, rx) = crossbeam_channel::unbounded::<AsyncRequest>();
-    ASYNC_WORKER_TX.set(tx).ok();
+    Python::attach(|py| {
+        let worker = py.import("fastapi_rs._async_worker").expect("_async_worker");
+        worker.call_method0("init").expect("worker init");
+        let submit = worker.getattr("submit").expect("submit").unbind();
+        let _ = ASYNC_SUBMIT.set(submit);
+    });
+}
 
-    std::thread::Builder::new()
-        .name("fastapi-rs-async-worker".to_string())
-        .spawn(move || {
-            Python::attach(|py| {
-                let asyncio = py.import("asyncio").expect("asyncio");
-                let loop_obj = match py.import("uvloop") {
-                    Ok(uvloop) => uvloop.call_method0("new_event_loop").expect("uvloop"),
-                    Err(_) => asyncio.call_method0("new_event_loop").expect("asyncio loop"),
-                };
-                asyncio.call_method1("set_event_loop", (&loop_obj,)).expect("set_event_loop");
-
-                loop {
-                    let req = py.detach(|| rx.recv().ok());
-                    let Some(req) = req else { break };
-                    let result = loop_obj.call_method1("run_until_complete", (req.coro.bind(py),));
-                    let _ = req.response_tx.send(result.map(|r| r.unbind()));
-                }
-            });
-        })
-        .expect("failed to spawn async worker");
+/// Submit a coroutine to the async worker and block until it completes.
+/// The worker's Python `submit()` calls `run_coroutine_threadsafe` +
+/// `future.result()` — Python's `future.result()` releases the GIL
+/// internally while waiting, so the worker thread can drive the coroutine.
+fn submit_to_async_worker(
+    py: Python<'_>,
+    coro: Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let submit = ASYNC_SUBMIT.get()
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Async worker not initialized"))?;
+    submit.call1(py, (coro.bind(py),))
 }
 
 /// Run an async Python handler — tries FAST path first (same-thread), falls back to SLOW path (worker thread).
@@ -79,67 +80,140 @@ pub fn init_async_worker() {
 /// SLOW path (fallback): If handler's DB pool was created on a different event loop
 /// (e.g., in on_event("startup")), we get an event loop mismatch error.
 /// Fall back to the dedicated async worker thread.
+/// Run a coroutine-producing handler where the caller has already built the
+/// coroutine (e.g. via positional args). Shared tail shared with
+/// `call_async_on_local_loop` which builds the coroutine from kwargs.
+pub fn drive_coroutine_on_local_loop(
+    py: Python<'_>,
+    coro: Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
+    match coro.call_method1(py, "send", (py.None(),)) {
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+            let v = e.value(py);
+            return match v.getattr("value") {
+                Ok(val) => Ok(val.unbind()),
+                Err(_) => Ok(py.None()),
+            };
+        }
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py) => {
+            let _ = coro.call_method0(py, "close");
+        }
+        Err(other) => return Err(other),
+        Ok(_) => {
+            let _ = coro.call_method0(py, "close");
+        }
+    }
+    // Handler suspended — route to the dedicated async worker where
+    // loop.run_forever() keeps background tasks (pool housekeeping) alive.
+    init_async_worker();
+    // Re-create coro since the probed one was consumed.
+    submit_to_async_worker(py, coro)
+}
+
+/// Call an async handler with a single positional arg. Used by the WebSocket
+/// bridge — the WS object is passed positionally so user code can rename the
+/// parameter (vLLM uses `websocket`, others use `ws`).
+pub fn call_async_on_local_loop_positional(
+    py: Python<'_>,
+    handler: &Py<PyAny>,
+    arg: Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let coro = handler.call1(py, (arg.bind(py),))?;
+    drive_coroutine_on_local_loop(py, coro)
+}
+
+/// Handler classification — determined on the FIRST call, reused forever.
+/// "sync-fast": completes via StopIteration on send(None) — no I/O.
+/// "needs-worker": suspends on send(None) — real async I/O, route to worker.
+static HANDLER_CLASS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, bool>>> =
+    std::sync::OnceLock::new();
+
+fn handler_class_map() -> &'static std::sync::Mutex<std::collections::HashMap<usize, bool>> {
+    HANDLER_CLASS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 pub fn call_async_on_local_loop(
     py: Python<'_>,
     handler: &Py<PyAny>,
     kwargs: &Bound<'_, PyDict>,
 ) -> PyResult<Py<PyAny>> {
-    // === FAST PATH: run on thread-local event loop (zero cross-thread overhead) ===
-    use std::cell::RefCell;
-    thread_local! {
-        static LOCAL_LOOP: RefCell<Option<Py<PyAny>>> = const { RefCell::new(None) };
-    }
+    let handler_id = handler.as_ptr() as usize;
 
-    let loop_obj = LOCAL_LOOP.with(|cell| -> PyResult<Py<PyAny>> {
-        let mut opt = cell.borrow_mut();
-        if opt.is_none() {
-            let asyncio = py.import("asyncio")?;
-            let new_loop = match py.import("uvloop") {
-                Ok(uvloop) => uvloop.call_method0("new_event_loop")?,
-                Err(_) => asyncio.call_method0("new_event_loop")?,
-            };
-            asyncio.call_method1("set_event_loop", (&new_loop,))?;
-            *opt = Some(new_loop.unbind());
+    // Check cached classification for this handler.
+    let classification = {
+        let map = handler_class_map().lock().unwrap();
+        map.get(&handler_id).copied()
+    };
+
+    match classification {
+        Some(true) => {
+            // === KNOWN SYNC-FAST: probe safely ===
+            let coro = handler.call(py, (), Some(kwargs))?;
+            match coro.call_method1(py, "send", (py.None(),)) {
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                    let v = e.value(py);
+                    return match v.getattr("value") {
+                        Ok(val) => Ok(val.unbind()),
+                        Err(_) => Ok(py.None()),
+                    };
+                }
+                _ => {
+                    // Was fast, now isn't — reclassify as needs-worker.
+                    let mut map = handler_class_map().lock().unwrap();
+                    map.insert(handler_id, false);
+                    let _ = coro.call_method0(py, "close");
+                }
+            }
         }
-        Ok(opt.as_ref().unwrap().clone_ref(py))
-    })?;
-
-    // Create coroutine and run it on the thread-local loop
-    let coro = handler.call(py, (), Some(kwargs))?;
-    let result = loop_obj.call_method1(py, "run_until_complete", (coro.bind(py),));
-
-    match result {
-        Ok(val) => Ok(val),
-        Err(ref e) => {
-            // Check if this is an event loop mismatch error
-            // (pool created on startup event loop, handler running on different thread-local loop)
-            let msg = e.value(py).str().map(|s| s.to_string()).unwrap_or_default();
-            if msg.contains("event loop") || msg.contains("attached to a different loop")
-                || msg.contains("got Future") || msg.contains("is not the current") {
-                // === SLOW PATH: fall back to async worker thread ===
-                init_async_worker();
-
-                // Re-create coroutine (the first one was consumed by the failed run_until_complete)
-                let coro2 = handler.call(py, (), Some(kwargs))?;
-
-                let (result_tx, result_rx) = crossbeam_channel::bounded::<PyResult<Py<PyAny>>>(1);
-                let tx = ASYNC_WORKER_TX.get()
-                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Async worker not initialized"))?;
-
-                tx.send(AsyncRequest { coro: coro2, response_tx: result_tx })
-                    .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Async worker channel closed"))?;
-
-                py.detach(|| {
-                    result_rx.recv()
-                        .unwrap_or_else(|_| Err(pyo3::exceptions::PyRuntimeError::new_err("Async worker died")))
-                })
-            } else {
-                // Real error from the handler — propagate it
-                result
+        Some(false) => {
+            // === KNOWN NEEDS-WORKER: skip probe, go straight to worker ===
+            init_async_worker();
+            let coro = handler.call(py, (), Some(kwargs))?;
+            return submit_to_async_worker(py, coro);
+        }
+        None => {
+            // === FIRST CALL: probe to classify ===
+            let coro = handler.call(py, (), Some(kwargs))?;
+            match coro.call_method1(py, "send", (py.None(),)) {
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                    // Sync-fast — mark and return.
+                    {
+                        let mut map = handler_class_map().lock().unwrap();
+                        map.insert(handler_id, true);
+                    }
+                    let v = e.value(py);
+                    return match v.getattr("value") {
+                        Ok(val) => Ok(val.unbind()),
+                        Err(_) => Ok(py.None()),
+                    };
+                }
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py) => {
+                    // No running event loop — mark as needs-worker.
+                    let mut map = handler_class_map().lock().unwrap();
+                    map.insert(handler_id, false);
+                    let _ = coro.call_method0(py, "close");
+                }
+                Err(other) => return Err(other),
+                Ok(_yielded) => {
+                    // Suspended — mark as needs-worker. On first call this
+                    // is typically asyncpg.create_pool() — no connection
+                    // acquired yet, safe to close.
+                    let mut map = handler_class_map().lock().unwrap();
+                    map.insert(handler_id, false);
+                    let _ = coro.call_method0(py, "close");
+                }
             }
         }
     }
+
+    // Fall through: route to async worker
+    init_async_worker();
+    let coro = handler.call(py, (), Some(kwargs))?;
+    return submit_to_async_worker(py, coro);
 }
+
+
+
 
 // ── Async handler call (background event loop — for WS and legacy) ──
 

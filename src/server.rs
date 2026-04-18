@@ -1,13 +1,239 @@
 use axum::routing::get;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::{Any as CorsAny, CorsLayer};
+use tower_http::cors::{Any as CorsAny, AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
 
 use crate::router::{build_router, RouteInfo};
+
+// ── Static file cache ──────────────────────────────────────────────────
+//
+// Cache small static files (<= 1 MB) in memory keyed by absolute path.
+// We stat the file on each request to check mtime — if it changed, we
+// re-read. Keeps the working set hot while allowing live reloads.
+
+const STATIC_CACHE_MAX_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone)]
+struct CachedFile {
+    bytes: bytes::Bytes,
+    content_type: &'static str,
+    mtime: SystemTime,
+    /// Monotonic instant of the last mtime validation. We revalidate at most
+    /// once per `STATIC_TTL`; within that window, serve from cache without
+    /// hitting the filesystem.
+    validated_at: std::time::Instant,
+}
+
+/// How often to re-check mtime for cached static files. A 1s window is
+/// imperceptible for dev (edit → refresh still works) and eliminates the
+/// `fs::metadata` syscall from the hot path in production.
+const STATIC_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+static STATIC_CACHE: OnceLock<Mutex<HashMap<String, CachedFile>>> = OnceLock::new();
+
+fn static_cache() -> &'static Mutex<HashMap<String, CachedFile>> {
+    STATIC_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mime_for(path: &str) -> &'static str {
+    let p = path.to_ascii_lowercase();
+    let ext = p.rsplit('.').next().unwrap_or("");
+    match ext {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        "txt" => "text/plain; charset=utf-8",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Set of static-mount prefixes ("/static", etc.) — populated at server
+/// start. `slashes_redirect_middleware` fast-paths these so we don't run
+/// the declared-paths check on every static file request.
+static STATIC_PREFIXES: OnceLock<Vec<String>> = OnceLock::new();
+
+/// A tower Service that serves small files from memory with an mtime
+/// check, falling back to `ServeDir` for large files, range requests,
+/// and anything unusual. Uses `ServeDir` as its fallback inner service.
+#[derive(Clone)]
+struct CachedServeDir {
+    root: std::path::PathBuf,
+    inner: ServeDir,
+}
+
+impl CachedServeDir {
+    fn new(_prefix: &str, root: std::path::PathBuf) -> Self {
+        let inner = ServeDir::new(&root);
+        Self { root, inner }
+    }
+}
+
+impl<B> tower::Service<axum::http::Request<B>> for CachedServeDir
+where
+    B: axum::body::HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    <ServeDir as tower::Service<axum::http::Request<B>>>::Future: Send + 'static,
+    <ServeDir as tower::Service<axum::http::Request<B>>>::Response:
+        axum::response::IntoResponse + Send + 'static,
+    <ServeDir as tower::Service<axum::http::Request<B>>>::Error: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = <ServeDir as tower::Service<axum::http::Request<B>>>::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        <ServeDir as tower::Service<axum::http::Request<B>>>::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<B>) -> Self::Future {
+        let method = req.method().clone();
+        let has_range = req.headers().contains_key(axum::http::header::RANGE);
+        // NOTE: axum's `nest_service` strips the mount prefix before passing
+        // the request to the inner service, so `req.uri().path()` here is
+        // already relative (e.g., "/style.css" for "/static/style.css").
+        let path = req.uri().path().to_string();
+
+        // Only attempt cache for plain GET / HEAD without Range.
+        if !has_range
+            && (method == axum::http::Method::GET || method == axum::http::Method::HEAD)
+        {
+            let rel_clean = path.trim_start_matches('/');
+            // Reject attempts to escape the root via ".."
+            if rel_clean.split('/').any(|c| c == "..") {
+                // Fall through to ServeDir which handles the 403 properly.
+                let fut = self.inner.call(req);
+                return Box::pin(async move {
+                    let resp = fut.await?;
+                    Ok(axum::response::IntoResponse::into_response(resp))
+                });
+            }
+            let full_path = self.root.join(rel_clean);
+
+            // Try the cache — fast path for small, unchanged files.
+            if let Ok(full_str) = full_path.to_str().ok_or(()).map(str::to_owned) {
+                let cache = static_cache();
+                let cached = {
+                    let g = cache.lock().unwrap();
+                    g.get(&full_str).cloned()
+                };
+
+                if let Some(cf) = cached {
+                    let now = std::time::Instant::now();
+                    // TTL-skip path: if the mtime was validated recently,
+                    // skip the fs::metadata syscall entirely. This is the
+                    // hot loop for cached static serving.
+                    if now.duration_since(cf.validated_at) < STATIC_TTL {
+                        let body = if method == axum::http::Method::HEAD {
+                            axum::body::Body::empty()
+                        } else {
+                            axum::body::Body::from(cf.bytes.clone())
+                        };
+                        return Box::pin(async move {
+                            Ok(axum::response::Response::builder()
+                                .status(axum::http::StatusCode::OK)
+                                .header("content-type", cf.content_type)
+                                .header("content-length", cf.bytes.len())
+                                .body(body)
+                                .unwrap())
+                        });
+                    }
+                    // TTL expired — revalidate mtime
+                    if let Ok(meta) = std::fs::metadata(&full_path) {
+                        if let Ok(mt) = meta.modified() {
+                            if mt == cf.mtime {
+                                // Bump validated_at so we skip metadata checks again
+                                let mut g = cache.lock().unwrap();
+                                if let Some(entry) = g.get_mut(&full_str) {
+                                    entry.validated_at = now;
+                                }
+                                drop(g);
+                                let body = if method == axum::http::Method::HEAD {
+                                    axum::body::Body::empty()
+                                } else {
+                                    axum::body::Body::from(cf.bytes.clone())
+                                };
+                                return Box::pin(async move {
+                                    Ok(axum::response::Response::builder()
+                                        .status(axum::http::StatusCode::OK)
+                                        .header("content-type", cf.content_type)
+                                        .header("content-length", cf.bytes.len())
+                                        .body(body)
+                                        .unwrap())
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Cache miss — if the file is small, read + insert now
+                if let Ok(meta) = std::fs::metadata(&full_path) {
+                    if meta.is_file() && meta.len() <= STATIC_CACHE_MAX_BYTES {
+                        if let Ok(bytes) = std::fs::read(&full_path) {
+                            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                            let ct = mime_for(&full_str);
+                            let len = bytes.len();
+                            let bytes = bytes::Bytes::from(bytes);
+                            {
+                                let mut g = cache.lock().unwrap();
+                                g.insert(full_str, CachedFile {
+                                    bytes: bytes.clone(),
+                                    content_type: ct,
+                                    mtime,
+                                    validated_at: std::time::Instant::now(),
+                                });
+                            }
+                            let body = if method == axum::http::Method::HEAD {
+                                axum::body::Body::empty()
+                            } else {
+                                axum::body::Body::from(bytes)
+                            };
+                            return Box::pin(async move {
+                                Ok(axum::response::Response::builder()
+                                    .status(axum::http::StatusCode::OK)
+                                    .header("content-type", ct)
+                                    .header("content-length", len)
+                                    .body(body)
+                                    .unwrap())
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: delegate to ServeDir for range requests, large files,
+        // directory listings, error cases.
+        let fut = self.inner.call(req);
+        Box::pin(async move {
+            let resp = fut.await?;
+            Ok(axum::response::IntoResponse::into_response(resp))
+        })
+    }
+}
 
 // ── OpenAPI / documentation HTML templates ─────────────────────────
 
@@ -50,7 +276,7 @@ const REDOC_HTML: &str = r#"<!DOCTYPE html>
 ///
 /// This function blocks until the server shuts down (Ctrl-C).
 #[pyfunction]
-#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![], root_path=None))]
+#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![], root_path=None, redirect_slashes=true, max_request_size=None, not_found_handler=None, app=None, validation_handler=None))]
 pub fn run_server(
     py: Python<'_>,
     routes: Vec<RouteInfo>,
@@ -63,7 +289,27 @@ pub fn run_server(
     openapi_url: Option<String>,
     static_mounts: Vec<(String, String)>,
     root_path: Option<String>,
+    redirect_slashes: bool,
+    max_request_size: Option<usize>,
+    not_found_handler: Option<Py<PyAny>>,
+    app: Option<Py<PyAny>>,
+    validation_handler: Option<Py<PyAny>>,
 ) -> PyResult<()> {
+    // Stash the user's 404 handler so the Rust Router fallback can dispatch
+    // through Python when nothing else matched. Set once per process.
+    if let Some(h) = not_found_handler {
+        let _ = crate::router::NOT_FOUND_HANDLER.set(h);
+    }
+    // Stash the FastAPI app instance so Request objects injected into handlers
+    // expose request.app (vLLM / SGLang read request.app.state heavily).
+    if let Some(a) = app {
+        let _ = crate::router::APP_INSTANCE.set(a);
+    }
+    // Stash the validation-error dispatcher so body/query/path validation
+    // failures route through `@exception_handler(RequestValidationError)`.
+    if let Some(h) = validation_handler {
+        let _ = crate::router::VALIDATION_HANDLER.set(h);
+    }
     // Parse middleware config while we still have the GIL
     let mw_configs = parse_middleware_configs(py, &middlewares)?;
 
@@ -75,8 +321,15 @@ pub fn run_server(
             ))
         })?;
 
+        // Record declared paths for the redirect_slashes middleware.
+        {
+            use std::collections::HashSet;
+            let set: HashSet<String> = routes.iter().map(|r| r.path.clone()).collect();
+            let _ = DECLARED_PATHS.set(set);
+        }
+
         rt.block_on(async move {
-            let mut router = build_router(routes);
+            let (mut router, ws_router) = build_router(routes);
 
             // Pure Rust baseline endpoints — zero Python
             router = router.route("/_ping", get(|| async {
@@ -133,23 +386,58 @@ pub fn run_server(
                 }
             }
 
-            // Mount static file directories
+            // Register prefixes so the redirect_slashes middleware can
+            // short-circuit for static file requests.
+            let prefix_list: Vec<String> = static_mounts
+                .iter()
+                .map(|(p, _)| p.trim_end_matches('/').to_string())
+                .collect();
+            let _ = STATIC_PREFIXES.set(prefix_list.clone());
+
+            // FastAPI/Starlette semantics: root_path is metadata only — it is
+            // advertised in OpenAPI `servers` and used by `url_for`, but the
+            // routing layer always matches paths as-written. The ASGI server or
+            // reverse proxy is responsible for stripping the prefix before the
+            // request reaches us. vLLM relies on this behaviour.
+            let _ = &root_path;
+
+            // Apply app-level middleware (CORS, GZip, etc.) to the MAIN
+            // (HTTP) router. WebSocket routes are merged in AFTER middleware
+            // so they bypass the CORS/compression stack — tower-http's
+            // CorsLayer mutates the 101 Switching Protocols upgrade response
+            // and breaks the WS handshake when applied to WS routes.
+            let main_with_mw = apply_middlewares(router, &mw_configs);
+            // Merge WS routes in at the top level (no CORS). Then attach the
+            // FastAPI-style 404 fallback so it only fires when neither the
+            // HTTP nor WS branches matched.
+            let main_with_mw = crate::router::with_not_found_fallback(
+                ws_router.merge(main_with_mw)
+            );
+            let mut app = axum::Router::new();
             for (prefix, directory) in &static_mounts {
-                router = router.nest_service(prefix, ServeDir::new(directory));
+                let svc = CachedServeDir::new(prefix, std::path::PathBuf::from(directory));
+                app = app.nest_service(prefix, svc);
+            }
+            let mut app = app.fallback_service(main_with_mw);
+
+            // redirect_slashes: trailing-slash redirect middleware.
+            // Matches Starlette's `redirect_slashes=True` default.
+            if redirect_slashes {
+                app = app.layer(axum::middleware::from_fn(slashes_redirect_middleware));
             }
 
-            // Nest the entire app under root_path if specified (reverse proxy support)
-            let router = if let Some(ref prefix) = root_path {
-                if !prefix.is_empty() && prefix != "/" {
-                    axum::Router::new().nest(prefix, router)
-                } else {
-                    router
-                }
-            } else {
-                router
-            };
+            // Non-preflight OPTIONS: FastAPI/Starlette's CORS intercepts
+            // only actual cross-origin preflights (request has both
+            // `Origin` AND `Access-Control-Request-Method`). tower-http's
+            // CorsLayer is more lenient and returns 200 for any OPTIONS.
+            // We add a pre-middleware that lets OPTIONS *without* those
+            // headers fall through to method routing (→ 405 as expected).
+            app = app.layer(axum::middleware::from_fn(non_preflight_options_middleware));
 
-            let app = apply_middlewares(router, &mw_configs);
+            // max_request_size: 413 Payload Too Large on oversized bodies.
+            if let Some(limit) = max_request_size {
+                app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(limit));
+            }
 
             let addr = format!("{host}:{port}");
             let listener = TcpListener::bind(&addr).await.map_err(|e| {
@@ -172,6 +460,110 @@ pub fn run_server(
             Ok(())
         })
     })
+}
+
+/// Set of *declared* paths (verbatim) from the user's routes. Used by the
+/// redirect_slashes middleware to decide whether the alternate form of a
+/// requested URL is an actual registered route before redirecting.
+static DECLARED_PATHS: std::sync::OnceLock<std::collections::HashSet<String>> =
+    std::sync::OnceLock::new();
+
+/// Pass-through middleware for non-preflight OPTIONS. Tower-http's
+/// ``CorsLayer`` intercepts *every* OPTIONS request with configured
+/// ``allow_methods`` and returns 200 — FastAPI/Starlette only do that
+/// for true preflights (request carrying both ``Origin`` and
+/// ``Access-Control-Request-Method`` headers). Here we detect the
+/// non-preflight case and strip the method to something the CORS layer
+/// ignores, effectively routing through to the normal method handler.
+async fn non_preflight_options_middleware(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.method() == axum::http::Method::OPTIONS {
+        let has_origin = req.headers().contains_key("origin");
+        let has_acrm = req.headers().contains_key("access-control-request-method");
+        if !(has_origin && has_acrm) {
+            // Not a preflight — bypass CORS by bolting a short-circuit
+            // response that matches FastAPI's 405 behavior for OPTIONS on
+            // non-OPTIONS routes. The inner router would produce 405 too,
+            // but since CorsLayer sits between us and the router and will
+            // override with 200, we just emit the 405 directly.
+            return axum::response::Response::builder()
+                .status(axum::http::StatusCode::METHOD_NOT_ALLOWED)
+                .header("content-type", "application/json")
+                .header("allow", "GET, POST, PUT, DELETE, PATCH, HEAD")
+                .body(axum::body::Body::from(r#"{"detail":"Method Not Allowed"}"#))
+                .unwrap();
+        }
+    }
+    next.run(req).await
+}
+
+/// Middleware that 307-redirects between `/foo` ↔ `/foo/` ONLY when the
+/// alternate form matches a declared route. Matches Starlette's
+/// `redirect_slashes=True` behaviour. Implemented as a pre-filter: we check
+/// the declared-paths set before handing off to the inner router.
+async fn slashes_redirect_middleware(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // Work with the URI path as a &str — avoid allocating a String on the
+    // common hot path where we immediately fall through to next.run.
+    let path: &str = req.uri().path();
+
+    // Skip root / empty — most common static-serve case also hits here.
+    if path.len() <= 1 {
+        return next.run(req).await;
+    }
+    // Static mount prefixes never redirect.
+    if let Some(prefixes) = STATIC_PREFIXES.get() {
+        for p in prefixes {
+            if path.starts_with(p.as_str()) {
+                return next.run(req).await;
+            }
+        }
+    }
+    let declared = match DECLARED_PATHS.get() {
+        Some(s) => s,
+        None => return next.run(req).await,
+    };
+    // HashSet<String>::contains(&str) via Borrow<str> — zero-alloc lookup.
+    if declared.contains(path) {
+        return next.run(req).await;
+    }
+
+    // Only at this point do we potentially allocate (to build the alt form).
+    let alternate: String = if path.ends_with('/') {
+        path[..path.len() - 1].to_string()
+    } else {
+        format!("{path}/")
+    };
+
+    if !declared.contains(&alternate) {
+        return next.run(req).await;
+    }
+
+    // Only redirect safe methods — POST/PUT/DELETE with body should not be
+    // silently redirected (client must re-issue to canonical URL).
+    if !matches!(
+        req.method(),
+        &axum::http::Method::GET | &axum::http::Method::HEAD
+    ) {
+        return next.run(req).await;
+    }
+
+    // Preserve query string in the redirect target
+    let mut redirect_to = alternate;
+    if let Some(q) = req.uri().query() {
+        redirect_to.push('?');
+        redirect_to.push_str(q);
+    }
+
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::TEMPORARY_REDIRECT)
+        .header("location", redirect_to)
+        .body(axum::body::Body::empty())
+        .unwrap()
 }
 
 /// Wait for Ctrl-C (SIGINT).
@@ -210,7 +602,7 @@ fn parse_middleware_configs(
 
     for mw_obj in middlewares {
         let mw = mw_obj.bind(py);
-        let dict = mw.downcast::<PyDict>()?;
+        let dict = mw.cast::<PyDict>()?;
 
         let mw_type: String = dict
             .get_item("type")?
@@ -421,9 +813,21 @@ fn build_cors_layer(
 
     let mut cors = CorsLayer::new();
 
+    // When allow_credentials=true is combined with a wildcard spec for
+    // origins, methods or headers, tower-http refuses and panics. Starlette's
+    // CORSMiddleware quietly handles this by *mirroring* the request's value.
+    // Match Starlette semantics so users who write the common
+    //   CORSMiddleware(allow_origins=["*"], allow_credentials=True, ...)
+    // (which vLLM and SGLang both do) don't get a surprise panic.
+    let mirror_for_credentials = allow_credentials;
+
     // Origins
     if allow_origins.iter().any(|o| o == "*") {
-        cors = cors.allow_origin(CorsAny);
+        if mirror_for_credentials {
+            cors = cors.allow_origin(AllowOrigin::mirror_request());
+        } else {
+            cors = cors.allow_origin(CorsAny);
+        }
     } else if !allow_origins.is_empty() {
         let origins: Vec<http::HeaderValue> = allow_origins
             .iter()
@@ -434,7 +838,11 @@ fn build_cors_layer(
 
     // Methods
     if allow_methods.iter().any(|m| m == "*") {
-        cors = cors.allow_methods(CorsAny);
+        if mirror_for_credentials {
+            cors = cors.allow_methods(AllowMethods::mirror_request());
+        } else {
+            cors = cors.allow_methods(CorsAny);
+        }
     } else if !allow_methods.is_empty() {
         let methods: Vec<Method> = allow_methods
             .iter()
@@ -445,7 +853,11 @@ fn build_cors_layer(
 
     // Headers
     if allow_headers.iter().any(|h| h == "*") {
-        cors = cors.allow_headers(CorsAny);
+        if mirror_for_credentials {
+            cors = cors.allow_headers(AllowHeaders::mirror_request());
+        } else {
+            cors = cors.allow_headers(CorsAny);
+        }
     } else if !allow_headers.is_empty() {
         let headers: Vec<HeaderName> = allow_headers
             .iter()

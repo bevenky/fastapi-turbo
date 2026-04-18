@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
 
 /// Server configuration exposed to Python.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     #[pyo3(get, set)]

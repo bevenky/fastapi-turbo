@@ -14,8 +14,42 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
+
+/// Cached `fastapi_rs.exceptions.WebSocketDisconnect` class — used by the
+/// receive awaitables to raise the correct typed exception without the
+/// Python-side `try/except` translation layer.
+static WS_DISCONNECT_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
+
+fn ws_disconnect_class(py: Python<'_>) -> Option<&'static Py<PyAny>> {
+    if let Some(c) = WS_DISCONNECT_CLS.get() {
+        return Some(c);
+    }
+    let exc = py.import("fastapi_rs.exceptions").ok()?;
+    let cls: Py<PyAny> = exc.getattr("WebSocketDisconnect").ok()?.unbind();
+    let _ = WS_DISCONNECT_CLS.set(cls);
+    WS_DISCONNECT_CLS.get()
+}
+
+fn disconnect_err(py: Python<'_>, code: u16, reason: &str) -> PyErr {
+    match ws_disconnect_class(py) {
+        Some(cls) => {
+            let kwargs = pyo3::types::PyDict::new(py);
+            let _ = kwargs.set_item("code", code);
+            let _ = kwargs.set_item("reason", reason);
+            match cls.bind(py).call((), Some(&kwargs)) {
+                Ok(exc) => PyErr::from_value(exc),
+                Err(_) => pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("WS_CLOSED:{code}:{reason}")
+                ),
+            }
+        }
+        None => pyo3::exceptions::PyRuntimeError::new_err(
+            format!("WS_CLOSED:{code}:{reason}")
+        ),
+    }
+}
 
 use crate::handler_bridge;
 
@@ -39,7 +73,8 @@ pub struct WsScopeInfo {
 pub const STATE_CONNECTING: u8 = 0;
 pub const STATE_CONNECTED: u8 = 1;
 pub const STATE_DISCONNECTED: u8 = 2;
-pub const STATE_RESPONSE: u8 = 3;
+// Note: Starlette also defines STATE_RESPONSE = 3 for when a WS handler
+// returns an HTTP response instead of upgrading. We don't yet emit that.
 
 // ── Typed message enum ────────────────────────────────────────────
 
@@ -118,8 +153,9 @@ impl TextAwaitable {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
 
     /// Returns str directly — fast path for receive_text().
-    /// On Close, raises RuntimeError with message "WS_CLOSED:<code>:<reason>"
-    /// so the Python layer can extract the real close code.
+    /// On Close, raises a proper `WebSocketDisconnect` with code + reason
+    /// so the Python handler can catch it with one `except` clause — no
+    /// Python-side exception translation wrapper needed.
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let rx = self.rx.clone();
         let state = self.state.clone();
@@ -135,9 +171,7 @@ impl TextAwaitable {
             }
             WsMessage::Close { code, reason } => {
                 self.state.store(STATE_DISCONNECTED, Ordering::Release);
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("WS_CLOSED:{code}:{reason}")
-                ));
+                return Err(disconnect_err(py, code, &reason));
             }
         };
         Err(pyo3::exceptions::PyStopIteration::new_err(value))
@@ -156,8 +190,7 @@ impl BytesAwaitable {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
 
     /// Returns bytes directly — fast path for receive_bytes().
-    /// Zero-copy from axum's Bytes → PyBytes (one allocation for the PyBytes).
-    /// On Close, raises RuntimeError with message "WS_CLOSED:<code>:<reason>".
+    /// On Close, raises `WebSocketDisconnect` directly.
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let rx = self.rx.clone();
         let state = self.state.clone();
@@ -167,9 +200,7 @@ impl BytesAwaitable {
             WsMessage::Text(s) => PyBytes::new(py, s.as_bytes()).into_any().unbind(),
             WsMessage::Close { code, reason } => {
                 self.state.store(STATE_DISCONNECTED, Ordering::Release);
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("WS_CLOSED:{code}:{reason}")
-                ));
+                return Err(disconnect_err(py, code, &reason));
             }
         };
         Err(pyo3::exceptions::PyStopIteration::new_err(value))
@@ -588,15 +619,27 @@ pub async fn handle_ws_upgrade(
         ws_cls.call1((ws_cell,)).expect("wrap").unbind()
     });
 
-    let mut kwargs: HashMap<String, Py<PyAny>> = HashMap::new();
-    kwargs.insert("websocket".to_string(), ws_obj);
-
-    tokio::spawn(async move {
-        if is_async {
-            let _ = handler_bridge::call_async_via_event_loop_pub(handler, kwargs).await;
-        } else {
-            let _ = handler_bridge::call_sync_handler(handler, kwargs).await;
-        }
+    // Run the Python WS handler on a DEDICATED blocking thread via
+    // `spawn_blocking`. This ensures the handler, its thread-local event
+    // loop, and the WS I/O select task stay on a stable thread boundary
+    // (the I/O task runs on the tokio worker, the handler runs in its own
+    // thread). Previously we routed through the global event-loop thread
+    // (`call_async_via_event_loop_pub`), which added a cross-thread wake
+    // for every await — ~5-8 μs per message in tight echo loops.
+    //
+    // The WS object is passed POSITIONALLY so user-defined parameter
+    // names work regardless of what they call it (`ws`, `websocket`,
+    // `conn`, ...). vLLM uses `websocket`; SGLang would use whatever.
+    tokio::task::spawn_blocking(move || {
+        Python::attach(|py| {
+            if is_async {
+                let _ = handler_bridge::call_async_on_local_loop_positional(
+                    py, &handler, ws_obj,
+                );
+            } else {
+                let _ = handler.call1(py, (ws_obj.bind(py),));
+            }
+        });
     });
 
     // Wait for the Python handler to call accept(). Bound with a timeout so
@@ -624,67 +667,89 @@ pub async fn handle_ws_upgrade(
     if let Some(ref proto) = params.subprotocol {
         upgrade = upgrade.protocols([proto.clone()]);
     }
-    // Note: custom response headers from `headers=...` aren't directly supported
-    // by axum's WebSocketUpgrade API without dropping to hyper — those are tracked
-    // but not emitted on the handshake response today. Subprotocol works.
-    let _ = params.headers; // consumed but not yet emitted
+    let extra_headers = params.headers.clone();
 
     // Now perform the upgrade. on_upgrade returns a Response (101 Switching Protocols);
     // the closure runs AFTER hyper completes the TCP upgrade.
     let state_clone = state.clone();
-    upgrade.on_upgrade(move |socket| async move {
+    let mut response = upgrade.on_upgrade(move |socket| async move {
         use futures_util::{SinkExt, StreamExt};
         let (mut ws_tx, mut ws_rx) = socket.split();
-
-        // Writer task
+        let state_r = state_clone;
         let mut rx_out = rx_out;
+
+        // Signal Python that the WS is ready BEFORE entering the loop —
+        // Python's accept() unblocks and may start sending immediately.
+        let _ = ready_tx.send(());
+
+        // SINGLE task handles both read and write via tokio::select!.
+        // Avoids the inter-task wake-up penalty that cost ~5-8 μs per
+        // message round-trip when reader and writer were separate tasks.
         tokio::spawn(async move {
-            while let Some(cmd) = rx_out.recv().await {
-                match cmd {
-                    WriterCmd::Send(msg) => {
-                        if ws_tx.send(msg).await.is_err() {
-                            break;
+            loop {
+                tokio::select! {
+                    biased; // Favour writes (queued by Python) over reads to
+                            // minimise perceived echo-loop latency.
+                    maybe_cmd = rx_out.recv() => {
+                        match maybe_cmd {
+                            Some(WriterCmd::Send(msg)) => {
+                                if ws_tx.send(msg).await.is_err() { break; }
+                            }
+                            Some(WriterCmd::Flush(tx)) => {
+                                let _ = tx.send(());
+                            }
+                            None => break,  // channel closed
                         }
                     }
-                    WriterCmd::Flush(tx) => {
-                        // All previous Send messages have been flushed before we
-                        // reach this Flush command (channel is FIFO). Signal.
-                        let _ = tx.send(());
+                    maybe_result = ws_rx.next() => {
+                        let result = match maybe_result {
+                            Some(r) => r,
+                            None => break,
+                        };
+                        let msg = match result {
+                            Ok(m) => m,
+                            Err(_) => break,
+                        };
+                        let ws_msg = match msg {
+                            Message::Text(t) => WsMessage::Text(t.to_string()),
+                            Message::Binary(b) => WsMessage::Binary(b),
+                            Message::Close(frame) => {
+                                let (code, reason) = frame
+                                    .map(|f| (f.code.into(), f.reason.to_string()))
+                                    .unwrap_or((1000u16, String::new()));
+                                let _ = cb_tx.send(WsMessage::Close { code, reason });
+                                state_r.store(STATE_DISCONNECTED, Ordering::Release);
+                                break;
+                            }
+                            _ => continue, // Ping/Pong handled by axum
+                        };
+                        if cb_tx.send(ws_msg).is_err() { break; }
                     }
                 }
             }
         });
+    });
 
-        // Reader task
-        let state_r = state_clone;
-        tokio::spawn(async move {
-            while let Some(result) = ws_rx.next().await {
-                let msg = match result {
-                    Ok(m) => m,
-                    Err(_) => break,
-                };
-                let ws_msg = match msg {
-                    Message::Text(t) => WsMessage::Text(t.to_string()),
-                    Message::Binary(b) => WsMessage::Binary(b),
-                    Message::Close(frame) => {
-                        let (code, reason) = frame
-                            .map(|f| (f.code.into(), f.reason.to_string()))
-                            .unwrap_or((1000u16, String::new()));
-                        let _ = cb_tx.send(WsMessage::Close { code, reason });
-                        state_r.store(STATE_DISCONNECTED, Ordering::Release);
-                        break;
-                    }
-                    _ => continue, // Ping/Pong handled by axum
-                };
-                if cb_tx.send(ws_msg).is_err() {
-                    break;
+    // Inject custom headers from `accept(headers=...)` into the 101 response.
+    // This lets WS handlers set headers like Set-Cookie during the handshake,
+    // matching Starlette's accept(headers=...) API.
+    {
+        let hdrs = response.headers_mut();
+        for (name, value) in extra_headers {
+            if let (Ok(hn), Ok(hv)) = (
+                axum::http::HeaderName::from_bytes(name.as_bytes()),
+                axum::http::HeaderValue::from_str(&value),
+            ) {
+                if hn.as_str().eq_ignore_ascii_case("set-cookie") {
+                    hdrs.append(hn, hv);
+                } else {
+                    hdrs.insert(hn, hv);
                 }
             }
-        });
+        }
+    }
 
-        // Signal Python that the WS is ready — its accept() call returns now.
-        let _ = ready_tx.send(());
-    })
+    response
 }
 
 /// Backward-compat alias — old code path took a fully-upgraded WebSocket.

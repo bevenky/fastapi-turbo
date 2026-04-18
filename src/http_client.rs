@@ -52,7 +52,7 @@ where
 
 /// Raw HTTP response from the Rust transport.
 /// Converted to a full Python Response object in http.py.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct RawResponse {
     #[pyo3(get)]

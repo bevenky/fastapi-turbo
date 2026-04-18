@@ -4,6 +4,7 @@ mod config;
 mod db_pool;
 mod handler_bridge;
 mod http_client;
+mod multipart;
 mod responses;
 mod router;
 mod server;
@@ -39,5 +40,8 @@ fn _fastapi_rs_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<db_pool::PyPool>()?;
     m.add_class::<http_client::RustTransport>()?;
     m.add_class::<http_client::RawResponse>()?;
+    m.add_class::<multipart::PyUploadFile>()?;
+    m.add_class::<multipart::ImmediateBytes>()?;
+    m.add_class::<multipart::ImmediateNone>()?;
     Ok(())
 }
