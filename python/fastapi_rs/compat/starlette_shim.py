@@ -7,6 +7,7 @@ to fastapi-rs implementations.
 from __future__ import annotations
 
 import types
+import typing
 from typing import Any
 
 
@@ -36,13 +37,18 @@ def _build() -> dict[str, types.ModuleType]:
         m.__package__ = name
         return m
 
+    import fastapi_rs._starlette_compat as _sc
+
     # ── starlette (top-level) ──────────────────────────────────────
     starlette = _mod("starlette")
+    # Expose a version string so `starlette.__version__` works.
+    starlette.__version__ = "1.0.0"  # type: ignore[attr-defined]
     modules["starlette"] = starlette
 
     # ── starlette.requests ─────────────────────────────────────────
     starlette_requests = _mod("starlette.requests")
     starlette_requests.Request = _requests.Request  # type: ignore[attr-defined]
+    starlette_requests.HTTPConnection = _requests.HTTPConnection  # type: ignore[attr-defined]
     modules["starlette.requests"] = starlette_requests
 
     # ── starlette.responses ────────────────────────────────────────
@@ -58,10 +64,26 @@ def _build() -> dict[str, types.ModuleType]:
 
     # ── starlette.routing ──────────────────────────────────────────
     starlette_routing = _mod("starlette.routing")
-    starlette_routing.Route = _routing.APIRoute  # type: ignore[attr-defined]
+    starlette_routing.Route = _sc.Route  # type: ignore[attr-defined]
+    starlette_routing.WebSocketRoute = _sc.WebSocketRoute  # type: ignore[attr-defined]
+    starlette_routing.Mount = _sc.Mount  # type: ignore[attr-defined]
+    starlette_routing.Host = _sc.Host  # type: ignore[attr-defined]
     starlette_routing.Router = _routing.APIRouter  # type: ignore[attr-defined]
     starlette_routing.APIRoute = _routing.APIRoute  # type: ignore[attr-defined]
     starlette_routing.APIRouter = _routing.APIRouter  # type: ignore[attr-defined]
+    # Stubs for BaseRoute, Match, NoMatchFound
+    import enum as _enum
+    class BaseRoute:
+        pass
+    class Match(_enum.Enum):
+        NONE = 0
+        PARTIAL = 1
+        FULL = 2
+    class NoMatchFound(Exception):
+        pass
+    starlette_routing.BaseRoute = BaseRoute  # type: ignore[attr-defined]
+    starlette_routing.Match = Match  # type: ignore[attr-defined]
+    starlette_routing.NoMatchFound = NoMatchFound  # type: ignore[attr-defined]
     modules["starlette.routing"] = starlette_routing
 
     # ── starlette.exceptions ───────────────────────────────────────
@@ -81,11 +103,51 @@ def _build() -> dict[str, types.ModuleType]:
     # ── starlette.datastructures ───────────────────────────────────
     starlette_ds = _mod("starlette.datastructures")
     starlette_ds.URL = _datastructures.URL  # type: ignore[attr-defined]
+    starlette_ds.URLPath = _datastructures.URLPath  # type: ignore[attr-defined]
     starlette_ds.Headers = _datastructures.Headers  # type: ignore[attr-defined]
+    starlette_ds.MutableHeaders = _datastructures.MutableHeaders  # type: ignore[attr-defined]
     starlette_ds.QueryParams = _datastructures.QueryParams  # type: ignore[attr-defined]
     starlette_ds.Address = _datastructures.Address  # type: ignore[attr-defined]
     starlette_ds.State = _datastructures.State  # type: ignore[attr-defined]
+    starlette_ds.FormData = _datastructures.FormData  # type: ignore[attr-defined]
+    starlette_ds.Secret = _datastructures.Secret  # type: ignore[attr-defined]
     starlette_ds.UploadFile = fastapi_rs.UploadFile  # type: ignore[attr-defined]
+    # Stubs for ImmutableMultiDict, MultiDict, CommaSeparatedStrings
+    class ImmutableMultiDict(dict):
+        """Stub for starlette.datastructures.ImmutableMultiDict."""
+        def getlist(self, key):
+            val = self.get(key)
+            if val is None:
+                return []
+            if isinstance(val, list):
+                return val
+            return [val]
+        def multi_items(self):
+            for k, v in self.items():
+                if isinstance(v, list):
+                    for item in v:
+                        yield k, item
+                else:
+                    yield k, v
+    class MultiDict(ImmutableMultiDict):
+        """Mutable variant of ImmutableMultiDict."""
+        pass
+    class CommaSeparatedStrings:
+        """String that splits on commas, iterates over parts."""
+        def __init__(self, value=""):
+            if isinstance(value, (list, tuple)):
+                self._items = list(value)
+            else:
+                self._items = [item.strip() for item in str(value).split(",") if item.strip()]
+        def __iter__(self):
+            return iter(self._items)
+        def __len__(self):
+            return len(self._items)
+        def __repr__(self):
+            return f"CommaSeparatedStrings({self._items!r})"
+    starlette_ds.ImmutableMultiDict = ImmutableMultiDict  # type: ignore[attr-defined]
+    starlette_ds.MultiDict = MultiDict  # type: ignore[attr-defined]
+    starlette_ds.CommaSeparatedStrings = CommaSeparatedStrings  # type: ignore[attr-defined]
     modules["starlette.datastructures"] = starlette_ds
 
     # ── starlette.status ───────────────────────────────────────────
@@ -100,6 +162,14 @@ def _build() -> dict[str, types.ModuleType]:
     starlette_concurrency = _mod("starlette.concurrency")
     starlette_concurrency.run_in_threadpool = _concurrency.run_in_threadpool  # type: ignore[attr-defined]
     starlette_concurrency.iterate_in_threadpool = _concurrency.iterate_in_threadpool  # type: ignore[attr-defined]
+    async def _run_until_first_complete(*args):
+        import asyncio
+        tasks = [asyncio.ensure_future(func(**kwargs)) for func, kwargs in args]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        return [(task, task.result() if task.done() and not task.cancelled() else None) for task in done]
+    starlette_concurrency.run_until_first_complete = _run_until_first_complete  # type: ignore[attr-defined]
     modules["starlette.concurrency"] = starlette_concurrency
 
     # ── starlette.background ───────────────────────────────────────
@@ -110,7 +180,75 @@ def _build() -> dict[str, types.ModuleType]:
 
     # ── starlette.middleware ───────────────────────────────────────
     starlette_middleware = _mod("starlette.middleware")
+    starlette_middleware.Middleware = _sc.Middleware  # type: ignore[attr-defined]
     modules["starlette.middleware"] = starlette_middleware
+
+    # ── starlette.middleware.errors ────────────────────────────────
+    starlette_mw_errors = _mod("starlette.middleware.errors")
+    starlette_mw_errors.ServerErrorMiddleware = _sc.ServerErrorMiddleware  # type: ignore[attr-defined]
+    modules["starlette.middleware.errors"] = starlette_mw_errors
+
+    # ── starlette.middleware.exceptions ────────────────────────────
+    starlette_mw_exc = _mod("starlette.middleware.exceptions")
+    starlette_mw_exc.ExceptionMiddleware = _sc.ExceptionMiddleware  # type: ignore[attr-defined]
+    modules["starlette.middleware.exceptions"] = starlette_mw_exc
+
+    # ── starlette.middleware.wsgi ──────────────────────────────────
+    starlette_mw_wsgi = _mod("starlette.middleware.wsgi")
+    starlette_mw_wsgi.WSGIMiddleware = _sc.WSGIMiddleware  # type: ignore[attr-defined]
+    modules["starlette.middleware.wsgi"] = starlette_mw_wsgi
+
+    # ── starlette.types ────────────────────────────────────────────
+    starlette_types = _mod("starlette.types")
+    starlette_types.ASGIApp = _sc.ASGIApp  # type: ignore[attr-defined]
+    starlette_types.Receive = _sc.Receive  # type: ignore[attr-defined]
+    starlette_types.Send = _sc.Send  # type: ignore[attr-defined]
+    starlette_types.Scope = _sc.Scope  # type: ignore[attr-defined]
+    starlette_types.Message = _sc.Message  # type: ignore[attr-defined]
+    starlette_types.Lifespan = typing.Any  # type: ignore[attr-defined]
+    starlette_types.StatefulLifespan = typing.Any  # type: ignore[attr-defined]
+    starlette_types.StatelessLifespan = typing.Any  # type: ignore[attr-defined]
+    starlette_types.ExceptionHandler = typing.Any  # type: ignore[attr-defined]
+    starlette_types.HTTPExceptionHandler = typing.Any  # type: ignore[attr-defined]
+    starlette_types.WebSocketExceptionHandler = typing.Any  # type: ignore[attr-defined]
+    starlette_types.AppType = typing.TypeVar("AppType")  # type: ignore[attr-defined]
+    modules["starlette.types"] = starlette_types
+
+    # ── starlette.convertors ───────────────────────────────────────
+    starlette_convertors = _mod("starlette.convertors")
+    starlette_convertors.Convertor = _sc.Convertor  # type: ignore[attr-defined]
+    starlette_convertors.StringConvertor = _sc.StringConvertor  # type: ignore[attr-defined]
+    starlette_convertors.PathConvertor = _sc.PathConvertor  # type: ignore[attr-defined]
+    starlette_convertors.IntegerConvertor = _sc.IntegerConvertor  # type: ignore[attr-defined]
+    starlette_convertors.FloatConvertor = _sc.FloatConvertor  # type: ignore[attr-defined]
+    starlette_convertors.UUIDConvertor = _sc.UUIDConvertor  # type: ignore[attr-defined]
+    starlette_convertors.CONVERTOR_TYPES = _sc.CONVERTOR_TYPES  # type: ignore[attr-defined]
+    modules["starlette.convertors"] = starlette_convertors
+
+    # ── starlette.formparsers ──────────────────────────────────────
+    starlette_formparsers = _mod("starlette.formparsers")
+    starlette_formparsers.FormParser = _sc.FormParser  # type: ignore[attr-defined]
+    starlette_formparsers.MultiPartParser = _sc.MultiPartParser  # type: ignore[attr-defined]
+    modules["starlette.formparsers"] = starlette_formparsers
+
+    # ── starlette.endpoints ────────────────────────────────────────
+    starlette_endpoints = _mod("starlette.endpoints")
+    starlette_endpoints.HTTPEndpoint = _sc.HTTPEndpoint  # type: ignore[attr-defined]
+    starlette_endpoints.WebSocketEndpoint = _sc.WebSocketEndpoint  # type: ignore[attr-defined]
+    modules["starlette.endpoints"] = starlette_endpoints
+
+    # ── starlette.schemas ──────────────────────────────────────────
+    starlette_schemas = _mod("starlette.schemas")
+    starlette_schemas.SchemaGenerator = _sc.SchemaGenerator  # type: ignore[attr-defined]
+    modules["starlette.schemas"] = starlette_schemas
+
+    # ── starlette.applications ─────────────────────────────────────
+    # FastAPI subclasses Starlette — for `isinstance(app, Starlette)`
+    # checks, we alias Starlette to our FastAPI class.
+    import fastapi_rs.applications as _applications
+    starlette_applications = _mod("starlette.applications")
+    starlette_applications.Starlette = _applications.FastAPI  # type: ignore[attr-defined]
+    modules["starlette.applications"] = starlette_applications
 
     # ── starlette.middleware.cors ──────────────────────────────────
     starlette_middleware_cors = _mod("starlette.middleware.cors")
@@ -136,6 +274,8 @@ def _build() -> dict[str, types.ModuleType]:
     import fastapi_rs.middleware.base as _base
     starlette_middleware_base = _mod("starlette.middleware.base")
     starlette_middleware_base.BaseHTTPMiddleware = _base.BaseHTTPMiddleware  # type: ignore[attr-defined]
+    starlette_middleware_base.RequestResponseEndpoint = typing.Callable  # type: ignore[attr-defined]
+    starlette_middleware_base.DispatchFunction = typing.Callable  # type: ignore[attr-defined]
     modules["starlette.middleware.base"] = starlette_middleware_base
 
     # ── starlette.middleware.sessions ──────────────────────────────
@@ -154,6 +294,7 @@ def _build() -> dict[str, types.ModuleType]:
     starlette_auth.SimpleUser = _auth.SimpleUser  # type: ignore[attr-defined]
     starlette_auth.UnauthenticatedUser = _auth.UnauthenticatedUser  # type: ignore[attr-defined]
     starlette_auth.requires = _auth.requires  # type: ignore[attr-defined]
+    starlette_auth.has_required_scope = _sc.has_required_scope  # type: ignore[attr-defined]
     modules["starlette.authentication"] = starlette_auth
 
     # ── starlette.middleware.authentication ────────────────────────
@@ -175,9 +316,27 @@ def _build() -> dict[str, types.ModuleType]:
 
     # ── starlette.testclient ───────────────────────────────────────
     starlette_testclient = _mod("starlette.testclient")
-    from fastapi_rs.testclient import TestClient
+    from fastapi_rs.testclient import TestClient, _WebSocketTestSession
     starlette_testclient.TestClient = TestClient  # type: ignore[attr-defined]
+    starlette_testclient.WebSocketTestSession = _WebSocketTestSession  # type: ignore[attr-defined]
     modules["starlette.testclient"] = starlette_testclient
+
+    # ── starlette.config ────────────────────────────────────────────
+    starlette_config = _mod("starlette.config")
+    import os as _os
+    class Config:
+        """Minimal starlette.config.Config stub."""
+        def __init__(self, env_file=None, environ=None):
+            self.environ = environ or _os.environ
+        def __call__(self, key, *, cast=None, default=None):
+            val = self.environ.get(key, default)
+            if cast is not None and val is not None:
+                val = cast(val)
+            return val
+        def get(self, key, *, cast=None, default=None):
+            return self(key, cast=cast, default=default)
+    starlette_config.Config = Config  # type: ignore[attr-defined]
+    modules["starlette.config"] = starlette_config
 
     # Set parent references
     starlette.requests = starlette_requests  # type: ignore[attr-defined]

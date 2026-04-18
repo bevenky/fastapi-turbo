@@ -83,6 +83,9 @@ def _build() -> dict[str, types.ModuleType]:
     # Background tasks
     fastapi.BackgroundTasks = _background.BackgroundTasks  # type: ignore[attr-defined]
 
+    # WebSocketDisconnect — commonly imported from top level
+    fastapi.WebSocketDisconnect = _exceptions.WebSocketDisconnect  # type: ignore[attr-defined]
+
     # Security (commonly imported from top-level too)
     fastapi.Security = _dependencies.Security  # type: ignore[attr-defined]
 
@@ -103,12 +106,28 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_responses.RedirectResponse = _responses.RedirectResponse  # type: ignore[attr-defined]
     fastapi_responses.StreamingResponse = _responses.StreamingResponse  # type: ignore[attr-defined]
     fastapi_responses.FileResponse = _responses.FileResponse  # type: ignore[attr-defined]
+    fastapi_responses.ORJSONResponse = _responses.ORJSONResponse  # type: ignore[attr-defined]
+    fastapi_responses.UJSONResponse = _responses.UJSONResponse  # type: ignore[attr-defined]
     modules["fastapi.responses"] = fastapi_responses
+
+    # ── fastapi.applications ───────────────────────────────────────
+    fastapi_applications = _mod("fastapi.applications")
+    fastapi_applications.FastAPI = _applications.FastAPI  # type: ignore[attr-defined]
+    modules["fastapi.applications"] = fastapi_applications
 
     # ── fastapi.routing ────────────────────────────────────────────
     fastapi_routing = _mod("fastapi.routing")
     fastapi_routing.APIRouter = _routing.APIRouter  # type: ignore[attr-defined]
     fastapi_routing.APIRoute = _routing.APIRoute  # type: ignore[attr-defined]
+    # APIWebSocketRoute stub — fastapi-rs registers WS routes directly
+    # via @app.websocket() rather than a dedicated class, but third-party
+    # code uses this class name for isinstance checks.
+    class APIWebSocketRoute:
+        def __init__(self, path: str, endpoint, *, name: str | None = None):
+            self.path = path
+            self.endpoint = endpoint
+            self.name = name or endpoint.__name__
+    fastapi_routing.APIWebSocketRoute = APIWebSocketRoute  # type: ignore[attr-defined]
     modules["fastapi.routing"] = fastapi_routing
 
     # ── fastapi.exceptions ─────────────────────────────────────────
@@ -116,6 +135,11 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_exceptions.HTTPException = _exceptions.HTTPException  # type: ignore[attr-defined]
     fastapi_exceptions.RequestValidationError = _exceptions.RequestValidationError  # type: ignore[attr-defined]
     fastapi_exceptions.WebSocketException = _exceptions.WebSocketException  # type: ignore[attr-defined]
+    fastapi_exceptions.WebSocketRequestValidationError = _exceptions.WebSocketRequestValidationError  # type: ignore[attr-defined]
+    fastapi_exceptions.FastAPIError = _exceptions.FastAPIError  # type: ignore[attr-defined]
+    fastapi_exceptions.ResponseValidationError = _exceptions.ResponseValidationError  # type: ignore[attr-defined]
+    fastapi_exceptions.StarletteHTTPException = _exceptions.HTTPException  # type: ignore[attr-defined]
+    fastapi_exceptions.StarletteWebSocketException = _exceptions.WebSocketException  # type: ignore[attr-defined]
     modules["fastapi.exceptions"] = fastapi_exceptions
 
     # ── fastapi.params ─────────────────────────────────────────────
@@ -128,12 +152,40 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_params.Form = _params.Form  # type: ignore[attr-defined]
     fastapi_params.File = _params.File  # type: ignore[attr-defined]
     fastapi_params.Depends = _dependencies.Depends  # type: ignore[attr-defined]
+    fastapi_params.Security = _dependencies.Security  # type: ignore[attr-defined]
+    # Stubs for Param / ParamTypes used by advanced introspection
+    import enum as _enum
+    class ParamTypes(str, _enum.Enum):
+        query = "query"
+        header = "header"
+        path = "path"
+        cookie = "cookie"
+    class Param:
+        def __init__(self, *, default=..., **kwargs):
+            self.default = default
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+    fastapi_params.Param = Param  # type: ignore[attr-defined]
+    fastapi_params.ParamTypes = ParamTypes  # type: ignore[attr-defined]
     modules["fastapi.params"] = fastapi_params
+
+    # ── fastapi.param_functions ────────────────────────────────────
+    # Mirror of fastapi.params — FastAPI splits them but we expose both.
+    fastapi_paramfunctions = _mod("fastapi.param_functions")
+    for _name in ("Query", "Path", "Header", "Cookie", "Body", "Form", "File"):
+        setattr(fastapi_paramfunctions, _name, getattr(_params, _name))
+    fastapi_paramfunctions.Depends = _dependencies.Depends  # type: ignore[attr-defined]
+    fastapi_paramfunctions.Security = _dependencies.Security  # type: ignore[attr-defined]
+    modules["fastapi.param_functions"] = fastapi_paramfunctions
 
     # ── fastapi.security ───────────────────────────────────────────
     fastapi_security = _mod("fastapi.security")
     fastapi_security.OAuth2PasswordBearer = _security.OAuth2PasswordBearer  # type: ignore[attr-defined]
     fastapi_security.OAuth2PasswordRequestForm = _security.OAuth2PasswordRequestForm  # type: ignore[attr-defined]
+    # OAuth2 base class — parent of all OAuth2* flavours for isinstance checks
+    fastapi_security.OAuth2 = _security.OAuth2  # type: ignore[attr-defined]
+    # Strict variant: requires grant_type="password"
+    fastapi_security.OAuth2PasswordRequestFormStrict = _security.OAuth2PasswordRequestFormStrict  # type: ignore[attr-defined]
     fastapi_security.HTTPBearer = _security.HTTPBearer  # type: ignore[attr-defined]
     fastapi_security.HTTPDigest = _security.HTTPDigest  # type: ignore[attr-defined]
     fastapi_security.HTTPBasic = _security.HTTPBasic  # type: ignore[attr-defined]
@@ -167,11 +219,39 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_ds.Headers = _datastructures.Headers  # type: ignore[attr-defined]
     fastapi_ds.QueryParams = _datastructures.QueryParams  # type: ignore[attr-defined]
     fastapi_ds.State = _datastructures.State  # type: ignore[attr-defined]
+    fastapi_ds.Address = _datastructures.Address  # type: ignore[attr-defined]
+    fastapi_ds.FormData = _datastructures.FormData  # type: ignore[attr-defined]
+    # FastAPI-specific: Default + DefaultPlaceholder sentinel classes used
+    # to mark "not set" kwargs so routers can distinguish from explicit None.
+    class DefaultPlaceholder:
+        """Internal sentinel — FastAPI uses this to detect "not explicitly set"."""
+        def __init__(self, value):
+            self.value = value
+        def __bool__(self) -> bool:
+            return bool(self.value)
+    def Default(value):
+        return DefaultPlaceholder(value)
+    fastapi_ds.Default = Default  # type: ignore[attr-defined]
+    fastapi_ds.DefaultPlaceholder = DefaultPlaceholder  # type: ignore[attr-defined]
     modules["fastapi.datastructures"] = fastapi_ds
 
     # ── fastapi.concurrency ────────────────────────────────────────
     fastapi_concurrency = _mod("fastapi.concurrency")
     fastapi_concurrency.run_in_threadpool = _concurrency.run_in_threadpool  # type: ignore[attr-defined]
+    fastapi_concurrency.iterate_in_threadpool = _concurrency.iterate_in_threadpool  # type: ignore[attr-defined]
+    import contextlib as _contextlib
+    @_contextlib.asynccontextmanager
+    async def _contextmanager_in_threadpool(cm):
+        exit_val = await _concurrency.run_in_threadpool(cm.__enter__)
+        try:
+            yield exit_val
+        except Exception as exc:
+            ok = await _concurrency.run_in_threadpool(cm.__exit__, type(exc), exc, exc.__traceback__)
+            if not ok:
+                raise
+        else:
+            await _concurrency.run_in_threadpool(cm.__exit__, None, None, None)
+    fastapi_concurrency.contextmanager_in_threadpool = _contextmanager_in_threadpool  # type: ignore[attr-defined]
     modules["fastapi.concurrency"] = fastapi_concurrency
 
     # ── fastapi.background ─────────────────────────────────────────
@@ -185,14 +265,81 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_testclient.TestClient = TestClient  # type: ignore[attr-defined]
     modules["fastapi.testclient"] = fastapi_testclient
 
+    # ── fastapi.requests ──────────────────────────────────────────
+    fastapi_requests_mod = _mod("fastapi.requests")
+    fastapi_requests_mod.Request = _requests.Request  # type: ignore[attr-defined]
+    modules["fastapi.requests"] = fastapi_requests_mod
+
     # ── fastapi.websockets ─────────────────────────────────────────
     fastapi_websockets = _mod("fastapi.websockets")
     fastapi_websockets.WebSocket = _websockets.WebSocket  # type: ignore[attr-defined]
+    fastapi_websockets.WebSocketDisconnect = _exceptions.WebSocketDisconnect  # type: ignore[attr-defined]
+    fastapi_websockets.WebSocketState = _websockets.WebSocketState  # type: ignore[attr-defined]
     modules["fastapi.websockets"] = fastapi_websockets
 
     # ── fastapi.middleware ─────────────────────────────────────────
+    import fastapi_rs._starlette_compat as _sc
     fastapi_middleware = _mod("fastapi.middleware")
+    fastapi_middleware.Middleware = _sc.Middleware  # type: ignore[attr-defined]
     modules["fastapi.middleware"] = fastapi_middleware
+
+    # ── fastapi.middleware.wsgi ────────────────────────────────────
+    fastapi_middleware_wsgi = _mod("fastapi.middleware.wsgi")
+    fastapi_middleware_wsgi.WSGIMiddleware = _sc.WSGIMiddleware  # type: ignore[attr-defined]
+    modules["fastapi.middleware.wsgi"] = fastapi_middleware_wsgi
+
+    # ── fastapi.staticfiles ────────────────────────────────────────
+    import fastapi_rs.staticfiles as _staticfiles
+    fastapi_staticfiles = _mod("fastapi.staticfiles")
+    fastapi_staticfiles.StaticFiles = _staticfiles.StaticFiles  # type: ignore[attr-defined]
+    modules["fastapi.staticfiles"] = fastapi_staticfiles
+
+    # ── fastapi.templating ─────────────────────────────────────────
+    import fastapi_rs.templating as _templating
+    fastapi_templating = _mod("fastapi.templating")
+    fastapi_templating.Jinja2Templates = _templating.Jinja2Templates  # type: ignore[attr-defined]
+    modules["fastapi.templating"] = fastapi_templating
+
+    # ── fastapi.logger ─────────────────────────────────────────────
+    import logging
+    fastapi_logger = _mod("fastapi.logger")
+    fastapi_logger.logger = logging.getLogger("fastapi")  # type: ignore[attr-defined]
+    modules["fastapi.logger"] = fastapi_logger
+
+    # ── fastapi.openapi.* ──────────────────────────────────────────
+    import fastapi_rs._openapi as _oa
+    fastapi_openapi = _mod("fastapi.openapi")
+    modules["fastapi.openapi"] = fastapi_openapi
+
+    fastapi_openapi_utils = _mod("fastapi.openapi.utils")
+    fastapi_openapi_utils.get_openapi = _oa.generate_openapi_schema  # type: ignore[attr-defined]
+    modules["fastapi.openapi.utils"] = fastapi_openapi_utils
+
+    # Swagger/ReDoc HTML helpers — pull from server.rs wiring; stub here.
+    fastapi_openapi_docs = _mod("fastapi.openapi.docs")
+    def _stub_swagger_ui_html(*, openapi_url, title="API", **_):
+        return f"<!DOCTYPE html><html><body><div id=swagger></div><script>const url='{openapi_url}'</script></body></html>"
+    def _stub_redoc_html(*, openapi_url, title="API", **_):
+        return f"<!DOCTYPE html><html><body><redoc spec-url='{openapi_url}'></redoc></body></html>"
+    def _stub_oauth2_redirect():
+        return "<!DOCTYPE html><html><body></body></html>"
+    fastapi_openapi_docs.get_swagger_ui_html = _stub_swagger_ui_html  # type: ignore[attr-defined]
+    fastapi_openapi_docs.get_redoc_html = _stub_redoc_html  # type: ignore[attr-defined]
+    fastapi_openapi_docs.get_swagger_ui_oauth2_redirect_html = _stub_oauth2_redirect  # type: ignore[attr-defined]
+    modules["fastapi.openapi.docs"] = fastapi_openapi_docs
+
+    # Minimal OpenAPI models stubs (Pydantic-like shapes)
+    fastapi_openapi_models = _mod("fastapi.openapi.models")
+    class _OpenAPI(dict):
+        pass
+    class _Schema(dict):
+        pass
+    class _Tag(dict):
+        pass
+    fastapi_openapi_models.OpenAPI = _OpenAPI  # type: ignore[attr-defined]
+    fastapi_openapi_models.Schema = _Schema  # type: ignore[attr-defined]
+    fastapi_openapi_models.Tag = _Tag  # type: ignore[attr-defined]
+    modules["fastapi.openapi.models"] = fastapi_openapi_models
 
     # ── fastapi.middleware.cors ────────────────────────────────────
     fastapi_middleware_cors = _mod("fastapi.middleware.cors")
@@ -216,6 +363,52 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_middleware_hr = _mod("fastapi.middleware.httpsredirect")
     fastapi_middleware_hr.HTTPSRedirectMiddleware = _HTTPSRedirectMiddleware  # type: ignore[attr-defined]
     modules["fastapi.middleware.httpsredirect"] = fastapi_middleware_hr
+
+    # ── fastapi.exception_handlers ───────────────────────────────────
+    fastapi_exc_handlers = _mod("fastapi.exception_handlers")
+    async def _http_exception_handler(request, exc):
+        from fastapi_rs.responses import JSONResponse
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    async def _request_validation_exception_handler(request, exc):
+        from fastapi_rs.responses import JSONResponse
+        return JSONResponse({"detail": exc.errors()}, status_code=422)
+    fastapi_exc_handlers.http_exception_handler = _http_exception_handler  # type: ignore[attr-defined]
+    fastapi_exc_handlers.request_validation_exception_handler = _request_validation_exception_handler  # type: ignore[attr-defined]
+    modules["fastapi.exception_handlers"] = fastapi_exc_handlers
+
+    # ── fastapi.dependencies ───────────────────────────────────────
+    # Stub module — real FastAPI has fastapi.dependencies.utils with Dependant
+    fastapi_dependencies_mod = _mod("fastapi.dependencies")
+    modules["fastapi.dependencies"] = fastapi_dependencies_mod
+
+    fastapi_dependencies_utils = _mod("fastapi.dependencies.utils")
+    class Dependant:
+        """Stub for fastapi.dependencies.utils.Dependant."""
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+    fastapi_dependencies_utils.Dependant = Dependant  # type: ignore[attr-defined]
+    fastapi_dependencies_utils.get_dependant = lambda **kw: Dependant(**kw)  # type: ignore[attr-defined]
+    fastapi_dependencies_utils.solve_dependencies = lambda **kw: {}  # type: ignore[attr-defined]
+    modules["fastapi.dependencies.utils"] = fastapi_dependencies_utils
+
+    # ── fastapi.types ──────────────────────────────────────────────
+    import typing as _typing
+    fastapi_types = _mod("fastapi.types")
+    fastapi_types.DecoratedCallable = _typing.TypeVar("DecoratedCallable", bound=_typing.Callable)  # type: ignore[attr-defined]
+    fastapi_types.IncEx = _typing.Union[_typing.Set[int], _typing.Set[str], _typing.Dict[int, _typing.Any], _typing.Dict[str, _typing.Any], None]  # type: ignore[attr-defined]
+    modules["fastapi.types"] = fastapi_types
+
+    # ── fastapi.utils ──────────────────────────────────────────────
+    fastapi_utils = _mod("fastapi.utils")
+    def _generate_unique_id(route):
+        name = getattr(route, "name", None) or getattr(route.endpoint, "__name__", "unknown")
+        methods = getattr(route, "methods", None) or ["GET"]
+        method = next(iter(methods))
+        path = getattr(route, "path", "/")
+        return f"{name}{path}{method}"
+    fastapi_utils.generate_unique_id = _generate_unique_id  # type: ignore[attr-defined]
+    modules["fastapi.utils"] = fastapi_utils
 
     # Set parent references
     fastapi.responses = fastapi_responses  # type: ignore[attr-defined]
