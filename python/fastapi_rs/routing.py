@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Sequence
+from urllib.parse import quote
 
 
 def _default_generate_unique_id(route: "APIRoute", method: str) -> str:
@@ -100,6 +102,12 @@ class APIRouter:
         callbacks: list | None = None,
         generate_unique_id_function: Callable | None = None,
         route_class: type | None = None,
+        redirect_slashes: bool = True,
+        on_startup: Sequence[Callable] | None = None,
+        on_shutdown: Sequence[Callable] | None = None,
+        lifespan: Any = None,
+        dependency_overrides_provider: Any = None,
+        default: Any = None,
         **kwargs: Any,
     ):
         self.routes: list[APIRoute] = []
@@ -114,6 +122,13 @@ class APIRouter:
         self.callbacks = callbacks or []
         self.generate_unique_id_function = generate_unique_id_function
         self.route_class = route_class
+        self.redirect_slashes = redirect_slashes
+        self._on_startup: list[Callable] = list(on_startup or [])
+        self._on_shutdown: list[Callable] = list(on_shutdown or [])
+        self.lifespan = lifespan
+        self.dependency_overrides_provider = dependency_overrides_provider
+        self.default = default
+        self._mounts: list[tuple[str, Any, str | None]] = []
 
     # ------------------------------------------------------------------
     # Core registration
@@ -186,6 +201,35 @@ class APIRouter:
         return decorator
 
     # ------------------------------------------------------------------
+    # Generic route decorator and imperative registration
+    # ------------------------------------------------------------------
+
+    def route(self, path: str, methods: list[str] | None = None, **kwargs: Any):
+        """Generic route decorator (Starlette-compatible).
+
+        Usage::
+
+            @router.route("/health", methods=["GET", "POST"])
+            async def health(request): ...
+        """
+
+        def decorator(func: Callable) -> Callable:
+            self.add_api_route(path, func, methods=methods, **kwargs)
+            return func
+
+        return decorator
+
+    def add_route(
+        self,
+        path: str,
+        endpoint: Callable,
+        methods: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Imperative generic route registration (Starlette-compatible)."""
+        self.add_api_route(path, endpoint, methods=methods, **kwargs)
+
+    # ------------------------------------------------------------------
     # WebSocket routes
     # ------------------------------------------------------------------
 
@@ -209,6 +253,17 @@ class APIRouter:
         route._is_websocket = True
         self.routes.append(route)
 
+    def add_api_websocket_route(
+        self,
+        path: str,
+        endpoint: Callable,
+        *,
+        name: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Imperative form of @router.websocket (alias for add_websocket_route)."""
+        self.add_websocket_route(path, endpoint, name=name, **kwargs)
+
     def websocket(self, path: str, **kwargs: Any):
         """Decorator to register a WebSocket endpoint."""
 
@@ -217,6 +272,86 @@ class APIRouter:
             return func
 
         return decorator
+
+    def websocket_route(self, path: str, name: str | None = None, **kwargs: Any):
+        """Decorator to register a WebSocket endpoint (returns the callable).
+
+        Unlike ``websocket()``, this mirrors Starlette's ``websocket_route``
+        which returns the original callable for further use.
+        """
+
+        def decorator(func: Callable) -> Callable:
+            self.add_websocket_route(path, func, name=name, **kwargs)
+            return func
+
+        return decorator
+
+    # ------------------------------------------------------------------
+    # Lifecycle events
+    # ------------------------------------------------------------------
+
+    def on_event(self, event_type: str):
+        """Decorator to register startup/shutdown handlers on this router."""
+
+        def decorator(func: Callable) -> Callable:
+            if event_type == "startup":
+                self._on_startup.append(func)
+            elif event_type == "shutdown":
+                self._on_shutdown.append(func)
+            return func
+
+        return decorator
+
+    def add_event_handler(self, event_type: str, func: Callable) -> None:
+        """Imperative form of on_event — register a startup/shutdown handler."""
+        if event_type == "startup":
+            self._on_startup.append(func)
+        elif event_type == "shutdown":
+            self._on_shutdown.append(func)
+
+    # ------------------------------------------------------------------
+    # Mount sub-applications
+    # ------------------------------------------------------------------
+
+    def mount(self, path: str, app: Any = None, *, name: str | None = None) -> None:
+        """Mount a sub-application or static files at the given path prefix."""
+        self._mounts.append((path, app, name))
+
+    # ------------------------------------------------------------------
+    # URL building
+    # ------------------------------------------------------------------
+
+    def url_path_for(self, name: str, /, **path_params: Any) -> str:
+        """Search routes by name and return the URL path with params filled in.
+
+        Raises ``LookupError`` if no route with the given name is found.
+        """
+        for route in self.routes:
+            if route.name == name:
+                path = self.prefix + route.path
+
+                def _sub(match: re.Match) -> str:
+                    pname = match.group(1).split(":")[0]
+                    if pname not in path_params:
+                        raise KeyError(
+                            f"Missing path param {pname!r} for route {name!r}"
+                        )
+                    val = path_params[pname]
+                    if ":path" in match.group(0):
+                        return str(val)
+                    return quote(str(val), safe="")
+
+                return re.sub(r"\{([^}]+)\}", _sub, path)
+
+        # Search included routers recursively
+        for child_router, child_prefix, _tags, _meta in self._included_routers:
+            try:
+                child_path = child_router.url_path_for(name, **path_params)
+                return self.prefix + child_prefix + child_path
+            except LookupError:
+                continue
+
+        raise LookupError(f"No route named {name!r}")
 
     # ------------------------------------------------------------------
     # Sub-router inclusion

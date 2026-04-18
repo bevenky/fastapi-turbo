@@ -24,9 +24,10 @@ class Depends:
         within a single request will only be called once and the result reused.
     """
 
-    def __init__(self, dependency=None, *, use_cache: bool = True):
+    def __init__(self, dependency=None, *, use_cache: bool = True, scope: str | None = None):
         self.dependency = dependency
         self.use_cache = use_cache
+        self.scope = scope
 
     def __repr__(self) -> str:
         return f"Depends({self.dependency!r}, use_cache={self.use_cache})"

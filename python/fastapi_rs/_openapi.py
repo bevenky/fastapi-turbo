@@ -23,6 +23,8 @@ def generate_openapi_schema(
     openapi_tags: list[dict[str, Any]] | None = None,
     webhooks: list[dict[str, Any]] | None = None,
     external_docs: dict[str, Any] | None = None,
+    summary: str | None = None,
+    separate_input_output_schemas: bool = True,
 ) -> dict[str, Any]:
     """Generate an OpenAPI 3.1.0 schema dict from collected route metadata."""
     schema: dict[str, Any] = {
@@ -34,6 +36,8 @@ def generate_openapi_schema(
         "paths": {},
     }
 
+    if summary:
+        schema["info"]["summary"] = summary
     if description:
         schema["info"]["description"] = description
     if terms_of_service:
@@ -88,6 +92,46 @@ def generate_openapi_schema(
         if wh_dict:
             schema["webhooks"] = wh_dict
 
+    # Check if any operation references the 422 ValidationError schema.
+    # If so, ensure the standard ValidationError + HTTPValidationError
+    # schemas are present in components/schemas.
+    _needs_validation_schemas = False
+    for _path_ops in schema["paths"].values():
+        for _op in _path_ops.values():
+            if "422" in _op.get("responses", {}):
+                _needs_validation_schemas = True
+                break
+        if _needs_validation_schemas:
+            break
+    if _needs_validation_schemas:
+        components_schemas.setdefault("ValidationError", {
+            "title": "ValidationError",
+            "type": "object",
+            "required": ["loc", "msg", "type"],
+            "properties": {
+                "loc": {
+                    "title": "Location",
+                    "type": "array",
+                    "items": {
+                        "anyOf": [{"type": "string"}, {"type": "integer"}]
+                    },
+                },
+                "msg": {"title": "Message", "type": "string"},
+                "type": {"title": "Error Type", "type": "string"},
+            },
+        })
+        components_schemas.setdefault("HTTPValidationError", {
+            "title": "HTTPValidationError",
+            "type": "object",
+            "properties": {
+                "detail": {
+                    "title": "Detail",
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/ValidationError"},
+                }
+            },
+        })
+
     components: dict[str, Any] = {}
     if components_schemas:
         components["schemas"] = components_schemas
@@ -105,9 +149,21 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     response_desc = route.get("response_description") or "Successful Response"
 
     # Success response skeleton — overridable by route.responses[status]
+    # Use $ref for response_model if it's a Pydantic model
+    response_model = route.get("response_model")
+    response_schema: dict[str, Any] = {}
+    if response_model is not None:
+        ref = _model_ref(response_model)
+        if ref is not None:
+            response_schema = ref
+        elif hasattr(response_model, "model_json_schema"):
+            try:
+                response_schema = response_model.model_json_schema()
+            except Exception:
+                pass
     success_response: dict[str, Any] = {
         "description": response_desc,
-        "content": {"application/json": {"schema": {}}},
+        "content": {"application/json": {"schema": response_schema}},
     }
 
     # Build the full responses dict, starting with user-supplied responses
@@ -124,6 +180,25 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     else:
         # Merge user-supplied entry at success code with auto-generated description
         responses_dict[success_key].setdefault("description", response_desc)
+
+    # Auto-add 422 Validation Error response if the endpoint has
+    # validated parameters (body, path, or constrained query).
+    has_validated_params = any(
+        p.get("kind") in ("body", "path", "query", "header", "cookie")
+        for p in route.get("params", [])
+        if p.get("include_in_schema", True)
+    )
+    if has_validated_params and "422" not in responses_dict:
+        responses_dict["422"] = {
+            "description": "Validation Error",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "$ref": "#/components/schemas/HTTPValidationError",
+                    }
+                }
+            },
+        }
 
     operation: dict[str, Any] = {
         "summary": route.get("summary") or route["handler_name"],
@@ -201,14 +276,18 @@ def _build_response_entry(resp_info: dict[str, Any]) -> dict[str, Any]:
     entry: dict[str, Any] = {}
     entry["description"] = resp_info.get("description", "Response")
 
-    # If model is provided, build content automatically
+    # If model is provided, build content automatically using $ref if possible
     model = resp_info.get("model")
-    if model is not None and hasattr(model, "model_json_schema"):
-        try:
-            schema = model.model_json_schema()
-            entry["content"] = {"application/json": {"schema": schema}}
-        except Exception:
-            pass
+    if model is not None:
+        ref = _model_ref(model)
+        if ref is not None:
+            entry["content"] = {"application/json": {"schema": ref}}
+        elif hasattr(model, "model_json_schema"):
+            try:
+                model_schema = model.model_json_schema()
+                entry["content"] = {"application/json": {"schema": model_schema}}
+            except Exception:
+                pass
 
     # Direct content/headers overrides
     if "content" in resp_info:
@@ -248,7 +327,10 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
 def _build_request_body(param: dict[str, Any]) -> dict[str, Any]:
     """Build an OpenAPI requestBody from a body parameter."""
     model_class = param.get("model_class")
-    if model_class is not None and hasattr(model_class, "model_json_schema"):
+    ref = _model_ref(model_class) if model_class is not None else None
+    if ref is not None:
+        body_schema = ref
+    elif model_class is not None and hasattr(model_class, "model_json_schema"):
         body_schema = model_class.model_json_schema()
     else:
         body_schema = {"type": "object"}
@@ -293,6 +375,29 @@ def _normalize_examples(examples: Any) -> dict[str, Any]:
     return {"example1": {"value": examples}}
 
 
+def _rewrite_defs_refs(obj: Any) -> Any:
+    """Recursively rewrite ``$ref: #/$defs/Foo`` to ``$ref: #/components/schemas/Foo``."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k == "$ref" and isinstance(v, str) and v.startswith("#/$defs/"):
+                out[k] = v.replace("#/$defs/", "#/components/schemas/", 1)
+            else:
+                out[k] = _rewrite_defs_refs(v)
+        return out
+    if isinstance(obj, list):
+        return [_rewrite_defs_refs(item) for item in obj]
+    return obj
+
+
+def _model_ref(model_class) -> dict[str, str] | None:
+    """Return a ``{"$ref": "#/components/schemas/Name"}`` dict for a Pydantic model."""
+    name = getattr(model_class, "__name__", None)
+    if name and hasattr(model_class, "model_json_schema"):
+        return {"$ref": f"#/components/schemas/{name}"}
+    return None
+
+
 def _collect_schemas(
     route: dict[str, Any], schemas: dict[str, Any]
 ) -> None:
@@ -312,7 +417,12 @@ def _collect_schemas(
 
 
 def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
-    """Extract $defs from a single Pydantic model."""
+    """Extract Pydantic model schema and its $defs into the shared components/schemas bucket.
+
+    Registers the model itself under its class name so operations can
+    reference it via ``$ref: #/components/schemas/ModelName``.  Also
+    promotes any ``$defs`` (nested models) into the same flat bucket.
+    """
     if model_class is None:
         return
     if not hasattr(model_class, "model_json_schema"):
@@ -321,9 +431,20 @@ def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
         json_schema = model_class.model_json_schema()
     except Exception:
         return
+
+    # Promote nested $defs into components/schemas
     if "$defs" in json_schema:
         for name, defn in json_schema["$defs"].items():
             schemas.setdefault(name, defn)
+
+    # Register the top-level model itself
+    model_name = getattr(model_class, "__name__", None)
+    if model_name and model_name not in schemas:
+        # Build a clean schema without $defs (they live in components/schemas)
+        clean = {k: v for k, v in json_schema.items() if k != "$defs"}
+        # Rewrite internal $defs references to component $ref paths
+        clean = _rewrite_defs_refs(clean)
+        schemas[model_name] = clean
 
 
 def _collect_security_schemes(

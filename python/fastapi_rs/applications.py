@@ -6,12 +6,12 @@ import asyncio
 import atexit
 import inspect
 import json
-from types import SimpleNamespace
 from typing import Any, Callable, Sequence
 
 from fastapi_rs._introspect import introspect_endpoint
 from fastapi_rs._openapi import generate_openapi_schema
 from fastapi_rs._resolution import build_resolution_plan, _make_sync_wrapper
+from fastapi_rs.datastructures import State
 from fastapi_rs.routing import APIRouter
 
 
@@ -623,6 +623,7 @@ class FastAPI:
         self,
         *,
         title: str = "FastAPI",
+        summary: str | None = None,
         description: str = "",
         version: str = "0.1.0",
         docs_url: str | None = "/docs",
@@ -661,6 +662,7 @@ class FastAPI:
         **kwargs: Any,
     ):
         self.title = title
+        self.summary = summary
         self.description = description
         self.version = version
         self.docs_url = docs_url
@@ -709,11 +711,14 @@ class FastAPI:
         # router-like container for webhook definitions that appear under
         # the top-level `webhooks` field of the OpenAPI schema.
         self.webhooks: APIRouter = webhooks if webhooks is not None else APIRouter()
-        # Top-level OpenAPI externalDocs
+        # Top-level OpenAPI externalDocs — accept both our `external_docs`
+        # and FastAPI's `openapi_external_docs` spelling.
+        if external_docs is None and "openapi_external_docs" in kwargs:
+            external_docs = kwargs.pop("openapi_external_docs")
         self.external_docs: dict[str, Any] | None = external_docs
 
         self.router = APIRouter()
-        self.state = SimpleNamespace()
+        self.state = State()
         self.dependency_overrides: dict[Callable, Callable] = {}
         self.dependencies: list = list(dependencies or [])
 
@@ -800,6 +805,28 @@ class FastAPI:
     def add_route(self, path: str, route: Callable, **kwargs: Any) -> None:
         """Starlette-compatible add_route (delegates to add_api_route)."""
         return self.router.add_api_route(path, route, **kwargs)
+
+    def websocket_route(self, path: str, name: str | None = None, **kwargs: Any):
+        """Decorator to register a WebSocket route (delegates to router)."""
+        return self.router.websocket_route(path, name=name, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Stubs for FastAPI compatibility
+    # ------------------------------------------------------------------
+
+    def setup(self) -> None:
+        """No-op stub for Starlette compatibility."""
+        pass
+
+    def build_middleware_stack(self):
+        """No-op stub for Starlette compatibility."""
+        return self
+
+    def host(self, hostname: str, app: Any = None, name: str | None = None) -> None:
+        """Store host-based routing info (stub for Starlette compatibility)."""
+        if not hasattr(self, "_hosts"):
+            self._hosts: list[tuple[str, Any, str | None]] = []
+        self._hosts.append((hostname, app, name))
 
     # ------------------------------------------------------------------
     # Routes property
@@ -1403,6 +1430,8 @@ class FastAPI:
                 openapi_tags=self.openapi_tags,
                 webhooks=webhook_dicts,
                 external_docs=self.external_docs,
+                summary=self.summary,
+                separate_input_output_schemas=self.separate_input_output_schemas,
             )
         return self._openapi_schema
 
@@ -1535,6 +1564,8 @@ class FastAPI:
                 openapi_tags=self.openapi_tags,
                 webhooks=webhook_dicts,
                 external_docs=self.external_docs,
+                summary=self.summary,
+                separate_input_output_schemas=self.separate_input_output_schemas,
             )
             openapi_json = json.dumps(openapi_schema)
 
