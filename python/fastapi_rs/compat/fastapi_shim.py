@@ -138,6 +138,12 @@ def _build() -> dict[str, types.ModuleType]:
             self.endpoint = endpoint
             self.name = name or endpoint.__name__
     fastapi_routing.APIWebSocketRoute = APIWebSocketRoute  # type: ignore[attr-defined]
+    # Mount — Airflow uses `from fastapi.routing import Mount`
+    try:
+        from fastapi_rs._starlette_compat import Mount as _Mount
+        fastapi_routing.Mount = _Mount  # type: ignore[attr-defined]
+    except ImportError:
+        pass
     modules["fastapi.routing"] = fastapi_routing
 
     # ── fastapi.exceptions ─────────────────────────────────────────
@@ -527,6 +533,18 @@ def _build() -> dict[str, types.ModuleType]:
         return f"{name}{path}{method}"
     fastapi_utils.generate_unique_id = _generate_unique_id  # type: ignore[attr-defined]
     modules["fastapi.utils"] = fastapi_utils
+
+    # ── fastapi._compat ───────────────────────────────────────────
+    # Third-party plugins (fastapi-jsonrpc, etc.) import from here
+    try:
+        import fastapi_rs._compat_shim as _compat_mod
+        modules["fastapi._compat"] = _compat_mod
+    except ImportError:
+        pass
+
+    # ── starlette.routing.compile_path ────────────────────────────
+    # Used by fastapi-jsonrpc and Netflix dispatch
+    # Already in starlette shim if available
 
     # Set parent references
     fastapi.responses = fastapi_responses  # type: ignore[attr-defined]

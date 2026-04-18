@@ -84,6 +84,28 @@ def _build() -> dict[str, types.ModuleType]:
     starlette_routing.BaseRoute = BaseRoute  # type: ignore[attr-defined]
     starlette_routing.Match = Match  # type: ignore[attr-defined]
     starlette_routing.NoMatchFound = NoMatchFound  # type: ignore[attr-defined]
+    # compile_path — used by fastapi-jsonrpc, Netflix dispatch
+    import re as _re
+    def compile_path(path: str):
+        """Convert a path template to a regex pattern + format string."""
+        path_regex = "^"
+        path_format = ""
+        idx = 0
+        param_convertors = {}
+        for match in _re.finditer(r"\{(\w+)(?::(\w+))?\}", path):
+            param_name, convertor = match.groups("str")
+            path_regex += _re.escape(path[idx:match.start()])
+            if convertor == "path":
+                path_regex += f"(?P<{param_name}>.+)"
+            else:
+                path_regex += f"(?P<{param_name}>[^/]+)"
+            path_format += path[idx:match.start()] + "{" + param_name + "}"
+            param_convertors[param_name] = convertor
+            idx = match.end()
+        path_regex += _re.escape(path[idx:]) + "$"
+        path_format += path[idx:]
+        return _re.compile(path_regex), path_format, param_convertors
+    starlette_routing.compile_path = compile_path  # type: ignore[attr-defined]
     modules["starlette.routing"] = starlette_routing
 
     # ── starlette.exceptions ───────────────────────────────────────
