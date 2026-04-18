@@ -102,6 +102,64 @@ app.post('/products', async (request, reply) => {
   };
 });
 
+// Full update (PUT)
+app.put('/products/:id', async (request, reply) => {
+  const { id } = request.params;
+  const { name, description = '', price, category_id, stock = 0 } = request.body;
+  const { rows } = await pgPool.query(
+    `UPDATE products SET name=$1, description=$2, price=$3, category_id=$4, stock=$5
+     WHERE id=$6 RETURNING id, name, price, stock`,
+    [name, description, price, category_id, stock, id]
+  );
+  if (rows.length === 0) {
+    reply.code(404);
+    return { detail: 'Product not found' };
+  }
+  const row = rows[0];
+  return { id: row.id, name: row.name, price: parseFloat(row.price), stock: row.stock };
+});
+
+// Partial update (PATCH)
+app.patch('/products/:id', async (request, reply) => {
+  const { id } = request.params;
+  const body = request.body;
+  const fields = ['name', 'description', 'price', 'category_id', 'stock'];
+  const setClauses = [];
+  const values = [];
+  let idx = 1;
+  for (const key of fields) {
+    if (body[key] !== undefined) {
+      setClauses.push(`${key}=$${idx}`);
+      values.push(body[key]);
+      idx++;
+    }
+  }
+  if (setClauses.length === 0) {
+    reply.code(400);
+    return { detail: 'No fields to update' };
+  }
+  values.push(id);
+  const query = `UPDATE products SET ${setClauses.join(', ')} WHERE id=$${idx} RETURNING id, name, price, stock`;
+  const { rows } = await pgPool.query(query, values);
+  if (rows.length === 0) {
+    reply.code(404);
+    return { detail: 'Product not found' };
+  }
+  const row = rows[0];
+  return { id: row.id, name: row.name, price: parseFloat(row.price), stock: row.stock };
+});
+
+// Delete product
+app.delete('/products/:id', async (request, reply) => {
+  const { id } = request.params;
+  const { rowCount } = await pgPool.query('DELETE FROM products WHERE id=$1', [id]);
+  if (rowCount === 0) {
+    reply.code(404);
+    return { detail: 'Product not found' };
+  }
+  return { deleted: true, id: parseInt(id) };
+});
+
 // Complex JOIN + GROUP BY aggregation
 app.get('/categories/stats', async () => {
   const { rows } = await pgPool.query(

@@ -1,0 +1,25 @@
+[package]
+name = "ws-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ws-echo-tungstenite"
+path = "echo_tungstenite.rs"
+
+[[bin]]
+name = "ws-echo-fastws"
+path = "echo_fastws.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+fastwebsockets = { version = "0.8", features = ["upgrade", "with_axum"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -8,7 +8,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use bb8::Pool;
@@ -202,6 +202,148 @@ async fn create_product(
         StatusCode::CREATED,
         Json(serde_json::to_value(product).unwrap()),
     )
+}
+
+async fn update_product(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Json(body): Json<ProductCreate>,
+) -> impl IntoResponse {
+    let conn = state.db.get().await.unwrap();
+    let price_decimal =
+        rust_decimal::Decimal::from_str_exact(&format!("{:.2}", body.price)).unwrap();
+    let row = conn
+        .query_opt(
+            "UPDATE products SET name=$1, description=$2, price=$3, category_id=$4, stock=$5 \
+             WHERE id=$6 RETURNING id, name, price, stock",
+            &[
+                &body.name,
+                &body.description,
+                &price_decimal,
+                &body.category_id,
+                &body.stock,
+                &id,
+            ],
+        )
+        .await
+        .unwrap();
+
+    match row {
+        Some(row) => {
+            let price: rust_decimal::Decimal = row.get("price");
+            let product = ProductOut {
+                id: row.get("id"),
+                name: row.get("name"),
+                price: price.to_string().parse::<f64>().unwrap_or(0.0),
+                stock: row.get("stock"),
+                category_name: String::new(),
+            };
+            (StatusCode::OK, Json(serde_json::to_value(product).unwrap()))
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"detail": "Product not found"})),
+        ),
+    }
+}
+
+async fn patch_product(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let conn = state.db.get().await.unwrap();
+    // Build dynamic query from provided fields
+    let mut set_clauses = Vec::new();
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+    let mut idx = 1;
+
+    if let Some(v) = body.get("name").and_then(|v| v.as_str()) {
+        set_clauses.push(format!("name=${}", idx));
+        params.push(Box::new(v.to_string()));
+        idx += 1;
+    }
+    if let Some(v) = body.get("description").and_then(|v| v.as_str()) {
+        set_clauses.push(format!("description=${}", idx));
+        params.push(Box::new(v.to_string()));
+        idx += 1;
+    }
+    if let Some(v) = body.get("price").and_then(|v| v.as_f64()) {
+        set_clauses.push(format!("price=${}", idx));
+        let dec = rust_decimal::Decimal::from_str_exact(&format!("{:.2}", v)).unwrap();
+        params.push(Box::new(dec));
+        idx += 1;
+    }
+    if let Some(v) = body.get("category_id").and_then(|v| v.as_i64()) {
+        set_clauses.push(format!("category_id=${}", idx));
+        params.push(Box::new(v as i32));
+        idx += 1;
+    }
+    if let Some(v) = body.get("stock").and_then(|v| v.as_i64()) {
+        set_clauses.push(format!("stock=${}", idx));
+        params.push(Box::new(v as i32));
+        idx += 1;
+    }
+
+    if set_clauses.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"detail": "No fields to update"})),
+        );
+    }
+
+    params.push(Box::new(id));
+    let query = format!(
+        "UPDATE products SET {} WHERE id=${} RETURNING id, name, price, stock",
+        set_clauses.join(", "),
+        idx
+    );
+
+    let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+
+    let row = conn.query_opt(&query, &param_refs).await.unwrap();
+
+    match row {
+        Some(row) => {
+            let price: rust_decimal::Decimal = row.get("price");
+            let product = ProductOut {
+                id: row.get("id"),
+                name: row.get("name"),
+                price: price.to_string().parse::<f64>().unwrap_or(0.0),
+                stock: row.get("stock"),
+                category_name: String::new(),
+            };
+            (StatusCode::OK, Json(serde_json::to_value(product).unwrap()))
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"detail": "Product not found"})),
+        ),
+    }
+}
+
+async fn delete_product(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> impl IntoResponse {
+    let conn = state.db.get().await.unwrap();
+    let rows_affected = conn
+        .execute("DELETE FROM products WHERE id=$1", &[&id])
+        .await
+        .unwrap();
+
+    if rows_affected == 0 {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"detail": "Product not found"})),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"deleted": true, "id": id})),
+        )
+    }
 }
 
 async fn category_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -401,7 +543,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/products/{id}", get(get_product))
+        .route("/products/{id}", get(get_product).put(update_product).patch(patch_product).delete(delete_product))
         .route("/products", get(list_products).post(create_product))
         .route("/categories/stats", get(category_stats))
         .route("/cached/products/{id}", get(get_cached_product))

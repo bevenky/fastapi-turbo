@@ -1,0 +1,26 @@
+[package]
+name = "pure-axum-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pure-axum-bench"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["multipart", "ws"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["compression-gzip", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+memchr = "2"
+futures-util = "0.3"
+tempfile = "3"
+minijinja = { version = "2", features = ["loader"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

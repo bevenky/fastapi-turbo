@@ -1,0 +1,7 @@
+{
+  "name": "node-bench",
+  "private": true,
+  "dependencies": {
+    "hyper-express": "^6.17.3"
+  }
+}

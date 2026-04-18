@@ -124,6 +124,9 @@ func main() {
 	r.GET("/products/:id", getProductHandler)
 	r.GET("/products", listProductsHandler)
 	r.POST("/products", createProductHandler)
+	r.PUT("/products/:id", updateProductHandler)
+	r.PATCH("/products/:id", patchProductHandler)
+	r.DELETE("/products/:id", deleteProductHandler)
 	r.GET("/categories/stats", categoryStatsHandler)
 	r.GET("/cached/products/:id", getCachedProductHandler)
 	r.GET("/orders/:id", getOrderHandler)
@@ -213,6 +216,96 @@ func createProductHandler(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusCreated, p)
+}
+
+// Full update (PUT)
+func updateProductHandler(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Invalid product ID"})
+		return
+	}
+	var body ProductCreate
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
+		return
+	}
+	var p ProductOut
+	err = dbPool.QueryRow(c.Request.Context(),
+		"UPDATE products SET name=$1, description=$2, price=$3, category_id=$4, stock=$5 "+
+			"WHERE id=$6 RETURNING id, name, price, stock",
+		body.Name, body.Description, body.Price, body.CategoryID, body.Stock, id,
+	).Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "Product not found"})
+		return
+	}
+	c.JSON(http.StatusOK, p)
+}
+
+// Partial update (PATCH)
+func patchProductHandler(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Invalid product ID"})
+		return
+	}
+	var body map[string]interface{}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
+		return
+	}
+	setClauses := []string{}
+	values := []interface{}{}
+	idx := 1
+	for _, key := range []string{"name", "description", "price", "category_id", "stock"} {
+		if val, ok := body[key]; ok {
+			setClauses = append(setClauses, fmt.Sprintf("%s=$%d", key, idx))
+			values = append(values, val)
+			idx++
+		}
+	}
+	if len(setClauses) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "No fields to update"})
+		return
+	}
+	values = append(values, id)
+	query := fmt.Sprintf("UPDATE products SET %s WHERE id=$%d RETURNING id, name, price, stock",
+		joinStrings(setClauses, ", "), idx)
+	var p ProductOut
+	err = dbPool.QueryRow(c.Request.Context(), query, values...).Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "Product not found"})
+		return
+	}
+	c.JSON(http.StatusOK, p)
+}
+
+// Delete product
+func deleteProductHandler(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Invalid product ID"})
+		return
+	}
+	tag, err := dbPool.Exec(c.Request.Context(),
+		"DELETE FROM products WHERE id=$1", id)
+	if err != nil || tag.RowsAffected() == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "Product not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id})
+}
+
+func joinStrings(strs []string, sep string) string {
+	result := ""
+	for i, s := range strs {
+		if i > 0 {
+			result += sep
+		}
+		result += s
+	}
+	return result
 }
 
 // Complex JOIN + GROUP BY aggregation
