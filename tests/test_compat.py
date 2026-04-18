@@ -143,8 +143,8 @@ def test_fastapi_security_all_classes():
     assert callable(APIKeyHeader)
     assert callable(APIKeyQuery)
     assert callable(APIKeyCookie)
-    assert HTTPBasicCredentials("a", "b").username == "a"
-    assert HTTPAuthorizationCredentials("Bearer", "tok").credentials == "tok"
+    assert HTTPBasicCredentials(username="a", password="b").username == "a"
+    assert HTTPAuthorizationCredentials(scheme="Bearer", credentials="tok").credentials == "tok"
     assert SecurityScopes(["read", "write"]).scope_str == "read write"
 
 

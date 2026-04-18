@@ -298,8 +298,10 @@ def test_oauth2_password_bearer():
     assert scheme.scheme_name == "OAuth2PasswordBearer"
     assert scheme.model["type"] == "oauth2"
 
-    # Test __call__ with valid token
-    token = asyncio.run(scheme(authorization="Bearer mytoken123"))
+    # Test __call__ with Request (new FastAPI-compatible signature)
+    from fastapi_rs.requests import Request
+    req = Request({"type": "http", "headers": [(b"authorization", b"Bearer mytoken123")]})
+    token = asyncio.run(scheme(req))
     assert token == "mytoken123"
 
 
@@ -307,26 +309,32 @@ def test_oauth2_password_bearer_no_token():
     import pytest
     from fastapi_rs.security import OAuth2PasswordBearer
     from fastapi_rs.exceptions import HTTPException
+    from fastapi_rs.requests import Request
 
     scheme = OAuth2PasswordBearer(tokenUrl="/token")
+    req = Request({"type": "http", "headers": []})
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(scheme(authorization=None))
+        asyncio.run(scheme(req))
     assert exc_info.value.status_code == 401
 
 
 def test_oauth2_password_bearer_no_auto_error():
     from fastapi_rs.security import OAuth2PasswordBearer
+    from fastapi_rs.requests import Request
 
     scheme = OAuth2PasswordBearer(tokenUrl="/token", auto_error=False)
-    result = asyncio.run(scheme(authorization=None))
+    req = Request({"type": "http", "headers": []})
+    result = asyncio.run(scheme(req))
     assert result is None
 
 
 def test_http_bearer():
     from fastapi_rs.security import HTTPBearer
+    from fastapi_rs.requests import Request
 
     scheme = HTTPBearer()
-    cred = asyncio.run(scheme(authorization="Bearer xyz"))
+    req = Request({"type": "http", "headers": [(b"authorization", b"Bearer xyz")]})
+    cred = asyncio.run(scheme(req))
     assert cred.scheme == "Bearer"
     assert cred.credentials == "xyz"
 
@@ -334,10 +342,12 @@ def test_http_bearer():
 def test_http_basic():
     import base64
     from fastapi_rs.security import HTTPBasic
+    from fastapi_rs.requests import Request
 
     scheme = HTTPBasic()
     encoded = base64.b64encode(b"user:pass").decode()
-    cred = asyncio.run(scheme(authorization=f"Basic {encoded}"))
+    req = Request({"type": "http", "headers": [(b"authorization", f"Basic {encoded}".encode())]})
+    cred = asyncio.run(scheme(req))
     assert cred.username == "user"
     assert cred.password == "pass"
 
