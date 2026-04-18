@@ -363,6 +363,29 @@ class Secret:
         return bool(self._value)
 
 
+class DefaultPlaceholder:
+    """Internal sentinel used by FastAPI to detect "not explicitly set".
+
+    Routers use this to distinguish between a user passing ``None`` and
+    not passing a value at all, allowing router-level defaults to merge
+    properly with route-level overrides.
+    """
+
+    def __init__(self, value: Any):
+        self.value = value
+
+    def __bool__(self) -> bool:
+        return bool(self.value)
+
+    def __repr__(self) -> str:
+        return f"DefaultPlaceholder({self.value!r})"
+
+
+def Default(value: Any) -> DefaultPlaceholder:
+    """Create a :class:`DefaultPlaceholder` wrapping *value*."""
+    return DefaultPlaceholder(value)
+
+
 class State:
     """Simple attribute-based namespace for app/request state.
 

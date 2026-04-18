@@ -98,6 +98,17 @@ def _build() -> dict[str, types.ModuleType]:
     starlette_websockets.WebSocketState = _websockets.WebSocketState  # type: ignore[attr-defined]
     starlette_websockets.WebSocketDisconnect = _exceptions.WebSocketDisconnect  # type: ignore[attr-defined]
     starlette_websockets.WebSocketException = _exceptions.WebSocketException  # type: ignore[attr-defined]
+
+    class WebSocketClose:
+        """Starlette-compatible WebSocketClose -- an ASGI response that sends
+        a websocket.close message when called."""
+        def __init__(self, code: int = 1000, reason: str | None = None):
+            self.code = code
+            self.reason = reason
+        async def __call__(self, scope, receive, send):
+            await send({"type": "websocket.close", "code": self.code, "reason": self.reason or ""})
+    starlette_websockets.WebSocketClose = WebSocketClose  # type: ignore[attr-defined]
+
     modules["starlette.websockets"] = starlette_websockets
 
     # ── starlette.datastructures ───────────────────────────────────
@@ -162,14 +173,7 @@ def _build() -> dict[str, types.ModuleType]:
     starlette_concurrency = _mod("starlette.concurrency")
     starlette_concurrency.run_in_threadpool = _concurrency.run_in_threadpool  # type: ignore[attr-defined]
     starlette_concurrency.iterate_in_threadpool = _concurrency.iterate_in_threadpool  # type: ignore[attr-defined]
-    async def _run_until_first_complete(*args):
-        import asyncio
-        tasks = [asyncio.ensure_future(func(**kwargs)) for func, kwargs in args]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        return [(task, task.result() if task.done() and not task.cancelled() else None) for task in done]
-    starlette_concurrency.run_until_first_complete = _run_until_first_complete  # type: ignore[attr-defined]
+    starlette_concurrency.run_until_first_complete = _concurrency.run_until_first_complete  # type: ignore[attr-defined]
     modules["starlette.concurrency"] = starlette_concurrency
 
     # ── starlette.background ───────────────────────────────────────
