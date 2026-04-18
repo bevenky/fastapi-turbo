@@ -32,6 +32,52 @@ class WebSocketState(enum.IntEnum):
 _VALID_SEND_JSON_MODES = ("text", "binary")
 
 
+# ── Minimal awaitable wrappers ──────────────────────────────────────
+#
+# The Rust side exposes already-resolved awaitables for send ops and
+# crossbeam-backed awaitables for receive ops. Wrapping them in
+# `async def` adds ~3-5 μs of coroutine overhead PER call — significant
+# for tight WebSocket loops that do 2 awaits per message (receive + send).
+#
+# These class-based awaitables skip the coroutine-alloc dance entirely
+# while still letting Python translate low-level Rust RuntimeError into
+# Starlette-compatible WebSocketDisconnect.
+
+
+class _ImmediateNone:
+    """Resolves synchronously to None on first __next__ — for fire-and-forget
+    send ops where the Rust side queues the frame and returns immediately."""
+    __slots__ = ()
+
+    def __await__(self):
+        return self
+    def __iter__(self):
+        return self
+    def __next__(self):
+        raise StopIteration(None)
+
+
+_IMMEDIATE_NONE = _ImmediateNone()
+
+
+class _RecvAwaitable:
+    """Wraps a Rust awaitable; translates its RuntimeError into
+    WebSocketDisconnect on the way out, and flips self._ws._app_state."""
+    __slots__ = ("_inner", "_ws")
+
+    def __init__(self, inner, ws):
+        self._inner = inner
+        self._ws = ws
+
+    def __await__(self):
+        try:
+            return (yield from self._inner.__await__())
+        except RuntimeError as e:
+            self._ws._app_state = WebSocketState.DISCONNECTED
+            code, reason = _extract_close_info_from_error(str(e))
+            raise WebSocketDisconnect(code=code, reason=reason) from e
+
+
 class WebSocket:
     """Wraps the Rust PyWebSocket for FastAPI/Starlette compatibility.
 
@@ -153,6 +199,22 @@ class WebSocket:
         self._app = value
 
     @property
+    def state(self):
+        """Per-connection state namespace (Starlette-compatible)."""
+        if not hasattr(self, '_state'):
+            from fastapi_rs.datastructures import State
+            self._state = State()
+        return self._state
+
+    async def send_denial_response(self, response) -> None:
+        """Send an HTTP response to reject a WebSocket upgrade.
+
+        Stub -- our Rust layer handles upgrade rejection before the
+        Python handler is invoked, so this is a no-op for API compat.
+        """
+        pass
+
+    @property
     def application_state(self) -> WebSocketState:
         """Server-side WebSocket state (matches Starlette)."""
         if self._ws is not None:
@@ -186,10 +248,9 @@ class WebSocket:
         negotiated via axum's `WebSocketUpgrade.protocols(...)` — the chosen
         subprotocol appears in the response's Sec-WebSocket-Protocol header.
 
-        headers: list of (bytes, bytes) — accepted for API compatibility with
-        Starlette but not yet emitted on the handshake response (axum's
-        WebSocketUpgrade API doesn't expose custom response headers without
-        dropping to lower-level hyper).
+        headers: list of (bytes, bytes) or (str, str) — emitted on the
+        handshake 101 response. Typical use is setting Set-Cookie during
+        upgrade. Multiple Set-Cookie entries are preserved as duplicates.
         """
         if self._app_state != WebSocketState.CONNECTING:
             # Starlette tolerates double-accept; we mirror that.
@@ -247,37 +308,41 @@ class WebSocket:
         elif msg_type == "websocket.close":
             await self.close(code=message.get("code", 1000), reason=message.get("reason"))
 
-    async def send_text(self, data: str) -> None:
+    # NOTE: send_* methods are sync but return an awaitable so
+    # `await ws.send_text(x)` keeps working. Skipping the `async def`
+    # wrapper saves ~3-5 μs of coroutine allocation per call.
+
+    def send_text(self, data: str):
         if self._app_state != WebSocketState.CONNECTED:
             raise RuntimeError(
                 'Cannot call "send_text" before "accept" or after a close.'
             )
         self._ws.send_text(data)
+        return _IMMEDIATE_NONE
 
-    async def send_bytes(self, data: bytes) -> None:
+    def send_bytes(self, data):
         if self._app_state != WebSocketState.CONNECTED:
             raise RuntimeError(
                 'Cannot call "send_bytes" before "accept" or after a close.'
             )
-        # Accept bytes/bytearray/memoryview — Rust side expects PyBytes.
         if not isinstance(data, bytes):
             data = bytes(data)
         self._ws.send_bytes(data)
+        return _IMMEDIATE_NONE
 
-    async def send_json(self, data: Any, mode: str = "text") -> None:
+    def send_json(self, data, mode: str = "text"):
         if mode not in _VALID_SEND_JSON_MODES:
             raise RuntimeError('The "mode" argument should be "text" or "binary".')
         if self._app_state != WebSocketState.CONNECTED:
             raise RuntimeError(
                 'Cannot call "send_json" before "accept" or after a close.'
             )
-        # Starlette-compatible serialization: no whitespace, no ASCII escapes.
-        # Matters for HMAC-signed payloads and byte-count-sensitive consumers.
         text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
         if mode == "text":
             self._ws.send_text(text)
         else:
             self._ws.send_bytes(text.encode("utf-8"))
+        return _IMMEDIATE_NONE
 
     # ── Receive ───────────────────────────────────────────────────
 
@@ -302,36 +367,21 @@ class WebSocket:
             self._app_state = WebSocketState.DISCONNECTED
         return msg
 
-    async def receive_text(self) -> str:
-        """Fast path: returns str directly, no dict allocation.
+    def receive_text(self):
+        """Returns the Rust TextAwaitable directly — zero Python wrapping.
 
-        Propagates the actual Close code and reason from the peer as fields on
-        WebSocketDisconnect — matches Starlette.
+        On close, the Rust side raises `WebSocketDisconnect(code, reason)`
+        directly, so we don't need a Python try/except translation layer.
         """
         if self._app_state == WebSocketState.DISCONNECTED:
             raise WebSocketDisconnect(code=1000, reason="already disconnected")
-        try:
-            return await self._ws.receive_text_async()
-        except RuntimeError as e:
-            # The Rust side lost track of the real close code when it
-            # converted it to a RuntimeError. Re-check by peeking at receive()
-            # for the actual disconnect dict — but that would consume another
-            # message. For now propagate 1000, and use receive() if you need
-            # the exact code.
-            self._app_state = WebSocketState.DISCONNECTED
-            code, reason = _extract_close_info_from_error(str(e))
-            raise WebSocketDisconnect(code=code, reason=reason) from e
+        return self._ws.receive_text_async()
 
-    async def receive_bytes(self) -> bytes:
-        """Fast path: returns bytes directly, no dict allocation."""
+    def receive_bytes(self):
+        """Returns the Rust BytesAwaitable directly."""
         if self._app_state == WebSocketState.DISCONNECTED:
             raise WebSocketDisconnect(code=1000, reason="already disconnected")
-        try:
-            return await self._ws.receive_bytes_async()
-        except RuntimeError as e:
-            self._app_state = WebSocketState.DISCONNECTED
-            code, reason = _extract_close_info_from_error(str(e))
-            raise WebSocketDisconnect(code=code, reason=reason) from e
+        return self._ws.receive_bytes_async()
 
     async def receive_json(self, mode: str = "text") -> Any:
         if mode not in _VALID_SEND_JSON_MODES:

@@ -9,58 +9,58 @@ These are callable classes that work as ``Depends()`` dependencies:
         return {"token": token}
 """
 
-from __future__ import annotations
+# Note: do NOT use `from __future__ import annotations` — it converts
+# type annotations to strings, breaking the DI system's ability to detect
+# `request: Request` params for injection.
+
+from pydantic import BaseModel
 
 from fastapi_rs.exceptions import HTTPException
+from fastapi_rs.param_functions import (
+    Header as _Header,
+    Query as _Query,
+    Cookie as _Cookie,
+    Form as _Form,
+)
+from fastapi_rs.requests import Request
 
 
 # ── Credential models ──────────────────────────────────────────────
 
 
-class HTTPBasicCredentials:
+class HTTPBasicCredentials(BaseModel):
     """Holds username and password from HTTP Basic auth."""
 
-    def __init__(self, username: str, password: str):
-        self.username = username
-        self.password = password
-
-    def __repr__(self) -> str:
-        return f"HTTPBasicCredentials(username={self.username!r})"
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, HTTPBasicCredentials):
-            return self.username == other.username and self.password == other.password
-        return NotImplemented
+    username: str
+    password: str
 
 
-class HTTPAuthorizationCredentials:
+class HTTPAuthorizationCredentials(BaseModel):
     """Holds scheme and credentials from an Authorization header."""
 
-    def __init__(self, scheme: str, credentials: str):
-        self.scheme = scheme
-        self.credentials = credentials
-
-    def __repr__(self) -> str:
-        return f"HTTPAuthorizationCredentials(scheme={self.scheme!r}, credentials={self.credentials!r})"
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, HTTPAuthorizationCredentials):
-            return self.scheme == other.scheme and self.credentials == other.credentials
-        return NotImplemented
+    scheme: str
+    credentials: str
 
 
 class OAuth2PasswordRequestForm:
-    """Dependency class for OAuth2 password flow form data."""
+    """Dependency class for OAuth2 password flow form data.
+
+    When used as ``form: OAuth2PasswordRequestForm = Depends()`` FastAPI
+    uses the class itself as the dep callable, inspects its ``__init__``
+    signature, and pulls each field from the request form body. We match
+    that by marking each field with a ``Form`` default so the framework
+    pulls them from ``application/x-www-form-urlencoded`` / multipart.
+    """
 
     def __init__(
         self,
         *,
-        grant_type: str | None = None,
-        username: str = "",
-        password: str = "",
-        scope: str = "",
-        client_id: str | None = None,
-        client_secret: str | None = None,
+        grant_type: str | None = _Form(default=None),
+        username: str = _Form(default=""),
+        password: str = _Form(default=""),
+        scope: str = _Form(default=""),
+        client_id: str | None = _Form(default=None),
+        client_secret: str | None = _Form(default=None),
     ):
         self.grant_type = grant_type
         self.username = username
@@ -68,6 +68,90 @@ class OAuth2PasswordRequestForm:
         self.scopes = scope.split() if scope else []
         self.client_id = client_id
         self.client_secret = client_secret
+
+
+class OAuth2PasswordRequestFormStrict(OAuth2PasswordRequestForm):
+    """Like OAuth2PasswordRequestForm but requires grant_type="password".
+
+    Matches FastAPI's ``OAuth2PasswordRequestFormStrict`` which enforces
+    the ``grant_type`` field to be exactly ``"password"`` per the OAuth2 spec.
+    """
+
+    def __init__(
+        self,
+        *,
+        grant_type: str = _Form(default="password"),
+        username: str = _Form(default=""),
+        password: str = _Form(default=""),
+        scope: str = _Form(default=""),
+        client_id: str | None = _Form(default=None),
+        client_secret: str | None = _Form(default=None),
+    ):
+        super().__init__(
+            grant_type=grant_type,
+            username=username,
+            password=password,
+            scope=scope,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+
+
+# ── Helper: extract authorization header from request or string ────
+
+
+def _get_authorization(request_or_str=None, **kwargs) -> str | None:
+    """Extract the Authorization header value.
+
+    Accepts either a Request object, a plain string (for backward
+    compatibility with DI systems that pass extracted header values),
+    or an ``authorization`` keyword argument.
+    """
+    # Check kwargs first (backward compat: scheme(authorization="Bearer ..."))
+    if "authorization" in kwargs:
+        return kwargs["authorization"]
+    if request_or_str is None:
+        return None
+    if isinstance(request_or_str, str):
+        return request_or_str
+    # Request-like object
+    if hasattr(request_or_str, "headers"):
+        return request_or_str.headers.get("authorization")
+    return None
+
+
+# ── OAuth2 base class ────────────────────────────────────────────
+
+
+class OAuth2:
+    """Base OAuth2 security scheme (matches FastAPI's OAuth2 base class).
+
+    Can be used directly with custom flows or subclassed for specific
+    OAuth2 flow types.
+    """
+
+    def __init__(
+        self,
+        *,
+        flows: dict | None = None,
+        scheme_name: str | None = None,
+        description: str | None = None,
+        auto_error: bool = True,
+    ):
+        self.model = {"type": "oauth2", "flows": flows or {}}
+        self.scheme_name = scheme_name or self.__class__.__name__
+        self.description = description
+        self.auto_error = auto_error
+        if description:
+            self.model["description"] = description
+
+    async def __call__(self, request: Request = None, **kwargs) -> str | None:
+        authorization = _get_authorization(request, **kwargs)
+        if authorization:
+            return authorization
+        if self.auto_error:
+            raise HTTPException(status_code=403, detail="Not authenticated")
+        return None
 
 
 # ── Security schemes ───────────────────────────────────────────────
@@ -103,11 +187,8 @@ class OAuth2PasswordBearer:
             },
         }
 
-    async def __call__(self, authorization: str | None = None, **kwargs) -> str | None:
-        # When used as a Depends(), the DI system calls this.
-        # Since we can't easily hook into the header extraction from here,
-        # the authorization param needs to be extracted by the caller.
-        # For now, we implement a simple token extraction.
+    async def __call__(self, request: Request = None, **kwargs) -> str | None:
+        authorization = _get_authorization(request, **kwargs)
         if authorization and authorization.startswith("Bearer "):
             return authorization[7:]
         if self.auto_error:
@@ -144,7 +225,8 @@ class HTTPBearer:
         if bearerFormat:
             self.model["bearerFormat"] = bearerFormat
 
-    async def __call__(self, authorization: str | None = None, **kwargs) -> HTTPAuthorizationCredentials | None:
+    async def __call__(self, request: Request = None, **kwargs) -> HTTPAuthorizationCredentials | None:
+        authorization = _get_authorization(request, **kwargs)
         if authorization and authorization.startswith("Bearer "):
             return HTTPAuthorizationCredentials(
                 scheme="Bearer",
@@ -159,7 +241,7 @@ class HTTPDigest:
     """HTTP Digest authentication scheme.
 
     Extracts a ``Digest`` Authorization header and returns
-    ``HTTPAuthorizationCredentials``.  This matches FastAPI's behavior —
+    ``HTTPAuthorizationCredentials``.  This matches FastAPI's behavior --
     it does NOT implement the full RFC 7616 challenge/response handshake.
     """
 
@@ -180,7 +262,8 @@ class HTTPDigest:
         if description:
             self.model["description"] = description
 
-    async def __call__(self, authorization: str | None = None, **kwargs) -> HTTPAuthorizationCredentials | None:
+    async def __call__(self, request: Request = None, **kwargs) -> HTTPAuthorizationCredentials | None:
+        authorization = _get_authorization(request, **kwargs)
         if authorization and authorization.lower().startswith("digest "):
             return HTTPAuthorizationCredentials(
                 scheme="Digest",
@@ -211,9 +294,10 @@ class HTTPBasic:
             "scheme": "basic",
         }
 
-    async def __call__(self, authorization: str | None = None, **kwargs) -> HTTPBasicCredentials | None:
+    async def __call__(self, request: Request = None, **kwargs) -> HTTPBasicCredentials | None:
         import base64
 
+        authorization = _get_authorization(request, **kwargs)
         if authorization and authorization.startswith("Basic "):
             try:
                 decoded = base64.b64decode(authorization[6:]).decode("utf-8")
@@ -230,96 +314,64 @@ class HTTPBasic:
         return None
 
 
-class APIKeyHeader:
+def _make_api_key_call(location: str, name: str, auto_error: bool, self_ref):
+    """Factory: build a __call__ with an instance-specific marker default.
+
+    Each APIKey* instance has its own `name` -- we synthesize an async def
+    whose default value is an instance-bound Header/Query/Cookie marker so
+    the dep resolver knows where to pull the value from.
+    """
+    if location == "header":
+        marker = _Header(default=None, alias=name)
+    elif location == "query":
+        marker = _Query(default=None, alias=name)
+    elif location == "cookie":
+        marker = _Cookie(default=None, alias=name)
+    else:
+        marker = None
+
+    # Shadow-default used by inspect.signature -- the default VALUE is the
+    # marker itself, which the introspector recognises.
+    async def _call(api_key: str | None = marker, **_kwargs) -> str | None:
+        if api_key:
+            return api_key
+        if auto_error:
+            raise HTTPException(status_code=403, detail="Not authenticated")
+        return None
+    return _call
+
+
+class _APIKeyBase:
+    _location: str = "header"
+
+    def __init__(self, *, name: str, scheme_name: str | None = None,
+                 description: str | None = None, auto_error: bool = True):
+        self.name = name
+        self.scheme_name = scheme_name or self.__class__.__name__
+        self.description = description
+        self.auto_error = auto_error
+        self.model = {"type": "apiKey", "in": self._location, "name": name}
+        self._call = _make_api_key_call(self._location, name, auto_error, self)
+        import inspect as _inspect
+        self.__signature__ = _inspect.signature(self._call)
+
+    async def __call__(self, *args, **kwargs):
+        return await self._call(*args, **kwargs)
+
+
+class APIKeyHeader(_APIKeyBase):
     """API key from a request header."""
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        scheme_name: str | None = None,
-        description: str | None = None,
-        auto_error: bool = True,
-    ):
-        self.name = name
-        self.scheme_name = scheme_name or self.__class__.__name__
-        self.description = description
-        self.auto_error = auto_error
-        self.model = {
-            "type": "apiKey",
-            "in": "header",
-            "name": name,
-        }
-
-    async def __call__(self, **kwargs) -> str | None:
-        # The API key should be passed from the header with the configured name.
-        # When used in the DI system, the caller extracts it.
-        api_key = kwargs.get(self.name) or kwargs.get(self.name.lower())
-        if api_key:
-            return api_key
-        if self.auto_error:
-            raise HTTPException(status_code=403, detail="Not authenticated")
-        return None
+    _location = "header"
 
 
-class APIKeyQuery:
+class APIKeyQuery(_APIKeyBase):
     """API key from a query parameter."""
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        scheme_name: str | None = None,
-        description: str | None = None,
-        auto_error: bool = True,
-    ):
-        self.name = name
-        self.scheme_name = scheme_name or self.__class__.__name__
-        self.description = description
-        self.auto_error = auto_error
-        self.model = {
-            "type": "apiKey",
-            "in": "query",
-            "name": name,
-        }
-
-    async def __call__(self, **kwargs) -> str | None:
-        api_key = kwargs.get(self.name)
-        if api_key:
-            return api_key
-        if self.auto_error:
-            raise HTTPException(status_code=403, detail="Not authenticated")
-        return None
+    _location = "query"
 
 
-class APIKeyCookie:
+class APIKeyCookie(_APIKeyBase):
     """API key from a cookie."""
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        scheme_name: str | None = None,
-        description: str | None = None,
-        auto_error: bool = True,
-    ):
-        self.name = name
-        self.scheme_name = scheme_name or self.__class__.__name__
-        self.description = description
-        self.auto_error = auto_error
-        self.model = {
-            "type": "apiKey",
-            "in": "cookie",
-            "name": name,
-        }
-
-    async def __call__(self, **kwargs) -> str | None:
-        api_key = kwargs.get(self.name)
-        if api_key:
-            return api_key
-        if self.auto_error:
-            raise HTTPException(status_code=403, detail="Not authenticated")
-        return None
+    _location = "cookie"
 
 
 class SecurityScopes:
@@ -374,7 +426,8 @@ class OAuth2ClientCredentials:
         if description:
             self.model["description"] = description
 
-    async def __call__(self, authorization: str | None = None, **kwargs) -> str | None:
+    async def __call__(self, request: Request = None, **kwargs) -> str | None:
+        authorization = _get_authorization(request, **kwargs)
         if authorization and authorization.startswith("Bearer "):
             return authorization[7:]
         if self.auto_error:
@@ -420,7 +473,8 @@ class OAuth2AuthorizationCodeBearer:
         if description:
             self.model["description"] = description
 
-    async def __call__(self, authorization: str | None = None, **kwargs) -> str | None:
+    async def __call__(self, request: Request = None, **kwargs) -> str | None:
+        authorization = _get_authorization(request, **kwargs)
         if authorization and authorization.startswith("Bearer "):
             return authorization[7:]
         if self.auto_error:
@@ -457,7 +511,8 @@ class OpenIdConnect:
         if description:
             self.model["description"] = description
 
-    async def __call__(self, authorization: str | None = None, **kwargs) -> str | None:
+    async def __call__(self, request: Request = None, **kwargs) -> str | None:
+        authorization = _get_authorization(request, **kwargs)
         if authorization:
             # User presents an OIDC id_token (typically in Authorization: Bearer ...)
             if authorization.startswith("Bearer "):

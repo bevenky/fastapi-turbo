@@ -13,20 +13,18 @@ from typing import Any
 from fastapi_rs.datastructures import URL, Address, Headers, QueryParams, State
 
 
-class Request:
-    """Starlette-compatible Request wrapper.
+class HTTPConnection:
+    """Starlette-compatible HTTPConnection base class.
 
-    For now, wraps a simple dict-based scope since the Rust side
-    does not yet pass a Request object.
+    Shared base for Request and WebSocket in Starlette — provides the
+    URL/header/cookie/client/state scope-derived properties. Many
+    third-party middlewares do ``isinstance(conn, HTTPConnection)``.
     """
 
     def __init__(self, scope: dict[str, Any] | None = None, receive=None, send=None):
         self._scope = scope or {}
         self._receive = receive
         self._send = send
-        self._body: bytes | None = None
-        self._json: Any = None
-        self._form: dict[str, Any] | None = None
         self._cookies: dict[str, str] | None = None
         self._state: State | None = None
 
@@ -35,8 +33,8 @@ class Request:
         return self._scope
 
     @property
-    def method(self) -> str:
-        return self._scope.get("method", "GET")
+    def app(self):
+        return self._scope.get("app")
 
     @property
     def url(self) -> URL:
@@ -44,39 +42,87 @@ class Request:
 
     @property
     def base_url(self) -> URL:
-        scope = dict(self._scope)
-        scope["path"] = "/"
-        scope["query_string"] = ""
-        return URL(scope)
+        scheme = self._scope.get("scheme", "http")
+        server = self._scope.get("server")
+        host = server[0] if server else "localhost"
+        port = server[1] if server else None
+        if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+            return URL(f"{scheme}://{host}:{port}/")
+        return URL(f"{scheme}://{host}/")
 
     @property
     def headers(self) -> Headers:
-        return Headers(self._scope.get("headers", {}))
+        raw = self._scope.get("headers", [])
+        return Headers(raw)
 
     @property
     def query_params(self) -> QueryParams:
-        qs = self._scope.get("query_string", "")
+        qs = self._scope.get("query_string", b"")
         return QueryParams(qs)
 
     @property
-    def path_params(self) -> dict[str, Any]:
-        return self._scope.get("path_params", {})
+    def path_params(self) -> dict:
+        return dict(self._scope.get("path_params", {}))
 
     @property
     def cookies(self) -> dict[str, str]:
         if self._cookies is None:
-            self._cookies = {}
-            headers = self.headers
-            cookie_header = headers.get("cookie", "")
+            cookies: dict[str, str] = {}
+            cookie_header = self.headers.get("cookie")
             if cookie_header:
                 sc = SimpleCookie()
                 sc.load(cookie_header)
-                self._cookies = {key: morsel.value for key, morsel in sc.items()}
+                for key, morsel in sc.items():
+                    cookies[key] = morsel.value
+            self._cookies = cookies
         return self._cookies
 
     @property
-    def client(self) -> Address:
-        return Address(self._scope.get("client", ("0.0.0.0", 0)))
+    def client(self):
+        c = self._scope.get("client")
+        if c:
+            return Address(c)
+        return None
+
+    @property
+    def session(self) -> dict:
+        return self._scope.setdefault("session", {})
+
+    @property
+    def auth(self):
+        return self._scope.get("auth")
+
+    @property
+    def user(self):
+        return self._scope.get("user")
+
+    @property
+    def state(self) -> State:
+        if self._state is None:
+            self._state = State()
+        return self._state
+
+
+class Request(HTTPConnection):
+    """Starlette-compatible Request wrapper.
+
+    For now, wraps a simple dict-based scope since the Rust side
+    does not yet pass a Request object.
+    """
+
+    def __init__(self, scope: dict[str, Any] | None = None, receive=None, send=None):
+        super().__init__(scope, receive, send)
+        self._body: bytes | None = None
+        self._json: Any = None
+        self._form: dict[str, Any] | None = None
+
+    # Most properties (url, headers, query_params, path_params, cookies,
+    # client, state, app, auth) are inherited from HTTPConnection.
+    # Request-only: method + body/json/form access.
+
+    @property
+    def method(self) -> str:
+        return self._scope.get("method", "GET")
 
     @property
     def state(self) -> State:
@@ -87,10 +133,6 @@ class Request:
     @state.setter
     def state(self, value: State) -> None:
         self._state = value
-
-    @property
-    def app(self):
-        return self._scope.get("app")
 
     @property
     def user(self):
@@ -124,6 +166,19 @@ class Request:
         SessionMiddleware is fully absent. We're permissive.
         """
         return self._scope.setdefault("session", {})
+
+    @property
+    def receive(self):
+        """The ASGI receive callable (Starlette-compatible)."""
+        return self._receive
+
+    async def is_disconnected(self) -> bool:
+        """Check if the client has disconnected.
+
+        Cannot reliably detect in our Rust-bridged architecture, so
+        this always returns False. Matches the Starlette API surface.
+        """
+        return False
 
     def url_for(self, name: str, /, **path_params: Any) -> URL:
         """Return the full URL for a named route (includes scheme and host)."""
@@ -198,14 +253,16 @@ class Request:
         self._json = _json.loads(raw)
         return self._json
 
-    async def form(self) -> dict[str, Any]:
+    async def form(self, *, max_files: int = 1000, max_fields: int = 1000) -> "FormData":
         if self._form is not None:
             return self._form
         # Basic form parsing — assumes application/x-www-form-urlencoded
         raw = await self.body()
         from urllib.parse import parse_qs
+        from fastapi_rs.datastructures import FormData
         parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
-        self._form = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+        flat = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+        self._form = FormData(flat)
         return self._form
 
     async def close(self) -> None:

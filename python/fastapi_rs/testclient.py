@@ -118,6 +118,99 @@ class TestClient:
         assert self._client is not None, "TestClient must be used as a context manager"
         return self._client.request(method, url, **kwargs)
 
+    # ── WebSocket ──────────────────────────────────────────────────
+    #
+    # NOTE: `TestClient.websocket_connect` runs the WS client in a thread
+    # in the SAME Python process as the server, which hits a GIL/event-loop
+    # deadlock in our current setup. For now, WebSocket tests should use
+    # the subprocess pattern (see tests/test_websocket.py `server_app`
+    # fixture) or the `WebSocketTestSession` helper below, which launches
+    # the app in a subprocess.
+
+    def websocket_connect(
+        self,
+        url: str,
+        subprotocols: list[str] | None = None,
+        **kwargs: Any,
+    ) -> "_WebSocketTestSession":
+        """Open a WebSocket connection to the running server.
+
+        WARNING: in-process WS has a known deadlock under some conditions.
+        For reliable WS testing, use the `WebSocketTestSession.from_code()`
+        helper (launches a subprocess).
+        """
+        assert self._port is not None, "TestClient must be used as a context manager"
+        ws_url = f"ws://127.0.0.1:{self._port}{url}"
+        return _WebSocketTestSession(ws_url, subprotocols=subprotocols, **kwargs)
+
+
+class _WebSocketTestSession:
+    """Synchronous Starlette-compatible test WebSocket session."""
+
+    def __init__(self, url: str, subprotocols: list[str] | None = None, **_: Any):
+        self._url = url
+        self._subprotocols = subprotocols
+        self._ws = None
+        from websockets.sync.client import connect as _connect  # noqa: E402
+        self._connect = _connect
+
+    def __enter__(self) -> "_WebSocketTestSession":
+        kw: dict = {}
+        if self._subprotocols:
+            kw["subprotocols"] = self._subprotocols
+        self._ws = self._connect(self._url, **kw)
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        if self._ws is not None:
+            self._ws.close()
+            self._ws = None
+
+    # ── Send ───────────────────────────────────────────────────────
+
+    def send_text(self, data: str) -> None:
+        assert self._ws is not None
+        self._ws.send(data)
+
+    def send_bytes(self, data: bytes) -> None:
+        assert self._ws is not None
+        self._ws.send(data)
+
+    def send_json(self, data: Any, mode: str = "text") -> None:
+        import json as _json
+        payload = _json.dumps(data)
+        if mode == "binary":
+            self.send_bytes(payload.encode("utf-8"))
+        else:
+            self.send_text(payload)
+
+    # ── Receive ────────────────────────────────────────────────────
+
+    def receive_text(self) -> str:
+        assert self._ws is not None
+        msg = self._ws.recv()
+        if isinstance(msg, bytes):
+            return msg.decode("utf-8")
+        return msg
+
+    def receive_bytes(self) -> bytes:
+        assert self._ws is not None
+        msg = self._ws.recv()
+        if isinstance(msg, str):
+            return msg.encode("utf-8")
+        return msg
+
+    def receive_json(self, mode: str = "text") -> Any:
+        import json as _json
+        if mode == "binary":
+            return _json.loads(self.receive_bytes().decode("utf-8"))
+        return _json.loads(self.receive_text())
+
+    def close(self, code: int = 1000, reason: str = "") -> None:
+        if self._ws is not None:
+            self._ws.close(code=code, reason=reason)
+            self._ws = None
+
 
 class AsyncTestClient:
     """Async HTTP test client that launches a real fastapi-rs server in a background thread."""

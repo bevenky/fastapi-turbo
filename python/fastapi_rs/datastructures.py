@@ -228,6 +228,141 @@ class Address:
         return NotImplemented
 
 
+class URLPath(str):
+    """Starlette-compatible URLPath — a str subclass with protocol + host.
+
+    Returned by ``request.url_for(name, **params)`` / ``app.url_path_for(...)``.
+    Call ``.make_absolute_url(base_url)`` to materialise a full URL string.
+    """
+
+    def __new__(cls, path: str = "", protocol: str = "", host: str = ""):
+        instance = super().__new__(cls, path)
+        instance._protocol = protocol
+        instance._host = host
+        return instance
+
+    @property
+    def protocol(self) -> str:
+        return getattr(self, "_protocol", "")
+
+    @property
+    def host(self) -> str:
+        return getattr(self, "_host", "")
+
+    def make_absolute_url(self, base_url) -> str:
+        base = str(base_url).rstrip("/")
+        return base + str(self)
+
+
+class MutableHeaders(Headers):
+    """Headers that support __setitem__/__delitem__/append (Starlette-compat)."""
+
+    def __setitem__(self, key: str, value: str) -> None:
+        self._dict[key.lower()] = str(value)
+
+    def __delitem__(self, key: str) -> None:
+        del self._dict[key.lower()]
+
+    def setdefault(self, key: str, value: str) -> str:
+        return self._dict.setdefault(key.lower(), str(value))
+
+    def update(self, other) -> None:
+        if isinstance(other, Headers):
+            for k, v in other.items():
+                self._dict[k.lower()] = v
+        elif isinstance(other, dict):
+            for k, v in other.items():
+                self._dict[k.lower()] = str(v)
+
+    def append(self, key: str, value: str) -> None:
+        """Append adds (or overwrites in this single-value impl). Starlette's
+        append preserves duplicates — our simplified store collapses them."""
+        self._dict[key.lower()] = str(value)
+
+
+class FormData:
+    """Multipart/urlencoded form-data wrapper — dict-like multi-value.
+
+    Starlette-compat: ``form.get("name")``, ``form.getlist("name")``,
+    ``form.items()``, iterate over keys. Can hold both str values and
+    UploadFile instances.
+    """
+
+    def __init__(self, items=None):
+        self._items: list[tuple[str, Any]] = []
+        if items is None:
+            return
+        if isinstance(items, dict):
+            for k, v in items.items():
+                self._items.append((k, v))
+        elif isinstance(items, (list, tuple)):
+            for pair in items:
+                if len(pair) == 2:
+                    self._items.append((pair[0], pair[1]))
+        elif isinstance(items, FormData):
+            self._items = list(items._items)
+
+    def __getitem__(self, key: str):
+        for k, v in self._items:
+            if k == key:
+                return v
+        raise KeyError(key)
+
+    def __contains__(self, key: object) -> bool:
+        return any(k == key for k, _ in self._items)
+
+    def get(self, key: str, default=None):
+        for k, v in self._items:
+            if k == key:
+                return v
+        return default
+
+    def getlist(self, key: str) -> list:
+        return [v for k, v in self._items if k == key]
+
+    def keys(self):
+        seen = set()
+        for k, _ in self._items:
+            if k not in seen:
+                seen.add(k)
+                yield k
+
+    def values(self):
+        for _, v in self._items:
+            yield v
+
+    def items(self):
+        return iter(self._items)
+
+    def multi_items(self):
+        return iter(self._items)
+
+    def __iter__(self):
+        return self.keys()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+class Secret:
+    """Wrapper that hides its value in repr(). For env-var secrets.
+
+    Matches ``starlette.datastructures.Secret``.
+    """
+
+    def __init__(self, value: str):
+        self._value = value
+
+    def __repr__(self) -> str:
+        return "Secret('**********')"
+
+    def __str__(self) -> str:
+        return self._value
+
+    def __bool__(self) -> bool:
+        return bool(self._value)
+
+
 class State:
     """Simple attribute-based namespace for app/request state.
 
