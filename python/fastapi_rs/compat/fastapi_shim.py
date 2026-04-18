@@ -108,7 +108,17 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_responses.FileResponse = _responses.FileResponse  # type: ignore[attr-defined]
     fastapi_responses.ORJSONResponse = _responses.ORJSONResponse  # type: ignore[attr-defined]
     fastapi_responses.UJSONResponse = _responses.UJSONResponse  # type: ignore[attr-defined]
+    fastapi_responses.EventSourceResponse = _responses.EventSourceResponse  # type: ignore[attr-defined]
     modules["fastapi.responses"] = fastapi_responses
+
+    # ── fastapi.sse ───────────────────────────────────────────────
+    import fastapi_rs.sse as _sse
+    fastapi_sse = _mod("fastapi.sse")
+    fastapi_sse.EventSourceResponse = _responses.EventSourceResponse  # type: ignore[attr-defined]
+    fastapi_sse.ServerSentEvent = _sse.ServerSentEvent  # type: ignore[attr-defined]
+    fastapi_sse.format_sse_event = _sse.format_sse_event  # type: ignore[attr-defined]
+    fastapi_sse.KEEPALIVE_COMMENT = _sse.KEEPALIVE_COMMENT  # type: ignore[attr-defined]
+    modules["fastapi.sse"] = fastapi_sse
 
     # ── fastapi.applications ───────────────────────────────────────
     fastapi_applications = _mod("fastapi.applications")
@@ -138,8 +148,14 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_exceptions.WebSocketRequestValidationError = _exceptions.WebSocketRequestValidationError  # type: ignore[attr-defined]
     fastapi_exceptions.FastAPIError = _exceptions.FastAPIError  # type: ignore[attr-defined]
     fastapi_exceptions.ResponseValidationError = _exceptions.ResponseValidationError  # type: ignore[attr-defined]
+    fastapi_exceptions.ValidationException = _exceptions.ValidationException  # type: ignore[attr-defined]
     fastapi_exceptions.StarletteHTTPException = _exceptions.HTTPException  # type: ignore[attr-defined]
     fastapi_exceptions.StarletteWebSocketException = _exceptions.WebSocketException  # type: ignore[attr-defined]
+    fastapi_exceptions.DependencyScopeError = _exceptions.DependencyScopeError  # type: ignore[attr-defined]
+    fastapi_exceptions.PydanticV1NotSupportedError = _exceptions.PydanticV1NotSupportedError  # type: ignore[attr-defined]
+    fastapi_exceptions.FastAPIDeprecationWarning = _exceptions.FastAPIDeprecationWarning  # type: ignore[attr-defined]
+    fastapi_exceptions.RequestErrorModel = _exceptions.RequestErrorModel  # type: ignore[attr-defined]
+    fastapi_exceptions.WebSocketErrorModel = _exceptions.WebSocketErrorModel  # type: ignore[attr-defined]
     modules["fastapi.exceptions"] = fastapi_exceptions
 
     # ── fastapi.params ─────────────────────────────────────────────
@@ -199,6 +215,47 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_security.APIKeyCookie = _security.APIKeyCookie  # type: ignore[attr-defined]
     fastapi_security.SecurityScopes = _security.SecurityScopes  # type: ignore[attr-defined]
     modules["fastapi.security"] = fastapi_security
+
+    # ── Security sub-modules ──────────────────────────────────────
+    fastapi_security_oauth2 = _mod("fastapi.security.oauth2")
+    fastapi_security_oauth2.OAuth2 = _security.OAuth2  # type: ignore[attr-defined]
+    fastapi_security_oauth2.OAuth2PasswordBearer = _security.OAuth2PasswordBearer  # type: ignore[attr-defined]
+    fastapi_security_oauth2.OAuth2AuthorizationCodeBearer = _security.OAuth2AuthorizationCodeBearer  # type: ignore[attr-defined]
+    fastapi_security_oauth2.OAuth2PasswordRequestForm = _security.OAuth2PasswordRequestForm  # type: ignore[attr-defined]
+    fastapi_security_oauth2.OAuth2PasswordRequestFormStrict = _security.OAuth2PasswordRequestFormStrict  # type: ignore[attr-defined]
+    modules["fastapi.security.oauth2"] = fastapi_security_oauth2
+
+    fastapi_security_http = _mod("fastapi.security.http")
+    fastapi_security_http.HTTPBearer = _security.HTTPBearer  # type: ignore[attr-defined]
+    fastapi_security_http.HTTPDigest = _security.HTTPDigest  # type: ignore[attr-defined]
+    fastapi_security_http.HTTPBasic = _security.HTTPBasic  # type: ignore[attr-defined]
+    fastapi_security_http.HTTPBasicCredentials = _security.HTTPBasicCredentials  # type: ignore[attr-defined]
+    fastapi_security_http.HTTPAuthorizationCredentials = _security.HTTPAuthorizationCredentials  # type: ignore[attr-defined]
+    modules["fastapi.security.http"] = fastapi_security_http
+
+    fastapi_security_api_key = _mod("fastapi.security.api_key")
+    fastapi_security_api_key.APIKeyHeader = _security.APIKeyHeader  # type: ignore[attr-defined]
+    fastapi_security_api_key.APIKeyQuery = _security.APIKeyQuery  # type: ignore[attr-defined]
+    fastapi_security_api_key.APIKeyCookie = _security.APIKeyCookie  # type: ignore[attr-defined]
+    modules["fastapi.security.api_key"] = fastapi_security_api_key
+
+    fastapi_security_open_id = _mod("fastapi.security.open_id_connect_url")
+    fastapi_security_open_id.OpenIdConnect = _security.OpenIdConnect  # type: ignore[attr-defined]
+    modules["fastapi.security.open_id_connect_url"] = fastapi_security_open_id
+
+    fastapi_security_base = _mod("fastapi.security.base")
+    class SecurityBase: pass
+    fastapi_security_base.SecurityBase = SecurityBase  # type: ignore[attr-defined]
+    modules["fastapi.security.base"] = fastapi_security_base
+
+    fastapi_security_utils = _mod("fastapi.security.utils")
+    def get_authorization_scheme_param(authorization_header_value):
+        if not authorization_header_value:
+            return "", ""
+        scheme, _, param = authorization_header_value.partition(" ")
+        return scheme, param
+    fastapi_security_utils.get_authorization_scheme_param = get_authorization_scheme_param  # type: ignore[attr-defined]
+    modules["fastapi.security.utils"] = fastapi_security_utils
 
     # ── fastapi.encoders ───────────────────────────────────────────
     fastapi_encoders = _mod("fastapi.encoders")
@@ -315,30 +372,84 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_openapi_utils.get_openapi = _oa.generate_openapi_schema  # type: ignore[attr-defined]
     modules["fastapi.openapi.utils"] = fastapi_openapi_utils
 
-    # Swagger/ReDoc HTML helpers — pull from server.rs wiring; stub here.
+    # ── fastapi.openapi.constants ──────────────────────────────────
+    fastapi_openapi_constants = _mod("fastapi.openapi.constants")
+    fastapi_openapi_constants.REF_PREFIX = "#/components/schemas/"  # type: ignore[attr-defined]
+    fastapi_openapi_constants.REF_TEMPLATE = "#/components/schemas/{model}"  # type: ignore[attr-defined]
+    fastapi_openapi_constants.METHODS_WITH_BODY = {"GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"}  # type: ignore[attr-defined]
+    modules["fastapi.openapi.constants"] = fastapi_openapi_constants
+
+    # Swagger/ReDoc HTML helpers
     fastapi_openapi_docs = _mod("fastapi.openapi.docs")
-    def _stub_swagger_ui_html(*, openapi_url, title="API", **_):
-        return f"<!DOCTYPE html><html><body><div id=swagger></div><script>const url='{openapi_url}'</script></body></html>"
+
+    def get_swagger_ui_html(
+        *,
+        openapi_url,
+        title="API docs",
+        swagger_js_url=None,
+        swagger_css_url=None,
+        swagger_favicon_url=None,
+        oauth2_redirect_url=None,
+        init_oauth=None,
+        swagger_ui_parameters=None,
+    ):
+        js_url = swagger_js_url or "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"
+        css_url = swagger_css_url or "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css"
+        favicon = ""
+        if swagger_favicon_url:
+            favicon = f'<link rel="icon" href="{swagger_favicon_url}">'
+        html = (
+            f"<!DOCTYPE html><html><head><title>{title}</title>\n"
+            f'<link rel="stylesheet" href="{css_url}">\n'
+            f"{favicon}</head><body>\n"
+            f'<div id="swagger-ui"></div>\n'
+            f'<script src="{js_url}"></script>\n'
+            f'<script>SwaggerUIBundle({{url:"{openapi_url}",dom_id:"#swagger-ui"}})</script>\n'
+            f"</body></html>"
+        )
+        from fastapi_rs.responses import HTMLResponse
+        return HTMLResponse(html)
+
     def _stub_redoc_html(*, openapi_url, title="API", **_):
         return f"<!DOCTYPE html><html><body><redoc spec-url='{openapi_url}'></redoc></body></html>"
-    def _stub_oauth2_redirect():
-        return "<!DOCTYPE html><html><body></body></html>"
-    fastapi_openapi_docs.get_swagger_ui_html = _stub_swagger_ui_html  # type: ignore[attr-defined]
+
+    def get_swagger_ui_oauth2_redirect_html():
+        from fastapi_rs.responses import HTMLResponse
+        return HTMLResponse(
+            '<!doctype html><html><body>'
+            '<script>window.onload=function(){'
+            'var qp=window.location.hash?window.location.hash.substring(1):window.location.search.substring(1);'
+            'var data={};qp.split("&").forEach(function(p){var kv=p.split("=");data[kv[0]]=decodeURIComponent(kv[1]||"");});'
+            'window.opener.swaggerUIRedirectOauth2(data);window.close();'
+            '}</script></body></html>'
+        )
+
+    fastapi_openapi_docs.get_swagger_ui_html = get_swagger_ui_html  # type: ignore[attr-defined]
     fastapi_openapi_docs.get_redoc_html = _stub_redoc_html  # type: ignore[attr-defined]
-    fastapi_openapi_docs.get_swagger_ui_oauth2_redirect_html = _stub_oauth2_redirect  # type: ignore[attr-defined]
+    fastapi_openapi_docs.get_swagger_ui_oauth2_redirect_html = get_swagger_ui_oauth2_redirect_html  # type: ignore[attr-defined]
+
+    fastapi_openapi_docs.swagger_ui_default_parameters = {  # type: ignore[attr-defined]
+        "dom_id": "#swagger-ui",
+        "layout": "BaseLayout",
+        "deepLinking": True,
+        "showExtensions": True,
+        "showCommonExtensions": True,
+    }
+
     modules["fastapi.openapi.docs"] = fastapi_openapi_docs
 
-    # Minimal OpenAPI models stubs (Pydantic-like shapes)
+    # OpenAPI models stubs -- dict subclasses that pass isinstance checks
     fastapi_openapi_models = _mod("fastapi.openapi.models")
-    class _OpenAPI(dict):
-        pass
-    class _Schema(dict):
-        pass
-    class _Tag(dict):
-        pass
-    fastapi_openapi_models.OpenAPI = _OpenAPI  # type: ignore[attr-defined]
-    fastapi_openapi_models.Schema = _Schema  # type: ignore[attr-defined]
-    fastapi_openapi_models.Tag = _Tag  # type: ignore[attr-defined]
+    _openapi_model_names = [
+        "OpenAPI", "Info", "Contact", "License", "Server", "ServerVariable",
+        "PathItem", "Operation", "ExternalDocumentation", "Parameter",
+        "RequestBody", "MediaType", "Encoding", "Response", "Responses",
+        "Reference", "Discriminator", "XML", "Schema", "Example",
+        "Link", "Header", "Tag", "Components", "SecurityScheme",
+        "OAuthFlow", "OAuthFlows", "SecurityBase", "Callback", "Webhook",
+    ]
+    for _oai_name in _openapi_model_names:
+        setattr(fastapi_openapi_models, _oai_name, type(_oai_name, (dict,), {}))
     modules["fastapi.openapi.models"] = fastapi_openapi_models
 
     # ── fastapi.middleware.cors ────────────────────────────────────
@@ -367,13 +478,20 @@ def _build() -> dict[str, types.ModuleType]:
     # ── fastapi.exception_handlers ───────────────────────────────────
     fastapi_exc_handlers = _mod("fastapi.exception_handlers")
     async def _http_exception_handler(request, exc):
-        from fastapi_rs.responses import JSONResponse
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        from fastapi_rs.responses import JSONResponse, Response
+        status_code = exc.status_code
+        # 1xx, 204, 304 cannot have body
+        if status_code < 200 or status_code in (204, 304):
+            return Response(status_code=status_code, headers=exc.headers)
+        return JSONResponse({"detail": exc.detail}, status_code=status_code, headers=exc.headers)
     async def _request_validation_exception_handler(request, exc):
         from fastapi_rs.responses import JSONResponse
         return JSONResponse({"detail": exc.errors()}, status_code=422)
+    async def _websocket_request_validation_exception_handler(websocket, exc):
+        await websocket.close(code=1008)
     fastapi_exc_handlers.http_exception_handler = _http_exception_handler  # type: ignore[attr-defined]
     fastapi_exc_handlers.request_validation_exception_handler = _request_validation_exception_handler  # type: ignore[attr-defined]
+    fastapi_exc_handlers.websocket_request_validation_exception_handler = _websocket_request_validation_exception_handler  # type: ignore[attr-defined]
     modules["fastapi.exception_handlers"] = fastapi_exc_handlers
 
     # ── fastapi.dependencies ───────────────────────────────────────
@@ -423,6 +541,7 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi.background = fastapi_background  # type: ignore[attr-defined]
     fastapi.testclient = fastapi_testclient  # type: ignore[attr-defined]
     fastapi.websockets = fastapi_websockets  # type: ignore[attr-defined]
+    fastapi.sse = fastapi_sse  # type: ignore[attr-defined]
     fastapi.middleware = fastapi_middleware  # type: ignore[attr-defined]
 
     return modules

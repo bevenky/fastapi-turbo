@@ -11,7 +11,19 @@ class HTTPException(Exception):
         super().__init__(detail)
 
 
-class RequestValidationError(Exception):
+class ValidationException(Exception):
+    """Base for all validation errors. FastAPI code checks isinstance(exc, ValidationException)."""
+
+    def __init__(self, errors=None, *, body=None):
+        self._errors = list(errors) if errors else []
+        self.body = body
+        super().__init__(self._errors)
+
+    def errors(self):
+        return self._errors
+
+
+class RequestValidationError(ValidationException):
     """Raised when request data fails validation.
 
     FastAPI inherits this from ``pydantic.ValidationError``, where ``errors``
@@ -20,13 +32,9 @@ class RequestValidationError(Exception):
     attribute.
     """
 
-    def __init__(self, errors, *, body=None):
-        self._errors = list(errors) if errors is not None else []
-        self.body = body
-        super().__init__(self._errors)
-
-    def errors(self):
-        return self._errors
+    def __init__(self, errors, *, body=None, endpoint_ctx=None):
+        self.endpoint_ctx = endpoint_ctx
+        super().__init__(errors, body=body)
 
 
 class WebSocketException(Exception):
@@ -47,19 +55,14 @@ class WebSocketDisconnect(Exception):
         super().__init__(f"WebSocket disconnected with code {code}")
 
 
-class WebSocketRequestValidationError(Exception):
+class WebSocketRequestValidationError(ValidationException):
     """Raised when WebSocket request data fails validation.
 
     Matches FastAPI's ``fastapi.exceptions.WebSocketRequestValidationError``.
     """
 
     def __init__(self, errors, *, body=None):
-        self._errors = list(errors) if errors is not None else []
-        self.body = body
-        super().__init__(self._errors)
-
-    def errors(self):
-        return self._errors
+        super().__init__(errors, body=body)
 
 
 class FastAPIError(RuntimeError):
@@ -68,16 +71,37 @@ class FastAPIError(RuntimeError):
     """
 
 
-class ResponseValidationError(ValueError):
+class ResponseValidationError(ValidationException):
     """Raised when a response fails validation against a response_model.
 
     Matches ``fastapi.exceptions.ResponseValidationError``.
     """
 
     def __init__(self, errors, *, body=None):
-        self._errors = list(errors) if errors is not None else []
-        self.body = body
-        super().__init__(self._errors)
+        super().__init__(errors, body=body)
 
-    def errors(self):
-        return self._errors
+
+class DependencyScopeError(FastAPIError):
+    """Raised when a dependency is used outside its allowed scope."""
+    pass
+
+
+class PydanticV1NotSupportedError(FastAPIError):
+    """Raised when Pydantic v1 model is used with FastAPI features requiring v2."""
+    pass
+
+
+class FastAPIDeprecationWarning(DeprecationWarning):
+    pass
+
+
+# ── Error models for structured error responses ──────��──────────────
+from pydantic import BaseModel
+
+
+class RequestErrorModel(BaseModel):
+    detail: list[dict] = []
+
+
+class WebSocketErrorModel(BaseModel):
+    detail: str = ""

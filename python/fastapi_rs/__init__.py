@@ -5,10 +5,11 @@ from fastapi_rs.applications import FastAPI
 from fastapi_rs.background import BackgroundTasks
 from fastapi_rs.dependencies import Depends, Security
 from fastapi_rs.encoders import jsonable_encoder
-from fastapi_rs.exceptions import HTTPException, RequestValidationError, WebSocketDisconnect, WebSocketException
+from fastapi_rs.exceptions import HTTPException, RequestValidationError, ValidationException, WebSocketDisconnect, WebSocketException
 from fastapi_rs.param_functions import Body, Cookie, File, Form, Header, Path, Query, UploadFile
 from fastapi_rs.requests import Request
 from fastapi_rs.responses import (
+    EventSourceResponse,
     FileResponse,
     HTMLResponse,
     JSONResponse,
@@ -19,6 +20,7 @@ from fastapi_rs.responses import (
     StreamingResponse,
     UJSONResponse,
 )
+from fastapi_rs.sse import ServerSentEvent, format_sse_event, KEEPALIVE_COMMENT
 from fastapi_rs.routing import APIRoute, APIRouter
 from fastapi_rs.security import (
     APIKeyCookie,
@@ -83,7 +85,11 @@ __all__ = [
     "PlainTextResponse",
     "RedirectResponse",
     "StreamingResponse",
+    "EventSourceResponse",
     "FileResponse",
+    "ServerSentEvent",
+    "format_sse_event",
+    "KEEPALIVE_COMMENT",
     "HTTPException",
     "RequestValidationError",
     "WebSocketDisconnect",

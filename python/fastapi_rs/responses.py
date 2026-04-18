@@ -215,6 +215,24 @@ class StreamingResponse(Response):
         await asyncio.sleep(float('inf'))
 
 
+class EventSourceResponse(StreamingResponse):
+    """SSE response — wraps an async/sync generator of events."""
+    media_type = "text/event-stream"
+
+    def __init__(self, content, *, status_code=200, headers=None, media_type=None, background=None, ping=None, sep=None):
+        _headers = dict(headers or {})
+        _headers.setdefault("Cache-Control", "no-store")
+        _headers.setdefault("Connection", "keep-alive")
+        _headers.setdefault("X-Accel-Buffering", "no")
+        super().__init__(
+            content=content,
+            status_code=status_code,
+            headers=_headers,
+            media_type=media_type or self.media_type,
+            background=background,
+        )
+
+
 class ORJSONResponse(Response):
     """JSON response using orjson for serialization (with stdlib json fallback)."""
 
