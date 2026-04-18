@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head><title>{{ title }}</title></head>
+<body>
+<h1>Hello, {{ name }}!</h1>
+<p>You have {{ items|length }} items.</p>
+<ul>
+{% for item in items %}
+  <li class="item">
+    <strong>{{ item.name }}</strong> - ${{ item.price }}
+    {% if item.on_sale %}
+      <span class="sale">ON SALE!</span>
+    {% endif %}
+  </li>
+{% endfor %}
+</ul>
+<footer>
+  <p>Total: {{ items|length }} items. User: {{ user.name }} ({{ user.email }}).</p>
+</footer>
+</body>
+</html>

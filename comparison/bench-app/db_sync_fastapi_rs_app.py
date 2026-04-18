@@ -6,7 +6,7 @@ block with GIL released. Zero event loop overhead.
 Matches how Go works — pgx blocks the goroutine on socket read.
 """
 import fastapi_rs
-from fastapi_rs import FastAPI, Query, HTTPException
+from fastapi_rs import FastAPI, Query, Body, HTTPException
 from fastapi_rs.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg2
@@ -95,6 +95,69 @@ def create_product(product: ProductCreate):
     finally:
         put_conn(conn)
     return {"id": row[0], "name": row[1], "price": float(row[2]), "stock": row[3]}
+
+
+@app.put("/products/{product_id}")
+def update_product(product_id: int, product: ProductCreate):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE products SET name=%s, description=%s, price=%s, category_id=%s, stock=%s "
+            "WHERE id=%s RETURNING id, name, price, stock",
+            (product.name, product.description, float(product.price),
+             product.category_id, product.stock, product_id)
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+    finally:
+        put_conn(conn)
+    if not row:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"id": row[0], "name": row[1], "price": float(row[2]), "stock": row[3]}
+
+
+@app.patch("/products/{product_id}")
+def patch_product(product_id: int, updates: dict = Body(...)):
+    conn = get_conn()
+    try:
+        set_clauses = []
+        values = []
+        for key in ("name", "description", "price", "category_id", "stock"):
+            if key in updates:
+                set_clauses.append(f"{key}=%s")
+                values.append(updates[key])
+        if not set_clauses:
+            raise HTTPException(status_code=400, detail="No fields to update")
+        values.append(product_id)
+        query = f"UPDATE products SET {', '.join(set_clauses)} WHERE id=%s RETURNING id, name, price, stock"
+        cur = conn.cursor()
+        cur.execute(query, values)
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+    finally:
+        put_conn(conn)
+    if not row:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"id": row[0], "name": row[1], "price": float(row[2]), "stock": row[3]}
+
+
+@app.delete("/products/{product_id}")
+def delete_product(product_id: int):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM products WHERE id=%s RETURNING id", (product_id,))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+    finally:
+        put_conn(conn)
+    if not row:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"deleted": True, "id": product_id}
 
 
 @app.get("/categories/stats")

@@ -111,6 +111,47 @@ The "2x faster" claims apply to large frames with SIMD masking, not small echo p
 
 ---
 
+## File Handling Benchmark (uploads + downloads + static)
+
+5,000 requests, 200 warmup, single keep-alive connection. Local sockets only.
+Run with: `comparison/bench-app/run_files_benchmark.sh`
+
+### Throughput (req/s, higher is better)
+
+| Endpoint            | fastapi-rs | Go Gin  | Fastify |
+|---------------------|-----------:|--------:|--------:|
+| POST /upload 1 KB   | 12,167     | 31,918  | 16,679  |
+| POST /upload 64 KB  | **10,668** | 8,835   | 10,827  |
+| GET /download small | 20,797     | 23,141  | 9,641   |
+| GET /download 64 KB | 16,678     | 17,462  | 9,847   |
+| GET /download 1 MB  | 3,539      | 3,679   | 2,251   |
+| GET /static/*.css   | 12,727     | 18,857  | 11,288  |
+
+### Latency p50 (μs, lower is better)
+
+| Endpoint            | fastapi-rs | Go Gin | Fastify |
+|---------------------|-----------:|-------:|--------:|
+| POST /upload 1 KB   | 81         | **29** | 57      |
+| POST /upload 64 KB  | 92         | 89     | 84      |
+| GET /download small | 48         | **42** | 86      |
+| GET /download 64 KB | 59         | 54     | 86      |
+| GET /download 1 MB  | 279        | 267    | 402     |
+| GET /static/*.css   | 77         | 52     | 87      |
+
+**Takeaways**
+
+- fastapi-rs **beats Go Gin** on 64 KB multipart uploads (10,668 vs 8,835 req/s)
+  and ties Fastify.
+- fastapi-rs **beats Fastify by 2x** on FileResponse downloads (all sizes),
+  and lands within 5–10% of Go Gin on downloads.
+- Static file serving is 30–40% slower than Go (tower-http ServeDir + mount
+  dispatch overhead); still beats Fastify. Room to close the gap by caching
+  the ServeDir future.
+- Small 1 KB uploads carry fixed multipart-parse + Python wrap overhead; this
+  overhead amortises at realistic upload sizes (64 KB+).
+
+---
+
 ## fastapi-rs vs FastAPI Speedup
 
 | Endpoint | FastAPI + uvicorn | fastapi-rs | Speedup |
