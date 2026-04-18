@@ -319,7 +319,9 @@ def test_return_none(server_app):
         app.run(host="127.0.0.1", port=__PORT__)
     """)
     r = httpx.delete(f"{url}/items/1")
-    assert r.status_code == 204
+    # FastAPI returns 200 with body "null" (JSON-serialized None)
+    assert r.status_code == 200
+    assert r.json() is None
 
 
 # ── Phase 3: Parameter markers, headers, cookies ────────────────────

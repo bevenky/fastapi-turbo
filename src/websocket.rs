@@ -598,6 +598,9 @@ pub async fn handle_ws_upgrade(
     let (ready_tx, ready_rx) = cb::bounded::<()>(1);
     let state = Arc::new(AtomicU8::new(STATE_CONNECTING));
 
+    // Capture path params before scope_info is moved, for passing as kwargs to the Python handler.
+    let ws_path_params: Vec<(String, String)> = scope_info.path_params.clone();
+
     let py_ws = PyWebSocket {
         tx: tx_out,
         rx: cb_rx,
@@ -630,14 +633,32 @@ pub async fn handle_ws_upgrade(
     // The WS object is passed POSITIONALLY so user-defined parameter
     // names work regardless of what they call it (`ws`, `websocket`,
     // `conn`, ...). vLLM uses `websocket`; SGLang would use whatever.
+    // Path params (e.g., /ws/{room_id}) are passed as keyword arguments
+    // so handlers can declare them as additional parameters.
     tokio::task::spawn_blocking(move || {
         Python::attach(|py| {
-            if is_async {
-                let _ = handler_bridge::call_async_on_local_loop_positional(
-                    py, &handler, ws_obj,
-                );
+            if ws_path_params.is_empty() {
+                // No path params — call with just the WS object positionally
+                if is_async {
+                    let _ = handler_bridge::call_async_on_local_loop_positional(
+                        py, &handler, ws_obj,
+                    );
+                } else {
+                    let _ = handler.call1(py, (ws_obj.bind(py),));
+                }
             } else {
-                let _ = handler.call1(py, (ws_obj.bind(py),));
+                // Has path params — pass them as kwargs
+                let kwargs = PyDict::new(py);
+                for (k, v) in &ws_path_params {
+                    let _ = kwargs.set_item(k.as_str(), v.as_str());
+                }
+                if is_async {
+                    let _ = handler_bridge::call_async_on_local_loop_positional_with_kwargs(
+                        py, &handler, ws_obj, &kwargs,
+                    );
+                } else {
+                    let _ = handler.call(py, (ws_obj.bind(py),), Some(&kwargs));
+                }
             }
         });
     });

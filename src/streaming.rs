@@ -140,9 +140,8 @@ fn drain_one_sync_chunk(iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
 /// async generators (`async def gen(): yield x`) this advances the generator
 /// state, and the body task's subsequent `__aiter__()` returns `self`, so we
 /// continue from chunk 2 without duplicating chunk 1. If the coroutine
-/// suspends we close it and fall back to the normal streaming path (which
-/// restarts from the beginning — correct for user-defined iterables where
-/// `__aiter__` returns a fresh object).
+/// suspends we return None WITHOUT closing the coro — closing would propagate
+/// GeneratorExit to the async generator, destroying it.
 fn drain_one_async_chunk_sync(py: Python<'_>, iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
     let anext_name = pyo3::intern!(py, "__anext__");
     if !iter_bound.hasattr(anext_name).unwrap_or(false) {
@@ -158,11 +157,9 @@ fn drain_one_async_chunk_sync(py: Python<'_>, iter_bound: &Bound<'_, PyAny>) -> 
         }
         Err(_) => None,
         Ok(_) => {
-            // Coroutine suspended — close and let the streaming task redo it.
-            // Note: the generator has already been "stepped into" to the first
-            // suspension point, so the next __anext__ will resume from there,
-            // NOT restart from the top. Safe either way.
-            let _ = coro.call_method0("close");
+            // Coroutine suspended — do NOT close it (closing propagates
+            // GeneratorExit to the async generator). Just return None and
+            // let iterate_async_generator handle it via run_until_complete.
             None
         }
     }
@@ -207,6 +204,10 @@ fn iterate_sync_generator(
 /// loop, pushing each chunk to the mpsc channel as soon as it's yielded.
 /// This is the hot path for LLM token streaming (vLLM / SGLang) — every
 /// token must reach the client immediately; buffering defeats the purpose.
+///
+/// Strategy: try the fast sync probe (send(None)) first. If the generator
+/// suspends on real I/O, switch to run_until_complete for ALL remaining
+/// chunks permanently. This avoids destroying the generator state.
 fn iterate_async_generator(
     py: Python<'_>,
     iterator: &Py<PyAny>,
@@ -249,8 +250,14 @@ fn iterate_async_generator(
         }
     };
 
+    // Drive each __anext__ through run_until_complete on the thread-local
+    // event loop. This is correct for ALL async generators — both those that
+    // do real async I/O (asyncio.sleep, DB queries) and those that complete
+    // synchronously. The overhead of run_until_complete for sync generators
+    // is ~5μs per chunk — negligible compared to the network I/O cost of
+    // streaming. The pre-drain above already captured the first chunk via
+    // the fast send(None) path to minimize TTFB.
     loop {
-        // Build one __anext__ coroutine and drive it to completion.
         let coro = match aiter.call_method0(py, "__anext__") {
             Ok(c) => c,
             Err(e) => {
@@ -261,53 +268,7 @@ fn iterate_async_generator(
             }
         };
 
-        // Fast path: coroutine completes synchronously (StopIteration on send).
-        match coro.call_method1(py, "send", (py.None(),)) {
-            Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
-                let val = e.value(py);
-                match val.getattr("value") {
-                    Ok(v) => {
-                        let chunk = python_val_to_bytes(&v);
-                        if tx.blocking_send(Ok(chunk)).is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                    Err(_) => continue,
-                }
-            }
-            Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) => {
-                // Async generator exhausted.
-                break;
-            }
-            Err(e) if e.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py) => {
-                // Needs real loop — fall through to run_until_complete.
-                let _ = coro.call_method0(py, "close");
-            }
-            Err(other) => {
-                if other.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
-                    break;
-                }
-                eprintln!("fastapi-rs: streaming error: {other}");
-                break;
-            }
-            Ok(_yielded) => {
-                // Coroutine suspended — close and re-create for the loop path.
-                let _ = coro.call_method0(py, "close");
-            }
-        }
-
-        // Slow path: drive one __anext__ through run_until_complete.
-        let coro2 = match aiter.call_method0(py, "__anext__") {
-            Ok(c) => c,
-            Err(e) => {
-                if !e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
-                    eprintln!("fastapi-rs: __anext__ error: {e}");
-                }
-                break;
-            }
-        };
-        match loop_obj.call_method1(py, "run_until_complete", (coro2.bind(py),)) {
+        match loop_obj.call_method1(py, "run_until_complete", (coro.bind(py),)) {
             Ok(val) => {
                 let chunk = python_val_to_bytes(val.bind(py));
                 if tx.blocking_send(Ok(chunk)).is_err() {

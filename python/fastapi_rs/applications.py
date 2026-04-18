@@ -255,6 +255,10 @@ def _try_compile_handler(
     dep_steps = [p for p in params if p["kind"] == "dependency"]
     _has_exc_handlers = app is not None and bool(getattr(app, "exception_handlers", None))
     _debug_on = app is not None and bool(getattr(app, "debug", False))
+    _has_enum_params = any(
+        p.get("enum_class") is not None and p.get("_is_handler_param")
+        for p in params
+    )
     if not dep_steps:
         if (
             response_model is not None
@@ -262,6 +266,7 @@ def _try_compile_handler(
             or _has_exc_handlers
             or _debug_on
             or status_code is not None
+            or _has_enum_params
         ):
             # Even without deps, we may need response_model filtering or response_class wrapping
             handler_param_names = {p["name"] for p in params if p.get("_is_handler_param")}
@@ -314,6 +319,13 @@ def _try_compile_handler(
         return None
 
     handler_param_names = {p["name"] for p in params if p.get("_is_handler_param")}
+
+    # Build enum coercion map for the deps path too
+    _enum_coerce_deps = {
+        p["name"]: p["enum_class"]
+        for p in params
+        if p.get("enum_class") is not None and p.get("_is_handler_param")
+    }
 
     # Prepare dep callables (wrap async -> sync) and store originals for override lookup
     dep_chain = []
@@ -397,7 +409,15 @@ def _try_compile_handler(
 
         try:
             try:
-                result = handler_func(**{k: resolved[k] for k in handler_param_names if k in resolved})
+                _hkwargs = {k: resolved[k] for k in handler_param_names if k in resolved}
+                # Coerce raw strings to Enum types (FastAPI does this automatically)
+                for _ek, _ecls in _enum_coerce_deps.items():
+                    if _ek in _hkwargs and isinstance(_hkwargs[_ek], str):
+                        try:
+                            _hkwargs[_ek] = _ecls(_hkwargs[_ek])
+                        except (ValueError, KeyError):
+                            pass
+                result = handler_func(**_hkwargs)
             except Exception as exc:
                 # In debug mode, surface the full traceback on non-HTTPException errors.
                 _maybe_print_debug_traceback(_app, exc)
@@ -478,6 +498,22 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
 
     def _call_handler_sync(kwargs):
         """Run the underlying handler, returning a Response-normalized value."""
+        # Replace any Rust-injected Request objects with the middleware's
+        # Request so that request.state set by middleware propagates to the
+        # handler. The middleware Request shares state with the middleware chain.
+        mw_request = kwargs.pop("_middleware_request", None)
+        if mw_request is not None:
+            for key in list(kwargs.keys()):
+                val = kwargs.get(key)
+                if isinstance(val, _Request):
+                    # Merge scope data from Rust's Request (has body, path_params,
+                    # app, etc.) into the middleware's Request.
+                    for sk, sv in val._scope.items():
+                        if sk not in mw_request._scope:
+                            mw_request._scope[sk] = sv
+                    # Copy over the state from middleware's Request
+                    kwargs[key] = mw_request
+                    break
         if is_async_endpoint:
             coro = endpoint(**kwargs)
             try:
@@ -539,6 +575,10 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
 
     def wrapped_sync(**kwargs):
         request = _Request(_make_scope(kwargs))
+        # Store the middleware's Request object in kwargs so Rust's
+        # inject_framework_objects can reuse it instead of creating a new one.
+        # This ensures request.state set by middleware propagates to the handler.
+        kwargs["_middleware_request"] = request
         try:
             return runner(request, kwargs)
         except _MiddlewareSuspendedError:
@@ -1103,6 +1143,11 @@ class FastAPI:
 
         full_prefix = prefix + router.prefix
 
+        # Merge the router's own tags into extra_tags so all routes
+        # within this router inherit them (FastAPI parity).
+        if router.tags:
+            extra_tags = extra_tags + router.tags
+
         for route in router.routes:
             full_path = full_prefix + route.path
             # Normalise double slashes but keep leading slash
@@ -1201,9 +1246,16 @@ class FastAPI:
                         from fastapi_rs._resolution import _make_sync_wrapper
                         endpoint = _make_sync_wrapper(endpoint)
                         is_async = False
-            elif response_model is not None or response_class is not None or route.status_code or self.exception_handlers or self.debug:
+            elif (
+                response_model is not None
+                or response_class is not None
+                or route.status_code
+                or self.exception_handlers
+                or self.debug
+                or any(p.get("enum_class") is not None for p in params)
+            ):
                 # No deps but has response_model/response_class/status_code/
-                # exception_handlers — wrap handler via compile.
+                # exception_handlers/enum params — wrap handler via compile.
                 compiled = _try_compile_handler(
                     endpoint, params, app=self, response_model=response_model,
                     status_code=route.status_code,

@@ -13,8 +13,19 @@ async def run_in_threadpool(func: Callable[..., T], *args: Any, **kwargs: Any) -
     """Run a sync function in a thread pool executor.
 
     Equivalent to ``starlette.concurrency.run_in_threadpool``.
+
+    When called from a handler driven via the sync fast path (coro.send(None)),
+    there is no running event loop. In that case, call the function directly —
+    we are already in a blocking thread, so running sync code is safe and avoids
+    the "no running event loop" RuntimeError.
     """
-    loop = asyncio.get_running_loop()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running event loop — we're already in a blocking thread, just call directly
+        if kwargs:
+            return func(*args, **kwargs)
+        return func(*args)
     if kwargs:
         func = partial(func, **kwargs)  # type: ignore[assignment]
     return await loop.run_in_executor(None, func, *args)

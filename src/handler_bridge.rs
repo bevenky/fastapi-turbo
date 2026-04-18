@@ -122,6 +122,18 @@ pub fn call_async_on_local_loop_positional(
     drive_coroutine_on_local_loop(py, coro)
 }
 
+/// Call an async handler with a single positional arg + keyword args.
+/// Used by the WebSocket bridge when the route has path params like /ws/{room_id}.
+pub fn call_async_on_local_loop_positional_with_kwargs(
+    py: Python<'_>,
+    handler: &Py<PyAny>,
+    arg: Py<PyAny>,
+    kwargs: &pyo3::Bound<'_, PyDict>,
+) -> PyResult<Py<PyAny>> {
+    let coro = handler.call(py, (arg.bind(py),), Some(kwargs))?;
+    drive_coroutine_on_local_loop(py, coro)
+}
+
 /// Handler classification — determined on the FIRST call, reused forever.
 /// "sync-fast": completes via StopIteration on send(None) — no I/O.
 /// "needs-worker": suspends on send(None) — real async I/O, route to worker.

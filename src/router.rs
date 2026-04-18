@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::extract::{Path, Query, Request};
+use axum::extract::{ConnectInfo, Path, Query, Request};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -8,6 +8,7 @@ use axum::Router;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::handler_bridge::call_async_handler;
@@ -103,60 +104,72 @@ fn inject_framework_objects(
     path_map: &HashMap<String, String>,
     query_params: &HashMap<String, String>,
     body_bytes: &[u8],
+    client_addr: &Option<SocketAddr>,
 ) -> PyResult<()> {
     for param in &state.params {
         match param.kind.as_str() {
             "inject_request" => {
-                // Build an ASGI-ish scope dict
-                let scope = PyDict::new(py);
-                scope.set_item("type", "http")?;
-                scope.set_item("method", scope_method.as_deref().unwrap_or("GET"))?;
-                scope.set_item("path", scope_path.as_deref().unwrap_or("/"))?;
-                let qs_bytes: &[u8] =
-                    scope_query.as_deref().map(|s| s.as_bytes()).unwrap_or(b"");
-                scope.set_item(
-                    "query_string",
-                    pyo3::types::PyBytes::new(py, qs_bytes),
-                )?;
-                // Headers as list of (bytes, bytes)
-                let hdrs_list = pyo3::types::PyList::empty(py);
-                if let Some(h) = headers {
-                    for (k, v) in h.iter() {
-                        let k_b = pyo3::types::PyBytes::new(py, k.as_str().as_bytes());
-                        let v_b = pyo3::types::PyBytes::new(py, v.as_bytes());
-                        hdrs_list.append((k_b, v_b))?;
-                    }
-                }
-                scope.set_item("headers", hdrs_list)?;
-                // Path params
-                let pp = PyDict::new(py);
-                for (k, v) in path_map.iter() {
-                    pp.set_item(k, v)?;
-                }
-                scope.set_item("path_params", pp)?;
-                // Query params as a dict too (convenience)
-                let qp = PyDict::new(py);
-                for (k, v) in query_params.iter() {
-                    qp.set_item(k, v)?;
-                }
-                scope.set_item("query_params", qp)?;
-                // Starlette/FastAPI: request.app -> scope["app"]. vLLM and
-                // SGLang read `request.app.state.<field>` on every request.
-                if let Some(app) = APP_INSTANCE.get() {
-                    scope.set_item("app", app.bind(py))?;
-                }
-                // Pre-populate the body so `await request.body()` / .json()
-                // / .form() return the already-buffered bytes without needing
-                // a real ASGI receive() callable. vLLM parses bodies this way.
-                if !body_bytes.is_empty() {
+                // Reuse the middleware's Request object if present — this ensures
+                // request.state set by middleware propagates to the handler (P480/P483).
+                if let Ok(Some(mw_req)) = kwargs.get_item("_middleware_request") {
+                    kwargs.set_item(&param.name, mw_req)?;
+                } else {
+                    // Build an ASGI-ish scope dict
+                    let scope = PyDict::new(py);
+                    scope.set_item("type", "http")?;
+                    scope.set_item("method", scope_method.as_deref().unwrap_or("GET"))?;
+                    scope.set_item("path", scope_path.as_deref().unwrap_or("/"))?;
+                    let qs_bytes: &[u8] =
+                        scope_query.as_deref().map(|s| s.as_bytes()).unwrap_or(b"");
                     scope.set_item(
-                        "_body",
-                        pyo3::types::PyBytes::new(py, body_bytes),
+                        "query_string",
+                        pyo3::types::PyBytes::new(py, qs_bytes),
                     )?;
-                }
+                    // Headers as list of (bytes, bytes)
+                    let hdrs_list = pyo3::types::PyList::empty(py);
+                    if let Some(h) = headers {
+                        for (k, v) in h.iter() {
+                            let k_b = pyo3::types::PyBytes::new(py, k.as_str().as_bytes());
+                            let v_b = pyo3::types::PyBytes::new(py, v.as_bytes());
+                            hdrs_list.append((k_b, v_b))?;
+                        }
+                    }
+                    scope.set_item("headers", hdrs_list)?;
+                    // Path params
+                    let pp = PyDict::new(py);
+                    for (k, v) in path_map.iter() {
+                        pp.set_item(k, v)?;
+                    }
+                    scope.set_item("path_params", pp)?;
+                    // Query params as a dict too (convenience)
+                    let qp = PyDict::new(py);
+                    for (k, v) in query_params.iter() {
+                        qp.set_item(k, v)?;
+                    }
+                    scope.set_item("query_params", qp)?;
+                    // Starlette/FastAPI: request.app -> scope["app"]. vLLM and
+                    // SGLang read `request.app.state.<field>` on every request.
+                    if let Some(app) = APP_INSTANCE.get() {
+                        scope.set_item("app", app.bind(py))?;
+                    }
+                    // Pre-populate the body so `await request.body()` / .json()
+                    // / .form() return the already-buffered bytes without needing
+                    // a real ASGI receive() callable. vLLM parses bodies this way.
+                    if !body_bytes.is_empty() {
+                        scope.set_item(
+                            "_body",
+                            pyo3::types::PyBytes::new(py, body_bytes),
+                        )?;
+                    }
+                    // Client address (host, port) tuple for request.client
+                    if let Some(addr) = client_addr {
+                        let client_tuple = (addr.ip().to_string(), addr.port());
+                        scope.set_item("client", client_tuple)?;
+                    }
 
-                let req = request_cls(py)?.bind(py).call1((scope,))?;
-                kwargs.set_item(&param.name, req)?;
+                    let req = request_cls(py)?.bind(py).call1((scope,))?;
+                    kwargs.set_item(&param.name, req)?;
+                }
             }
             "inject_background_tasks" => {
                 let bg = bg_tasks_cls(py)?.bind(py).call0()?;
@@ -547,11 +560,15 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                 &axum_path,
                 any(
                     move |ws: WebSocketUpgrade,
+                          path_params: Option<Path<HashMap<String, String>>>,
                           req_parts: axum::http::request::Parts| {
                         let state = ws_state.clone();
                         async move {
                             let h = Python::attach(|py| state.handler.clone_ref(py));
                             let is_a = state.is_async;
+
+                            // Extract path params from the axum extractor
+                            let path_map = path_params.map(|Path(m)| m).unwrap_or_default();
 
                             // Populate scope info from the upgrade request
                             let uri = &req_parts.uri;
@@ -589,6 +606,11 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                             // fall back to None for now. Users can read X-Forwarded-For from headers.
                             let client: Option<(String, u16)> = None;
 
+                            let ws_path_params: Vec<(String, String)> = path_map
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+
                             let scope = crate::websocket::WsScopeInfo {
                                 path,
                                 raw_path,
@@ -597,7 +619,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                                 client,
                                 scheme,
                                 host,
-                                path_params: Vec::new(),
+                                path_params: ws_path_params,
                             };
 
                             // Deferred-upgrade: the handler returns the Response
@@ -875,6 +897,12 @@ async fn handle_request(
     let scope_path = Some(request.uri().path().to_string());
     let scope_query = Some(request.uri().query().unwrap_or("").to_string());
 
+    // Extract client address from ConnectInfo (set by into_make_service_with_connect_info).
+    let client_addr: Option<SocketAddr> = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0);
+
     // Only read body if we have body/file/form params — OR if the handler
     // injects `Request`, which vLLM uses to parse bodies manually via
     // `await request.body()` / `await request.json()`.
@@ -978,7 +1006,7 @@ async fn handle_request(
                     py, &kwargs, &state,
                     &scope_method, &scope_path, &scope_query,
                     &headers, &path_map, &query_params,
-                    &body_bytes,
+                    &body_bytes, &client_addr,
                 ) {
                     return pyerr_to_response(py, &e);
                 }
@@ -1029,7 +1057,7 @@ async fn handle_request(
                         py, &kwargs, &state,
                         &scope_method, &scope_path, &scope_query,
                         &headers, &path_map, &query_params,
-                        &body_bytes,
+                        &body_bytes, &client_addr,
                     ) {
                         return pyerr_to_response(py, &e);
                     }
@@ -1057,7 +1085,7 @@ async fn handle_request(
                         py, &kwargs, &state,
                         &scope_method, &scope_path, &scope_query,
                         &headers, &path_map, &query_params,
-                        &body_bytes,
+                        &body_bytes, &client_addr,
                     ) {
                         return pyerr_to_response(py, &e);
                     }
@@ -1402,25 +1430,37 @@ fn extract_params_to_pydict_full<'py>(
                 }
             }
             "file" => {
-                // Multipart file param — wrap each PyUploadFile in the Python
-                // `UploadFile` class so handlers can `await file.read()`.
+                // Multipart file param — when the type annotation is `bytes`,
+                // return raw bytes instead of wrapping in UploadFile (FastAPI parity).
+                let wants_raw_bytes = param.type_hint == "bytes";
                 let fields = multipart_fields
                     .as_mut()
                     .and_then(|m| m.remove(&param.name));
                 match fields {
                     Some(mut fs) if !fs.is_empty() => {
                         if fs.len() == 1 {
-                            let wrapped = make_upload_file(py, fs.remove(0)).map_err(|_e| {
-                                validation_error_response("file", &param.name, "alloc")
-                            })?;
-                            let _ = kwargs.set_item(&param.name, wrapped);
+                            if wants_raw_bytes {
+                                let field = fs.remove(0);
+                                let py_bytes = pyo3::types::PyBytes::new(py, &field.data);
+                                let _ = kwargs.set_item(&param.name, py_bytes);
+                            } else {
+                                let wrapped = make_upload_file(py, fs.remove(0)).map_err(|_e| {
+                                    validation_error_response("file", &param.name, "alloc")
+                                })?;
+                                let _ = kwargs.set_item(&param.name, wrapped);
+                            }
                         } else {
                             let list = pyo3::types::PyList::empty(py);
                             for f in fs {
-                                let wrapped = make_upload_file(py, f).map_err(|_e| {
-                                    validation_error_response("file", &param.name, "alloc")
-                                })?;
-                                let _ = list.append(wrapped);
+                                if wants_raw_bytes {
+                                    let py_bytes = pyo3::types::PyBytes::new(py, &f.data);
+                                    let _ = list.append(py_bytes);
+                                } else {
+                                    let wrapped = make_upload_file(py, f).map_err(|_e| {
+                                        validation_error_response("file", &param.name, "alloc")
+                                    })?;
+                                    let _ = list.append(wrapped);
+                                }
                             }
                             let _ = kwargs.set_item(&param.name, list);
                         }

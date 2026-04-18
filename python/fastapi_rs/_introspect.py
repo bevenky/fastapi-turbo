@@ -95,9 +95,15 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
         # Check for Annotated[T, marker] pattern
         marker, inner_type = _extract_annotated_marker(annotation)
 
+        # Always unwrap the inner type from Annotated so _get_type_name
+        # resolves the base type (e.g., int) rather than the Annotated wrapper.
+        # This is needed for both Annotated[int, Query()] and Annotated[int, Field(ge=0)].
+        if inner_type is not annotation:
+            annotation = inner_type
+
         if marker is not None:
             # Use the inner type from Annotated for type resolution
-            annotation = inner_type
+            pass  # annotation already updated above
 
         # If no marker from Annotated, check if default is a marker
         if marker is None and isinstance(default, _ParamMarker):
@@ -167,7 +173,24 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
         # to the param dict so Rust can invoke ``.validate_python`` at
         # request time and surface a proper 422 on violation.
         scalar_validator = None
-        if marker is not None and kind in ("path", "query", "header", "cookie"):
+        # Also handle Annotated[int, Field(ge=0)] where Field is a FieldInfo, not _ParamMarker
+        _effective_marker = marker
+        if _effective_marker is None and kind in ("path", "query", "header", "cookie"):
+            # Check if the original annotation had a FieldInfo in the Annotated args
+            orig_annotation = hints.get(name, param.annotation)
+            _ann_origin = typing.get_origin(orig_annotation)
+            _annotated_type = getattr(typing, "Annotated", None)
+            if _annotated_type is not None and _ann_origin is _annotated_type:
+                _ann_args = typing.get_args(orig_annotation)
+                for _meta in _ann_args[1:]:
+                    try:
+                        from pydantic.fields import FieldInfo as _FieldInfo
+                        if isinstance(_meta, _FieldInfo):
+                            _effective_marker = _meta
+                            break
+                    except ImportError:
+                        break
+        if _effective_marker is not None and kind in ("path", "query", "header", "cookie"):
             constraint_keys = (
                 "gt", "ge", "lt", "le",
                 "min_length", "max_length",
@@ -176,8 +199,8 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             )
             # Check both direct attributes (legacy) and FieldInfo metadata
             has_constraints = any(
-                getattr(marker, k, None) is not None for k in constraint_keys
-            ) or bool(getattr(marker, "metadata", None))
+                getattr(_effective_marker, k, None) is not None for k in constraint_keys
+            ) or bool(getattr(_effective_marker, "metadata", None))
             if has_constraints:
                 try:
                     from pydantic import Field as _PField, TypeAdapter as _PTypeAdapter
@@ -185,12 +208,12 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
                     field_kwargs: dict = {}
                     # First try direct attributes (legacy path)
                     for k in constraint_keys:
-                        v = getattr(marker, k, None)
+                        v = getattr(_effective_marker, k, None)
                         if v is not None:
                             field_kwargs["pattern" if k == "regex" else k] = v
                     # If no direct attrs found, extract from FieldInfo.metadata
-                    if not field_kwargs and hasattr(marker, "metadata"):
-                        for meta in marker.metadata:
+                    if not field_kwargs and hasattr(_effective_marker, "metadata"):
+                        for meta in _effective_marker.metadata:
                             # annotated_types constraints: Ge(ge=0), Le(le=100), etc.
                             for k in constraint_keys:
                                 v = getattr(meta, k, None)

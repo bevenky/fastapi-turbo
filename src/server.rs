@@ -448,7 +448,10 @@ pub fn run_server(
 
             println!("fastapi-rs running on http://{addr}");
 
-            axum::serve(listener, app)
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
                 .with_graceful_shutdown(shutdown_signal())
                 .await
                 .map_err(|e| {

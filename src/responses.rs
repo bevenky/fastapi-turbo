@@ -131,9 +131,14 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
             .into_response();
     }
 
-    // None -> 204 No Content
+    // None -> 200 with "null" body (matches FastAPI: json-serializes None to null)
     if obj.is_instance_of::<PyNone>() {
-        return StatusCode::NO_CONTENT.into_response();
+        return (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            "null",
+        )
+            .into_response();
     }
 
     // ── Fast-path class dispatch for known Response subclasses ──
@@ -200,14 +205,9 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
         return response_object_to_response(py, obj, &status_attr);
     }
 
-    // str -> plain text
-    if let Ok(s) = obj.extract::<String>() {
-        return (StatusCode::OK, [("content-type", "text/plain")], s).into_response();
-    }
-
     // Pydantic BaseModel: call model_dump() then serialize as JSON.
-    // (Moved below primitives — it's rarer on the hot path and every other
-    // check is cheaper than `getattr("model_dump")`.)
+    // Checked BEFORE primitives because BaseModel instances may also satisfy
+    // extract::<String>() via __str__.
     if let Ok(dump) = obj.getattr("model_dump") {
         if dump.is_callable() {
             if let Ok(dumped) = dump.call0() {
@@ -229,7 +229,19 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
         }
     }
 
-    // int / float -> JSON number
+    // bool -> JSON boolean (MUST come before int — Python bool is subclass of int)
+    if obj.is_instance_of::<PyBool>() {
+        let value = pyobj_to_serde(py, obj);
+        let body = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
+        return (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            body,
+        )
+            .into_response();
+    }
+
+    // int / float -> JSON number (matches FastAPI: all scalars are JSON-serialized)
     if obj.is_instance_of::<PyInt>() || obj.is_instance_of::<PyFloat>() {
         let value = pyobj_to_serde(py, obj);
         let body = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
@@ -241,16 +253,10 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
             .into_response();
     }
 
-    // bool -> JSON boolean
-    if obj.is_instance_of::<PyBool>() {
-        let value = pyobj_to_serde(py, obj);
-        let body = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
-        return (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            body,
-        )
-            .into_response();
+    // str -> JSON-wrapped string (matches FastAPI: strings are JSON-serialized)
+    if let Ok(s) = obj.extract::<String>() {
+        let json = format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+        return (StatusCode::OK, [("content-type", "application/json")], json).into_response();
     }
 
     // Fallback: str() it
