@@ -1172,7 +1172,19 @@ def _try_compile_handler(
                                 _run_pending_teardowns(tds)
                         _final_result.body_iterator = _wrap_iter_sync()
                 else:
-                    _run_pending_teardowns(reversed(_request_scope_tds))
+                    # FA parity: a post-yield ``raise`` in a yield-dep
+                    # bubbles up to the TestClient via
+                    # ``_captured_server_exceptions``. The handler's
+                    # response has already been computed, so collect
+                    # (don't raise) any teardown errors.
+                    _td_errs: list = []
+                    _run_pending_teardowns(
+                        reversed(_request_scope_tds),
+                        collected_errors=_td_errs,
+                    )
+                    if _td_errs and _app is not None:
+                        for _td_exc in _td_errs:
+                            _app._captured_server_exceptions.append(_td_exc)
 
     # Marker for the Rust router: this compiled handler knows how to
     # consume a deferred extraction-errors blob, so Rust should stash
@@ -1187,6 +1199,7 @@ def _run_pending_teardowns(
     teardowns,
     throw_exc: BaseException | None = None,
     propagate_exceptions: bool = False,
+    collected_errors: list | None = None,
 ) -> None:
     """Drain a reversed-order iterable of (gen, loop[, scope]) tuples.
 
@@ -1260,8 +1273,15 @@ def _run_pending_teardowns(
             # from after the ``yield`` to surface as the HTTP response.
             if propagate_exceptions and throw_exc is None:
                 raise
-            # else: swallow silently.
-            pass
+            # FA parity: when teardown of a request-scope yield-dep
+            # raises post-yield (handler already completed), collect it
+            # for the TestClient's ``raise_server_exceptions=True`` path.
+            if (
+                collected_errors is not None
+                and throw_exc is None
+                and exc is not throw_exc
+            ):
+                collected_errors.append(exc)
         # FA parity: when the handler raised and a yield-dep's
         # post-yield ``except`` clause swallows the exception (generator
         # returns normally instead of re-raising), FA raises
