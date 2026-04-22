@@ -826,6 +826,13 @@ class APIRouter:
         generate_unique_id_function: Callable | None = None,
     ) -> None:
         """Store a child router for later flattening."""
+        # FA parity: detect the ``router.include_router(router)`` typo
+        # and raise at decoration time. The alternative (infinite
+        # recursion at route-flatten time) produces an unhelpful error.
+        assert router is not self, (
+            "Cannot include the same APIRouter instance into itself. "
+            "Did you mean to include a different router?"
+        )
         include_meta = {
             "prefix": prefix,
             "tags": tags or [],
