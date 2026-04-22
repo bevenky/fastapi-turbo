@@ -736,7 +736,8 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     # JSONL detection: generator endpoint with no explicit SSE response
-    # class and response_model of ``AsyncIterable[X]`` / ``Iterable[X]``.
+    # class — FA emits ``application/jsonl`` with an ``itemSchema`` (the
+    # inner yielded type when annotated, empty ``{}`` when not).
     if not _is_sse and not route.get("response_class"):
         _ret_ann = route.get("response_model")
         if _ret_ann is not None:
@@ -748,6 +749,14 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
                     _is_jsonl = True
             except Exception:  # noqa: BLE001
                 pass
+        # Un-annotated generator endpoints (``def f(): yield ...``) also
+        # stream as JSONL. Our ``applications._collect_routes_from_router``
+        # wraps them in a closure named ``_json_lines_wrap`` — use the
+        # wrapper name as the detection signal.
+        if not _is_jsonl:
+            _ep = route.get("endpoint")
+            if _ep is not None and getattr(_ep, "__name__", "") == "_json_lines_wrap":
+                _is_jsonl = True
 
     if _suppress_content:
         success_response = {"description": response_desc}
