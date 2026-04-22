@@ -72,22 +72,22 @@ fn dataclass_helpers(py: Python<'_>) -> Option<(&'static Py<PyAny>, &'static Py<
     Some((DC_IS_DATACLASS.get()?, DC_ASDICT.get()?))
 }
 
-/// Cached `float` builtin — used as `default=float` for orjson so that
-/// `decimal.Decimal` values (returned by psycopg3's numeric columns) get
-/// auto-converted to float instead of raising TypeError.
-static FLOAT_TYPE: OnceLock<Py<PyAny>> = OnceLock::new();
+/// Cached JSON ``default=`` callable — matches FA's
+/// ``jsonable_encoder`` for the common types orjson can't natively
+/// handle: ``Decimal`` → str, ``bytes`` → UTF-8 str, ``BaseModel`` →
+/// dict via ``model_dump``, falls back to ``str(obj)`` like FA.
+static JSON_DEFAULT: OnceLock<Py<PyAny>> = OnceLock::new();
 
-fn float_type(py: Python<'_>) -> &'static Py<PyAny> {
-    FLOAT_TYPE.get_or_init(|| {
-        py.import("builtins")
-            .expect("builtins")
-            .getattr("float")
-            .expect("float")
+fn json_default(py: Python<'_>) -> &'static Py<PyAny> {
+    JSON_DEFAULT.get_or_init(|| {
+        py.import("fastapi_rs.responses")
+            .and_then(|m| m.getattr("_json_default"))
+            .expect("fastapi_rs.responses._json_default")
             .unbind()
     })
 }
 
-/// Cached kwargs dict for orjson.dumps: `{"default": float}`.
+/// Cached kwargs dict for orjson.dumps: ``{"default": _json_default}``.
 /// Allocated once, reused forever — saves ~1-2μs per JSON response
 /// vs allocating a fresh PyDict on every call.
 static ORJSON_KWARGS: OnceLock<Py<PyAny>> = OnceLock::new();
@@ -95,7 +95,7 @@ static ORJSON_KWARGS: OnceLock<Py<PyAny>> = OnceLock::new();
 fn orjson_kwargs(py: Python<'_>) -> &'static Py<PyAny> {
     ORJSON_KWARGS.get_or_init(|| {
         let d = pyo3::types::PyDict::new(py);
-        d.set_item("default", float_type(py).bind(py)).expect("set default");
+        d.set_item("default", json_default(py).bind(py)).expect("set default");
         d.unbind().into_any()
     })
 }
@@ -581,6 +581,20 @@ fn write_any_json(py: Python<'_>, obj: &Bound<'_, PyAny>, buf: &mut String) {
     if let Ok(b) = obj.cast::<PyBool>() {
         buf.push_str(if b.is_true() { "true" } else { "false" });
         return;
+    }
+    // ``decimal.Decimal`` MUST come before int/float extraction —
+    // ``Decimal(5).__int__()`` succeeds, but FA (and its default
+    // ``jsonable_encoder``) serializes ``Decimal`` as a JSON STRING
+    // (preserving precision). Class-by-name check keeps this cheap.
+    {
+        let ty = obj.get_type();
+        if ty.name().map(|n| n == "Decimal").unwrap_or(false) {
+            let s = obj.str().map(|s| s.to_string()).unwrap_or_default();
+            buf.push('"');
+            json_escape_to(&s, buf);
+            buf.push('"');
+            return;
+        }
     }
     if let Ok(i) = obj.extract::<i64>() {
         use std::fmt::Write;

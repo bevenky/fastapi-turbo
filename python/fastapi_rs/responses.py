@@ -239,11 +239,25 @@ class Response:
 def _json_default(obj):
     """json.dumps ``default=`` callback for types that aren't JSON-native.
 
-    Handles ``bytes`` by UTF-8 decoding (matches FA's ``jsonable_encoder``)
-    and falls back to ``str()`` for everything else.
+    Mirrors ``fastapi.encoders.jsonable_encoder`` for the types FA
+    commonly sees: ``Decimal`` → str (FA's default), ``bytes`` → UTF-8
+    str, ``BaseModel`` → dict via ``model_dump``, Enum → ``.value``.
+    Anything else falls back to ``str(obj)``.
     """
+    import decimal as _decimal
+    if isinstance(obj, _decimal.Decimal):
+        return str(obj)
     if isinstance(obj, (bytes, bytearray)):
         return bytes(obj).decode("utf-8", errors="replace")
+    _md = getattr(obj, "model_dump", None)
+    if callable(_md):
+        try:
+            return _md(by_alias=True)
+        except Exception:  # noqa: BLE001
+            pass
+    import enum as _enum
+    if isinstance(obj, _enum.Enum):
+        return obj.value
     return str(obj)
 
 
