@@ -65,6 +65,20 @@ class _ParamMarker(FieldInfo):
         # Store custom attrs that FieldInfo doesn't natively keep
         self.include_in_schema = include_in_schema
         self.example = example
+        # FA emits ``FastAPIDeprecationWarning`` when ``example=`` is
+        # supplied — tests
+        # (e.g. ``test_schema_extra_examples::test_openapi_schema``)
+        # assert on this warning firing at decoration time.
+        if example is not None:
+            import warnings as _warnings
+            from fastapi_rs.exceptions import (
+                FastAPIDeprecationWarning as _FADeprecationWarning,
+            )
+            _warnings.warn(
+                "`example` has been deprecated, please use `examples` instead",
+                _FADeprecationWarning,
+                stacklevel=4,
+            )
         # pattern is the modern name; regex is the legacy alias.
         # Emit the same deprecation warning FA does — test suites that
         # assert ``pytest.warns(FastAPIDeprecationWarning)`` depend on
