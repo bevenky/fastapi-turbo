@@ -57,6 +57,228 @@
         "title": "Article",
         "type": "object"
       },
+      "Body_s062_s062_body_embed_post": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/Item"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "title": "Body_s062_s062_body_embed_post",
+        "type": "object"
+      },
+      "Body_s063_s063_body_multi_post": {
+        "properties": {
+          "extra": {
+            "title": "Extra",
+            "type": "string"
+          },
+          "item": {
+            "$ref": "#/components/schemas/Item"
+          }
+        },
+        "required": [
+          "item",
+          "extra"
+        ],
+        "title": "Body_s063_s063_body_multi_post",
+        "type": "object"
+      },
+      "Body_s076_s076_form_basic_post": {
+        "properties": {
+          "password": {
+            "title": "Password",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "Body_s076_s076_form_basic_post",
+        "type": "object"
+      },
+      "Body_s077_s077_file_basic_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "title": "Body_s077_s077_file_basic_post",
+        "type": "object"
+      },
+      "Body_s078_s078_uploadfile_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "title": "Body_s078_s078_uploadfile_post",
+        "type": "object"
+      },
+      "Body_s079_s079_form_file_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "file"
+        ],
+        "title": "Body_s079_s079_form_file_post",
+        "type": "object"
+      },
+      "Body_s080_s080_oauth2_form_post": {
+        "properties": {
+          "client_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Id"
+          },
+          "client_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "format": "password",
+            "title": "Client Secret"
+          },
+          "grant_type": {
+            "anyOf": [
+              {
+                "pattern": "^password$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Grant Type"
+          },
+          "password": {
+            "format": "password",
+            "title": "Password",
+            "type": "string"
+          },
+          "scope": {
+            "default": "",
+            "title": "Scope",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "Body_s080_s080_oauth2_form_post",
+        "type": "object"
+      },
+      "Body_s128_s128_body_annotated_embed_post": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/Item"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "title": "Body_s128_s128_body_annotated_embed_post",
+        "type": "object"
+      },
+      "Body_s144_s144_form_multi_post": {
+        "properties": {
+          "a": {
+            "title": "A",
+            "type": "string"
+          },
+          "b": {
+            "title": "B",
+            "type": "integer"
+          },
+          "c": {
+            "default": false,
+            "title": "C",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "a",
+          "b"
+        ],
+        "title": "Body_s144_s144_form_multi_post",
+        "type": "object"
+      },
+      "Body_s145_s145_files_list_post": {
+        "properties": {
+          "files": {
+            "items": {
+              "contentMediaType": "application/octet-stream",
+              "type": "string"
+            },
+            "title": "Files",
+            "type": "array"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "title": "Body_s145_s145_files_list_post",
+        "type": "object"
+      },
+      "Body_s146_s146_bytes_list_post": {
+        "properties": {
+          "files": {
+            "items": {
+              "contentMediaType": "application/octet-stream",
+              "type": "string"
+            },
+            "title": "Files",
+            "type": "array"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "title": "Body_s146_s146_bytes_list_post",
+        "type": "object"
+      },
       "Cat": {
         "properties": {
           "meows": {
@@ -153,7 +375,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Created At"
           },
           "download_url": {
@@ -219,7 +440,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Details"
           },
           "message": {
@@ -258,7 +478,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Description"
           },
           "name": {
@@ -340,8 +559,7 @@
               {
                 "type": "null"
               }
-            ],
-            "default": null
+            ]
           }
         },
         "title": "NestedOptional",
@@ -358,7 +576,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Optional Int"
           },
           "optional_str": {
@@ -370,7 +587,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Optional Str"
           },
           "required": {
@@ -389,7 +605,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Union Field"
           }
         },
@@ -429,9 +644,9 @@
           "pet": {
             "discriminator": {
               "mapping": {
-                "cat": "#/$defs/Cat",
-                "dog": "#/$defs/Dog",
-                "lizard": "#/$defs/Lizard"
+                "cat": "#/components/schemas/Cat",
+                "dog": "#/components/schemas/Dog",
+                "lizard": "#/components/schemas/Lizard"
               },
               "propertyName": "pet_type"
             },
@@ -456,6 +671,15 @@
         "title": "PetOwner",
         "type": "object"
       },
+      "Priority": {
+        "enum": [
+          1,
+          2,
+          3
+        ],
+        "title": "Priority",
+        "type": "integer"
+      },
       "Profile": {
         "properties": {
           "address": {
@@ -470,7 +694,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Bio"
           },
           "user": {
@@ -484,10 +707,19 @@
         "title": "Profile",
         "type": "object"
       },
+      "Status": {
+        "enum": [
+          "active",
+          "inactive",
+          "pending"
+        ],
+        "title": "Status",
+        "type": "string"
+      },
       "Tag": {
         "properties": {
           "color": {
-            "$ref": "#/$defs/Color"
+            "$ref": "#/components/schemas/Color"
           },
           "name": {
             "title": "Name",
@@ -512,7 +744,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Email"
           },
           "id": {
@@ -551,6 +782,13 @@
       },
       "ValidationError": {
         "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
           "loc": {
             "items": {
               "anyOf": [
@@ -654,18 +892,6 @@
         ],
         "title": "WithExamples",
         "type": "object"
-      },
-      "_CombinedBody": {
-        "properties": {
-          "item": {
-            "$ref": "#/components/schemas/Item"
-          }
-        },
-        "required": [
-          "item"
-        ],
-        "title": "_CombinedBody",
-        "type": "object"
       }
     },
     "securitySchemes": {
@@ -716,7 +942,7 @@
   "paths": {
     "/auth-area/s116": {
       "get": {
-        "operationId": "s116_get",
+        "operationId": "s116_auth_area_s116_get",
         "responses": {
           "200": {
             "content": {
@@ -727,7 +953,7 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s116",
+        "summary": "S116",
         "tags": [
           "secured"
         ]
@@ -735,7 +961,7 @@
     },
     "/auth-area/s117": {
       "post": {
-        "operationId": "s117_post",
+        "operationId": "s117_auth_area_s117_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -768,7 +994,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s117",
+        "summary": "S117",
         "tags": [
           "secured"
         ]
@@ -776,7 +1002,7 @@
     },
     "/health": {
       "get": {
-        "operationId": "health_get",
+        "operationId": "health_health_get",
         "responses": {
           "200": {
             "content": {
@@ -787,7 +1013,7 @@
             "description": "Successful Response"
           }
         },
-        "summary": "health"
+        "summary": "Health"
       }
     },
     "/s001-list-items": {
@@ -798,7 +1024,13 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Item"
+                  },
+                  "title": "Response S001 List Items",
+                  "type": "array"
+                }
               }
             },
             "description": "Successful Response"
@@ -819,6 +1051,7 @@
             "name": "item_id",
             "required": true,
             "schema": {
+              "title": "Item Id",
               "type": "integer"
             }
           }
@@ -901,6 +1134,7 @@
             "name": "item_id",
             "required": true,
             "schema": {
+              "title": "Item Id",
               "type": "integer"
             }
           }
@@ -937,7 +1171,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s004",
+        "summary": "S004",
         "tags": [
           "items"
         ]
@@ -952,6 +1186,7 @@
             "name": "item_id",
             "required": true,
             "schema": {
+              "title": "Item Id",
               "type": "integer"
             }
           }
@@ -988,7 +1223,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s005",
+        "summary": "S005",
         "tags": [
           "items"
         ]
@@ -1003,17 +1238,13 @@
             "name": "item_id",
             "required": true,
             "schema": {
+              "title": "Item Id",
               "type": "integer"
             }
           }
         ],
         "responses": {
           "204": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
             "description": "Successful Response"
           },
           "422": {
@@ -1027,7 +1258,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s006",
+        "summary": "S006",
         "tags": [
           "items"
         ]
@@ -1040,13 +1271,19 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/UserOut"
+                  },
+                  "title": "Response S007 List Users",
+                  "type": "array"
+                }
               }
             },
             "description": "Successful Response"
           }
         },
-        "summary": "s007",
+        "summary": "S007",
         "tags": [
           "users"
         ]
@@ -1061,6 +1298,7 @@
             "name": "user_id",
             "required": true,
             "schema": {
+              "title": "User Id",
               "type": "integer"
             }
           }
@@ -1087,7 +1325,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s008",
+        "summary": "S008",
         "tags": [
           "users"
         ]
@@ -1128,7 +1366,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s009",
+        "summary": "S009",
         "tags": [
           "users"
         ]
@@ -1143,6 +1381,7 @@
             "name": "user_id",
             "required": true,
             "schema": {
+              "title": "User Id",
               "type": "integer"
             }
           }
@@ -1169,7 +1408,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s010",
+        "summary": "S010",
         "tags": [
           "users"
         ]
@@ -1210,7 +1449,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s011",
+        "summary": "S011",
         "tags": [
           "users"
         ]
@@ -1223,13 +1462,19 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Article"
+                  },
+                  "title": "Response S012 Articles",
+                  "type": "array"
+                }
               }
             },
             "description": "Successful Response"
           }
         },
-        "summary": "s012",
+        "summary": "S012",
         "tags": [
           "articles"
         ]
@@ -1270,7 +1515,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s013",
+        "summary": "S013",
         "tags": [
           "articles"
         ]
@@ -1291,7 +1536,7 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s014"
+        "summary": "S014"
       }
     },
     "/s015-list-container": {
@@ -1329,7 +1574,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s015"
+        "summary": "S015"
       }
     },
     "/s016-dict-container": {
@@ -1367,7 +1612,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s016"
+        "summary": "S016"
       }
     },
     "/s017-nested-optional": {
@@ -1405,7 +1650,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s017"
+        "summary": "S017"
       }
     },
     "/s018-constrained": {
@@ -1443,7 +1688,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s018"
+        "summary": "S018"
       }
     },
     "/s019-defaults": {
@@ -1481,7 +1726,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s019"
+        "summary": "S019"
       }
     },
     "/s020-aliases": {
@@ -1519,18 +1764,20 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s020"
+        "summary": "S020"
       }
     },
     "/s021-q-ge": {
       "get": {
-        "operationId": "s021_get",
+        "operationId": "s021_s021_q_ge_get",
         "parameters": [
           {
             "in": "query",
             "name": "n",
             "required": true,
             "schema": {
+              "minimum": 0,
+              "title": "N",
               "type": "integer"
             }
           }
@@ -1555,18 +1802,20 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s021"
+        "summary": "S021"
       }
     },
     "/s022-q-le": {
       "get": {
-        "operationId": "s022_get",
+        "operationId": "s022_s022_q_le_get",
         "parameters": [
           {
             "in": "query",
             "name": "n",
             "required": true,
             "schema": {
+              "maximum": 100,
+              "title": "N",
               "type": "integer"
             }
           }
@@ -1591,18 +1840,20 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s022"
+        "summary": "S022"
       }
     },
     "/s023-q-gt": {
       "get": {
-        "operationId": "s023_get",
+        "operationId": "s023_s023_q_gt_get",
         "parameters": [
           {
             "in": "query",
             "name": "n",
             "required": true,
             "schema": {
+              "exclusiveMinimum": 0,
+              "title": "N",
               "type": "integer"
             }
           }
@@ -1627,18 +1878,20 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s023"
+        "summary": "S023"
       }
     },
     "/s024-q-lt": {
       "get": {
-        "operationId": "s024_get",
+        "operationId": "s024_s024_q_lt_get",
         "parameters": [
           {
             "in": "query",
             "name": "n",
             "required": true,
             "schema": {
+              "exclusiveMaximum": 100,
+              "title": "N",
               "type": "integer"
             }
           }
@@ -1663,18 +1916,21 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s024"
+        "summary": "S024"
       }
     },
     "/s025-q-ge-le": {
       "get": {
-        "operationId": "s025_get",
+        "operationId": "s025_s025_q_ge_le_get",
         "parameters": [
           {
             "in": "query",
             "name": "n",
             "required": true,
             "schema": {
+              "maximum": 100,
+              "minimum": 0,
+              "title": "N",
               "type": "integer"
             }
           }
@@ -1699,18 +1955,21 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s025"
+        "summary": "S025"
       }
     },
     "/s026-q-gt-lt": {
       "get": {
-        "operationId": "s026_get",
+        "operationId": "s026_s026_q_gt_lt_get",
         "parameters": [
           {
             "in": "query",
             "name": "n",
             "required": true,
             "schema": {
+              "exclusiveMaximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "N",
               "type": "integer"
             }
           }
@@ -1735,18 +1994,20 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s026"
+        "summary": "S026"
       }
     },
     "/s027-q-min-length": {
       "get": {
-        "operationId": "s027_get",
+        "operationId": "s027_s027_q_min_length_get",
         "parameters": [
           {
             "in": "query",
             "name": "s",
             "required": true,
             "schema": {
+              "minLength": 3,
+              "title": "S",
               "type": "string"
             }
           }
@@ -1771,18 +2032,20 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s027"
+        "summary": "S027"
       }
     },
     "/s028-q-max-length": {
       "get": {
-        "operationId": "s028_get",
+        "operationId": "s028_s028_q_max_length_get",
         "parameters": [
           {
             "in": "query",
             "name": "s",
             "required": true,
             "schema": {
+              "maxLength": 10,
+              "title": "S",
               "type": "string"
             }
           }
@@ -1807,18 +2070,21 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s028"
+        "summary": "S028"
       }
     },
     "/s029-q-min-max-length": {
       "get": {
-        "operationId": "s029_get",
+        "operationId": "s029_s029_q_min_max_length_get",
         "parameters": [
           {
             "in": "query",
             "name": "s",
             "required": true,
             "schema": {
+              "maxLength": 10,
+              "minLength": 3,
+              "title": "S",
               "type": "string"
             }
           }
@@ -1843,18 +2109,20 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s029"
+        "summary": "S029"
       }
     },
     "/s030-q-pattern": {
       "get": {
-        "operationId": "s030_get",
+        "operationId": "s030_s030_q_pattern_get",
         "parameters": [
           {
             "in": "query",
             "name": "code",
             "required": true,
             "schema": {
+              "pattern": "^[A-Z]+$",
+              "title": "Code",
               "type": "string"
             }
           }
@@ -1879,12 +2147,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s030"
+        "summary": "S030"
       }
     },
     "/s031-q-default-int": {
       "get": {
-        "operationId": "s031_get",
+        "operationId": "s031_s031_q_default_int_get",
         "parameters": [
           {
             "in": "query",
@@ -1892,6 +2160,7 @@
             "required": false,
             "schema": {
               "default": 10,
+              "title": "N",
               "type": "integer"
             }
           }
@@ -1916,12 +2185,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s031"
+        "summary": "S031"
       }
     },
     "/s032-q-default-str": {
       "get": {
-        "operationId": "s032_get",
+        "operationId": "s032_s032_q_default_str_get",
         "parameters": [
           {
             "in": "query",
@@ -1929,6 +2198,7 @@
             "required": false,
             "schema": {
               "default": "hello",
+              "title": "S",
               "type": "string"
             }
           }
@@ -1953,12 +2223,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s032"
+        "summary": "S032"
       }
     },
     "/s033-q-default-bool": {
       "get": {
-        "operationId": "s033_get",
+        "operationId": "s033_s033_q_default_bool_get",
         "parameters": [
           {
             "in": "query",
@@ -1966,6 +2236,7 @@
             "required": false,
             "schema": {
               "default": false,
+              "title": "B",
               "type": "boolean"
             }
           }
@@ -1990,19 +2261,27 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s033"
+        "summary": "S033"
       }
     },
     "/s034-q-optional": {
       "get": {
-        "operationId": "s034_get",
+        "operationId": "s034_s034_q_optional_get",
         "parameters": [
           {
             "in": "query",
             "name": "q",
             "required": false,
             "schema": {
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
             }
           }
         ],
@@ -2026,18 +2305,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s034"
+        "summary": "S034"
       }
     },
     "/s035-q-required": {
       "get": {
-        "operationId": "s035_get",
+        "operationId": "s035_s035_q_required_get",
         "parameters": [
           {
             "in": "query",
             "name": "q",
             "required": true,
             "schema": {
+              "title": "Q",
               "type": "string"
             }
           }
@@ -2062,19 +2342,23 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s035"
+        "summary": "S035"
       }
     },
     "/s036-q-list": {
       "get": {
-        "operationId": "s036_get",
+        "operationId": "s036_s036_q_list_get",
         "parameters": [
           {
             "in": "query",
             "name": "items",
             "required": true,
             "schema": {
-              "type": "string"
+              "items": {
+                "type": "string"
+              },
+              "title": "Items",
+              "type": "array"
             }
           }
         ],
@@ -2098,12 +2382,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s036"
+        "summary": "S036"
       }
     },
     "/s037-q-list-default": {
       "get": {
-        "operationId": "s037_get",
+        "operationId": "s037_s037_q_list_default_get",
         "parameters": [
           {
             "in": "query",
@@ -2111,7 +2395,11 @@
             "required": false,
             "schema": {
               "default": [],
-              "type": "string"
+              "items": {
+                "type": "string"
+              },
+              "title": "Items",
+              "type": "array"
             }
           }
         ],
@@ -2135,19 +2423,23 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s037"
+        "summary": "S037"
       }
     },
     "/s038-q-int-list": {
       "get": {
-        "operationId": "s038_get",
+        "operationId": "s038_s038_q_int_list_get",
         "parameters": [
           {
             "in": "query",
             "name": "nums",
             "required": true,
             "schema": {
-              "type": "string"
+              "items": {
+                "type": "integer"
+              },
+              "title": "Nums",
+              "type": "array"
             }
           }
         ],
@@ -2171,18 +2463,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s038"
+        "summary": "S038"
       }
     },
     "/s039-q-alias": {
       "get": {
-        "operationId": "s039_get",
+        "operationId": "s039_s039_q_alias_get",
         "parameters": [
           {
             "in": "query",
             "name": "user-query",
             "required": true,
             "schema": {
+              "title": "User-Query",
               "type": "string"
             }
           }
@@ -2207,12 +2500,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s039"
+        "summary": "S039"
       }
     },
     "/s040-q-description": {
       "get": {
-        "operationId": "s040_get",
+        "operationId": "s040_s040_q_description_get",
         "parameters": [
           {
             "description": "Search query string",
@@ -2220,6 +2513,8 @@
             "name": "q",
             "required": true,
             "schema": {
+              "description": "Search query string",
+              "title": "Q",
               "type": "string"
             }
           }
@@ -2244,18 +2539,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s040"
+        "summary": "S040"
       }
     },
     "/s041-p-int/{item_id}": {
       "get": {
-        "operationId": "s041_get",
+        "operationId": "s041_s041_p_int__item_id__get",
         "parameters": [
           {
             "in": "path",
             "name": "item_id",
             "required": true,
             "schema": {
+              "title": "Item Id",
               "type": "integer"
             }
           }
@@ -2280,18 +2576,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s041"
+        "summary": "S041"
       }
     },
     "/s042-p-str/{name}": {
       "get": {
-        "operationId": "s042_get",
+        "operationId": "s042_s042_p_str__name__get",
         "parameters": [
           {
             "in": "path",
             "name": "name",
             "required": true,
             "schema": {
+              "title": "Name",
               "type": "string"
             }
           }
@@ -2316,18 +2613,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s042"
+        "summary": "S042"
       }
     },
     "/s043-p-float/{price}": {
       "get": {
-        "operationId": "s043_get",
+        "operationId": "s043_s043_p_float__price__get",
         "parameters": [
           {
             "in": "path",
             "name": "price",
             "required": true,
             "schema": {
+              "title": "Price",
               "type": "number"
             }
           }
@@ -2352,18 +2650,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s043"
+        "summary": "S043"
       }
     },
     "/s044-p-bool/{flag}": {
       "get": {
-        "operationId": "s044_get",
+        "operationId": "s044_s044_p_bool__flag__get",
         "parameters": [
           {
             "in": "path",
             "name": "flag",
             "required": true,
             "schema": {
+              "title": "Flag",
               "type": "boolean"
             }
           }
@@ -2388,18 +2687,20 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s044"
+        "summary": "S044"
       }
     },
     "/s045-p-ge/{n}": {
       "get": {
-        "operationId": "s045_get",
+        "operationId": "s045_s045_p_ge__n__get",
         "parameters": [
           {
             "in": "path",
             "name": "n",
             "required": true,
             "schema": {
+              "minimum": 0,
+              "title": "N",
               "type": "integer"
             }
           }
@@ -2424,18 +2725,20 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s045"
+        "summary": "S045"
       }
     },
     "/s046-p-le/{n}": {
       "get": {
-        "operationId": "s046_get",
+        "operationId": "s046_s046_p_le__n__get",
         "parameters": [
           {
             "in": "path",
             "name": "n",
             "required": true,
             "schema": {
+              "maximum": 1000,
+              "title": "N",
               "type": "integer"
             }
           }
@@ -2460,18 +2763,21 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s046"
+        "summary": "S046"
       }
     },
     "/s047-p-range/{n}": {
       "get": {
-        "operationId": "s047_get",
+        "operationId": "s047_s047_p_range__n__get",
         "parameters": [
           {
             "in": "path",
             "name": "n",
             "required": true,
             "schema": {
+              "maximum": 100,
+              "minimum": 1,
+              "title": "N",
               "type": "integer"
             }
           }
@@ -2496,12 +2802,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s047"
+        "summary": "S047"
       }
     },
     "/s048-p-description/{n}": {
       "get": {
-        "operationId": "s048_get",
+        "operationId": "s048_s048_p_description__n__get",
         "parameters": [
           {
             "description": "The ID of the thing",
@@ -2509,6 +2815,8 @@
             "name": "n",
             "required": true,
             "schema": {
+              "description": "The ID of the thing",
+              "title": "N",
               "type": "integer"
             }
           }
@@ -2533,19 +2841,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s048"
+        "summary": "S048"
       }
     },
     "/s049-p-enum/{color}": {
       "get": {
-        "operationId": "s049_get",
+        "operationId": "s049_s049_p_enum__color__get",
         "parameters": [
           {
             "in": "path",
             "name": "color",
             "required": true,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/Color"
             }
           }
         ],
@@ -2569,18 +2877,24 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s049"
+        "summary": "S049"
       }
     },
     "/s050-p-literal/{val}": {
       "get": {
-        "operationId": "s050_get",
+        "operationId": "s050_s050_p_literal__val__get",
         "parameters": [
           {
             "in": "path",
             "name": "val",
             "required": true,
             "schema": {
+              "enum": [
+                "a",
+                "b",
+                "c"
+              ],
+              "title": "Val",
               "type": "string"
             }
           }
@@ -2605,18 +2919,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s050"
+        "summary": "S050"
       }
     },
     "/s051-header-basic": {
       "get": {
-        "operationId": "s051_get",
+        "operationId": "s051_s051_header_basic_get",
         "parameters": [
           {
             "in": "header",
             "name": "x-token",
             "required": true,
             "schema": {
+              "title": "X-Token",
               "type": "string"
             }
           }
@@ -2641,12 +2956,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s051"
+        "summary": "S051"
       }
     },
     "/s052-header-default": {
       "get": {
-        "operationId": "s052_get",
+        "operationId": "s052_s052_header_default_get",
         "parameters": [
           {
             "in": "header",
@@ -2654,6 +2969,7 @@
             "required": false,
             "schema": {
               "default": "def",
+              "title": "X-Custom",
               "type": "string"
             }
           }
@@ -2678,19 +2994,27 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s052"
+        "summary": "S052"
       }
     },
     "/s053-header-optional": {
       "get": {
-        "operationId": "s053_get",
+        "operationId": "s053_s053_header_optional_get",
         "parameters": [
           {
             "in": "header",
             "name": "x-opt",
             "required": false,
             "schema": {
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Opt"
             }
           }
         ],
@@ -2714,18 +3038,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s053"
+        "summary": "S053"
       }
     },
     "/s054-header-alias": {
       "get": {
-        "operationId": "s054_get",
+        "operationId": "s054_s054_header_alias_get",
         "parameters": [
           {
             "in": "header",
             "name": "X-Auth-Token",
             "required": true,
             "schema": {
+              "title": "X-Auth-Token",
               "type": "string"
             }
           }
@@ -2750,12 +3075,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s054"
+        "summary": "S054"
       }
     },
     "/s055-header-description": {
       "get": {
-        "operationId": "s055_get",
+        "operationId": "s055_s055_header_description_get",
         "parameters": [
           {
             "description": "The auth token",
@@ -2763,6 +3088,8 @@
             "name": "x-token",
             "required": true,
             "schema": {
+              "description": "The auth token",
+              "title": "X-Token",
               "type": "string"
             }
           }
@@ -2787,18 +3114,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s055"
+        "summary": "S055"
       }
     },
     "/s056-cookie-basic": {
       "get": {
-        "operationId": "s056_get",
+        "operationId": "s056_s056_cookie_basic_get",
         "parameters": [
           {
             "in": "cookie",
             "name": "session",
             "required": true,
             "schema": {
+              "title": "Session",
               "type": "string"
             }
           }
@@ -2823,12 +3151,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s056"
+        "summary": "S056"
       }
     },
     "/s057-cookie-default": {
       "get": {
-        "operationId": "s057_get",
+        "operationId": "s057_s057_cookie_default_get",
         "parameters": [
           {
             "in": "cookie",
@@ -2836,6 +3164,7 @@
             "required": false,
             "schema": {
               "default": "anon",
+              "title": "Session",
               "type": "string"
             }
           }
@@ -2860,19 +3189,27 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s057"
+        "summary": "S057"
       }
     },
     "/s058-cookie-optional": {
       "get": {
-        "operationId": "s058_get",
+        "operationId": "s058_s058_cookie_optional_get",
         "parameters": [
           {
             "in": "cookie",
             "name": "session",
             "required": false,
             "schema": {
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session"
             }
           }
         ],
@@ -2896,12 +3233,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s058"
+        "summary": "S058"
       }
     },
     "/s059-cookie-description": {
       "get": {
-        "operationId": "s059_get",
+        "operationId": "s059_s059_cookie_description_get",
         "parameters": [
           {
             "description": "Session cookie",
@@ -2909,6 +3246,8 @@
             "name": "session",
             "required": true,
             "schema": {
+              "description": "Session cookie",
+              "title": "Session",
               "type": "string"
             }
           }
@@ -2933,18 +3272,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s059"
+        "summary": "S059"
       }
     },
     "/s060-mixed-params/{item_id}": {
       "get": {
-        "operationId": "s060_get",
+        "operationId": "s060_s060_mixed_params__item_id__get",
         "parameters": [
           {
             "in": "path",
             "name": "item_id",
             "required": true,
             "schema": {
+              "title": "Item Id",
               "type": "integer"
             }
           },
@@ -2954,6 +3294,7 @@
             "required": false,
             "schema": {
               "default": "hi",
+              "title": "Q",
               "type": "string"
             }
           },
@@ -2963,6 +3304,7 @@
             "required": false,
             "schema": {
               "default": "nothing",
+              "title": "X-Token",
               "type": "string"
             }
           },
@@ -2972,6 +3314,7 @@
             "required": false,
             "schema": {
               "default": "anon",
+              "title": "Session",
               "type": "string"
             }
           }
@@ -2996,12 +3339,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s060"
+        "summary": "S060"
       }
     },
     "/s061-body-model": {
       "post": {
-        "operationId": "s061_post",
+        "operationId": "s061_s061_body_model_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3032,17 +3375,17 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s061"
+        "summary": "S061"
       }
     },
     "/s062-body-embed": {
       "post": {
-        "operationId": "s062_post",
+        "operationId": "s062_s062_body_embed_post",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/_CombinedBody"
+                "$ref": "#/components/schemas/Body_s062_s062_body_embed_post"
               }
             }
           },
@@ -3068,17 +3411,17 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s062"
+        "summary": "S062"
       }
     },
     "/s063-body-multi": {
       "post": {
-        "operationId": "s063_post",
+        "operationId": "s063_s063_body_multi_post",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/_CombinedBody"
+                "$ref": "#/components/schemas/Body_s063_s063_body_multi_post"
               }
             }
           },
@@ -3104,21 +3447,28 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s063"
+        "summary": "S063"
       }
     },
     "/s064-body-optional": {
       "post": {
-        "operationId": "s064_post",
+        "operationId": "s064_s064_body_optional_post",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "type": "object"
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/Item"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Item"
               }
             }
-          },
-          "required": false
+          }
         },
         "responses": {
           "200": {
@@ -3140,22 +3490,26 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s064"
+        "summary": "S064"
       }
     },
     "/s065-body-list": {
       "post": {
-        "operationId": "s065_post",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "items",
-            "required": true,
-            "schema": {
-              "type": "string"
+        "operationId": "s065_s065_body_list_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/Item"
+                },
+                "title": "Items",
+                "type": "array"
+              }
             }
-          }
-        ],
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -3176,22 +3530,26 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s065"
+        "summary": "S065"
       }
     },
     "/s066-body-dict": {
       "post": {
-        "operationId": "s066_post",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "mapping",
-            "required": true,
-            "schema": {
-              "type": "string"
+        "operationId": "s066_s066_body_dict_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/Item"
+                },
+                "title": "Mapping",
+                "type": "object"
+              }
             }
-          }
-        ],
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -3212,12 +3570,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s066"
+        "summary": "S066"
       }
     },
     "/s067-body-nested": {
       "post": {
-        "operationId": "s067_post",
+        "operationId": "s067_s067_body_nested_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3248,12 +3606,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s067"
+        "summary": "S067"
       }
     },
     "/s068-body-discriminated": {
       "post": {
-        "operationId": "s068_post",
+        "operationId": "s068_s068_body_discriminated_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3284,12 +3642,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s068"
+        "summary": "S068"
       }
     },
     "/s069-body-inherited": {
       "post": {
-        "operationId": "s069_post",
+        "operationId": "s069_s069_body_inherited_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3320,12 +3678,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s069"
+        "summary": "S069"
       }
     },
     "/s070-body-optional-fields": {
       "post": {
-        "operationId": "s070_post",
+        "operationId": "s070_s070_body_optional_fields_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3356,12 +3714,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s070"
+        "summary": "S070"
       }
     },
     "/s071-body-constrained": {
       "post": {
-        "operationId": "s071_post",
+        "operationId": "s071_s071_body_constrained_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3392,12 +3750,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s071"
+        "summary": "S071"
       }
     },
     "/s072-body-with-defaults": {
       "post": {
-        "operationId": "s072_post",
+        "operationId": "s072_s072_body_with_defaults_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3428,12 +3786,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s072"
+        "summary": "S072"
       }
     },
     "/s073-body-aliased": {
       "post": {
-        "operationId": "s073_post",
+        "operationId": "s073_s073_body_aliased_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3464,12 +3822,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s073"
+        "summary": "S073"
       }
     },
     "/s074-body-examples": {
       "post": {
-        "operationId": "s074_post",
+        "operationId": "s074_s074_body_examples_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3500,22 +3858,26 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s074"
+        "summary": "S074"
       }
     },
     "/s075-body-tag-list": {
       "post": {
-        "operationId": "s075_post",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "tags",
-            "required": true,
-            "schema": {
-              "type": "string"
+        "operationId": "s075_s075_body_tag_list_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/Tag"
+                },
+                "title": "Tags",
+                "type": "array"
+              }
             }
-          }
-        ],
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -3536,12 +3898,22 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s075"
+        "summary": "S075"
       }
     },
     "/s076-form-basic": {
       "post": {
-        "operationId": "s076_post",
+        "operationId": "s076_s076_form_basic_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_s076_s076_form_basic_post"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -3550,14 +3922,34 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
-        "summary": "s076"
+        "summary": "S076"
       }
     },
     "/s077-file-basic": {
       "post": {
-        "operationId": "s077_post",
+        "operationId": "s077_s077_file_basic_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_s077_s077_file_basic_post"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -3566,14 +3958,34 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
-        "summary": "s077"
+        "summary": "S077"
       }
     },
     "/s078-uploadfile": {
       "post": {
-        "operationId": "s078_post",
+        "operationId": "s078_s078_uploadfile_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_s078_s078_uploadfile_post"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -3582,14 +3994,34 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
-        "summary": "s078"
+        "summary": "S078"
       }
     },
     "/s079-form-file": {
       "post": {
-        "operationId": "s079_post",
+        "operationId": "s079_s079_form_file_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_s079_s079_form_file_post"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -3598,14 +4030,34 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
-        "summary": "s079"
+        "summary": "S079"
       }
     },
     "/s080-oauth2-form": {
       "post": {
-        "operationId": "s080_post",
+        "operationId": "s080_s080_oauth2_form_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_s080_s080_oauth2_form_post"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -3614,15 +4066,25 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
-        "summary": "s080"
+        "summary": "S080"
       }
     },
     "/s081-deprecated": {
       "get": {
         "deprecated": true,
-        "operationId": "s081_get",
+        "operationId": "s081_s081_deprecated_get",
         "responses": {
           "200": {
             "content": {
@@ -3633,12 +4095,12 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s081"
+        "summary": "S081"
       }
     },
     "/s082-non-deprecated": {
       "get": {
-        "operationId": "s082_get",
+        "operationId": "s082_s082_non_deprecated_get",
         "responses": {
           "200": {
             "content": {
@@ -3649,12 +4111,12 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s082"
+        "summary": "S082"
       }
     },
     "/s083-tags-multi": {
       "get": {
-        "operationId": "s083_get",
+        "operationId": "s083_s083_tags_multi_get",
         "responses": {
           "200": {
             "content": {
@@ -3665,7 +4127,7 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s083",
+        "summary": "S083",
         "tags": [
           "alpha",
           "beta"
@@ -3674,7 +4136,7 @@
     },
     "/s084-summary": {
       "get": {
-        "operationId": "s084_get",
+        "operationId": "s084_s084_summary_get",
         "responses": {
           "200": {
             "content": {
@@ -3691,7 +4153,7 @@
     "/s085-description": {
       "get": {
         "description": "A longer description of the endpoint",
-        "operationId": "s085_get",
+        "operationId": "s085_s085_description_get",
         "responses": {
           "200": {
             "content": {
@@ -3702,7 +4164,7 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s085"
+        "summary": "S085"
       }
     },
     "/s086-operation-id": {
@@ -3718,12 +4180,12 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s086"
+        "summary": "S086"
       }
     },
     "/s087-status-201": {
       "get": {
-        "operationId": "s087_get",
+        "operationId": "s087_s087_status_201_get",
         "responses": {
           "201": {
             "content": {
@@ -3734,12 +4196,12 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s087"
+        "summary": "S087"
       }
     },
     "/s088-status-202": {
       "get": {
-        "operationId": "s088_get",
+        "operationId": "s088_s088_status_202_get",
         "responses": {
           "202": {
             "content": {
@@ -3750,28 +4212,23 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s088"
+        "summary": "S088"
       }
     },
     "/s089-status-204": {
       "get": {
-        "operationId": "s089_get",
+        "operationId": "s089_s089_status_204_get",
         "responses": {
           "204": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
             "description": "Successful Response"
           }
         },
-        "summary": "s089"
+        "summary": "S089"
       }
     },
     "/s090-status-418": {
       "get": {
-        "operationId": "s090_get",
+        "operationId": "s090_s090_status_418_get",
         "responses": {
           "418": {
             "content": {
@@ -3782,12 +4239,12 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s090"
+        "summary": "S090"
       }
     },
     "/s091-multiple-responses": {
       "get": {
-        "operationId": "s091_get",
+        "operationId": "s091_s091_multiple_responses_get",
         "responses": {
           "200": {
             "content": {
@@ -3818,44 +4275,48 @@
             "description": "Server error"
           }
         },
-        "summary": "s091"
+        "summary": "S091"
       }
     },
     "/s092-response-class": {
       "get": {
-        "operationId": "s092_get",
+        "operationId": "s092_s092_response_class_get",
         "responses": {
           "200": {
             "content": {
-              "application/json": {
-                "schema": {}
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
               }
             },
             "description": "Successful Response"
           }
         },
-        "summary": "s092"
+        "summary": "S092"
       }
     },
     "/s093-response-class-plain": {
       "get": {
-        "operationId": "s093_get",
+        "operationId": "s093_s093_response_class_plain_get",
         "responses": {
           "200": {
             "content": {
-              "application/json": {
-                "schema": {}
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
               }
             },
             "description": "Successful Response"
           }
         },
-        "summary": "s093"
+        "summary": "S093"
       }
     },
     "/s094-response-model-exclude": {
       "get": {
-        "operationId": "s094_get",
+        "operationId": "s094_s094_response_model_exclude_get",
         "responses": {
           "200": {
             "content": {
@@ -3868,12 +4329,12 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s094"
+        "summary": "S094"
       }
     },
     "/s095-response-model-exclude-none": {
       "get": {
-        "operationId": "s095_get",
+        "operationId": "s095_s095_response_model_exclude_none_get",
         "responses": {
           "200": {
             "content": {
@@ -3886,12 +4347,12 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s095"
+        "summary": "S095"
       }
     },
     "/s096-response-model-include": {
       "get": {
-        "operationId": "s096_get",
+        "operationId": "s096_s096_response_model_include_get",
         "responses": {
           "200": {
             "content": {
@@ -3904,12 +4365,12 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s096"
+        "summary": "S096"
       }
     },
     "/s097-response-model-exclude-fields": {
       "get": {
-        "operationId": "s097_get",
+        "operationId": "s097_s097_response_model_exclude_fields_get",
         "responses": {
           "200": {
             "content": {
@@ -3922,7 +4383,7 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s097"
+        "summary": "S097"
       }
     },
     "/s098-combined": {
@@ -3950,7 +4411,7 @@
     },
     "/s099-no-response-model": {
       "get": {
-        "operationId": "s099_get",
+        "operationId": "s099_s099_no_response_model_get",
         "responses": {
           "200": {
             "content": {
@@ -3961,19 +4422,19 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s099"
+        "summary": "S099"
       }
     },
     "/s100-enum-query-param": {
       "get": {
-        "operationId": "s100_get",
+        "operationId": "s100_s100_enum_query_param_get",
         "parameters": [
           {
             "in": "query",
             "name": "c",
             "required": true,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/Color"
             }
           }
         ],
@@ -3997,12 +4458,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s100"
+        "summary": "S100"
       }
     },
     "/s101-oauth2": {
       "get": {
-        "operationId": "s101_get",
+        "operationId": "s101_s101_oauth2_get",
         "responses": {
           "200": {
             "content": {
@@ -4018,7 +4479,7 @@
             "oauth2pwd": []
           }
         ],
-        "summary": "s101",
+        "summary": "S101",
         "tags": [
           "auth"
         ]
@@ -4026,7 +4487,7 @@
     },
     "/s102-bearer": {
       "get": {
-        "operationId": "s102_get",
+        "operationId": "s102_s102_bearer_get",
         "responses": {
           "200": {
             "content": {
@@ -4042,7 +4503,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "s102",
+        "summary": "S102",
         "tags": [
           "auth"
         ]
@@ -4050,7 +4511,7 @@
     },
     "/s103-basic": {
       "get": {
-        "operationId": "s103_get",
+        "operationId": "s103_s103_basic_get",
         "responses": {
           "200": {
             "content": {
@@ -4066,7 +4527,7 @@
             "basicAuth": []
           }
         ],
-        "summary": "s103",
+        "summary": "S103",
         "tags": [
           "auth"
         ]
@@ -4074,7 +4535,7 @@
     },
     "/s104-digest": {
       "get": {
-        "operationId": "s104_get",
+        "operationId": "s104_s104_digest_get",
         "responses": {
           "200": {
             "content": {
@@ -4090,7 +4551,7 @@
             "digestAuth": []
           }
         ],
-        "summary": "s104",
+        "summary": "S104",
         "tags": [
           "auth"
         ]
@@ -4098,17 +4559,7 @@
     },
     "/s105-apikey-header": {
       "get": {
-        "operationId": "s105_get",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "X-API-Key",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
+        "operationId": "s105_s105_apikey_header_get",
         "responses": {
           "200": {
             "content": {
@@ -4117,16 +4568,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "security": [
@@ -4134,7 +4575,7 @@
             "apiKeyHeader": []
           }
         ],
-        "summary": "s105",
+        "summary": "S105",
         "tags": [
           "auth"
         ]
@@ -4142,17 +4583,7 @@
     },
     "/s106-apikey-query": {
       "get": {
-        "operationId": "s106_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "api_key",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
+        "operationId": "s106_s106_apikey_query_get",
         "responses": {
           "200": {
             "content": {
@@ -4161,16 +4592,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "security": [
@@ -4178,7 +4599,7 @@
             "apiKeyQuery": []
           }
         ],
-        "summary": "s106",
+        "summary": "S106",
         "tags": [
           "auth"
         ]
@@ -4186,17 +4607,7 @@
     },
     "/s107-apikey-cookie": {
       "get": {
-        "operationId": "s107_get",
-        "parameters": [
-          {
-            "in": "cookie",
-            "name": "api_key_cookie",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
+        "operationId": "s107_s107_apikey_cookie_get",
         "responses": {
           "200": {
             "content": {
@@ -4205,16 +4616,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "security": [
@@ -4222,7 +4623,7 @@
             "apiKeyCookie": []
           }
         ],
-        "summary": "s107",
+        "summary": "S107",
         "tags": [
           "auth"
         ]
@@ -4230,17 +4631,7 @@
     },
     "/s108-multi-security": {
       "get": {
-        "operationId": "s108_get",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "X-API-Key",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
+        "operationId": "s108_s108_multi_security_get",
         "responses": {
           "200": {
             "content": {
@@ -4249,16 +4640,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "security": [
@@ -4269,12 +4650,12 @@
             "apiKeyHeader": []
           }
         ],
-        "summary": "s108"
+        "summary": "S108"
       }
     },
     "/s109-common-deps": {
       "get": {
-        "operationId": "s109_get",
+        "operationId": "s109_s109_common_deps_get",
         "parameters": [
           {
             "in": "query",
@@ -4282,6 +4663,7 @@
             "required": false,
             "schema": {
               "default": 0,
+              "title": "Skip",
               "type": "integer"
             }
           },
@@ -4291,6 +4673,7 @@
             "required": false,
             "schema": {
               "default": 10,
+              "title": "Limit",
               "type": "integer"
             }
           }
@@ -4315,12 +4698,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s109"
+        "summary": "S109"
       }
     },
     "/s110-user-dep": {
       "get": {
-        "operationId": "s110_get",
+        "operationId": "s110_s110_user_dep_get",
         "responses": {
           "200": {
             "content": {
@@ -4336,12 +4719,12 @@
             "oauth2pwd": []
           }
         ],
-        "summary": "s110"
+        "summary": "S110"
       }
     },
     "/s111-route-level-dep": {
       "get": {
-        "operationId": "s111_get",
+        "operationId": "s111_s111_route_level_dep_get",
         "responses": {
           "200": {
             "content": {
@@ -4352,12 +4735,12 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s111"
+        "summary": "S111"
       }
     },
     "/s112-multi-route-deps": {
       "get": {
-        "operationId": "s112_get",
+        "operationId": "s112_s112_multi_route_deps_get",
         "parameters": [
           {
             "in": "query",
@@ -4365,6 +4748,7 @@
             "required": false,
             "schema": {
               "default": 0,
+              "title": "Skip",
               "type": "integer"
             }
           },
@@ -4374,6 +4758,7 @@
             "required": false,
             "schema": {
               "default": 10,
+              "title": "Limit",
               "type": "integer"
             }
           }
@@ -4398,12 +4783,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s112"
+        "summary": "S112"
       }
     },
     "/s118-literal-query": {
       "get": {
-        "operationId": "s118_get",
+        "operationId": "s118_s118_literal_query_get",
         "parameters": [
           {
             "in": "query",
@@ -4411,6 +4796,11 @@
             "required": false,
             "schema": {
               "default": "fast",
+              "enum": [
+                "fast",
+                "slow"
+              ],
+              "title": "Mode",
               "type": "string"
             }
           }
@@ -4435,12 +4825,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s118"
+        "summary": "S118"
       }
     },
     "/s119-literal-int-query": {
       "get": {
-        "operationId": "s119_get",
+        "operationId": "s119_s119_literal_int_query_get",
         "parameters": [
           {
             "in": "query",
@@ -4448,6 +4838,12 @@
             "required": false,
             "schema": {
               "default": 1,
+              "enum": [
+                1,
+                2,
+                3
+              ],
+              "title": "Code",
               "type": "string"
             }
           }
@@ -4472,19 +4868,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s119"
+        "summary": "S119"
       }
     },
     "/s120-priority-enum": {
       "get": {
-        "operationId": "s120_get",
+        "operationId": "s120_s120_priority_enum_get",
         "parameters": [
           {
             "in": "query",
             "name": "p",
             "required": true,
             "schema": {
-              "type": "integer"
+              "$ref": "#/components/schemas/Priority"
             }
           }
         ],
@@ -4508,19 +4904,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s120"
+        "summary": "S120"
       }
     },
     "/s121-status-enum": {
       "get": {
-        "operationId": "s121_get",
+        "operationId": "s121_s121_status_enum_get",
         "parameters": [
           {
             "in": "query",
             "name": "s",
             "required": true,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/Status"
             }
           }
         ],
@@ -4544,12 +4940,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s121"
+        "summary": "S121"
       }
     },
     "/s122-uuid-body": {
       "post": {
-        "operationId": "s122_post",
+        "operationId": "s122_s122_uuid_body_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -4580,18 +4976,20 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s122"
+        "summary": "S122"
       }
     },
     "/s123-uuid-path/{uid}": {
       "get": {
-        "operationId": "s123_get",
+        "operationId": "s123_s123_uuid_path__uid__get",
         "parameters": [
           {
             "in": "path",
             "name": "uid",
             "required": true,
             "schema": {
+              "format": "uuid",
+              "title": "Uid",
               "type": "string"
             }
           }
@@ -4616,12 +5014,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s123"
+        "summary": "S123"
       }
     },
     "/s124-str-query-default-empty": {
       "get": {
-        "operationId": "s124_get",
+        "operationId": "s124_s124_str_query_default_empty_get",
         "parameters": [
           {
             "in": "query",
@@ -4629,6 +5027,7 @@
             "required": false,
             "schema": {
               "default": "",
+              "title": "B",
               "type": "string"
             }
           }
@@ -4653,12 +5052,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s124"
+        "summary": "S124"
       }
     },
     "/s125-body-any": {
       "post": {
-        "operationId": "s125_post",
+        "operationId": "s125_s125_body_any_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -4689,12 +5088,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s125"
+        "summary": "S125"
       }
     },
     "/s126-body-any-list": {
       "post": {
-        "operationId": "s126_post",
+        "operationId": "s126_s126_body_any_list_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -4725,12 +5124,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s126"
+        "summary": "S126"
       }
     },
     "/s127-body-annotated": {
       "post": {
-        "operationId": "s127_post",
+        "operationId": "s127_s127_body_annotated_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -4761,17 +5160,17 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s127"
+        "summary": "S127"
       }
     },
     "/s128-body-annotated-embed": {
       "post": {
-        "operationId": "s128_post",
+        "operationId": "s128_s128_body_annotated_embed_post",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/_CombinedBody"
+                "$ref": "#/components/schemas/Body_s128_s128_body_annotated_embed_post"
               }
             }
           },
@@ -4797,18 +5196,21 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s128"
+        "summary": "S128"
       }
     },
     "/s129-annotated-query": {
       "get": {
-        "operationId": "s129_get",
+        "operationId": "s129_s129_annotated_query_get",
         "parameters": [
           {
             "in": "query",
             "name": "q",
             "required": true,
             "schema": {
+              "maxLength": 20,
+              "minLength": 1,
+              "title": "Q",
               "type": "string"
             }
           }
@@ -4833,18 +5235,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s129"
+        "summary": "S129"
       }
     },
     "/s130-annotated-header": {
       "get": {
-        "operationId": "s130_get",
+        "operationId": "s130_s130_annotated_header_get",
         "parameters": [
           {
             "in": "header",
             "name": "tok",
             "required": true,
             "schema": {
+              "title": "Tok",
               "type": "string"
             }
           }
@@ -4869,18 +5272,20 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s130"
+        "summary": "S130"
       }
     },
     "/s131-annotated-path/{x}": {
       "get": {
-        "operationId": "s131_get",
+        "operationId": "s131_s131_annotated_path__x__get",
         "parameters": [
           {
             "in": "path",
             "name": "x",
             "required": true,
             "schema": {
+              "minimum": 1,
+              "title": "X",
               "type": "integer"
             }
           }
@@ -4905,18 +5310,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s131"
+        "summary": "S131"
       }
     },
     "/s132-annotated-cookie": {
       "get": {
-        "operationId": "s132_get",
+        "operationId": "s132_s132_annotated_cookie_get",
         "parameters": [
           {
             "in": "cookie",
             "name": "c",
             "required": true,
             "schema": {
+              "title": "C",
               "type": "string"
             }
           }
@@ -4941,12 +5347,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s132"
+        "summary": "S132"
       }
     },
     "/s133-response-wildcard": {
       "post": {
-        "operationId": "s133_post",
+        "operationId": "s133_s133_response_wildcard_post",
         "responses": {
           "200": {
             "content": {
@@ -4964,15 +5370,15 @@
                 }
               }
             },
-            "description": "Response"
+            "description": "Client Error"
           }
         },
-        "summary": "s133"
+        "summary": "S133"
       }
     },
     "/s134-response-default": {
       "get": {
-        "operationId": "s134_get",
+        "operationId": "s134_s134_response_default_get",
         "responses": {
           "200": {
             "content": {
@@ -4990,95 +5396,142 @@
                 }
               }
             },
-            "description": "Response"
+            "description": "Default Response"
           }
         },
-        "summary": "s134"
+        "summary": "S134"
       }
     },
     "/s135-nested-dict-return": {
       "get": {
-        "operationId": "s135_get",
+        "operationId": "s135_s135_nested_dict_return_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response S135 S135 Nested Dict Return Get",
+                  "type": "object"
+                }
               }
             },
             "description": "Successful Response"
           }
         },
-        "summary": "s135"
+        "summary": "S135"
       }
     },
     "/s136-list-of-lists": {
       "get": {
-        "operationId": "s136_get",
+        "operationId": "s136_s136_list_of_lists_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "items": {
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response S136 S136 List Of Lists Get",
+                  "type": "array"
+                }
               }
             },
             "description": "Successful Response"
           }
         },
-        "summary": "s136"
+        "summary": "S136"
       }
     },
     "/s137-dict-of-dict": {
       "get": {
-        "operationId": "s137_get",
+        "operationId": "s137_s137_dict_of_dict_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "additionalProperties": {
+                    "additionalProperties": {
+                      "type": "integer"
+                    },
+                    "type": "object"
+                  },
+                  "title": "Response S137 S137 Dict Of Dict Get",
+                  "type": "object"
+                }
               }
             },
             "description": "Successful Response"
           }
         },
-        "summary": "s137"
+        "summary": "S137"
       }
     },
     "/s138-union-response": {
       "get": {
-        "operationId": "s138_get",
+        "operationId": "s138_s138_union_response_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/Item"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ItemOut"
+                    }
+                  ],
+                  "title": "Response S138 S138 Union Response Get"
+                }
               }
             },
             "description": "Successful Response"
           }
         },
-        "summary": "s138"
+        "summary": "S138"
       }
     },
     "/s139-optional-response": {
       "get": {
-        "operationId": "s139_get",
+        "operationId": "s139_s139_optional_response_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/Item"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response S139 S139 Optional Response Get"
+                }
               }
             },
             "description": "Successful Response"
           }
         },
-        "summary": "s139"
+        "summary": "S139"
       }
     },
     "/s140-pet-owner": {
       "post": {
-        "operationId": "s140_post",
+        "operationId": "s140_s140_pet_owner_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -5111,28 +5564,35 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s140"
+        "summary": "S140"
       }
     },
     "/s141-literal-response": {
       "get": {
-        "operationId": "s141_get",
+        "operationId": "s141_s141_literal_response_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "enum": [
+                    "ok",
+                    "err"
+                  ],
+                  "title": "Response S141 S141 Literal Response Get",
+                  "type": "string"
+                }
               }
             },
             "description": "Successful Response"
           }
         },
-        "summary": "s141"
+        "summary": "S141"
       }
     },
     "/s142-inherited-return": {
       "get": {
-        "operationId": "s142_get",
+        "operationId": "s142_s142_inherited_return_get",
         "responses": {
           "200": {
             "content": {
@@ -5145,7 +5605,7 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s142"
+        "summary": "S142"
       }
     },
     "/s143-multi-complex": {
@@ -5157,6 +5617,8 @@
             "name": "q",
             "required": true,
             "schema": {
+              "minLength": 1,
+              "title": "Q",
               "type": "string"
             }
           }
@@ -5203,7 +5665,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s143",
+        "summary": "S143",
         "tags": [
           "search"
         ]
@@ -5211,7 +5673,17 @@
     },
     "/s144-form-multi": {
       "post": {
-        "operationId": "s144_post",
+        "operationId": "s144_s144_form_multi_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_s144_s144_form_multi_post"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -5220,14 +5692,34 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
-        "summary": "s144"
+        "summary": "S144"
       }
     },
     "/s145-files-list": {
       "post": {
-        "operationId": "s145_post",
+        "operationId": "s145_s145_files_list_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_s145_s145_files_list_post"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -5236,14 +5728,34 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
-        "summary": "s145"
+        "summary": "S145"
       }
     },
     "/s146-bytes-list": {
       "post": {
-        "operationId": "s146_post",
+        "operationId": "s146_s146_bytes_list_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_s146_s146_bytes_list_post"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -5252,21 +5764,35 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
-        "summary": "s146"
+        "summary": "S146"
       }
     },
     "/s147-header-list": {
       "get": {
-        "operationId": "s147_get",
+        "operationId": "s147_s147_header_list_get",
         "parameters": [
           {
             "in": "header",
             "name": "x-tokens",
             "required": true,
             "schema": {
-              "type": "string"
+              "items": {
+                "type": "string"
+              },
+              "title": "X-Tokens",
+              "type": "array"
             }
           }
         ],
@@ -5290,12 +5816,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s147"
+        "summary": "S147"
       }
     },
     "/s148-query-int-default-0": {
       "get": {
-        "operationId": "s148_get",
+        "operationId": "s148_s148_query_int_default_0_get",
         "parameters": [
           {
             "in": "query",
@@ -5303,6 +5829,7 @@
             "required": false,
             "schema": {
               "default": 0,
+              "title": "N",
               "type": "integer"
             }
           }
@@ -5327,18 +5854,19 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s148"
+        "summary": "S148"
       }
     },
     "/s149-query-float": {
       "get": {
-        "operationId": "s149_get",
+        "operationId": "s149_s149_query_float_get",
         "parameters": [
           {
             "in": "query",
             "name": "x",
             "required": true,
             "schema": {
+              "title": "X",
               "type": "number"
             }
           }
@@ -5363,18 +5891,21 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s149"
+        "summary": "S149"
       }
     },
     "/s150-query-float-constrained": {
       "get": {
-        "operationId": "s150_get",
+        "operationId": "s150_s150_query_float_constrained_get",
         "parameters": [
           {
             "in": "query",
             "name": "x",
             "required": true,
             "schema": {
+              "exclusiveMaximum": 1.0,
+              "exclusiveMinimum": 0.0,
+              "title": "X",
               "type": "number"
             }
           }
@@ -5399,12 +5930,12 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s150"
+        "summary": "S150"
       }
     },
     "/sub/s113-sub-get": {
       "get": {
-        "operationId": "s113_get",
+        "operationId": "s113_sub_s113_sub_get_get",
         "responses": {
           "200": {
             "content": {
@@ -5415,7 +5946,7 @@
             "description": "Successful Response"
           }
         },
-        "summary": "s113",
+        "summary": "S113",
         "tags": [
           "sub"
         ]
@@ -5423,7 +5954,7 @@
     },
     "/sub/s114-sub-post": {
       "post": {
-        "operationId": "s114_post",
+        "operationId": "s114_sub_s114_sub_post_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -5456,7 +5987,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s114",
+        "summary": "S114",
         "tags": [
           "sub"
         ]
@@ -5464,13 +5995,14 @@
     },
     "/sub/s115-sub-path/{x}": {
       "get": {
-        "operationId": "s115_get",
+        "operationId": "s115_sub_s115_sub_path__x__get",
         "parameters": [
           {
             "in": "path",
             "name": "x",
             "required": true,
             "schema": {
+              "title": "X",
               "type": "integer"
             }
           }
@@ -5495,7 +6027,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "s115",
+        "summary": "S115",
         "tags": [
           "sub"
         ]

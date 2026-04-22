@@ -270,6 +270,10 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             if type(default).__name__ in _fa_marker_names:
                 marker = default
 
+        # Initialised here so downstream ``params.append`` can reference
+        # it on code paths that skip the marker-handling block (e.g. raw
+        # scalar param with no marker).
+        _has_factory = False
         if marker is not None:
             # Stock `fastapi.Form` / `fastapi.Query` etc. don't define
             # `_kind` (only our own `fastapi_rs.param_functions._ParamMarker`
@@ -311,6 +315,7 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
                 if not required:
                     df = getattr(marker, "default_factory", None)
                     if df is not None:
+                        _has_factory = True
                         try:
                             default_val = df()
                         except Exception:  # noqa: BLE001
@@ -651,6 +656,7 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
                 "required": required,
                 "default_value": default_val,
                 "has_default": has_default_val,
+                "_from_default_factory": _has_factory,
                 "model_class": model_class,
                 "alias": alias,
                 "_embed": embed,

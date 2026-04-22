@@ -1519,8 +1519,10 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
                 _dv = None
             else:
                 _dv = raw_default
-    if _dv is not None:
+    if _dv is not None and not param.get("_from_default_factory"):
         # Avoid putting non-JSON-serializable sentinels in the schema.
+        # Skip default_factory-computed defaults — FA emits null (or
+        # nothing) since factories produce a fresh value per call.
         try:
             import json as _json
             _json.dumps(_dv, default=str)
@@ -1602,12 +1604,12 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
     # Description appears on BOTH the parameter and its inner schema in
     # FastAPI-generated OpenAPI — UNLESS it came from a bare Pydantic
     # ``Field(description=...)``, in which case FA only places it on
-    # the schema (Pydantic surfaces it natively).
+    # the schema (Pydantic surfaces it natively). FA emits it on the
+    # schema even for pure ``$ref`` (OpenAPI 3.1 allows sibling keys).
     if param.get("description"):
         if not param.get("_description_on_schema_only"):
             p["description"] = param["description"]
-        if not _is_pure_ref(_top):
-            _top["description"] = param["description"]
+        _top["description"] = param["description"]
     if param.get("deprecated"):
         p["deprecated"] = True
         # Pydantic 2.10+ also surfaces ``deprecated`` INSIDE the schema
@@ -1810,7 +1812,13 @@ def _build_form_file_body(
             m = _copy.copy(raw_marker)
             if fp.get("has_default") and not fp.get("required", True):
                 try:
-                    m.default = fp.get("default_value")
+                    if fp.get("_from_default_factory"):
+                        # FA parity: ``Form(default_factory=list)`` emits
+                        # ``default: null`` in OpenAPI (the factory runs
+                        # per request; no stable schema default).
+                        m.default = None
+                    else:
+                        m.default = fp.get("default_value")
                     if getattr(m, "default_factory", None) is not None:
                         m.default_factory = None
                 except Exception:  # noqa: BLE001
@@ -1832,6 +1840,11 @@ def _build_form_file_body(
             kwargs["title"] = fp["title"]
         if fp.get("required", True):
             default_sentinel = ...
+        elif fp.get("_from_default_factory"):
+            # Pydantic ``Form(default_factory=list)`` etc. — FA emits
+            # ``default: null`` in OpenAPI (not the materialized ``[]``)
+            # because the factory produces a fresh value per call.
+            default_sentinel = None
         else:
             default_sentinel = fp.get("default_value")
         field_defs[name] = (py_type, _PField(default_sentinel, **kwargs))
