@@ -1550,6 +1550,12 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
             _top["description"] = param["description"]
     if param.get("deprecated"):
         p["deprecated"] = True
+        # Pydantic 2.10+ also surfaces ``deprecated`` INSIDE the schema
+        # (not just at the parameter level) — FastAPI tests assert on
+        # both locations. Emit it on the inner schema unless we're
+        # sitting on a pure $ref (which can't carry extra keys).
+        if not _is_pure_ref(_top):
+            _top["deprecated"] = True
     # OpenAPI: ``Query(example="Alice")`` → ``parameter.example``.
     # ``Query(examples=[...])`` (list) → ``schema.examples`` (FA's
     # OpenAPI 3.1 inline form). ``Query(examples={"n1": {"value": ...}})``

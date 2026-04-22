@@ -71,7 +71,12 @@ def _build() -> dict[str, types.ModuleType]:
 
     # ── starlette.routing ──────────────────────────────────────────
     starlette_routing = _mod("starlette.routing")
-    starlette_routing.Route = _sc.Route  # type: ignore[attr-defined]
+    # Use APIRoute as Starlette's Route so ``isinstance(route,
+    # starlette.routing.Route)`` returns True for routes collected via
+    # ``app.router.routes``. FA/Starlette treat APIRoute as a subclass
+    # of Route — we fold them together. ``_sc.Route`` stays exported as
+    # a fallback class for standalone ``Route(path, endpoint)`` usage.
+    starlette_routing.Route = _routing.APIRoute  # type: ignore[attr-defined]
     starlette_routing.WebSocketRoute = _sc.WebSocketRoute  # type: ignore[attr-defined]
     starlette_routing.Mount = _sc.Mount  # type: ignore[attr-defined]
     starlette_routing.Host = _sc.Host  # type: ignore[attr-defined]

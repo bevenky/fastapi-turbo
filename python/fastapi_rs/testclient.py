@@ -203,6 +203,21 @@ class TestClient:
         self._started = True
 
     def __enter__(self) -> TestClient:
+        # FA parity: ``with TestClient(app)`` must complete the
+        # lifespan STARTUP phase before ``__enter__`` returns — the
+        # tutorial ``app_testing/tutorial004`` pattern asserts the
+        # lifespan populated ``items`` inside the ``with`` block.
+        # If the server-backed ensure_started wouldn't fire startup
+        # soon enough, run it explicitly in the current thread.
+        if (
+            hasattr(self.app, "_collect_lifespans")
+            and self.app._collect_lifespans()
+            and not getattr(self.app, "_lifespan_cms", None)
+        ):
+            try:
+                self.app._run_lifespan_startup()
+            except Exception:  # noqa: BLE001
+                pass
         self._ensure_started()
         return self
 

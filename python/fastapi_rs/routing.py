@@ -951,3 +951,41 @@ class APIRouter:
             "generate_unique_id_function": generate_unique_id_function,
         }
         self._included_routers.append((router, prefix, tags or [], include_meta))
+
+        # Eagerly mirror the included router's routes into ``self.routes``
+        # as shadow clones with prefix-adjusted paths. Starlette/FA parity:
+        # ``app.router.routes`` lists EVERY registered route (including
+        # those reached via ``include_router``), so tests doing
+        # ``for r in app.router.routes: ...`` see sub-routes at their
+        # final paths. Shadow routes are tagged with
+        # ``_is_included_shadow=True`` so ``_collect_routes_from_router``
+        # skips them during the Rust flatten (avoids double-dispatch).
+        import copy as _copy
+        own_prefix = getattr(router, "prefix", "") or ""
+        full_prefix = (prefix or "") + own_prefix
+
+        def _stack_path(pfx: str, child: str) -> str:
+            if not pfx:
+                return child
+            if not child:
+                return pfx
+            joined = pfx.rstrip("/") + "/" + child.lstrip("/")
+            return joined or "/"
+
+        def _mirror(src_router, pfx: str) -> None:
+            for r in getattr(src_router, "routes", []):
+                if getattr(r, "_is_included_shadow", False):
+                    continue
+                clone = _copy.copy(r)
+                clone.path = _stack_path(pfx, getattr(r, "path", ""))
+                clone._is_included_shadow = True
+                self.routes.append(clone)
+            for entry in getattr(src_router, "_included_routers", []):
+                child_router, child_prefix = entry[0], entry[1]
+                nested_prefix = _stack_path(
+                    _stack_path(pfx, child_prefix or ""),
+                    getattr(child_router, "prefix", "") or "",
+                )
+                _mirror(child_router, nested_prefix)
+
+        _mirror(router, full_prefix)

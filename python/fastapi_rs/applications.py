@@ -3025,6 +3025,14 @@ class FastAPI:
             extra_tags = extra_tags + router.tags
 
         for route in router.routes:
+            # Shadow copies mirrored into ``self.routes`` by
+            # ``include_router(...)`` exist only so ``app.router.routes``
+            # surfaces the full flattened list. The real dispatch comes
+            # from the child router's ``_included_routers`` entry that we
+            # walk below, so skip the shadows here to avoid registering
+            # the same path twice.
+            if getattr(route, "_is_included_shadow", False):
+                continue
             full_path = full_prefix + route.path
             # Normalise accidental double-slash at a join point (e.g.
             # prefix="/api/" + route="/items") without losing a trailing

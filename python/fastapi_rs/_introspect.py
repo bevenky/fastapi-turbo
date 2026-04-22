@@ -733,7 +733,7 @@ def _maybe_expand_param_models(params: list[dict[str, Any]]) -> list[dict[str, A
         # constructs the BaseModel, passing it under the original
         # handler-variable name. Pydantic validates the whole model
         # (so missing-required / wrong-type errors surface uniformly).
-        def _make_builder(model_cls, fields, loc_prefix, source_kind):
+        def _make_builder(model_cls, fields, loc_prefix, source_kind, convert_underscores=True):
             # Map from synthesized extraction-kwarg name → wire alias that
             # the model expects. Pydantic validates by ``alias`` /
             # ``validation_alias``; handing it the field Python name would
@@ -787,8 +787,14 @@ def _maybe_expand_param_models(params: list[dict[str, Any]]) -> list[dict[str, A
             # visible in the validation ``input`` dict.
             wire_aliases_known = {alias for _fn, _r, alias in fields}
             # Also include hyphen-converted versions for headers so
-            # ``save-data`` is stripped when ``save_data`` is the field.
-            if source_kind == "header":
+            # ``save-data`` is stripped when ``save_data`` is the field
+            # (only when ``convert_underscores=True`` — the FA default).
+            # With ``convert_underscores=False`` the user has explicitly
+            # opted out of hyphen conversion, so incoming ``save-data``
+            # is unrelated to the ``save_data`` field and must REMAIN in
+            # the raw dict so the 422 ``input`` echoes it back (matches
+            # docs_src ``header_param_models/tutorial003``).
+            if source_kind == "header" and convert_underscores:
                 wire_aliases_known |= {
                     fn.replace("_", "-") for fn in wire_aliases_known
                 }
@@ -820,7 +826,10 @@ def _maybe_expand_param_models(params: list[dict[str, Any]]) -> list[dict[str, A
         # (forms are classified as body in the error shape).
         loc_prefix = "body" if kind == "form" else kind
         # Synthesize the builder
-        builder_func = _make_builder(model_cls, field_inputs, loc_prefix, kind)
+        builder_func = _make_builder(
+            model_cls, field_inputs, loc_prefix, kind,
+            convert_underscores=_convert_underscores,
+        )
         # Normal dep_input_map is 2-tuples (dep_param_name, source_key).
         # The builder's resolved_key is both its param name AND its
         # source — the extraction step writes under the same key.
@@ -1408,9 +1417,18 @@ def _is_body_type(annotation) -> bool:
     if annotation is inspect.Parameter.empty or annotation is None:
         return False
 
+    # Unwrap ``Annotated[T, ...]`` first — a Pydantic discriminated union
+    # like ``Annotated[A | B, Discriminator(...)]`` is still a body type
+    # because its inner is a Union of models.
+    origin = typing.get_origin(annotation)
+    annotated_type = getattr(typing, "Annotated", None)
+    if annotated_type is not None and origin is annotated_type:
+        _inner = typing.get_args(annotation)
+        if _inner:
+            return _is_body_type(_inner[0])
+
     # Unwrap ``Optional[T]`` / ``Union[T, None]`` / ``T | None`` before
     # classifying — ``foo: Foo | None = None`` is a body param in FA.
-    origin = typing.get_origin(annotation)
     if origin is typing.Union:
         _non_none = [a for a in typing.get_args(annotation) if a is not type(None)]
         if len(_non_none) == 1:
