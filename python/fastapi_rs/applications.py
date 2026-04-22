@@ -2944,6 +2944,11 @@ class FastAPI:
         self, router: APIRouter, route, include_deps: list | None = None,
     ) -> list:
         """Merge app-level, include-level, router-level, and route-level dependencies."""
+        # FA parity: the ``/openapi.json`` / ``/docs`` endpoints bypass
+        # ALL user-registered dependencies — the docs should never
+        # require app-level auth headers to fetch the schema.
+        if getattr(route, "_fastapi_rs_bypass_deps", False):
+            return []
         merged = []
         # App-level dependencies first
         merged.extend(self.dependencies)
@@ -2983,6 +2988,11 @@ class FastAPI:
         if isinstance(fn, _DP):
             fn = fn.value
         if fn is None or not callable(fn):
+            return None
+        # Skip internal routes (docs, openapi.json) — user's
+        # ``generate_unique_id_function`` likely reads
+        # ``route.tags[0]`` and our internal routes have no tags.
+        if not getattr(route, "include_in_schema", True):
             return None
         try:
             return fn(route)
@@ -3880,22 +3890,26 @@ class FastAPI:
             _openapi_dynamic.__name__ = "openapi"
             # Drop any existing dynamic route from a prior ``app.run()``
             # (some test suites re-run the same app multiple times).
+            def _is_prior_dynamic(r):
+                ep = getattr(r, "endpoint", None)
+                return (
+                    ep is not None
+                    and getattr(ep, "__name__", None) == "openapi"
+                    and getattr(r, "path", None) == _openapi_url_val
+                )
             self.router.routes = [
-                r for r in self.router.routes
-                if getattr(r, "endpoint", None).__name__ != "openapi"
-            ] if any(
-                getattr(r, "endpoint", None) and r.endpoint.__name__ == "openapi"
-                for r in self.router.routes
-            ) else self.router.routes
-            self.router.routes.insert(
-                0,
-                APIRoute(
-                    _openapi_url_val,
-                    _openapi_dynamic,
-                    methods=["GET"],
-                    include_in_schema=False,
-                ),
+                r for r in self.router.routes if not _is_prior_dynamic(r)
+            ]
+            _openapi_route = APIRoute(
+                _openapi_url_val,
+                _openapi_dynamic,
+                methods=["GET"],
+                include_in_schema=False,
             )
+            # Bypass app/router dependencies — docs shouldn't require
+            # user-level auth headers.
+            _openapi_route._fastapi_rs_bypass_deps = True
+            self.router.routes.insert(0, _openapi_route)
 
         route_dicts = self._collect_all_routes()
         route_infos: list[RouteInfo] = []
