@@ -372,16 +372,102 @@ class EventSourceResponse(StreamingResponse):
     def _encode_stream(content):
         """Wrap the generator/iterable so each yielded item becomes SSE
         wire-format bytes — matches FA's streaming encoder exactly.
+
+        Also emits a ``: ping\\n\\n`` keepalive comment between events
+        when the underlying generator is idle for longer than
+        ``fastapi.routing._PING_INTERVAL`` seconds (FA parity — allows
+        tests to monkeypatch the interval).
         """
         import inspect as _inspect
+
+        def _ping_interval() -> float:
+            # Read from fastapi.routing at REQUEST time so
+            # ``monkeypatch.setattr(fastapi.routing._PING_INTERVAL, 0.05)``
+            # takes effect.
+            try:
+                import fastapi.routing as _fr
+                v = getattr(_fr, "_PING_INTERVAL", None)
+                if isinstance(v, (int, float)) and v > 0:
+                    return float(v)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from fastapi_rs.sse import _PING_INTERVAL as _pi
+                return float(_pi)
+            except Exception:  # noqa: BLE001
+                return 15.0
+
         if _inspect.isasyncgen(content):
             async def _async_wrap():
-                async for item in content:
-                    yield EventSourceResponse._encode_item(item)
+                import asyncio as _asyncio
+                aiter = content.__aiter__()
+                # Start __anext__ as a task so a timeout does NOT
+                # cancel the generator's internal state — we just poll
+                # again on the next iteration. ``asyncio.wait_for``
+                # would cancel the coro and terminate the generator.
+                pending = _asyncio.ensure_future(aiter.__anext__())
+                try:
+                    while True:
+                        interval = _ping_interval()
+                        done, _not_done = await _asyncio.wait(
+                            {pending}, timeout=interval,
+                        )
+                        if not done:
+                            yield b": ping\n\n"
+                            continue
+                        try:
+                            item = pending.result()
+                        except StopAsyncIteration:
+                            return
+                        yield EventSourceResponse._encode_item(item)
+                        pending = _asyncio.ensure_future(aiter.__anext__())
+                finally:
+                    if not pending.done():
+                        pending.cancel()
+                        try:
+                            await pending
+                        except BaseException:  # noqa: BLE001
+                            pass
             return _async_wrap()
         if _inspect.isgenerator(content) or hasattr(content, "__iter__"):
+            # Sync generators are consumed on a thread (the Rust streaming
+            # layer drives ``__next__`` on a blocking thread). Use a
+            # thread+queue bridge so we can insert keepalive pings from
+            # an async wrapper.
             def _sync_wrap():
-                for item in content:
+                import threading as _th
+                import queue as _q
+                import time as _time
+
+                q: _q.Queue = _q.Queue(maxsize=1)
+                _DONE = object()
+
+                def _producer():
+                    try:
+                        for item in content:
+                            q.put(item)
+                    except BaseException as exc:  # noqa: BLE001
+                        q.put(("__error__", exc))
+                        return
+                    q.put(_DONE)
+
+                t = _th.Thread(target=_producer, daemon=True)
+                t.start()
+                while True:
+                    interval = _ping_interval()
+                    try:
+                        item = q.get(timeout=interval)
+                    except _q.Empty:
+                        yield b": ping\n\n"
+                        continue
+                    if item is _DONE:
+                        return
+                    if (
+                        isinstance(item, tuple)
+                        and len(item) == 2
+                        and item[0] == "__error__"
+                    ):
+                        raise item[1]
                     yield EventSourceResponse._encode_item(item)
             return _sync_wrap()
         return content

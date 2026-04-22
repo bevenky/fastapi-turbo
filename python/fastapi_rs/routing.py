@@ -265,6 +265,39 @@ class APIRoute:
             self.operation_id = None
         self.generate_unique_id_function = generate_unique_id_function
 
+    def get_route_handler(self) -> Callable:
+        """Return the callable FA dispatches requests through.
+
+        Default implementation returns a placeholder — fastapi-rs's Rust
+        dispatch pipeline invokes ``self.endpoint`` directly, so the
+        default handler is unused. The hook exists so subclasses can
+        override it with a wrapper that transforms the incoming
+        ``Request`` (e.g. ``GzipRequest`` that decompresses the body).
+
+        When a subclass overrides this method, the application layer
+        detects the override and routes the request through the
+        subclass's wrapper instead of the direct endpoint call. See
+        ``_build_custom_route_handler_adapter`` in ``applications.py``.
+        """
+        return self._default_route_handler()
+
+    def _default_route_handler(self) -> Callable:
+        """Build the default ``async (request) -> Response`` callable.
+
+        Mirrors FA's ``get_request_handler`` — runs body extraction,
+        dependency resolution, endpoint invocation and response
+        serialization given a ``Request``. fastapi-rs builds this lazily
+        from ``applications.py`` so the callable can reuse the
+        already-compiled pipeline.
+        """
+        build = getattr(self, "_fastapi_rs_build_default_handler", None)
+        if build is None:
+            raise RuntimeError(
+                "Default route handler unavailable: the application has "
+                "not finished registering routes yet."
+            )
+        return build()
+
 
 class APIRouter:
     """Route collection that mirrors FastAPI's APIRouter."""

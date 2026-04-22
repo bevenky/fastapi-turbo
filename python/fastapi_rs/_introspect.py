@@ -497,6 +497,12 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
         description_val = None
         include_in_schema_val = True
         deprecated_val = None
+        # Track whether description came from an explicit param marker
+        # (Query/Header/Cookie/Path/Body/Form) vs. a bare Pydantic
+        # ``Field(description=...)``. FA emits the former on both the
+        # OpenAPI parameter object AND its schema; the latter ONLY on
+        # the schema (Pydantic puts it there natively).
+        description_on_schema_only = False
         if marker is not None:
             example_val = getattr(marker, "example", None)
             examples_val = getattr(marker, "examples", None)
@@ -514,6 +520,8 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             example_val = getattr(_effective_marker, "example", None)
             examples_val = getattr(_effective_marker, "examples", None)
             deprecated_val = getattr(_effective_marker, "deprecated", None)
+            if description_val is not None:
+                description_on_schema_only = True
 
         # Detect Optional[T] / Union[T, None] on the original annotation so
         # the OpenAPI layer can emit `anyOf: [<T>, {type: null}]` (FastAPI's
@@ -586,6 +594,7 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
                 "openapi_examples": openapi_examples_val,
                 "title": title_val,
                 "description": description_val,
+                "_description_on_schema_only": description_on_schema_only,
                 "include_in_schema": include_in_schema_val,
                 "deprecated": deprecated_val,
                 "scalar_validator": scalar_validator,

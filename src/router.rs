@@ -2049,8 +2049,17 @@ fn extract_params_to_pydict_full<'py>(
                             // so ``tags=a&tags=b`` hydrates a list field
                             // (or a BaseModel ``tags: list[str]`` when the
                             // form body is a parameter-model expansion).
+                            //
+                            // Coerce each element to the declared inner
+                            // type — ``tuple[int, int]`` / ``list[float]``
+                            // etc. must arrive at the handler as ints /
+                            // floats, not raw strings. Matches the query
+                            // extractor's ``list_<inner>`` behaviour.
+                            let inner = &param.type_hint[5..]; // strip "list_"
+                            let coerce_inner = !inner.is_empty() && inner != "str";
                             let list = pyo3::types::PyList::empty(py);
-                            for f in fs.drain(..) {
+                            let mut any_err = false;
+                            for (idx, f) in fs.drain(..).enumerate() {
                                 if f.filename.is_some() {
                                     let wrapped = make_upload_file(py, f).map_err(|_e| {
                                         validation_error_response("body", alias_name, "alloc")
@@ -2058,10 +2067,28 @@ fn extract_params_to_pydict_full<'py>(
                                     let _ = list.append(wrapped);
                                 } else {
                                     let text = String::from_utf8_lossy(&f.data).into_owned();
-                                    let _ = list.append(pyo3::types::PyString::new(py, &text));
+                                    if coerce_inner {
+                                        match try_coerce_str_to_py(py, &text, inner) {
+                                            Some(v) => { let _ = list.append(v.bind(py)); }
+                                            None => {
+                                                extraction_errors.push(
+                                                    coercion_error_detail_indexed(
+                                                        "body", alias_name, idx, &text, inner,
+                                                    ),
+                                                );
+                                                any_err = true;
+                                            }
+                                        }
+                                    } else {
+                                        let _ = list.append(
+                                            pyo3::types::PyString::new(py, &text),
+                                        );
+                                    }
                                 }
                             }
-                            let _ = kwargs.set_item(&param.name, list);
+                            if !any_err {
+                                let _ = kwargs.set_item(&param.name, list);
+                            }
                         } else {
                             let field = fs.remove(0);
                             if field.filename.is_some() {
@@ -2427,10 +2454,20 @@ pub fn dispatch_validation_error(detail_json: serde_json::Value) -> Response {
                 .unwrap();
         }
     }
+    // Default response (no user exception_handler) — strip any ``body``
+    // that was plumbed for the handler's RVE.body, since FA's default
+    // 422 shape is ``{"detail": [...]}`` with no body.
+    let default_json = match detail_json {
+        serde_json::Value::Object(mut m) => {
+            m.remove("body");
+            serde_json::Value::Object(m).to_string()
+        }
+        other => other.to_string(),
+    };
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         [("content-type", "application/json")],
-        detail_json.to_string(),
+        default_json,
     )
         .into_response()
 }

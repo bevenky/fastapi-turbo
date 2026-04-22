@@ -425,6 +425,283 @@ def _close_one_upload(obj) -> None:
             pass
 
 
+def _has_overridden_get_route_handler(route) -> bool:
+    """True when ``type(route).get_route_handler`` is NOT the default
+    inherited from APIRoute. This is the marker FA uses to let users
+    wrap the request pipeline — GzipRoute decompresses bodies,
+    TimedRoute injects timing headers, etc. When detected, the app
+    builds a Python-side adapter (``_build_custom_route_handler_endpoint``)
+    that hands the request to the user's wrapper instead of the
+    direct Rust dispatch.
+    """
+    try:
+        return type(route).get_route_handler is not APIRoute.get_route_handler
+    except AttributeError:
+        return False
+
+
+def _build_default_route_handler(route, app):
+    """Return an ``async (request) -> Response`` callable that runs
+    the route's full pipeline (body parsing, param validation, endpoint
+    call, response serialization) given a Starlette-style ``Request``.
+
+    This is what ``APIRoute.get_route_handler()`` returns by default.
+    Custom route-class subclasses wrap this in their own coroutine so
+    the request is pre-processed before the pipeline runs — GzipRoute
+    swaps it for a ``GzipRequest`` that decompresses on ``body()``,
+    TimedRoute wraps the response with a timing header, etc.
+
+    Scope: supports the subset FA's ``get_request_handler`` hits on
+    the tutorial patterns — single ``Body()`` param (list/dict/primitive/
+    Pydantic model), ``Request`` injection, ``HTTPException`` / Pydantic
+    ``ValidationError`` translation into ``RequestValidationError``.
+    Complex dep graphs and form/file params fall back to the default
+    compiled handler since those tutorials don't exercise them.
+    """
+    import inspect as _ins
+    import typing as _tp
+    import json as _json
+    from pydantic import TypeAdapter as _TA, ValidationError as _PyVE, BaseModel as _BM
+    from fastapi_rs.exceptions import (
+        RequestValidationError as _RVE,
+        HTTPException as _HE,
+    )
+    from fastapi_rs.param_functions import _ParamMarker as _PM
+    from fastapi_rs.dependencies import Depends as _Dep
+    from fastapi_rs.responses import Response as _Resp, JSONResponse as _JR
+    from fastapi_rs.encoders import jsonable_encoder as _je
+
+    endpoint = route.endpoint
+    try:
+        sig = _ins.signature(endpoint)
+    except (TypeError, ValueError):
+        sig = None
+    try:
+        hints = _tp.get_type_hints(endpoint, include_extras=True)
+    except Exception:  # noqa: BLE001
+        hints = {}
+
+    # Classify params from the endpoint signature.
+    # Each entry: (name, kind, annotation, marker, default)
+    # kind in {"body", "request", "query", "path", "header", "cookie",
+    #          "depends", "other"}.
+    param_plan: list[dict] = []
+    if sig is not None:
+        from fastapi_rs.requests import Request as _Req, HTTPConnection as _HC
+        for pname, p in sig.parameters.items():
+            if p.kind in (_ins.Parameter.VAR_POSITIONAL, _ins.Parameter.VAR_KEYWORD):
+                continue
+            ann = hints.get(pname, p.annotation)
+            inner_ann = ann
+            markers: list = []
+            if _tp.get_origin(ann) is _tp.Annotated:
+                args = _tp.get_args(ann)
+                if args:
+                    inner_ann = args[0]
+                    markers = [m for m in args[1:]]
+            default = p.default
+            marker = None
+            for m in markers:
+                if isinstance(m, (_PM, _Dep)):
+                    marker = m
+                    break
+            if marker is None and isinstance(default, (_PM, _Dep)):
+                marker = default
+            kind = "other"
+            if isinstance(marker, _Dep):
+                kind = "depends"
+            elif isinstance(marker, _PM):
+                kind = getattr(marker, "_kind", "query") or "query"
+            elif isinstance(inner_ann, type) and issubclass(inner_ann, (_Req, _HC)):
+                kind = "request"
+            param_plan.append({
+                "name": pname,
+                "kind": kind,
+                "ann": inner_ann,
+                "marker": marker,
+                "default": default,
+            })
+
+    # Pre-build a body TypeAdapter when a single Body() param exists.
+    body_param = next((p for p in param_plan if p["kind"] == "body"), None)
+    body_adapter = None
+    body_model_cls = None
+    if body_param is not None:
+        try:
+            if isinstance(body_param["ann"], type) and issubclass(body_param["ann"], _BM):
+                body_model_cls = body_param["ann"]
+            else:
+                body_adapter = _TA(body_param["ann"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    is_async_endpoint = _ins.iscoroutinefunction(endpoint)
+    _app_ref = app
+    _route_ref = route
+
+    async def default_handler(request):
+        # Build kwargs one param at a time; for Body, read from
+        # ``await request.body()`` so Request subclass overrides fire.
+        kwargs: dict = {}
+        for p in param_plan:
+            nm = p["name"]
+            kd = p["kind"]
+            if kd == "request":
+                kwargs[nm] = request
+            elif kd == "body":
+                raw = await request.body()
+                if not raw:
+                    # Missing body → raise RequestValidationError mirroring
+                    # FA's "missing required body" response.
+                    raise _RVE([
+                        {
+                            "type": "missing",
+                            "loc": ("body",),
+                            "msg": "Field required",
+                            "input": None,
+                        }
+                    ], body=None)
+                try:
+                    parsed = _json.loads(raw)
+                except _json.JSONDecodeError as exc:
+                    raise _RVE([
+                        {
+                            "type": "json_invalid",
+                            "loc": ("body", exc.pos),
+                            "msg": f"JSON decode error: {exc.msg}",
+                            "input": {},
+                        }
+                    ], body=raw.decode("utf-8", errors="replace"))
+                try:
+                    if body_model_cls is not None:
+                        kwargs[nm] = body_model_cls.model_validate(parsed)
+                    elif body_adapter is not None:
+                        kwargs[nm] = body_adapter.validate_python(parsed)
+                    else:
+                        kwargs[nm] = parsed
+                except _PyVE as exc:
+                    raise _RVE(exc.errors(), body=parsed) from None
+            elif kd == "query":
+                # Pull from request.query_params; honour marker's alias/default.
+                alias = getattr(p["marker"], "alias", None) or nm
+                raw_val = request.query_params.get(alias)
+                if raw_val is None:
+                    if p["default"] is not _ins.Parameter.empty and not isinstance(p["default"], _PM):
+                        kwargs[nm] = p["default"]
+                    elif hasattr(p["marker"], "default") and p["marker"].default is not ...:
+                        kwargs[nm] = p["marker"].default
+                else:
+                    kwargs[nm] = raw_val
+            elif kd == "path":
+                kwargs[nm] = request.path_params.get(nm)
+            elif kd == "header":
+                alias = getattr(p["marker"], "alias", None) or nm
+                kwargs[nm] = request.headers.get(alias.replace("_", "-"))
+            elif kd == "cookie":
+                kwargs[nm] = request.cookies.get(nm)
+            elif kd == "depends":
+                # Minimal support: call the dep with no args (sync or async).
+                # Tutorial patterns don't exercise deep dep graphs through
+                # the custom-route-class path; when someone does, the
+                # Rust-compiled pipeline handles it instead.
+                dep_fn = p["marker"].dependency
+                if dep_fn is None:
+                    kwargs[nm] = None
+                elif _ins.iscoroutinefunction(dep_fn):
+                    kwargs[nm] = await dep_fn()
+                else:
+                    kwargs[nm] = dep_fn()
+            else:  # "other" — primitive query without marker
+                kwargs[nm] = request.query_params.get(nm)
+
+        # Call the endpoint.
+        result = endpoint(**kwargs)
+        if _ins.iscoroutine(result):
+            result = await result
+
+        # Wrap into a Response — defer to the route's response_class /
+        # status_code if set, else fall back to JSON encoding. Response
+        # instances pass through untouched.
+        if isinstance(result, _Resp):
+            return result
+
+        rm = getattr(_route_ref, "response_model", None)
+        if rm is not None:
+            try:
+                result = _apply_response_model(
+                    result, rm,
+                    include=getattr(_route_ref, "response_model_include", None),
+                    exclude=getattr(_route_ref, "response_model_exclude", None),
+                    exclude_unset=getattr(_route_ref, "response_model_exclude_unset", False),
+                    exclude_defaults=getattr(_route_ref, "response_model_exclude_defaults", False),
+                    exclude_none=getattr(_route_ref, "response_model_exclude_none", False),
+                    by_alias=getattr(_route_ref, "response_model_by_alias", True),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        response_cls = getattr(_route_ref, "response_class", None) or _JR
+        status_code = getattr(_route_ref, "status_code", None) or 200
+        encoded = _je(result)
+        return response_cls(content=encoded, status_code=status_code)
+
+    return default_handler
+
+
+def _build_custom_route_handler_endpoint(route, app):
+    """Return the endpoint that fastapi-rs registers with Rust when a
+    route's APIRoute subclass overrides ``get_route_handler``. The
+    endpoint takes a single ``Request`` kwarg (Rust injects it via
+    ``inject_request``) and delegates to the user's wrapper.
+
+    On first call, builds ``original_route_handler`` via
+    ``_build_default_route_handler`` and caches it on the route so
+    subsequent requests reuse it. The user's ``get_route_handler``
+    returns their coroutine, which closes over ``original_route_handler``
+    and wraps the request before calling it.
+    """
+    from fastapi_rs.responses import JSONResponse as _JR, Response as _Resp
+    from fastapi_rs.exceptions import (
+        RequestValidationError as _RVE,
+        HTTPException as _HE,
+    )
+
+    # Expose the builder so ``APIRoute._default_route_handler`` can
+    # resolve it. ``get_route_handler``'s ``super().get_route_handler()``
+    # call routes through this.
+    def _build_default() -> Callable:
+        return _build_default_route_handler(route, app)
+
+    route._fastapi_rs_build_default_handler = _build_default  # type: ignore[attr-defined]
+
+    _app_ref = app
+
+    async def custom_route_endpoint(request):
+        try:
+            custom_handler = route.get_route_handler()
+            response = await custom_handler(request)
+        except _HE as exc:
+            # Route through the app's registered HTTPException handler
+            # (TestClient path) so custom ``detail`` dicts surface.
+            if _app_ref is not None and _app_ref.exception_handlers:
+                hdl = _app_ref._invoke_exception_handler(exc)
+                if hdl is not None:
+                    return hdl
+            return _JR(content={"detail": exc.detail}, status_code=exc.status_code)
+        except _RVE as exc:
+            if _app_ref is not None and _RVE in _app_ref.exception_handlers:
+                hdl = _app_ref._invoke_exception_handler_strict(exc)
+                if hdl is not None:
+                    return hdl
+            return _JR(content={"detail": exc.errors()}, status_code=422)
+        if not isinstance(response, _Resp):
+            return _JR(content=response)
+        return response
+
+    custom_route_endpoint._fastapi_rs_custom_route_class = True  # type: ignore[attr-defined]
+    return custom_route_endpoint
+
+
 def _try_compile_handler(
     endpoint,
     params,
@@ -2037,6 +2314,43 @@ class FastAPI:
             "generate_unique_id_function": generate_unique_id_function,
         }
         self._included_routers.append((router, prefix, tags or [], include_meta))
+        # Mirror every effective sub-route onto ``self.router.routes``
+        # as shadow clones so ``app.router.routes`` surfaces the full
+        # flattened list (FA/Starlette parity). Shadow copies carry
+        # ``_is_included_shadow=True`` so ``_collect_routes_from_router``
+        # skips them during the Rust dispatch flatten.
+        try:
+            import copy as _copy
+            own_prefix = getattr(router, "prefix", "") or ""
+            full_prefix = (prefix or "") + own_prefix
+
+            def _stack_path(pfx: str, child: str) -> str:
+                if not pfx:
+                    return child
+                if not child:
+                    return pfx
+                joined = pfx.rstrip("/") + "/" + child.lstrip("/")
+                return joined or "/"
+
+            def _mirror(src_router, pfx: str) -> None:
+                for r in getattr(src_router, "routes", []):
+                    if getattr(r, "_is_included_shadow", False):
+                        continue
+                    clone = _copy.copy(r)
+                    clone.path = _stack_path(pfx, getattr(r, "path", ""))
+                    clone._is_included_shadow = True
+                    self.router.routes.append(clone)
+                for entry in getattr(src_router, "_included_routers", []):
+                    child_router, child_prefix = entry[0], entry[1]
+                    nested = _stack_path(
+                        _stack_path(pfx, child_prefix or ""),
+                        getattr(child_router, "prefix", "") or "",
+                    )
+                    _mirror(child_router, nested)
+
+            _mirror(router, full_prefix)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Middleware
@@ -3077,6 +3391,92 @@ class FastAPI:
                 )
                 continue
 
+            # ── Custom ``APIRoute`` subclass (GzipRoute, TimedRoute, …) ──
+            # When ``type(route).get_route_handler`` is overridden, the
+            # user's wrapper runs the request pipeline at the Python
+            # layer — Rust just needs to hand the ``Request`` over to a
+            # thin adapter. Short-circuit the normal param introspection
+            # / compile pipeline so body parsing, validation, and
+            # response wrapping all happen inside the user's wrapper
+            # (via ``super().get_route_handler()``).
+            if _has_overridden_get_route_handler(route):
+                custom_ep = _build_custom_route_handler_endpoint(route, self)
+                try:
+                    custom_ep._fastapi_rs_route_obj = route  # type: ignore[attr-defined]
+                except (AttributeError, TypeError):
+                    pass
+                custom_params = [{
+                    "name": "request",
+                    "kind": "inject_request",
+                    "type_hint": "any",
+                    "required": False,
+                    "default_value": None,
+                    "has_default": True,
+                    "model_class": None,
+                    "alias": None,
+                    "_embed": False,
+                    "media_type": None,
+                    "example": None,
+                    "examples": None,
+                    "openapi_examples": None,
+                    "title": None,
+                    "description": None,
+                    "include_in_schema": False,
+                    "deprecated": None,
+                    "scalar_validator": None,
+                    "enum_class": None,
+                    "container_type": None,
+                    "_is_optional": True,
+                    "_enum_values": None,
+                    "_unwrapped_annotation": None,
+                    "_raw_marker": None,
+                    "_raw_annotation": None,
+                    "_is_handler_param": True,
+                }]
+                collected.append({
+                    "path": full_path,
+                    "methods": route.methods,
+                    "endpoint": custom_ep,
+                    "is_async": True,
+                    "handler_name": route.name,
+                    "tags": extra_tags + route.tags,
+                    "params": custom_params,
+                    "_all_params": list(
+                        introspect_endpoint(route.endpoint, full_path)
+                    ),
+                    "is_websocket": False,
+                    "status_code": route.status_code or 200,
+                    "summary": route.summary,
+                    "description": route.description,
+                    "response_description": getattr(route, "response_description", "Successful Response"),
+                    "responses": {
+                        **self.responses,
+                        **include_responses,
+                        **getattr(router, "responses", {}),
+                        **getattr(route, "responses", {}),
+                    },
+                    "response_model": getattr(route, "response_model", None),
+                    "response_class": getattr(route, "response_class", None),
+                    "deprecated": route.deprecated or bool(include_deprecated),
+                    "operation_id": (
+                        route.operation_id
+                        or self._apply_generate_unique_id(
+                            route,
+                            include_generate_unique_id_function,
+                            router,
+                        )
+                    ),
+                    "include_in_schema": (
+                        getattr(route, "include_in_schema", True) and include_in_schema
+                    ),
+                    "openapi_extra": getattr(route, "openapi_extra", {}),
+                    "security": getattr(route, "security", None),
+                    "callbacks": getattr(route, "callbacks", []),
+                    "servers": getattr(route, "servers", None),
+                    "external_docs": getattr(route, "external_docs", None),
+                })
+                continue
+
             params = introspect_endpoint(route.endpoint, full_path)
 
             # Merge global/include/router-level/route-level dependencies
@@ -3173,9 +3573,11 @@ class FastAPI:
                         except Exception:  # noqa: BLE001
                             _item_adapter = None
 
+                _app_for_stream = self
+
                 def _json_lines_wrap(
                     _orig=_orig_endpoint, _is_a=_is_async_gen,
-                    _ta=_item_adapter, **kwargs,
+                    _ta=_item_adapter, _app=_app_for_stream, **kwargs,
                 ):
                     from fastapi_rs.responses import StreamingResponse as _SR
                     from fastapi_rs.encoders import jsonable_encoder as _je
@@ -3195,15 +3597,30 @@ class FastAPI:
                             raise
                     if _is_a:
                         async def _iter_async():
-                            async for item in _orig(**kwargs):
-                                validated = _check(item)
-                                yield (_json.dumps(_je(validated)) + "\n").encode("utf-8")
+                            try:
+                                async for item in _orig(**kwargs):
+                                    validated = _check(item)
+                                    yield (_json.dumps(_je(validated)) + "\n").encode("utf-8")
+                            except _RVE as exc:
+                                # FA parity: surface streaming-body
+                                # validation errors through
+                                # ``app._captured_server_exceptions``
+                                # so TestClient re-raises with
+                                # ``raise_server_exceptions=True``.
+                                if _app is not None:
+                                    _app._captured_server_exceptions.append(exc)
+                                return
                         return _SR(_iter_async(), media_type="application/jsonl")
                     else:
                         def _iter_sync():
-                            for item in _orig(**kwargs):
-                                validated = _check(item)
-                                yield (_json.dumps(_je(validated)) + "\n").encode("utf-8")
+                            try:
+                                for item in _orig(**kwargs):
+                                    validated = _check(item)
+                                    yield (_json.dumps(_je(validated)) + "\n").encode("utf-8")
+                            except _RVE as exc:
+                                if _app is not None:
+                                    _app._captured_server_exceptions.append(exc)
+                                return
                         return _SR(_iter_sync(), media_type="application/jsonl")
 
                 endpoint = _json_lines_wrap

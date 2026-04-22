@@ -1542,10 +1542,12 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
     if not (_is_pure_ref(_top)):
         _top["title"] = title
     # Description appears on BOTH the parameter and its inner schema in
-    # FastAPI-generated OpenAPI. Keeping them in sync is important for
-    # docs frontends (Swagger/Redoc) that render them from either side.
+    # FastAPI-generated OpenAPI — UNLESS it came from a bare Pydantic
+    # ``Field(description=...)``, in which case FA only places it on
+    # the schema (Pydantic surfaces it natively).
     if param.get("description"):
-        p["description"] = param["description"]
+        if not param.get("_description_on_schema_only"):
+            p["description"] = param["description"]
         if not _is_pure_ref(_top):
             _top["description"] = param["description"]
     if param.get("deprecated"):
