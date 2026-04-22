@@ -758,7 +758,37 @@ def _build() -> dict[str, types.ModuleType]:
         fastapi_compat_v2.get_missing_field_error = _fa_internal_stub(  # type: ignore[attr-defined]
             "fastapi._compat.v2.get_missing_field_error"
         )
-        fastapi_compat_v2.ModelField = Dependant  # type: ignore[attr-defined]
+        # Minimal ``ModelField`` stub — tests in FA's suite construct
+        # ``v2.ModelField(name="foo", field_info=field_info)`` and assert
+        # ``.default`` tracks pydantic's ``PydanticUndefined``.
+        from fastapi_rs._compat_shim import Undefined as _Undef
+
+        class _ModelField:
+            def __init__(self, name, field_info=None, **kwargs):
+                self.name = name
+                self.field_info = field_info
+                self.mode = kwargs.get("mode", "validation")
+
+            @property
+            def default(self):
+                fi = self.field_info
+                if fi is None:
+                    return _Undef
+                return getattr(fi, "default", _Undef)
+
+            @property
+            def required(self) -> bool:
+                return self.default is _Undef
+
+            @property
+            def alias(self):
+                fi = self.field_info
+                return getattr(fi, "alias", None) if fi is not None else None
+
+            @property
+            def field_info_metadata(self):
+                return self.field_info
+        fastapi_compat_v2.ModelField = _ModelField  # type: ignore[attr-defined]
         modules["fastapi._compat.v2"] = fastapi_compat_v2
         # Expose submodules as attributes on the package so
         # ``from fastapi._compat import v2`` / ``import shared`` resolve.
