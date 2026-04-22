@@ -143,7 +143,21 @@ def _apply_response_model(
         try:
             validated = ta.validate_python(result, from_attributes=True)
         except _PyVE as exc:
-            raise _RVE(errors=exc.errors(), body=result, endpoint_ctx=endpoint_ctx) from None
+            # FA parity: response-validation errors prepend ``"response"``
+            # to ``loc`` so tests asserting ``loc == ("response", "name")``
+            # (``test_validator_is_cloned``) pass. Strip pydantic's ``url``
+            # field since FA doesn't emit it.
+            _prefixed = [
+                {
+                    k: v for k, v in {
+                        **_e,
+                        "loc": ("response", *tuple(_e.get("loc", ()))),
+                    }.items()
+                    if k != "url"
+                }
+                for _e in exc.errors()
+            ]
+            raise _RVE(errors=_prefixed, body=result, endpoint_ctx=endpoint_ctx) from None
         return ta.dump_python(validated, **dump_kwargs)
 
     try:
@@ -228,7 +242,19 @@ def _apply_response_model(
         try:
             from pydantic import ValidationError as _PyVE
             if isinstance(exc, _PyVE):
-                raise _RVE(errors=exc.errors(), body=result, endpoint_ctx=endpoint_ctx) from None
+                # FA parity: prepend ``"response"`` to ``loc`` and
+                # strip pydantic's ``url`` field.
+                _prefixed = [
+                    {
+                        k: v for k, v in {
+                            **_e,
+                            "loc": ("response", *tuple(_e.get("loc", ()))),
+                        }.items()
+                        if k != "url"
+                    }
+                    for _e in exc.errors()
+                ]
+                raise _RVE(errors=_prefixed, body=result, endpoint_ctx=endpoint_ctx) from None
         except ImportError:
             pass
     return result
