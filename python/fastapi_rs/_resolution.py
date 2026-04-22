@@ -140,6 +140,38 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False):
     return _sync_caller
 
 
+def _propagate_scopes_to_descendants(
+    dep_steps: list[dict[str, Any]],
+    start_key: str,
+    new_scopes: list[str],
+) -> None:
+    """Union ``new_scopes`` into the ``_security_scopes`` of every dep
+    step reachable via ``dep_input_map`` from ``start_key``. Used when a
+    cached sub-dep receives a larger scope set from a later
+    ``Security()`` wrapper — without this, a scheme buried inside a
+    ``get_token`` wrapper keeps the scopes of whichever ``Depends()``
+    resolved it first.
+    """
+    by_name = {s.get("name"): s for s in dep_steps if s.get("name")}
+    visited: set[str] = set()
+    stack = [start_key]
+    while stack:
+        nm = stack.pop()
+        if nm in visited:
+            continue
+        visited.add(nm)
+        step = by_name.get(nm)
+        if step is None:
+            continue
+        existing = list(step.get("_security_scopes") or [])
+        for s in new_scopes:
+            if s not in existing:
+                existing.append(s)
+        step["_security_scopes"] = existing
+        for _, src_key in step.get("dep_input_map", []) or []:
+            stack.append(src_key)
+
+
 def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str, Any]]:
     """Build a flat, topologically-sorted execution plan for a route handler.
 
@@ -227,7 +259,29 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
 
         # For sub-deps (not top-level), deduplicate
         if not is_top_level and dep.use_cache and func_id in sub_dep_result_keys:
-            return sub_dep_result_keys[func_id]
+            # Dedup hit — but propagate scopes forward. FA semantics:
+            # when two different Security() chains resolve to the same
+            # scheme, the scopes UNION. Without this, a dep resolved
+            # via a ``Depends()`` (no scopes) followed by the same dep
+            # via ``Security(..., scopes=[...])`` keeps the first
+            # (empty) scope list forever.
+            cached_key = sub_dep_result_keys[func_id]
+            if chain_scopes:
+                # Locate the cached step and union scopes.
+                for _ds in dep_steps:
+                    if _ds.get("name") == cached_key:
+                        _existing = list(_ds.get("_security_scopes") or [])
+                        for _s in chain_scopes:
+                            if _s not in _existing:
+                                _existing.append(_s)
+                        _ds["_security_scopes"] = _existing
+                        # Propagate to sub-deps of this cached dep too,
+                        # so scheme-bearing leaves inherit the scopes.
+                        _propagate_scopes_to_descendants(
+                            dep_steps, cached_key, chain_scopes,
+                        )
+                        break
+            return cached_key
 
         # Introspect the dependency function's own parameters
         dep_params = introspect_endpoint(dep_func, path)
