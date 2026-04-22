@@ -1869,7 +1869,47 @@ class FastAPI:
                 return True
             return False
 
+        from fastapi_rs.param_functions import (
+            Query as _Query,
+            Header as _Header,
+            Cookie as _Cookie,
+            _ParamMarker,
+        )
+
+        def _extract_marker(annotation, default):
+            """Find a Query/Header/Cookie marker on this param either
+            via ``Annotated[T, Query()]`` or ``= Query(...)`` default.
+            Returns (marker, effective_default_value, is_required).
+            """
+            import typing as _t
+            marker = None
+            if isinstance(default, _ParamMarker):
+                marker = default
+            if _t.get_origin(annotation) is _t.Annotated:
+                for m in _t.get_args(annotation)[1:]:
+                    if isinstance(m, _ParamMarker):
+                        marker = m
+                        break
+            if marker is None:
+                return None, None, False
+            return marker, marker.default, False
+
+        def _resolve_ws_scalar(ws, p_name, marker):
+            """Pull a query/cookie/header value off the WebSocket scope."""
+            alias = marker.alias or p_name
+            if isinstance(marker, _Query):
+                return ws.query_params.get(alias)
+            if isinstance(marker, _Cookie):
+                return ws.cookies.get(alias)
+            if isinstance(marker, _Header):
+                wire = alias
+                if getattr(marker, "convert_underscores", True) and "_" in wire:
+                    wire = wire.replace("_", "-")
+                return ws.headers.get(wire)
+            return None
+
         dep_params: list[tuple[str, object, bool]] = []
+        handler_scalars: list[tuple[str, object]] = []  # [(name, marker)]
         ws_param_name: str | None = None
         if sig is not None:
             for name, param in sig.parameters.items():
@@ -1883,6 +1923,10 @@ class FastAPI:
                     continue
                 if _is_websocket_annotation(name, param.annotation):
                     ws_param_name = name
+                    continue
+                marker, _, _ = _extract_marker(param.annotation, default)
+                if marker is not None:
+                    handler_scalars.append((name, marker))
 
         is_async_endpoint = _inspect.iscoroutinefunction(endpoint)
         app_ref = self
@@ -1890,7 +1934,7 @@ class FastAPI:
         def _resolve_dep(dep_func, ws, is_async_dep):
             dep_sig = _inspect.signature(dep_func)
             try:
-                dep_hints = _inspect.get_type_hints(dep_func)
+                dep_hints = _inspect.get_type_hints(dep_func, include_extras=True)
             except Exception:  # noqa: BLE001
                 dep_hints = {}
             dep_kwargs: dict = {}
@@ -1903,6 +1947,15 @@ class FastAPI:
                     or (isinstance(raw, str) and raw in ("WebSocket", "fastapi_rs.websockets.WebSocket"))
                 ):
                     dep_kwargs[p_name] = ws
+                    continue
+                marker, default_val, _ = _extract_marker(ann, p.default)
+                if marker is not None:
+                    val = _resolve_ws_scalar(ws, p_name, marker)
+                    if val is None:
+                        from pydantic_core import PydanticUndefined as _PU
+                        if default_val is not _PU and default_val is not ...:
+                            val = default_val
+                    dep_kwargs[p_name] = val
             if is_async_dep:
                 from fastapi_rs._async_worker import submit as _submit
                 return _submit(dep_func(**dep_kwargs))
@@ -1921,6 +1974,19 @@ class FastAPI:
             except Exception:  # noqa: BLE001
                 pass
 
+        def _resolve_handler_scalars(ws):
+            from pydantic_core import PydanticUndefined as _PU
+            out: dict = {}
+            for name, marker in handler_scalars:
+                val = _resolve_ws_scalar(ws, name, marker)
+                if val is None:
+                    default_val = marker.default
+                    if default_val is _PU or default_val is ...:
+                        continue
+                    val = default_val
+                out[name] = val
+            return out
+
         if is_async_endpoint:
             async def _ws_entry(ws, **path_kwargs):
                 ws._app = app_ref
@@ -1931,6 +1997,7 @@ class FastAPI:
                     kwargs: dict = dict(path_kwargs)
                     if ws_param_name is not None:
                         kwargs[ws_param_name] = ws
+                    kwargs.update(_resolve_handler_scalars(ws))
                     kwargs.update(resolved)
                     await endpoint(**kwargs)
                 except _WSExc as exc:
@@ -1953,6 +2020,7 @@ class FastAPI:
                 kwargs: dict = dict(path_kwargs)
                 if ws_param_name is not None:
                     kwargs[ws_param_name] = ws
+                kwargs.update(_resolve_handler_scalars(ws))
                 kwargs.update(resolved)
                 endpoint(**kwargs)
             except _WSExc as exc:
