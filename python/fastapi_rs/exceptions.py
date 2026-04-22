@@ -26,7 +26,14 @@ class ValidationException(Exception):
         super().__init__(self._errors)
 
     def errors(self):
-        return self._errors
+        # FA parity: ``loc`` is emitted as a tuple (pydantic's native
+        # representation). Our Rust extractor builds error dicts with
+        # ``loc`` as a list — convert on the way out so handler code
+        # like ``error['loc'] == ('body', 'name')`` works.
+        return [
+            {**e, "loc": tuple(e["loc"])} if isinstance(e.get("loc"), list) else e
+            for e in self._errors
+        ]
 
     def _format_endpoint_context(self) -> str:
         if not (self.endpoint_file and self.endpoint_line and self.endpoint_function):
