@@ -1621,11 +1621,13 @@ fn extract_params_to_pydict_full<'py>(
     // when a body-level error fires (it short-circuits the whole
     // request).
     let mut extraction_errors: Vec<serde_json::Value> = Vec::new();
-    // Stash the raw body so Python can populate
-    // ``RequestValidationError.body`` on a 422 — FA's
+    // Stash the raw body for the DEFERRED-extraction path so Python
+    // can populate ``RequestValidationError.body`` on a 422.
     // ``test_handling_errors/test_tutorial005`` asserts ``exc.body``
-    // equals the original JSON body dict.
-    if !body_bytes.is_empty() {
+    // equals the original JSON body dict. Skipped when the handler is
+    // a raw user function (no deferral wrapper) to avoid leaking the
+    // sentinel kwarg.
+    if defers_extraction_errors && !body_bytes.is_empty() {
         if let Ok(raw_str) = std::str::from_utf8(body_bytes) {
             let _ = kwargs.set_item("__fastapi_rs_raw_body_str__", raw_str);
         }
