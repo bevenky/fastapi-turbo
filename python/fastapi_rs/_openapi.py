@@ -144,6 +144,9 @@ def generate_openapi_schema(
             _pmc = p.get("_param_model_class")
             if _pmc is not None and p.get("kind") in ("form", "file"):
                 _note_model_usage(_pmc, "input")
+            # Form Union expansion — mark each arm as input.
+            for _fu_m in p.get("_form_union_models") or ():
+                _note_model_usage(_fu_m, "input")
             _collect_enum_class(p.get("enum_class"))
         _note_model_usage(route.get("response_model"), "output")
         for resp_info in (route.get("responses") or {}).values():
@@ -219,6 +222,8 @@ def generate_openapi_schema(
             _pmc = p.get("_param_model_class")
             if _pmc is not None and p.get("kind") in ("form", "file"):
                 _register_model(_pmc)
+            for _fu_m in p.get("_form_union_models") or ():
+                _register_model(_fu_m)
         # For SSE routes, response_model carries the AsyncIterable[...]
         # form — register only the NON-SSE inner types. ServerSentEvent
         # itself is a transport wrapper and FA excludes it from
@@ -2602,17 +2607,22 @@ def _derive_security_from_deps(route: dict[str, Any]) -> list[dict[str, list[str
     advertises what scopes exist, not what each endpoint requires.
     """
     all_params = route.get("_all_params", route.get("params", []))
-    out: list[dict[str, list[str]]] = []
-    seen: set[str] = set()
+    # Accumulate scopes per scheme: FA uses whatever ``Security(scheme,
+    # scopes=[...])`` the user declared. If the same scheme shows up in
+    # multiple deps (e.g. via a router-level ``Security(scheme, scopes=
+    # ["read"])`` and a route-level ``Security(scheme, scopes=["read",
+    # "write"])``), merge their scopes deduped, order preserved.
+    by_scheme: dict[str, list[str]] = {}
+    order: list[str] = []
     for param in all_params:
         dep_callable = param.get("_original_dep_callable") or param.get("dep_callable")
         if dep_callable is None:
             continue
         if hasattr(dep_callable, "model") and isinstance(dep_callable.model, dict):
             scheme_name = getattr(dep_callable, "scheme_name", None) or type(dep_callable).__name__
-            if scheme_name in seen:
-                continue
-            seen.add(scheme_name)
+            if scheme_name not in by_scheme:
+                by_scheme[scheme_name] = []
+                order.append(scheme_name)
             # Scopes are the scopes REQUIRED by this specific Security()
             # call (empty list = just "must be authenticated"). Our resolver
             # stashes the user-supplied scopes on the dep step under
@@ -2624,8 +2634,10 @@ def _derive_security_from_deps(route: dict[str, Any]) -> list[dict[str, list[str
                 list(param.get("_security_scopes") or [])
                 or list(param.get("_security_scopes_top") or [])
             )
-            out.append({scheme_name: scopes})
-    return out
+            for s in scopes:
+                if s not in by_scheme[scheme_name]:
+                    by_scheme[scheme_name].append(s)
+    return [{name: by_scheme[name]} for name in order]
 
 
 def _build_callbacks(callbacks: list) -> dict[str, Any]:
