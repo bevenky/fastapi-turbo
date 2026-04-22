@@ -1365,13 +1365,20 @@ def _try_compile_handler(
                         if _sync_ok:
                             generators_to_cleanup.append((gen, None, dep_scope))
                         else:
-                            # The coro suspended — we've already driven
-                            # it once, so we can't hand it to a fresh
-                            # worker-loop task. Close this partially-
-                            # driven coro and start fresh on the worker.
-                            _anext_coro.close()
-                            from fastapi_rs._async_worker import submit as _submit
-                            result = _submit(gen.__anext__())
+                            # The coro suspended — continue the SAME
+                            # partially-driven coro on the worker loop.
+                            # Closing it here and calling ``gen.__anext__()``
+                            # afresh would leave the async-gen in a
+                            # half-stepped state whose next step yields
+                            # ``StopAsyncIteration`` — the dep value is
+                            # lost and the handler never runs (trace
+                            # fidelity bug with 5-middleware + async
+                            # yield-dep stacks).
+                            import asyncio as _asyncio
+                            from fastapi_rs._async_worker import get_loop as _get_loop
+                            _loop = _get_loop()
+                            _fut = _asyncio.run_coroutine_threadsafe(_anext_coro, _loop)
+                            result = _fut.result(timeout=30)
                             generators_to_cleanup.append((gen, "worker", dep_scope))
                     else:
                         result = next(gen)
