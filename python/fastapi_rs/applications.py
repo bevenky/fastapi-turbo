@@ -183,6 +183,25 @@ def _apply_response_model(
             # exclude_unset / exclude_defaults.
             if type(result) is response_model:
                 validated = result
+            elif (
+                isinstance(response_model, type)
+                and isinstance(result, response_model)
+                and (exclude_unset or exclude_defaults or exclude_none)
+            ):
+                # FA parity: ``ModelSubclass`` returned by handler with
+                # ``response_model=Model`` and ``exclude_unset=True``
+                # should preserve which fields the HANDLER explicitly
+                # set. Dumping subclass + filtering to response_model's
+                # field set preserves ``model_fields_set``.
+                _sub_dump = result.model_dump(
+                    by_alias=by_alias, mode="json",
+                    exclude_unset=exclude_unset,
+                    exclude_defaults=exclude_defaults,
+                    exclude_none=exclude_none,
+                    include=include, exclude=exclude,
+                )
+                _rm_fields = set(getattr(response_model, "model_fields", {}).keys())
+                return {k: v for k, v in _sub_dump.items() if k in _rm_fields}
             else:
                 # FA parity: when ``response_model`` declares
                 # ``model_config = {"from_attributes": True}``, pull the
