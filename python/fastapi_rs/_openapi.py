@@ -2208,10 +2208,28 @@ def _collect_schemas(
             for sub in _flatten_annotation_types(resp_model):
                 _collect_model_schemas(sub, schemas)
 
-    # response_model — same container-walk.
+    # response_model — same container-walk. SSE routes use the
+    # AsyncIterable[...] form as response_model; ServerSentEvent itself
+    # is a transport wrapper that FA excludes from components.schemas.
+    _is_sse_route = False
+    try:
+        from fastapi_rs.responses import EventSourceResponse as _ESR_cs
+        _rc_cs = route.get("response_class")
+        if _rc_cs is not None and isinstance(_rc_cs, type) and issubclass(_rc_cs, _ESR_cs):
+            _is_sse_route = True
+    except Exception:  # noqa: BLE001
+        pass
     resp_m = route.get("response_model")
-    _collect_model_schemas(resp_m, schemas)
+    if not _is_sse_route:
+        _collect_model_schemas(resp_m, schemas)
     for sub in _flatten_annotation_types(resp_m):
+        if _is_sse_route:
+            try:
+                from fastapi_rs.sse import ServerSentEvent as _SSE_CS
+                if isinstance(sub, type) and issubclass(sub, _SSE_CS):
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
         _collect_model_schemas(sub, schemas)
 
     # Callback routes' response models
