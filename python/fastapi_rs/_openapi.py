@@ -503,6 +503,22 @@ def generate_openapi_schema(
             },
         })
 
+    # FA strips the private part of a model docstring after the first
+    # ``\f`` (formfeed) — ``"Public\fPrivate"`` → ``"Public"``. Apply the
+    # same truncation to any ``description`` in components.schemas.
+    def _strip_formfeed(obj: Any) -> None:
+        if isinstance(obj, dict):
+            _d = obj.get("description")
+            if isinstance(_d, str) and "\f" in _d:
+                obj["description"] = _d.split("\f", 1)[0]
+            for v in obj.values():
+                _strip_formfeed(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _strip_formfeed(v)
+    for _sname in list(components_schemas.keys()):
+        _strip_formfeed(components_schemas[_sname])
+
     components: dict[str, Any] = {}
     if components_schemas:
         components["schemas"] = components_schemas

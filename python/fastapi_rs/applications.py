@@ -2132,7 +2132,21 @@ class FastAPI:
         if route_path:
             _ws_endpoint_ctx["path"] = route_path
 
-        def _validate_scalar(val, ann, p_name, kind):
+        def _build_ctx(ws=None):
+            """Build endpoint_ctx dict; prefer the route path from the
+            matched scope (covers mount-prefixed sub-apps) over the
+            static decoration-time path."""
+            ctx = dict(_ws_endpoint_ctx)
+            if ws is not None:
+                try:
+                    rt = ws.scope.get("route") if isinstance(ws.scope, dict) else None
+                    if rt is not None and getattr(rt, "path", None):
+                        ctx["path"] = rt.path
+                except Exception:  # noqa: BLE001
+                    pass
+            return ctx
+
+        def _validate_scalar(val, ann, p_name, kind, ws=None):
             """Validate + coerce ``val`` against ``ann`` using pydantic
             ``TypeAdapter``. On failure raise
             ``WebSocketRequestValidationError`` — routed through app
@@ -2156,7 +2170,7 @@ class FastAPI:
                         "msg": str(exc),
                         "type": "value_error",
                     }]
-                raise _WRVE(errors, endpoint_ctx=dict(_ws_endpoint_ctx)) from exc
+                raise _WRVE(errors, endpoint_ctx=_build_ctx(ws)) from exc
 
         # Extract path parameter names from the route path. Supports both
         # plain ``{name}`` and Starlette-style ``{name:path}`` converter

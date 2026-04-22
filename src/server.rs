@@ -440,6 +440,17 @@ pub fn run_server(
             if let Ok(mut slot) = DECLARED_PATHS.write() {
                 *slot = Some(set);
             }
+            // Paths with an explicit OPTIONS route — used by
+            // ``non_preflight_options_middleware`` to decide whether to
+            // fall through (explicit handler) vs short-circuit (405).
+            let opts: HashSet<String> = routes
+                .iter()
+                .filter(|r| r.methods.iter().any(|m| m.eq_ignore_ascii_case("OPTIONS")))
+                .map(|r| r.path.clone())
+                .collect();
+            if let Ok(mut slot) = DECLARED_OPTIONS_PATHS.write() {
+                *slot = Some(opts);
+            }
         }
 
         rt.block_on(async move {
@@ -611,6 +622,14 @@ pub fn run_server(
 static DECLARED_PATHS: std::sync::RwLock<Option<std::collections::HashSet<String>>> =
     std::sync::RwLock::new(None);
 
+/// Paths that explicitly declare an OPTIONS route. The
+/// ``non_preflight_options_middleware`` consults this set so that an
+/// explicit ``@app.options("/p")`` handler is reached instead of being
+/// short-circuited with 405. Path templates (``/items/{item_id}``) are
+/// matched segment-by-segment.
+static DECLARED_OPTIONS_PATHS: std::sync::RwLock<Option<std::collections::HashSet<String>>> =
+    std::sync::RwLock::new(None);
+
 /// Pass-through middleware for non-preflight OPTIONS. Tower-http's
 /// ``CorsLayer`` intercepts *every* OPTIONS request with configured
 /// ``allow_methods`` and returns 200 — FastAPI/Starlette only do that
@@ -626,20 +645,45 @@ async fn non_preflight_options_middleware(
         let has_origin = req.headers().contains_key("origin");
         let has_acrm = req.headers().contains_key("access-control-request-method");
         if !(has_origin && has_acrm) {
-            // Not a preflight — bypass CORS by bolting a short-circuit
-            // response that matches FastAPI's 405 behavior for OPTIONS on
-            // non-OPTIONS routes. The inner router would produce 405 too,
-            // but since CorsLayer sits between us and the router and will
-            // override with 200, we just emit the 405 directly.
-            return axum::response::Response::builder()
-                .status(axum::http::StatusCode::METHOD_NOT_ALLOWED)
-                .header("content-type", "application/json")
-                .header("allow", "GET, POST, PUT, DELETE, PATCH, HEAD")
-                .body(axum::body::Body::from(r#"{"detail":"Method Not Allowed"}"#))
-                .unwrap();
+            // If the user registered an explicit ``@app.options(...)``
+            // route matching this path, let it through — the inner
+            // router will dispatch to the user's handler.
+            let path = req.uri().path();
+            let has_explicit_opts = DECLARED_OPTIONS_PATHS
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|paths| {
+                    paths.iter().any(|tpl| options_path_matches(tpl, path))
+                }))
+                .unwrap_or(false);
+            if !has_explicit_opts {
+                // Not a preflight, no explicit OPTIONS — bypass CORS by
+                // bolting a short-circuit 405 response (the inner router
+                // would do this too but CorsLayer would override it to 200).
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::METHOD_NOT_ALLOWED)
+                    .header("content-type", "application/json")
+                    .header("allow", "GET, POST, PUT, DELETE, PATCH, HEAD")
+                    .body(axum::body::Body::from(r#"{"detail":"Method Not Allowed"}"#))
+                    .unwrap();
+            }
         }
     }
     next.run(req).await
+}
+
+fn options_path_matches(template: &str, concrete: &str) -> bool {
+    let t_segs: Vec<&str> = template.split('/').collect();
+    let c_segs: Vec<&str> = concrete.split('/').collect();
+    if t_segs.len() != c_segs.len() { return false; }
+    for (t, c) in t_segs.iter().zip(c_segs.iter()) {
+        if t.starts_with('{') && t.ends_with('}') {
+            if c.is_empty() { return false; }
+            continue;
+        }
+        if t != c { return false; }
+    }
+    true
 }
 
 /// Middleware that 307-redirects between `/foo` ↔ `/foo/` ONLY when the
