@@ -2976,6 +2976,14 @@ class FastAPI:
         )
         if fn is None:
             return None
+        # FA parity: when users write ``generate_unique_id_function=
+        # Default(my_fn)``, the value is wrapped in a ``DefaultPlaceholder``.
+        # Unwrap here before invoking.
+        from fastapi_rs.datastructures import DefaultPlaceholder as _DP
+        if isinstance(fn, _DP):
+            fn = fn.value
+        if fn is None or not callable(fn):
+            return None
         try:
             return fn(route)
         except TypeError:
