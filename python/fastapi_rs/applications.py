@@ -4341,8 +4341,146 @@ class FastAPI:
                 all_routes.extend(
                     self._collect_routes_from_router(mounted_app, prefix=mount_path)
                 )
+            elif callable(mounted_app):
+                # Arbitrary ASGI app (WSGIMiddleware, sub-ASGI, static
+                # file server, etc.). Register a catch-all HTTP route
+                # under ``<mount_path>/{__asgi_rest__:path}`` that proxies
+                # through an ASGI shim — we materialise a Starlette scope,
+                # drive the inner app, and stream its response back out
+                # as a ``fastapi_rs.responses.Response``.
+                all_routes.extend(
+                    self._build_asgi_mount_routes(mount_path, mounted_app)
+                )
 
         return all_routes
+
+    def _build_asgi_mount_routes(
+        self, mount_path: str, asgi_app: Any
+    ) -> list[dict[str, Any]]:
+        """Build catch-all HTTP route entries that proxy requests under
+        ``mount_path`` to ``asgi_app`` (the Starlette/ASGI app the user
+        handed to ``app.mount``).  One entry is emitted per common HTTP
+        method so axum's method router dispatches correctly."""
+        mount_path_clean = mount_path.rstrip("/")
+
+        async def _proxy(request: Any) -> Any:
+            # Drive the inner ASGI app via a minimal scope + buffered
+            # receive/send. Stream the resulting response back as a
+            # fastapi_rs Response.
+            scope = dict(getattr(request, "scope", {}) or {})
+            # Strip the mount prefix from the path so the inner app sees
+            # requests relative to its own root (Starlette behaviour).
+            full_path = scope.get("path", "")
+            if mount_path_clean and full_path.startswith(mount_path_clean):
+                inner_path = full_path[len(mount_path_clean):] or "/"
+            else:
+                inner_path = full_path or "/"
+            scope = {
+                **scope,
+                "type": "http",
+                "path": inner_path,
+                "raw_path": inner_path.encode("latin-1"),
+                "root_path": (scope.get("root_path", "") or "") + mount_path_clean,
+            }
+            body_bytes = await request.body()
+
+            async def _receive():
+                return {
+                    "type": "http.request",
+                    "body": body_bytes,
+                    "more_body": False,
+                }
+
+            status_holder: dict[str, Any] = {"status": 200, "headers": []}
+            body_parts: list[bytes] = []
+
+            async def _send(message):
+                mtype = message.get("type")
+                if mtype == "http.response.start":
+                    status_holder["status"] = message.get("status", 200)
+                    status_holder["headers"] = list(message.get("headers") or [])
+                elif mtype == "http.response.body":
+                    chunk = message.get("body", b"") or b""
+                    if chunk:
+                        body_parts.append(chunk)
+
+            await asgi_app(scope, _receive, _send)
+
+            from fastapi_rs.responses import Response as _Response
+            resp = _Response(
+                content=b"".join(body_parts),
+                status_code=status_holder["status"],
+            )
+            # Replace the default headers with the inner app's — content-
+            # type etc. must come from the mounted app, not our JSON
+            # default.
+            resp.headers.clear()
+            resp.raw_headers.clear()
+            for raw_k, raw_v in status_holder["headers"]:
+                k = raw_k.decode("latin-1") if isinstance(raw_k, bytes) else str(raw_k)
+                v = raw_v.decode("latin-1") if isinstance(raw_v, bytes) else str(raw_v)
+                resp.headers.append(k, v)
+            return resp
+
+        _proxy.__name__ = f"__asgi_mount_{mount_path_clean.strip('/').replace('/', '_') or 'root'}__"
+
+        # Explicit ``request`` parameter: Rust injects the Request object
+        # and we forward it to the ASGI shim.
+        from fastapi_rs.requests import Request as _Req
+        _proxy.__annotations__ = {"request": _Req}
+
+        catchall_path = f"{mount_path_clean}/{{__asgi_rest__:path}}"
+        root_path = mount_path_clean or "/"
+
+        out: list[dict[str, Any]] = []
+        # Emit both the exact-mount and catchall variants so ``GET
+        # /v1`` and ``GET /v1/foo`` both dispatch to the proxy.
+        for path_variant in (root_path, mount_path_clean or "/", catchall_path):
+            # Dedupe while preserving order — the two leading entries
+            # collapse when root_path has no extra prefix.
+            if any(r["path"] == path_variant for r in out):
+                continue
+            for method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+                out.append({
+                    "path": path_variant,
+                    "methods": [method],
+                    "endpoint": _proxy,
+                    "is_async": True,
+                    "handler_name": _proxy.__name__,
+                    "params": [{
+                        "name": "request",
+                        "kind": "inject_request",
+                        "type_hint": "any",
+                        "required": False,
+                        "default_value": None,
+                        "has_default": True,
+                        "model_class": None,
+                        "alias": None,
+                        "_embed": False,
+                        "media_type": None,
+                        "example": None,
+                        "examples": None,
+                        "openapi_examples": None,
+                        "title": None,
+                        "description": None,
+                        "include_in_schema": False,
+                        "deprecated": None,
+                        "scalar_validator": None,
+                        "enum_class": None,
+                        "container_type": None,
+                        "_is_optional": True,
+                        "_enum_values": None,
+                        "_unwrapped_annotation": None,
+                        "_raw_marker": None,
+                        "_raw_annotation": None,
+                        "_is_handler_param": True,
+                    }],
+                    "is_websocket": False,
+                    "include_in_schema": False,
+                    "_from_mount": mount_path_clean,
+                    "tags": [],
+                })
+        return out
 
     # ------------------------------------------------------------------
     # URL building

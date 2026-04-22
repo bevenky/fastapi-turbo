@@ -202,6 +202,12 @@ def generate_openapi_schema(
         # Honor include_in_schema=False — skip route entirely
         if not route.get("include_in_schema", True):
             continue
+        # WebSocket routes never appear in the OpenAPI schema. FastAPI /
+        # Starlette exclude them; Strawberry's GraphQLRouter for example
+        # registers a WS subscription route with ``methods=["GET"]`` which
+        # would otherwise masquerade as a duplicate HTTP GET entry.
+        if route.get("is_websocket"):
+            continue
 
         # Register every BaseModel reachable from this route so post-pass
         # has the concrete classes it needs for split emission. If the
@@ -723,6 +729,14 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     # Choose the response media type from the configured response_class.
     # HTMLResponse → text/html, PlainTextResponse → text/plain, etc.
     _resp_cls = route.get("response_class")
+    # Unwrap ``DefaultPlaceholder`` (``fastapi.datastructures.Default``)
+    # sentinel wrappers. Routes registered through the FastAPI compat
+    # shim store ``response_class=Default(JSONResponse)`` rather than
+    # the raw class; without unwrapping, ``getattr(rc, "media_type",
+    # None)`` returns None and the OpenAPI emitter mistakenly suppresses
+    # the success response body.
+    if _resp_cls is not None and type(_resp_cls).__name__ == "DefaultPlaceholder":
+        _resp_cls = getattr(_resp_cls, "value", None)
     _media_type: str | None = "application/json"
     _suppress_content = False
     if _resp_cls is not None:
