@@ -170,9 +170,23 @@ def _apply_response_model(
             if type(result) is response_model:
                 validated = result
             else:
-                validated = response_model.model_validate(
-                    result.model_dump() if hasattr(result, "model_dump") else result
-                )
+                # FA parity: when ``response_model`` declares
+                # ``model_config = {"from_attributes": True}``, pull the
+                # response fields via attribute access on the handler's
+                # return value — needed for ``@property``-derived fields
+                # (e.g. ``Person.full_name`` computed from ``name`` + ``lastname``).
+                _from_attrs = False
+                _cfg = getattr(response_model, "model_config", None)
+                if isinstance(_cfg, dict) and _cfg.get("from_attributes"):
+                    _from_attrs = True
+                if _from_attrs:
+                    validated = response_model.model_validate(
+                        result, from_attributes=True
+                    )
+                else:
+                    validated = response_model.model_validate(
+                        result.model_dump() if hasattr(result, "model_dump") else result
+                    )
         elif _dc.is_dataclass(result) and not isinstance(result, type):
             # Convert dataclass → dict so Pydantic model_validate can apply
             # exclude_none / exclude_unset / aliases consistently.
