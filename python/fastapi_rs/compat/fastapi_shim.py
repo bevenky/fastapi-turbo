@@ -683,7 +683,22 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_dependencies_utils.Dependant = Dependant  # type: ignore[attr-defined]
     fastapi_dependencies_utils.get_dependant = _fa_internal_stub("fastapi.dependencies.utils.get_dependant")  # type: ignore[attr-defined]
     fastapi_dependencies_utils.solve_dependencies = _fa_internal_stub("fastapi.dependencies.utils.solve_dependencies")  # type: ignore[attr-defined]
-    fastapi_dependencies_utils.get_typed_annotation = _fa_internal_stub("fastapi.dependencies.utils.get_typed_annotation")  # type: ignore[attr-defined]
+    def _get_typed_annotation(annotation, globalns):
+        # Real FA helper: resolve a string forward-ref against a namespace.
+        # ``"None"`` resolves to the singleton ``None`` per the test's
+        # coverage assertion; everything else is eval'd normally.
+        if annotation == "None":
+            return None
+        import typing as _t
+        if isinstance(annotation, str):
+            try:
+                return _t._eval_type(  # type: ignore[attr-defined]
+                    _t.ForwardRef(annotation), globalns, globalns,
+                )
+            except Exception:
+                return annotation
+        return annotation
+    fastapi_dependencies_utils.get_typed_annotation = _get_typed_annotation  # type: ignore[attr-defined]
     fastapi_dependencies_utils.get_typed_signature = _fa_internal_stub("fastapi.dependencies.utils.get_typed_signature")  # type: ignore[attr-defined]
     fastapi_dependencies_utils.get_flat_dependant = _fa_internal_stub("fastapi.dependencies.utils.get_flat_dependant")  # type: ignore[attr-defined]
     fastapi_dependencies_utils.get_parameterless_sub_dependant = _fa_internal_stub("fastapi.dependencies.utils.get_parameterless_sub_dependant")  # type: ignore[attr-defined]
