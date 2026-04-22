@@ -62,12 +62,12 @@ class OAuth2PasswordRequestForm:
             _Form(pattern="^password$"),
         ] = None,
         username: Annotated[str, _Form()],
-        password: Annotated[str, _Form(json_schema_extra={"format": "password"})],
+        password: Annotated[str, _Form()],
         scope: Annotated[str, _Form()] = "",
         client_id: Annotated[Optional[str], _Form()] = None,
         client_secret: Annotated[
             Optional[str],
-            _Form(json_schema_extra={"format": "password"}),
+            _Form(),
         ] = None,
     ):
         self.grant_type = grant_type
@@ -87,12 +87,12 @@ class OAuth2PasswordRequestFormStrict(OAuth2PasswordRequestForm):
         *,
         grant_type: Annotated[str, _Form(pattern="^password$")],
         username: Annotated[str, _Form()],
-        password: Annotated[str, _Form(json_schema_extra={"format": "password"})],
+        password: Annotated[str, _Form()],
         scope: Annotated[str, _Form()] = "",
         client_id: Annotated[Optional[str], _Form()] = None,
         client_secret: Annotated[
             Optional[str],
-            _Form(json_schema_extra={"format": "password"}),
+            _Form(),
         ] = None,
     ):
         super().__init__(

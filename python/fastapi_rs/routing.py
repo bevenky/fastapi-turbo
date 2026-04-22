@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import re
+import typing
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
@@ -10,6 +12,85 @@ from urllib.parse import quote
 def _default_generate_unique_id(route: "APIRoute", method: str) -> str:
     """Default function to generate a unique operation ID for OpenAPI."""
     return f"{route.name}_{method.lower()}"
+
+
+def _ws_check_scope_mismatch(endpoint: Callable) -> None:
+    """Raise ``FastAPIError`` at WS-route decoration time when a
+    request-scope yield dep depends on a function-scope yield dep.
+
+    FastAPI 0.120+ rule — our runtime resolution already honours it,
+    but the test suite asserts ``pytest.raises(FastAPIError)`` fires on
+    the decorator itself, so we replicate the check synchronously.
+    """
+    from fastapi_rs.dependencies import Depends as _Depends
+    from fastapi_rs.exceptions import FastAPIError as _FE
+
+    def _get_scope(dep) -> str:
+        s = getattr(dep, "scope", None)
+        return s if s in ("function", "request") else "request"
+
+    def _extract_dep(annotation, default):
+        if isinstance(default, _Depends):
+            return default
+        if typing.get_origin(annotation) is typing.Annotated:
+            for m in typing.get_args(annotation)[1:]:
+                if isinstance(m, _Depends):
+                    return m
+        return None
+
+    def _walk(dep, visited: set) -> None:
+        dep_func = dep.dependency
+        if dep_func is None or id(dep_func) in visited:
+            return
+        visited.add(id(dep_func))
+        try:
+            sig = inspect.signature(dep_func)
+        except (TypeError, ValueError):
+            return
+        try:
+            hints = typing.get_type_hints(dep_func, include_extras=True)
+        except Exception:  # noqa: BLE001
+            hints = {}
+        outer_scope = _get_scope(dep)
+        outer_yield = (
+            inspect.isgeneratorfunction(dep_func)
+            or inspect.isasyncgenfunction(dep_func)
+        )
+        for p_name, p in sig.parameters.items():
+            ann = hints.get(p_name, p.annotation)
+            sub = _extract_dep(ann, p.default)
+            if sub is None or sub.dependency is None:
+                continue
+            sub_scope = _get_scope(sub)
+            sub_yield = (
+                inspect.isgeneratorfunction(sub.dependency)
+                or inspect.isasyncgenfunction(sub.dependency)
+            )
+            if (
+                outer_yield and sub_yield
+                and outer_scope == "request" and sub_scope == "function"
+            ):
+                outer_name = getattr(dep_func, "__name__", repr(dep_func))
+                raise _FE(
+                    f'The dependency "{outer_name}" has a scope of "request", '
+                    f'it cannot depend on dependencies with scope "function"'
+                )
+            _walk(sub, visited)
+
+    try:
+        sig = inspect.signature(endpoint)
+    except (TypeError, ValueError):
+        return
+    try:
+        hints = typing.get_type_hints(endpoint, include_extras=True)
+    except Exception:  # noqa: BLE001
+        hints = {}
+    for p_name, p in sig.parameters.items():
+        ann = hints.get(p_name, p.annotation)
+        dep = _extract_dep(ann, p.default)
+        if dep is None or dep.dependency is None:
+            continue
+        _walk(dep, set())
 
 
 _UNSET = object()
@@ -595,6 +676,11 @@ class APIRouter:
         **kwargs: Any,
     ) -> None:
         """Register a WebSocket route."""
+        # FastAPI 0.120+ scope rule check. Raise FastAPIError at
+        # decoration time when a request-scope yield-dep depends on a
+        # function-scope yield-dep — matches FA parity so tests asserting
+        # ``pytest.raises(FastAPIError)`` around the decorator fire.
+        _ws_check_scope_mismatch(endpoint)
         route = APIRoute(
             path,
             endpoint,

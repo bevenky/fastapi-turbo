@@ -2017,8 +2017,9 @@ class FastAPI:
         # annotations`) so we can identify the WebSocket parameter by
         # class identity rather than by string name — some handlers
         # pass the WS under different aliases (`websocket`, `conn`…).
+        import typing as _typing_mod
         try:
-            type_hints = _inspect.get_type_hints(endpoint, include_extras=True)
+            type_hints = _typing_mod.get_type_hints(endpoint, include_extras=True)
         except Exception:  # noqa: BLE001
             type_hints = {}
 
@@ -2194,9 +2195,12 @@ class FastAPI:
             visited.add(id(dep_func))
             try:
                 dep_sig = _inspect.signature(dep_func)
-                dep_hints = _inspect.get_type_hints(dep_func, include_extras=True)
-            except Exception:  # noqa: BLE001
+            except (TypeError, ValueError):
                 return
+            try:
+                dep_hints = _typing_mod.get_type_hints(dep_func, include_extras=True)
+            except Exception:  # noqa: BLE001
+                dep_hints = {}
             outer_scope = _get_dep_scope(dep)
             outer_is_yield = (
                 _inspect.isgeneratorfunction(dep_func)
@@ -2256,11 +2260,14 @@ class FastAPI:
             if use_cache and cache_key in cache:
                 return cache[cache_key]
 
+            import typing as _typing
             try:
                 dep_sig = _inspect.signature(effective)
-                dep_hints = _inspect.get_type_hints(effective, include_extras=True)
-            except Exception:  # noqa: BLE001
+            except (TypeError, ValueError):  # noqa: BLE001
                 dep_sig = None
+            try:
+                dep_hints = _typing.get_type_hints(effective, include_extras=True)
+            except Exception:  # noqa: BLE001
                 dep_hints = {}
 
             dep_kwargs: dict = {}

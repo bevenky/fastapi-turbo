@@ -63,6 +63,11 @@ def generate_openapi_schema(
     # called fresh for each build and decides the split on the current set
     # of routes; do the same.
     _MODEL_USAGE.clear()
+    # Track whether split is requested so `_model_ref` and the post-pass
+    # can honor ``separate_input_output_schemas=False`` (a single merged
+    # schema per model, no ``-Input``/``-Output`` variants).
+    global _SEPARATE_INPUT_OUTPUT
+    _SEPARATE_INPUT_OUTPUT = separate_input_output_schemas
 
     # Pre-pass: walk every route to classify each Pydantic model as used
     # in "input" (body / form / file) and/or "output" (response_model,
@@ -268,14 +273,16 @@ def generate_openapi_schema(
         return _walk(body)
 
     for mid, mc in model_class_by_id.items():
+        if not separate_input_output_schemas:
+            break
         usage = _MODEL_USAGE.get(mid, set())
         if not ("input" in usage and "output" in usage):
             continue
-        if not _model_is_self_recursive(mc):
+        if not (_model_is_self_recursive(mc) or _val_ser_schemas_differ(mc)):
             continue
         raw = getattr(mc, "__name__", None)
         name = _normalize_model_name(raw) if raw else None
-        if not name or name not in components_schemas:
+        if not name:
             continue
         try:
             v_schema = mc.model_json_schema(mode="validation")
@@ -410,28 +417,34 @@ def generate_openapi_schema(
     # null` leaves that FastAPI strips from its own generated spec.
     if components_schemas:
         schema.setdefault("components", {})["schemas"] = components_schemas
-    _hoist_inline_defs(schema, components_schemas)
+    _hoist_inline_defs(schema, components_schemas, skip=split_models)
     schema = _rewrite_defs_refs(schema)
 
     return schema
 
 
-def _hoist_inline_defs(node: Any, bucket: dict[str, Any]) -> None:
+def _hoist_inline_defs(node: Any, bucket: dict[str, Any], skip: set[str] | None = None) -> None:
     """Walk a schema tree, move any `$defs` entries into `bucket`, and
     delete them in place. Subsequent `_rewrite_defs_refs` re-points
     `$ref: #/$defs/X` at the hoisted component.
+
+    ``skip`` is a set of model names that were split into
+    ``<Name>-Input`` / ``<Name>-Output`` variants — those must NOT be
+    re-added to the components bucket under the plain name.
     """
     if isinstance(node, dict):
         if "$defs" in node:
             defs = node.pop("$defs")
             if isinstance(defs, dict):
                 for name, defn in defs.items():
+                    if skip and name in skip:
+                        continue
                     bucket.setdefault(name, defn)
         for v in node.values():
-            _hoist_inline_defs(v, bucket)
+            _hoist_inline_defs(v, bucket, skip)
     elif isinstance(node, list):
         for v in node:
-            _hoist_inline_defs(v, bucket)
+            _hoist_inline_defs(v, bucket, skip)
 
 
 def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
@@ -1690,6 +1703,10 @@ def _json_encode_fallback(obj) -> str:
 # during operation building so _collect_schemas knows whether to emit
 # `<Name>-Input` / `<Name>-Output` split variants for dual-use models.
 _MODEL_USAGE: dict[int, set[str]] = {}
+# Whether the current schema build allows ``-Input``/``-Output`` splits.
+# ``FastAPI(separate_input_output_schemas=False)`` sets this to False and
+# `_model_ref` / post-pass A then emit a single merged schema per model.
+_SEPARATE_INPUT_OUTPUT: bool = True
 
 
 def _normalize_model_name(name: str) -> str:
@@ -1774,7 +1791,8 @@ def _model_ref(model_class, mode: str | None = None) -> dict[str, str] | None:
     name = _normalize_model_name(name)
     usage = _MODEL_USAGE.get(id(model_class), set())
     split = (
-        "input" in usage and "output" in usage
+        _SEPARATE_INPUT_OUTPUT
+        and "input" in usage and "output" in usage
         and (
             _model_is_self_recursive(model_class)
             or _val_ser_schemas_differ(model_class)
@@ -1974,7 +1992,11 @@ def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
     used_as = _MODEL_USAGE.get(id(model_class), set())
     is_self_recursive = _model_is_self_recursive(model_class)
     _differ = _val_ser_schemas_differ(model_class)
-    if model_name and ("input" in used_as and "output" in used_as) and (is_self_recursive or _differ):
+    if (
+        _SEPARATE_INPUT_OUTPUT
+        and model_name and ("input" in used_as and "output" in used_as)
+        and (is_self_recursive or _differ)
+    ):
         # Self-recursive + dual-use — FastAPI emits split `-Input`/`-Output`
         # variants so body vs response can differ (the schemas are usually
         # identical, but the two distinct refs let the spec read cleanly
@@ -2050,7 +2072,13 @@ def _derive_security_from_deps(route: dict[str, Any]) -> list[dict[str, list[str
             # call (empty list = just "must be authenticated"). Our resolver
             # stashes the user-supplied scopes on the dep step under
             # `_security_scopes` when it sees `Security(scheme, scopes=...)`.
-            scopes = list(param.get("_security_scopes") or [])
+            # Top-level handler params additionally carry
+            # ``_security_scopes_top`` (set by _introspect when a
+            # ``Security(scheme, scopes=[...])`` marker is attached).
+            scopes = (
+                list(param.get("_security_scopes") or [])
+                or list(param.get("_security_scopes_top") or [])
+            )
             out.append({scheme_name: scopes})
     return out
 
