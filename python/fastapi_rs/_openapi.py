@@ -702,8 +702,74 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             if not route.get("response_model"):
                 response_schema = {}
+    # SSE (text/event-stream) + generator endpoint → FA emits an
+    # ``itemSchema`` object describing the per-event structure (data,
+    # event, id, retry), with ``contentSchema`` pointing at the yielded
+    # item type when the handler annotates it.
+    _is_sse = False
+    try:
+        from fastapi_rs.responses import EventSourceResponse as _ESR
+        _rc_cls = route.get("response_class")
+        if _rc_cls is not None and isinstance(_rc_cls, type) and issubclass(_rc_cls, _ESR):
+            _is_sse = True
+    except Exception:  # noqa: BLE001
+        pass
+
     if _suppress_content:
         success_response = {"description": response_desc}
+    elif _is_sse:
+        # Item schema for SSE events. ``data`` may carry a JSON-encoded
+        # payload (``contentMediaType: application/json`` +
+        # ``contentSchema: <item>``), or be a plain string when the
+        # handler has no return annotation.
+        item_schema: dict[str, Any] = {
+            "type": "object",
+            "properties": {
+                "data": {"type": "string"},
+                "event": {"type": "string"},
+                "id": {"type": "string"},
+                "retry": {"type": "integer", "minimum": 0},
+            },
+        }
+        # Try to pull the inner item type from the handler's return
+        # annotation (``AsyncIterable[Item]`` → ``Item``). FA walks
+        # this when building ``contentSchema``. For SSE endpoints the
+        # ``response_model`` is set to the AsyncIterable/Iterable form,
+        # so we unwrap it here.
+        _ret = route.get("response_model")
+        _inner = None
+        try:
+            import typing as _typing
+            _origin = _typing.get_origin(_ret)
+            if _origin is not None:
+                _args = _typing.get_args(_ret)
+                if _args:
+                    _inner = _args[0]
+            elif isinstance(_ret, type) and hasattr(_ret, "model_json_schema"):
+                _inner = _ret
+        except Exception:  # noqa: BLE001
+            _inner = None
+        if _inner is not None:
+            content_schema = _model_ref(_inner, mode="serialization")
+            if content_schema is None:
+                try:
+                    from pydantic import TypeAdapter as _TA
+                    content_schema = _TA(_inner).json_schema(mode="serialization")
+                    if "$defs" in content_schema:
+                        content_schema = {k: v for k, v in content_schema.items() if k != "$defs"}
+                except Exception:  # noqa: BLE001
+                    content_schema = None
+            if content_schema is not None:
+                item_schema["required"] = ["data"]
+                item_schema["properties"]["data"] = {
+                    "type": "string",
+                    "contentMediaType": "application/json",
+                    "contentSchema": content_schema,
+                }
+        success_response = {
+            "description": response_desc,
+            "content": {"text/event-stream": {"itemSchema": item_schema}},
+        }
     else:
         success_response = {
             "description": response_desc,

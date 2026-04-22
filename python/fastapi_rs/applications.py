@@ -1771,6 +1771,17 @@ class FastAPI:
         generate_unique_id_function: Callable | None = None,
     ) -> None:
         """Register a child router for later flattening."""
+        # FA raises when the included router would expose a route with
+        # an empty path AND no prefix — matches
+        # ``test_empty_router::test_include_empty``.
+        if not prefix:
+            from fastapi_rs.exceptions import FastAPIError as _FE
+            for r in getattr(router, "routes", []):
+                if not getattr(r, "path", ""):
+                    raise _FE(
+                        "Prefix and path cannot be both empty (e.g. "
+                        "'' and '')"
+                    )
         include_meta = {
             "prefix": prefix,
             "tags": tags or [],

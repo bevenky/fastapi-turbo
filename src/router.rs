@@ -985,10 +985,30 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
             // Merge with any existing accumulator for this path so that
             // `@app.get("/x")` and `@app.post("/x")` end up on one MethodRouter.
             if let Some(entry) = by_path.iter_mut().find(|(p, _, _, _)| p == &axum_path) {
-                let merged = std::mem::replace(&mut entry.1, MethodRouter::new()).merge(mr);
-                entry.1 = merged;
-                entry.2.extend(declared_methods);
-                entry.3 = entry.3 || has_explicit_options;
+                // FA parity: defining the SAME method twice on the same
+                // path keeps the FIRST handler and silently drops later
+                // registrations. Axum's ``merge`` panics on this, so
+                // filter out already-registered methods before merging.
+                let dup: Vec<String> = declared_methods
+                    .iter()
+                    .filter(|m| entry.2.iter().any(|prev| prev == *m))
+                    .cloned()
+                    .collect();
+                if dup.len() == declared_methods.len() {
+                    // Every method was already registered — nothing new to merge.
+                } else if dup.is_empty() {
+                    let merged = std::mem::replace(&mut entry.1, MethodRouter::new()).merge(mr);
+                    entry.1 = merged;
+                    entry.2.extend(declared_methods);
+                    entry.3 = entry.3 || has_explicit_options;
+                } else {
+                    // Mixed case: some methods new, some duplicate. Skip
+                    // the whole route since we can't split the
+                    // MethodRouter. Rare; a warning helps surface it.
+                    eprintln!(
+                        "fastapi-rs: duplicate method(s) {dup:?} on path {axum_path:?}, skipping second registration"
+                    );
+                }
             } else {
                 by_path.push((axum_path, mr, declared_methods, has_explicit_options));
             }
