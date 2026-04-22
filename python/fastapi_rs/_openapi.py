@@ -430,6 +430,18 @@ def _hoist_inline_defs(node: Any, bucket: dict[str, Any]) -> None:
 def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     """Build an OpenAPI operation object for a single route+method."""
     status_code = route.get("status_code") or 200
+
+    # Pre-compute the operation_id here so response-schema titling can
+    # reference it. FA's ``Response <Title-cased Operation Id>`` uses
+    # the auto-generated ``<name>_<path>_<method>`` form.
+    if route.get("operation_id"):
+        _op_id_for_title = route["operation_id"]
+    else:
+        import re as _re
+        _op_id_for_title = f"{route.get('handler_name', '')}{route.get('path', '')}"
+        _op_id_for_title = _re.sub(r"\W", "_", _op_id_for_title)
+        _op_id_for_title = f"{_op_id_for_title}_{method.lower()}"
+    route = {**route, "operation_id": _op_id_for_title}
     response_desc = route.get("response_description") or "Successful Response"
 
     # Success response skeleton — overridable by route.responses[status]
@@ -461,8 +473,11 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
                         or route.get("handler_name")
                         or "response"
                     )
+                    # FA preserves empty segments from double-underscore
+                    # splits (``items__get`` → ``Items  Get`` with two
+                    # spaces). Keep empty tokens in the join.
                     response_schema["title"] = "Response " + " ".join(
-                        w.capitalize() for w in source.replace("-", "_").split("_") if w
+                        w.capitalize() for w in source.replace("-", "_").split("_")
                     )
             except Exception:
                 pass
