@@ -177,12 +177,17 @@ class APIRoute:
         self.tags = tags or []
         self.summary = summary
         # FA: when description= isn't set, falls back to the endpoint's
-        # docstring (``inspect.cleandoc(endpoint.__doc__)``).
+        # docstring (``inspect.cleandoc(endpoint.__doc__)``). Matches
+        # FA's ``get_openapi`` which also truncates at the first ``\f``
+        # (formfeed) — text after ``\f`` is considered private
+        # (``:param`` / internal notes).
         if description is None:
             _raw_doc = getattr(endpoint, "__doc__", None)
             if _raw_doc:
                 import inspect as _ins
                 description = _ins.cleandoc(_raw_doc)
+        if isinstance(description, str) and "\f" in description:
+            description = description.split("\f", 1)[0].rstrip("\n")
         self.description = description
         self.response_description = response_description
         self.responses = responses or {}

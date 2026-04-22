@@ -2608,20 +2608,48 @@ class FastAPI:
                             pass
                     await _teardown_generators(generators)
                     return
+                # Route through app-registered exception_handlers if
+                # one matches this exception type. FA parity: a handler
+                # registered on ``@app.exception_handler(MyError)`` for
+                # WebSocket routes runs with ``(websocket, exc)`` and
+                # is expected to call ``websocket.close(code, reason)``
+                # itself. If it does, the client sees that close code.
+                handled = False
+                if app_ref is not None and getattr(app_ref, "exception_handlers", None):
+                    handler_cls = type(exc)
+                    handler = None
+                    for k, v in app_ref.exception_handlers.items():
+                        try:
+                            if isinstance(exc, k):
+                                handler = v
+                                handler_cls = k
+                                break
+                        except TypeError:
+                            continue
+                    if handler is not None:
+                        try:
+                            r = handler(ws, exc)
+                            if _inspect.iscoroutine(r):
+                                await r
+                            handled = True
+                        except Exception:  # noqa: BLE001
+                            pass
                 # Capture for TestClient re-raise semantics BEFORE we
                 # disturb the WS state.
-                _capture_server_exception(exc)
-                # Abort the handshake cleanly if still pre-accept so the
-                # client sees an HTTP 500 instead of hanging.
-                if ws.application_state == _WSState.CONNECTING:
-                    ws._reject(500)
-                else:
-                    # Post-accept unhandled exception — close cleanly so
-                    # the client's ``recv()`` sees a close frame.
-                    try:
-                        ws._ws.close(1006, "")
-                    except Exception:  # noqa: BLE001
-                        pass
+                if not handled:
+                    _capture_server_exception(exc)
+                if not handled:
+                    # Abort the handshake cleanly if still pre-accept so the
+                    # client sees an HTTP 500 instead of hanging.
+                    if ws.application_state == _WSState.CONNECTING:
+                        ws._reject(500)
+                    else:
+                        # Post-accept unhandled exception — close cleanly so
+                        # the client's ``recv()`` sees a close frame.
+                        try:
+                            ws._ws.close(1006, "")
+                        except Exception:  # noqa: BLE001
+                            pass
                 await _teardown_generators(generators)
                 return
             # Normal exit — drain teardowns (both scopes; no response
