@@ -219,8 +219,28 @@ def generate_openapi_schema(
             _pmc = p.get("_param_model_class")
             if _pmc is not None and p.get("kind") in ("form", "file"):
                 _register_model(_pmc)
-        _register_model(route.get("response_model"))
+        # For SSE routes, response_model carries the AsyncIterable[...]
+        # form — register only the NON-SSE inner types. ServerSentEvent
+        # itself is a transport wrapper and FA excludes it from
+        # components.schemas.
+        _is_sse_for_reg = False
+        try:
+            from fastapi_rs.responses import EventSourceResponse as _ESR_reg
+            _rc_reg = route.get("response_class")
+            if _rc_reg is not None and isinstance(_rc_reg, type) and issubclass(_rc_reg, _ESR_reg):
+                _is_sse_for_reg = True
+        except Exception:  # noqa: BLE001
+            pass
+        if not _is_sse_for_reg:
+            _register_model(route.get("response_model"))
         for sub in _flatten_annotation_types(route.get("response_model")):
+            if _is_sse_for_reg:
+                try:
+                    from fastapi_rs.sse import ServerSentEvent as _SSE_REG
+                    if isinstance(sub, type) and issubclass(sub, _SSE_REG):
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
             _register_model(sub)
         for resp_info in (route.get("responses") or {}).values():
             if isinstance(resp_info, dict):
@@ -749,6 +769,14 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
                 _inner = _ret
         except Exception:  # noqa: BLE001
             _inner = None
+        # FA excludes ``ServerSentEvent`` itself as the inner type — it's
+        # a transport wrapper, not a data model, so no ``contentSchema``.
+        try:
+            from fastapi_rs.sse import ServerSentEvent as _SSE_CLS
+            if isinstance(_inner, type) and issubclass(_inner, _SSE_CLS):
+                _inner = None
+        except Exception:  # noqa: BLE001
+            pass
         if _inner is not None:
             content_schema = _model_ref(_inner, mode="serialization")
             if content_schema is None:
@@ -1797,27 +1825,41 @@ def _build_request_body(param: dict[str, Any]) -> dict[str, Any]:
             return body
         except Exception:  # noqa: BLE001
             pass
-    if annotation is not None and _typing.get_origin(annotation) is _typing.Union:
+    # Handle both ``typing.Union`` and PEP 604 (``X | Y``) — in 3.10+ the
+    # latter resolves to ``types.UnionType``. ``get_origin`` returns
+    # ``Union`` for the former and ``UnionType`` for the latter.
+    import types as _types
+    _u_origin = _typing.get_origin(annotation) if annotation is not None else None
+    if annotation is not None and _u_origin in (_typing.Union, _types.UnionType):
         arms = _typing.get_args(annotation)
         non_none = [a for a in arms if a is not type(None)]
         has_none = any(a is type(None) for a in arms)
-        if non_none and has_none:
-            any_of: list[Any] = []
-            title_from: Any = None
-            for arm in non_none:
-                arm_ref = _model_ref(arm, mode="validation")
-                if arm_ref is not None:
-                    any_of.append(arm_ref)
+        any_of: list[Any] = []
+        title_from: Any = None
+        for arm in non_none:
+            arm_ref = _model_ref(arm, mode="validation")
+            if arm_ref is not None:
+                any_of.append(arm_ref)
+                if title_from is None:
                     title_from = arm
+            else:
+                frag = _type_hint_to_schema(_get_type_name(arm))
+                if frag and frag != {"type": "object"}:
+                    any_of.append(frag)
                 else:
-                    frag = _type_hint_to_schema(_get_type_name(arm))
-                    if frag and frag != {"type": "object"}:
-                        any_of.append(frag)
-                    else:
-                        any_of.append({"type": "object"})
+                    any_of.append({"type": "object"})
+        if has_none:
             any_of.append({"type": "null"})
+        if any_of:
             body_schema: dict[str, Any] = {"anyOf": any_of}
-            if title_from is not None:
+            # FA parity: title is the handler param name capitalized
+            # (``item`` → ``Item``), not the first arm's class name.
+            pname = param.get("name")
+            if pname:
+                body_schema["title"] = (
+                    pname.replace("_", " ").title().replace(" ", "")
+                )
+            elif title_from is not None:
                 body_schema["title"] = getattr(title_from, "__name__", "Body")
             media_type = param.get("media_type") or "application/json"
             content: dict[str, Any] = {media_type: {"schema": body_schema}}
