@@ -3803,6 +3803,7 @@ class FastAPI:
             not_found_handler,
             self,
             validation_handler,
+            self.swagger_ui_oauth2_redirect_url,
         )
 
     # ------------------------------------------------------------------

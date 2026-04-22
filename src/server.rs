@@ -388,7 +388,7 @@ const REDOC_HTML: &str = r#"
 ///
 /// This function blocks until the server shuts down (Ctrl-C).
 #[pyfunction]
-#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![], root_path=None, redirect_slashes=true, max_request_size=None, not_found_handler=None, app=None, validation_handler=None))]
+#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![], root_path=None, redirect_slashes=true, max_request_size=None, not_found_handler=None, app=None, validation_handler=None, swagger_ui_oauth2_redirect_url=None))]
 pub fn run_server(
     py: Python<'_>,
     routes: Vec<RouteInfo>,
@@ -406,6 +406,7 @@ pub fn run_server(
     not_found_handler: Option<Py<PyAny>>,
     app: Option<Py<PyAny>>,
     validation_handler: Option<Py<PyAny>>,
+    swagger_ui_oauth2_redirect_url: Option<String>,
 ) -> PyResult<()> {
     // Stash the user's 404 handler so the Rust Router fallback can dispatch
     // through Python when nothing else matched. Set once per process.
@@ -496,29 +497,41 @@ pub fn run_server(
 
                 // Swagger UI
                 if let Some(ref docs_path) = docs_url {
-                    // FA default oauth2_redirect_url is ``/docs/oauth2-redirect``;
-                    // derive ours from the docs path so custom docs URLs still
-                    // produce the right redirect path.
-                    let oauth_redirect = format!(
-                        "{}/oauth2-redirect",
-                        docs_path.trim_end_matches('/')
-                    );
-                    let swagger_html = SWAGGER_UI_HTML
-                        .replace("__OPENAPI_URL__", oa_url)
-                        .replace("__OAUTH2_REDIRECT_URL__", &oauth_redirect);
+                    // FA parity: ``swagger_ui_oauth2_redirect_url`` from
+                    // the FastAPI app controls the oauth2-redirect path.
+                    //   - ``None`` → omit the ``oauth2RedirectUrl`` JS
+                    //     entry AND skip registering the redirect page.
+                    //   - ``"/custom"`` → embed ``/custom`` in the HTML
+                    //     and serve the redirect page at that path.
+                    let swagger_html = if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
+                        SWAGGER_UI_HTML
+                            .replace("__OPENAPI_URL__", oa_url)
+                            .replace("__OAUTH2_REDIRECT_URL__", oauth_redirect)
+                    } else {
+                        // Strip the entire oauth2RedirectUrl line so the
+                        // rendered HTML has no oauth2 machinery.
+                        SWAGGER_UI_HTML
+                            .replace("__OPENAPI_URL__", oa_url)
+                            .lines()
+                            .filter(|l| !l.contains("oauth2RedirectUrl"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
                     router = router.route(
                         docs_path,
                         get(move || async move {
                             axum::response::Html(swagger_html.clone())
                         }),
                     );
-                    // OAuth2 redirect page (FA default at /docs/oauth2-redirect)
-                    router = router.route(
-                        &oauth_redirect,
-                        get(|| async {
-                            axum::response::Html(SWAGGER_OAUTH2_REDIRECT_HTML)
-                        }),
-                    );
+                    // OAuth2 redirect page — only register when configured.
+                    if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
+                        router = router.route(
+                            oauth_redirect,
+                            get(|| async {
+                                axum::response::Html(SWAGGER_OAUTH2_REDIRECT_HTML)
+                            }),
+                        );
+                    }
                 }
 
                 // ReDoc
