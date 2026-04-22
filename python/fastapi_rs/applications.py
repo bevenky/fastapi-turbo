@@ -964,9 +964,17 @@ def _try_compile_handler(
                 # letting the yield-dep's ``except`` clause observe the
                 # error (the test suite asserts on this).
                 if generators_to_cleanup:
-                    _run_pending_teardowns(
-                        reversed(generators_to_cleanup), throw_exc=exc
-                    )
+                    try:
+                        _run_pending_teardowns(
+                            reversed(generators_to_cleanup), throw_exc=exc
+                        )
+                    except Exception as _te_exc:
+                        # FA parity: yield-dep swallowed the handler's
+                        # exception and teardown raised ``FastAPIError``.
+                        # Capture & replace ``exc`` so downstream
+                        # capture + handler logic sees the FastAPIError.
+                        exc = _te_exc
+                        _raised_exc = _te_exc
                     generators_to_cleanup.clear()
                 # Capture non-HTTP exceptions FIRST so ``TestClient``
                 # with ``raise_server_exceptions=True`` can re-raise
@@ -983,7 +991,7 @@ def _try_compile_handler(
                     handler_result = _app._invoke_exception_handler(exc)
                     if handler_result is not None:
                         return handler_result
-                raise
+                raise exc
             # Apply response_model filtering (P0 fix #5)
             if response_model is not None:
                 try:
@@ -1125,6 +1133,7 @@ def _run_pending_teardowns(
             gen, loop, _scope = tup
         else:
             gen, loop = tup
+        swallowed_handler_exc = False
         try:
             if loop == "worker":
                 from fastapi_rs._async_worker import submit as _submit
@@ -1133,25 +1142,33 @@ def _run_pending_teardowns(
                         _submit(gen.athrow(throw_exc))
                     else:
                         _submit(gen.__anext__())
+                    if throw_exc is not None:
+                        swallowed_handler_exc = True
                 except StopAsyncIteration:
-                    pass
+                    if throw_exc is not None:
+                        swallowed_handler_exc = True
             elif loop is not None:
                 try:
                     if throw_exc is not None and hasattr(gen, "athrow"):
                         loop.run_until_complete(gen.athrow(throw_exc))
                     else:
                         loop.run_until_complete(gen.__anext__())
+                    if throw_exc is not None:
+                        swallowed_handler_exc = True
                 except StopAsyncIteration:
-                    pass
+                    if throw_exc is not None:
+                        swallowed_handler_exc = True
                 finally:
                     loop.close()
             else:
                 if throw_exc is not None:
                     gen.throw(throw_exc)
+                    swallowed_handler_exc = True
                 else:
                     next(gen)
         except StopIteration:
-            pass
+            if throw_exc is not None:
+                swallowed_handler_exc = True
         except BaseException as exc:  # noqa: BLE001
             # Teardown-raised errors:
             # - if we threw the original exception in and the generator
@@ -1167,6 +1184,18 @@ def _run_pending_teardowns(
                 raise
             # else: swallow silently.
             pass
+        # FA parity: when the handler raised and a yield-dep's
+        # post-yield ``except`` clause swallows the exception (generator
+        # returns normally instead of re-raising), FA raises
+        # ``FastAPIError`` with this specific message to flag the
+        # broken dependency pattern.
+        if swallowed_handler_exc:
+            from fastapi_rs.exceptions import FastAPIError as _FE
+            raise _FE(
+                "No response returned. Either the view returned nothing "
+                "or it is raising an exception and a dependency with "
+                "yield caught the exception."
+            ) from throw_exc
 
 
 # Imports hoisted to module-level for the hot path (used by wrapped endpoints)
