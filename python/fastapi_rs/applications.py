@@ -580,7 +580,21 @@ def _build_default_route_handler(route, app):
                     else:
                         kwargs[nm] = parsed
                 except _PyVE as exc:
-                    raise _RVE(exc.errors(), body=parsed) from None
+                    # FA parity: prepend ``"body"`` to each error's
+                    # ``loc`` tuple and strip the pydantic-only ``url``
+                    # / ``ctx`` keys so the JSON response matches FA's
+                    # shape exactly (``loc: ["body"]`` for root errors,
+                    # ``loc: ["body", "field"]`` for field errors).
+                    errs = []
+                    for err in exc.errors():
+                        new_err = {
+                            k: v for k, v in err.items()
+                            if k not in ("url", "ctx")
+                        }
+                        loc = list(new_err.get("loc", ()))
+                        new_err["loc"] = ["body", *loc] if loc else ["body"]
+                        errs.append(new_err)
+                    raise _RVE(errs, body=parsed) from None
             elif kd == "query":
                 # Pull from request.query_params; honour marker's alias/default.
                 alias = getattr(p["marker"], "alias", None) or nm
@@ -3403,6 +3417,11 @@ class FastAPI:
         include_deps = include_deps or []
         include_responses = include_responses or {}
         include_callbacks = include_callbacks or []
+        # Router-level ``APIRouter(callbacks=...)`` propagates to every
+        # route inside it, stacked on top of outer ``include_callbacks``.
+        effective_callbacks = list(include_callbacks) + list(
+            getattr(router, "callbacks", []) or []
+        )
         collected: list[dict[str, Any]] = []
 
         full_prefix = prefix + router.prefix
@@ -3545,7 +3564,7 @@ class FastAPI:
                     ),
                     "openapi_extra": getattr(route, "openapi_extra", {}),
                     "security": getattr(route, "security", None),
-                    "callbacks": list(include_callbacks or []) + list(
+                    "callbacks": list(effective_callbacks) + list(
                         getattr(route, "callbacks", []) or []
                     ),
                     "servers": getattr(route, "servers", None),
@@ -3930,7 +3949,7 @@ class FastAPI:
                     ),
                     "openapi_extra": getattr(route, "openapi_extra", {}),
                     "security": getattr(route, "security", None),
-                    "callbacks": list(include_callbacks or []) + list(
+                    "callbacks": list(effective_callbacks) + list(
                         getattr(route, "callbacks", []) or []
                     ),
                     "servers": getattr(route, "servers", None),
@@ -3984,11 +4003,12 @@ class FastAPI:
                 child_gfn = getattr(router, "generate_unique_id_function", None)
             if child_gfn is None:
                 child_gfn = include_generate_unique_id_function
-            # Callbacks cascade too: accumulate outer ``include_callbacks``
-            # with the child include's own ``callbacks=`` list so descendant
+            # Callbacks cascade too: accumulate outer ``effective_callbacks``
+            # (which already folded in this router's own callbacks) with
+            # the child include's own ``callbacks=`` list so descendant
             # routes inherit them.
             merged_callbacks = (
-                list(include_callbacks or [])
+                list(effective_callbacks)
                 + list(child_meta.get("callbacks", []) or [])
             )
             collected.extend(
@@ -4010,8 +4030,14 @@ class FastAPI:
 
     def _collect_all_routes(self) -> list[dict[str, Any]]:
         """Walk the root router and all included routers, returning a flat list."""
+        # App-level callbacks propagate to every top-level route's
+        # ``operation.callbacks`` — same as route-level/include-level.
+        _app_callbacks = list(getattr(self, "callbacks", []) or [])
         # Routes registered directly on self.router
-        all_routes = self._collect_routes_from_router(self.router)
+        all_routes = self._collect_routes_from_router(
+            self.router,
+            include_callbacks=_app_callbacks,
+        )
 
         # Routers added via app.include_router(...)
         for router, prefix, tags, meta in self._included_routers:
@@ -4026,7 +4052,7 @@ class FastAPI:
                     include_in_schema=meta.get("include_in_schema", True),
                     include_default_response_class=meta.get("default_response_class"),
                     include_generate_unique_id_function=meta.get("generate_unique_id_function"),
-                    include_callbacks=meta.get("callbacks", []),
+                    include_callbacks=_app_callbacks + list(meta.get("callbacks") or []),
                 )
             )
 

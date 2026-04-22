@@ -296,6 +296,33 @@ def generate_openapi_schema(
                     )
                 else:
                     _seen_operation_ids[op_id] = (path, method)
+            # FA also walks callback operations for duplicate-op-id detection
+            # — the same callback route referenced from multiple top-level
+            # routes emits its op_id many times, which should surface as a
+            # UserWarning.
+            _callbacks = operation.get("callbacks") or {}
+            if isinstance(_callbacks, dict):
+                for _cb_name, _cb_paths in _callbacks.items():
+                    if not isinstance(_cb_paths, dict):
+                        continue
+                    for _cb_path, _cb_methods in _cb_paths.items():
+                        if not isinstance(_cb_methods, dict):
+                            continue
+                        for _cb_method, _cb_op in _cb_methods.items():
+                            if not isinstance(_cb_op, dict):
+                                continue
+                            _cb_op_id = _cb_op.get("operationId")
+                            if not _cb_op_id:
+                                continue
+                            if _cb_op_id in _seen_operation_ids:
+                                import warnings as _w2
+                                _w2.warn(
+                                    f"Duplicate Operation ID {_cb_op_id} for function "
+                                    f"{route['handler_name']}",
+                                    stacklevel=1,
+                                )
+                            else:
+                                _seen_operation_ids[_cb_op_id] = (_cb_path, _cb_method)
             schema["paths"].setdefault(path, {})[method.lower()] = operation
 
             # Hoist any synthesized Body_<handler> form/file schema into
