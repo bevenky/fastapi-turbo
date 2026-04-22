@@ -426,6 +426,7 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
         # Propagate example/examples/description from markers for OpenAPI
         example_val = None
         examples_val = None
+        openapi_examples_val = None
         title_val = None
         description_val = None
         include_in_schema_val = True
@@ -433,6 +434,7 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
         if marker is not None:
             example_val = getattr(marker, "example", None)
             examples_val = getattr(marker, "examples", None)
+            openapi_examples_val = getattr(marker, "openapi_examples", None)
             title_val = getattr(marker, "title", None)
             description_val = getattr(marker, "description", None)
             include_in_schema_val = getattr(marker, "include_in_schema", True)
@@ -506,6 +508,7 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
                 "media_type": media_type_override,
                 "example": example_val,
                 "examples": examples_val,
+                "openapi_examples": openapi_examples_val,
                 "title": title_val,
                 "description": description_val,
                 "include_in_schema": include_in_schema_val,
@@ -670,7 +673,11 @@ def _maybe_expand_param_models(params: list[dict[str, Any]]) -> list[dict[str, A
                 "enum_class": None,
                 "container_type": None,
                 "_is_optional": sub_is_optional,
-                "_enum_values": None,
+                "_enum_values": (
+                    list(typing.get_args(field_ann))
+                    if typing.get_origin(field_ann) is typing.Literal
+                    else None
+                ),
                 "_unwrapped_annotation": _unwrap_optional(field_ann),
                 "_raw_marker": None,
                 "_raw_annotation": field_ann,
@@ -678,6 +685,7 @@ def _maybe_expand_param_models(params: list[dict[str, Any]]) -> list[dict[str, A
                 # OpenAPI uses this to emit the field name + rich type.
                 "_param_model_field_name": field_name,
                 "_param_model_owner": handler_var,
+                "_param_model_class": model_cls,
                 "_param_model_schema_type_hint": schema_type_hint,
                 "_param_model_container_type": sub_container,
                 "_param_model_field_info": field_info,
@@ -1343,6 +1351,16 @@ def _is_body_type(annotation) -> bool:
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
             return True
     except ImportError:
+        pass
+
+    # Python ``@dataclass`` classes — FA treats them as body params
+    # (goes through a Pydantic TypeAdapter under the hood).
+    try:
+        import dataclasses as _dc
+
+        if isinstance(annotation, type) and _dc.is_dataclass(annotation):
+            return True
+    except Exception:  # noqa: BLE001
         pass
 
     # Bare `dict` / `Dict` always goes to body — arbitrary key/value can't

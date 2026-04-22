@@ -90,6 +90,12 @@ def generate_openapi_schema(
         for p in route.get("params", []):
             if p.get("kind") in ("body", "form", "file"):
                 _note_model_usage(p.get("model_class"), "input")
+            # Param-model-expansion fields carry the owning BaseModel on
+            # ``_param_model_class``. Register its component schema too
+            # (``Annotated[FormData, Form()]`` → ``FormData`` schema).
+            _pmc = p.get("_param_model_class")
+            if _pmc is not None and p.get("kind") in ("form", "file"):
+                _note_model_usage(_pmc, "input")
             _collect_enum_class(p.get("enum_class"))
         _note_model_usage(route.get("response_model"), "output")
         for resp_info in (route.get("responses") or {}).values():
@@ -141,6 +147,13 @@ def generate_openapi_schema(
             if _inner_ann is not None:
                 for sub in _flatten_annotation_types(_inner_ann):
                     _register_model(sub)
+            # Param-model expansion keeps the owning BaseModel on
+            # ``_param_model_class``. Only register for Form/File where
+            # the schema IS emitted under components; Query/Header/
+            # Cookie param-models are flattened into parameters only.
+            _pmc = p.get("_param_model_class")
+            if _pmc is not None and p.get("kind") in ("form", "file"):
+                _register_model(_pmc)
         _register_model(route.get("response_model"))
         for sub in _flatten_annotation_types(route.get("response_model")):
             _register_model(sub)
@@ -548,10 +561,14 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
             return True
         return False
 
+    # FA emits 422 even when the param is ``include_in_schema=False`` —
+    # the hidden param can still fail validation; the error response
+    # just references HTTPValidationError (the hidden param doesn't
+    # appear in ``parameters``).
     has_validated_params = any(
         _param_can_fail_validation(p)
         for p in route.get("params", [])
-        if p.get("include_in_schema", True) and p.get("_is_handler_param", False)
+        if p.get("_is_handler_param", False)
     )
     if has_validated_params and "422" not in responses_dict:
         responses_dict["422"] = {
@@ -844,6 +861,7 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
     ua = param.get("_unwrapped_annotation")
     inner_schema = None
     list_inner_ann = None
+    _bare_list = False
     if ua is not None:
         # Peel list containers to get the item annotation.
         import typing as _typing
@@ -852,12 +870,18 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
             args = _typing.get_args(ua)
             if args:
                 list_inner_ann = args[0]
+        elif ua in (list, tuple, set, frozenset):
+            # Bare ``list`` / ``tuple`` / ``set`` — FA emits ``items: {}``.
+            _bare_list = True
         else:
             inner_schema = _schema_for_annotation(ua)
     if inner_schema is None:
-        inner_schema = _type_hint_to_schema(
-            _schema_type_hint, inner_annotation=list_inner_ann
-        )
+        if _bare_list:
+            inner_schema = {"type": "array", "items": {}}
+        else:
+            inner_schema = _type_hint_to_schema(
+                _schema_type_hint, inner_annotation=list_inner_ann
+            )
 
     # Apply constraint metadata to the INNER schema first, then decide
     # whether to wrap it in an anyOf for Optional[...] params. FA
@@ -1099,6 +1123,43 @@ def _build_form_file_body(
     from pydantic import create_model, Field as _PField
     from typing import Optional, Any as _Any
 
+    # Form taking a BaseModel directly (``data: FormData = Form()``) —
+    # FA emits the MODEL's own schema under
+    # ``components.schemas.<ModelName>`` rather than synthesising a
+    # ``Body_<endpoint>`` wrapper. Our ``_maybe_expand_param_models``
+    # already flattened the model into individual form extraction
+    # entries; detect this case by checking every ``form_params`` entry
+    # shares the same ``_param_model_owner`` and class.
+    if form_params and not file_params:
+        from pydantic import BaseModel as _BM
+        _owners = {fp.get("_param_model_owner") for fp in form_params}
+        _classes = {fp.get("_param_model_class") for fp in form_params}
+        _model_cls = next(iter(_classes), None) if len(_classes) == 1 else None
+        if (
+            len(_owners) == 1
+            and next(iter(_owners)) is not None
+            and _model_cls is not None
+            and isinstance(_model_cls, type)
+            and issubclass(_model_cls, _BM)
+        ):
+            _marker = form_params[0].get("_raw_marker")
+            _media = getattr(_marker, "media_type", None) or "application/x-www-form-urlencoded"
+            # FormData's schema lands in components.schemas via
+            # ``_collect_schemas`` (which walks ``_param_model_class``).
+            # FA adds ``additionalProperties: False`` for form models to
+            # reject unknown fields; we patch that in post-pass when the
+            # form is the sole body.
+            return {
+                "content": {
+                    _media: {
+                        "schema": {
+                            "$ref": f"#/components/schemas/{_model_cls.__name__}"
+                        }
+                    }
+                },
+                "required": True,
+            }
+
     type_map = {"int": int, "float": float, "bool": bool, "str": str, "bytes": bytes}
     field_defs: dict[str, Any] = {}
 
@@ -1204,7 +1265,16 @@ def _build_form_file_body(
             "type": "string",
             "contentMediaType": "application/octet-stream",
         }
-        if fp.get("type_hint", "").startswith("list_"):
+        # Detect list-of-files via type_hint OR the unwrapped annotation
+        # (``list[UploadFile]`` has type_hint="file" but is still a list).
+        import typing as _fp_typing
+        _ua = fp.get("_unwrapped_annotation")
+        _is_list = fp.get("type_hint", "").startswith("list_") or (
+            _fp_typing.get_origin(_ua) in (list, tuple, set, frozenset)
+            if _ua is not None
+            else False
+        )
+        if _is_list:
             schema = {"items": base_item, "type": "array"}
         else:
             schema = dict(base_item)
@@ -1221,10 +1291,10 @@ def _build_form_file_body(
     if not body_schema["required"]:
         body_schema.pop("required", None)
 
-    # Reorder properties to match the handler's signature declaration
-    # order (FastAPI preserves that — our Pydantic-generated body puts
-    # form fields first then file fields, which differs when the user
-    # wrote `title, description, file, tags`).
+    # Reorder properties AND required to match the handler's signature
+    # declaration order (FastAPI preserves that — our Pydantic-generated
+    # body puts form fields first then file fields, which differs when
+    # the user wrote `title, description, file, tags`).
     if ordered_mixed:
         props = body_schema.get("properties", {})
         ordered_keys: list[str] = []
@@ -1236,12 +1306,25 @@ def _build_form_file_body(
             if k not in ordered_keys:
                 ordered_keys.append(k)
         body_schema["properties"] = {k: props[k] for k in ordered_keys}
+        # Reorder required to match — FA emits them in signature order.
+        if body_schema.get("required"):
+            existing = set(body_schema["required"])
+            body_schema["required"] = [k for k in ordered_keys if k in existing]
 
     media_type = "multipart/form-data" if file_params else "application/x-www-form-urlencoded"
-    return {
-        "required": True,
+    # FA only emits ``required: True`` when the body has at least one
+    # actually-required field. An endpoint like
+    # ``file: bytes | None = File(default=None)`` has
+    # ``required: False`` → no ``required`` key in requestBody.
+    _has_required = any(
+        fp.get("required", True) for fp in (form_params + file_params)
+    )
+    body: dict[str, Any] = {
         "content": {media_type: {"schema": body_schema}},
     }
+    if _has_required:
+        body["required"] = True
+    return body
 
 
 def _build_request_body(param: dict[str, Any]) -> dict[str, Any]:
@@ -1325,8 +1408,24 @@ def _build_request_body(param: dict[str, Any]) -> dict[str, Any]:
     content: dict[str, Any] = {media_type: {"schema": body_schema}}
     if param.get("example") is not None:
         content[media_type]["example"] = param["example"]
+    # ``Body(examples=[...])`` — FA inlines as a LIST on the inner
+    # schema (OpenAPI 3.1 allows ``schema.examples`` as an array).
+    # ``Body(openapi_examples={"name": {"value": ...}})`` — FA emits at
+    # content level as a named-examples DICT.
     if param.get("examples") is not None:
-        content[media_type]["examples"] = _normalize_examples(param["examples"])
+        raw = param["examples"]
+        if isinstance(raw, list):
+            # Inline as schema.examples (the new Pydantic-ish form).
+            # Wrap $ref in an allOf to permit extra keys.
+            inner = body_schema
+            if isinstance(inner, dict) and "$ref" in inner:
+                inner.setdefault("examples", list(raw))
+            else:
+                inner.setdefault("examples", list(raw))
+        elif isinstance(raw, dict):
+            content[media_type]["examples"] = raw
+    if param.get("openapi_examples") is not None:
+        content[media_type]["examples"] = _normalize_examples(param["openapi_examples"])
 
     # Match FA's ``get_openapi_operation_request_body``: emit
     # ``"required"`` only when the body is required, not always.
@@ -1559,6 +1658,14 @@ def _collect_schemas(
         if inner is not None:
             for sub in _flatten_annotation_types(inner):
                 _collect_model_schemas(sub, schemas)
+        # Param-model expansion's owning class. For ``Form()`` models we
+        # emit the BaseModel schema in ``components.schemas`` (so
+        # ``$ref: FormData`` resolves); for ``Query()`` / ``Header()`` /
+        # ``Cookie()`` param models FA does NOT emit a component — the
+        # model's fields are flattened into individual ``parameters``.
+        _pmc = param.get("_param_model_class")
+        if _pmc is not None and param.get("kind") in ("form", "file"):
+            _collect_model_schemas(_pmc, schemas)
 
     # From route.responses (extra status codes with models).
     # ``responses={404: {"model": list[Message]}}`` — walk container
