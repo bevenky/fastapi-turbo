@@ -3133,20 +3133,59 @@ class FastAPI:
             ) and not getattr(route, "response_class", None):
                 _orig_endpoint = endpoint
                 _is_async_gen = inspect.isasyncgenfunction(endpoint)
+                # FA parity: when the return annotation is
+                # ``AsyncIterable[Item]`` / ``Iterable[Item]``, validate
+                # each yielded item against ``Item`` and raise
+                # ``ResponseValidationError`` on mismatch — mirrors real
+                # FA's streaming validation path.
+                _item_adapter = None
+                _rm = getattr(route, "response_model", None)
+                import typing as _tp
+                import collections.abc as _cabc
+                if _tp.get_origin(_rm) in {
+                    _cabc.AsyncIterable, _cabc.AsyncIterator,
+                    _cabc.AsyncGenerator, _cabc.Iterable,
+                    _cabc.Iterator, _cabc.Generator,
+                }:
+                    _args = _tp.get_args(_rm)
+                    if _args:
+                        try:
+                            from pydantic import TypeAdapter as _TA
+                            _item_adapter = _TA(_args[0])
+                        except Exception:  # noqa: BLE001
+                            _item_adapter = None
 
-                def _json_lines_wrap(_orig=_orig_endpoint, _is_a=_is_async_gen, **kwargs):
+                def _json_lines_wrap(
+                    _orig=_orig_endpoint, _is_a=_is_async_gen,
+                    _ta=_item_adapter, **kwargs,
+                ):
                     from fastapi_rs.responses import StreamingResponse as _SR
                     from fastapi_rs.encoders import jsonable_encoder as _je
+                    from fastapi_rs.exceptions import (
+                        ResponseValidationError as _RVE,
+                    )
                     import json as _json
+                    def _check(item):
+                        if _ta is None:
+                            return item
+                        try:
+                            return _ta.validate_python(item)
+                        except Exception as exc:  # noqa: BLE001
+                            from pydantic import ValidationError as _PyVE
+                            if isinstance(exc, _PyVE):
+                                raise _RVE(errors=exc.errors(), body=item) from None
+                            raise
                     if _is_a:
                         async def _iter_async():
                             async for item in _orig(**kwargs):
-                                yield (_json.dumps(_je(item)) + "\n").encode("utf-8")
+                                validated = _check(item)
+                                yield (_json.dumps(_je(validated)) + "\n").encode("utf-8")
                         return _SR(_iter_async(), media_type="application/jsonl")
                     else:
                         def _iter_sync():
                             for item in _orig(**kwargs):
-                                yield (_json.dumps(_je(item)) + "\n").encode("utf-8")
+                                validated = _check(item)
+                                yield (_json.dumps(_je(validated)) + "\n").encode("utf-8")
                         return _SR(_iter_sync(), media_type="application/jsonl")
 
                 endpoint = _json_lines_wrap
