@@ -160,7 +160,35 @@ class APIRoute:
                 derived = _ra
             except (TypeError, ValueError, NameError):
                 pass
+            # FA parity: ``-> Response`` (or subclass) is a RESPONSE-CLASS
+            # hint, not a Pydantic response_model. Drop it so the route
+            # bypasses response_model filtering.
+            try:
+                from fastapi_rs.responses import Response as _RespCls
+                if isinstance(derived, type) and issubclass(derived, _RespCls):
+                    derived = None
+            except ImportError:
+                pass
             response_model = derived
+            # FA parity: validate the DERIVED response_model too —
+            # ``def f() -> Response | None`` (Union of Response + None)
+            # should error at decoration because ``Response`` isn't a
+            # valid Pydantic field type. Pure ``Response`` was already
+            # dropped above.
+            if response_model is not None:
+                try:
+                    APIRouter._assert_response_models_are_valid(
+                        {"response_model": response_model},
+                    )
+                except Exception as _e:
+                    from fastapi_rs.exceptions import FastAPIError as _FAErr
+                    if isinstance(_e, _FAErr):
+                        raise _FAErr(
+                            str(_e) + " If you don't need to use the "
+                            "response field, you can set the parameter "
+                            "response_model=None to skip response model generation."
+                        ) from None
+                    raise
         elif response_model is None:
             # Explicit ``response_model=None`` — FA treats this as "skip
             # response-model filtering entirely, even if the handler has
