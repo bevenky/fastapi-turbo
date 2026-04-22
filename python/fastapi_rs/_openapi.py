@@ -440,6 +440,10 @@ def generate_openapi_schema(
             if not wh.get("include_in_schema", True):
                 continue
             name = wh.get("name") or wh["path"].lstrip("/")
+            # Mark the route so ``_build_operation`` strips the leading
+            # ``/`` when deriving operationId (FA treats webhook paths
+            # as event names, not URLs).
+            wh = {**wh, "_is_webhook": True}
             for method in wh["methods"]:
                 op = _build_operation(wh, method.lower())
                 wh_dict.setdefault(name, {})[method.lower()] = op
@@ -463,7 +467,7 @@ def generate_openapi_schema(
         if isinstance(node, list):
             return any(_uses_validation_ref(v) for v in node)
         return False
-    _needs_validation_schemas = _uses_validation_ref(schema["paths"])
+    _needs_validation_schemas = _uses_validation_ref(schema["paths"]) or _uses_validation_ref(schema.get("webhooks") or {})
     if _needs_validation_schemas:
         components_schemas.setdefault("ValidationError", {
             "title": "ValidationError",
