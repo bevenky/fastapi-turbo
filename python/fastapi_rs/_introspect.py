@@ -91,6 +91,11 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             and typing.get_origin(param.annotation) is typing.Annotated
         ):
             annotation = param.annotation
+        # PEP 695 ``TypeAliasType`` (e.g. ``type Foo = Annotated[int, Depends(x)]``
+        # or ``TypeAliasType("Foo", Annotated[int, Depends(x)], ...)``): unwrap
+        # ``.__value__`` so the inner ``Annotated`` is what we introspect.
+        if hasattr(annotation, "__value__") and type(annotation).__name__ == "TypeAliasType":
+            annotation = annotation.__value__
         default = param.default
         model_class = None
         alias = None

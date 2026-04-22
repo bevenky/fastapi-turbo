@@ -439,10 +439,28 @@ class ORJSONResponse(Response):
 
     media_type = "application/json"
 
+    def __init__(self, *args, **kwargs):
+        import warnings as _warnings
+        from fastapi_rs.exceptions import FastAPIDeprecationWarning as _W
+        _warnings.warn(
+            "ORJSONResponse is deprecated and will be removed in a future "
+            "version. Use JSONResponse with orjson serialization instead.",
+            _W,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
+
     def render(self, content) -> bytes:
         try:
             import orjson
-            return orjson.dumps(content, default=float)
+            # FA parity: ``OPT_NON_STR_KEYS`` lets handlers return dicts
+            # with non-string keys (e.g. ``quoted_name`` from SQLAlchemy,
+            # integers) — same behaviour as fastapi.responses.ORJSONResponse.
+            return orjson.dumps(
+                content,
+                default=float,
+                option=orjson.OPT_NON_STR_KEYS,
+            )
         except ImportError:
             import json
             return json.dumps(content, ensure_ascii=False, default=str).encode("utf-8")
