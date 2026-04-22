@@ -261,19 +261,21 @@ fn inject_framework_objects(
 /// the response is flushed, matching FastAPI/Starlette semantics.
 /// The handler doesn't wait for task completion.
 fn drain_background_tasks(
-    py: Python<'_>,
+    _py: Python<'_>,
     kwargs: &Bound<'_, PyDict>,
     params: &[ParamInfo],
 ) {
+    let mut seen_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for param in params {
         if param.kind == "inject_background_tasks" {
             if let Ok(Some(bg_obj)) = kwargs.get_item(&param.name) {
-                // Extract the BackgroundTasks instance as an unbound Py<PyAny>
-                // so we can ship it to a detached blocking thread.
-                let owned: Py<PyAny> = bg_obj.clone().unbind();
-                // Only spawn if there's work queued — inspect via _tasks attr.
-                let has_tasks = owned
-                    .bind(py)
+                // Dedup across params — multiple inject_background_tasks
+                // params may share one BackgroundTasks instance.
+                let obj_id = bg_obj.as_ptr() as usize;
+                if !seen_ids.insert(obj_id) {
+                    continue;
+                }
+                let has_tasks = bg_obj
                     .getattr("_tasks")
                     .ok()
                     .and_then(|t| t.len().ok())
@@ -282,11 +284,11 @@ fn drain_background_tasks(
                 if !has_tasks {
                     continue;
                 }
-                tokio::task::spawn_blocking(move || {
-                    Python::attach(|py| {
-                        let _ = owned.bind(py).call_method0("run_sync");
-                    });
-                });
+                // Run tasks SYNCHRONOUSLY while holding the GIL so the
+                // response doesn't return before tasks execute —
+                // matches Starlette's post-response event-loop drain
+                // from a test-observable standpoint.
+                let _ = bg_obj.call_method0("run_sync");
             }
         }
     }
@@ -797,6 +799,71 @@ struct WsRouteState {
     is_async: bool,
 }
 
+// Shared WS dispatch — extracts scope info from the HTTP request parts and
+// invokes the user's WebSocket handler via `handle_ws_upgrade`. Used by
+// both the dedicated `ws_router` and the GET dispatcher we build when a WS
+// route shares its path with HTTP routes (Strawberry GraphQLRouter).
+async fn dispatch_ws(
+    ws: WebSocketUpgrade,
+    path_map: HashMap<String, String>,
+    req_parts: &axum::http::request::Parts,
+    handler: Py<PyAny>,
+    is_async: bool,
+) -> Response {
+    let uri = &req_parts.uri;
+    let path = uri.path().to_string();
+    let raw_path = path.as_bytes().to_vec();
+    let query_string = uri.query().map(|q| q.as_bytes().to_vec()).unwrap_or_default();
+    let headers: Vec<(String, String)> = req_parts
+        .headers
+        .iter()
+        .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
+        .collect();
+    let host = req_parts
+        .headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let scheme = if req_parts
+        .headers
+        .get("x-forwarded-proto")
+        .map(|v| v.to_str().unwrap_or("") == "https")
+        .unwrap_or(false)
+    {
+        "wss"
+    } else {
+        "ws"
+    }
+    .to_string();
+    let client: Option<(String, u16)> = None;
+    let ws_path_params: Vec<(String, String)> =
+        path_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let subprotocols: Vec<String> = req_parts
+        .headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let scope = crate::websocket::WsScopeInfo {
+        path,
+        raw_path,
+        query_string,
+        headers,
+        client,
+        scheme,
+        host,
+        path_params: ws_path_params,
+        subprotocols,
+    };
+    handle_ws_upgrade(ws, handler, is_async, scope).await
+}
+
 // ── Router builder ────────────────────────────────────────────────────
 
 /// Build `(http_router, ws_router)`. The HTTP branch is returned *without*
@@ -810,7 +877,21 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
     // Accumulate MethodRouter per axum-path so we can merge multiple
     // @app.get/post decorators on the same path, and only then attach the
     // OPTIONS/405 fallbacks (which must be added exactly once per path).
-    let mut by_path: Vec<(String, MethodRouter, Vec<String>, bool)> = Vec::new();
+    // The 5th element preserves the optional GET RouteState so a later
+    // WS-route collision can rewire the GET to a WS-upgrade dispatcher
+    // (Strawberry GraphQLRouter: /graphql serves GET/POST AND a WS sub).
+    let mut by_path: Vec<(
+        String,
+        MethodRouter,
+        Vec<String>,
+        bool,
+        Option<Arc<RouteState>>,
+    )> = Vec::new();
+    // Paths with a WS route. Collision-free paths go on `ws_router`;
+    // paths shared with HTTP get a combined GET dispatcher on the main
+    // router (axum can't merge two routers when both have method-router
+    // fallbacks on the same path).
+    let mut ws_by_path: HashMap<String, Arc<WsRouteState>> = HashMap::new();
 
     for route in routes {
         let axum_path = convert_path(&route.path);
@@ -820,95 +901,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                 handler: Python::attach(|py| route.handler.clone_ref(py)),
                 is_async: route.is_async,
             });
-            ws_router = ws_router.route(
-                &axum_path,
-                any(
-                    move |ws: WebSocketUpgrade,
-                          path_params: Option<Path<HashMap<String, String>>>,
-                          req_parts: axum::http::request::Parts| {
-                        let state = ws_state.clone();
-                        async move {
-                            let h = Python::attach(|py| state.handler.clone_ref(py));
-                            let is_a = state.is_async;
-
-                            // Extract path params from the axum extractor
-                            let path_map = path_params.map(|Path(m)| m).unwrap_or_default();
-
-                            // Populate scope info from the upgrade request
-                            let uri = &req_parts.uri;
-                            let path = uri.path().to_string();
-                            let raw_path = path.as_bytes().to_vec();
-                            let query_string = uri
-                                .query()
-                                .map(|q| q.as_bytes().to_vec())
-                                .unwrap_or_default();
-                            let headers: Vec<(String, String)> = req_parts
-                                .headers
-                                .iter()
-                                .map(|(k, v)| {
-                                    (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned())
-                                })
-                                .collect();
-                            let host = req_parts
-                                .headers
-                                .get("host")
-                                .and_then(|h| h.to_str().ok())
-                                .unwrap_or("")
-                                .to_string();
-                            let scheme = if req_parts
-                                .headers
-                                .get("x-forwarded-proto")
-                                .map(|v| v.to_str().unwrap_or("") == "https")
-                                .unwrap_or(false)
-                            {
-                                "wss"
-                            } else {
-                                "ws"
-                            }
-                            .to_string();
-                            // ConnectInfo requires into_make_service_with_connect_info —
-                            // fall back to None for now. Users can read X-Forwarded-For from headers.
-                            let client: Option<(String, u16)> = None;
-
-                            let ws_path_params: Vec<(String, String)> = path_map
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect();
-
-                            // Parse client-offered subprotocols from the
-                            // ``Sec-WebSocket-Protocol`` header (comma-
-                            // separated list of tokens).
-                            let subprotocols: Vec<String> = req_parts
-                                .headers
-                                .get("sec-websocket-protocol")
-                                .and_then(|v| v.to_str().ok())
-                                .map(|s| {
-                                    s.split(',')
-                                        .map(|t| t.trim().to_string())
-                                        .filter(|t| !t.is_empty())
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-
-                            let scope = crate::websocket::WsScopeInfo {
-                                path,
-                                raw_path,
-                                query_string,
-                                headers,
-                                client,
-                                scheme,
-                                host,
-                                path_params: ws_path_params,
-                                subprotocols,
-                            };
-
-                            // Deferred-upgrade: the handler returns the Response
-                            // (101 or 500) and wires up the upgrade callback internally.
-                            handle_ws_upgrade(ws, h, is_a, scope).await
-                        }
-                    },
-                ),
-            );
+            ws_by_path.insert(axum_path.clone(), ws_state);
             continue;
         }
 
@@ -1032,9 +1025,14 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
         }
 
         if let Some(mr) = method_router {
+            let get_state_opt = if declared_methods.iter().any(|m| m == "GET") {
+                Some(state.clone())
+            } else {
+                None
+            };
             // Merge with any existing accumulator for this path so that
             // `@app.get("/x")` and `@app.post("/x")` end up on one MethodRouter.
-            if let Some(entry) = by_path.iter_mut().find(|(p, _, _, _)| p == &axum_path) {
+            if let Some(entry) = by_path.iter_mut().find(|(p, _, _, _, _)| p == &axum_path) {
                 // FA parity: defining the SAME method twice on the same
                 // path keeps the FIRST handler and silently drops later
                 // registrations. Axum's ``merge`` panics on this, so
@@ -1051,6 +1049,9 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     entry.1 = merged;
                     entry.2.extend(declared_methods);
                     entry.3 = entry.3 || has_explicit_options;
+                    if entry.4.is_none() {
+                        entry.4 = get_state_opt;
+                    }
                 } else {
                     // Mixed case: some methods new, some duplicate. Skip
                     // the whole route since we can't split the
@@ -1060,7 +1061,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     );
                 }
             } else {
-                by_path.push((axum_path, mr, declared_methods, has_explicit_options));
+                by_path.push((axum_path, mr, declared_methods, has_explicit_options, get_state_opt));
             }
         }
     }
@@ -1072,12 +1073,105 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
     //   - OPTIONS and HEAD on a GET-only route both return 405, matching
     //     Starlette. If the user wants OPTIONS (CORS preflight), they should
     //     mount CORSMiddleware or declare OPTIONS explicitly.
-    for (path, mut mr, declared, _had_options) in by_path {
+    for (path, mut mr, declared, _had_options, get_state) in by_path {
         // Dedupe while preserving order
         let mut seen = std::collections::HashSet::new();
         let mut allow: Vec<String> = declared.clone();
         allow.retain(|m| seen.insert(m.clone()));
         let allow_header = allow.join(", ");
+
+        // WS + HTTP collide on the same path (Strawberry GraphQLRouter:
+        // GET + POST http queries AND subscription WebSocket at /graphql).
+        // We can't merge the WS MethodRouter (an `any` handler with a
+        // fallback) with the HTTP MethodRouter (specific methods + 405
+        // fallback) — axum panics when both sides have a fallback.
+        // Rebuild this path's method router from scratch with a combined
+        // GET dispatcher that delegates to the WS bridge on upgrade
+        // requests and to the original HTTP GET otherwise.
+        if let (Some(ws_state), Some(s)) = (ws_by_path.remove(&path), get_state.as_ref()) {
+            let mut new_mr: MethodRouter = MethodRouter::new();
+            for m in &declared {
+                if m == "GET" {
+                    continue;
+                }
+                let state_clone = s.clone();
+                let handler_fn = move |path_params: Option<Path<HashMap<String, String>>>,
+                                       query_params: Query<HashMap<String, String>>,
+                                       request: Request<Body>| {
+                    let state = state_clone.clone();
+                    async move {
+                        handle_request(state, path_params, query_params, request).await
+                    }
+                };
+                let piece = match m.as_str() {
+                    "POST" => post(handler_fn),
+                    "PUT" => put(handler_fn),
+                    "DELETE" => delete(handler_fn),
+                    "PATCH" => patch(handler_fn),
+                    "HEAD" => head(handler_fn),
+                    "OPTIONS" => axum::routing::options(handler_fn),
+                    "TRACE" => axum::routing::on(axum::routing::MethodFilter::TRACE, handler_fn),
+                    _ => continue,
+                };
+                new_mr = new_mr.merge(piece);
+            }
+            let http_get_state = s.clone();
+            // Dispatcher: WS upgrade → WS bridge; else HTTP GET handler.
+            // Axum's `WebSocketUpgrade` extractor wants to own the
+            // connection, so it conflicts with taking `Request` alongside
+            // it. Instead, detect the WS handshake headers on the Request
+            // and build a WebSocketUpgrade via `from_request_parts` only
+            // when needed.
+            let get_handler = move |path_params: Option<Path<HashMap<String, String>>>,
+                                    query_params: Query<HashMap<String, String>>,
+                                    request: Request<Body>| {
+                let ws_state = ws_state.clone();
+                let http_state = http_get_state.clone();
+                async move {
+                    let is_ws_upgrade = {
+                        let h = request.headers();
+                        let conn_upgrade = h
+                            .get(axum::http::header::CONNECTION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|v| {
+                                v.to_ascii_lowercase()
+                                    .split(',')
+                                    .any(|p| p.trim() == "upgrade")
+                            })
+                            .unwrap_or(false);
+                        let upgrade_ws = h
+                            .get(axum::http::header::UPGRADE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|v| v.eq_ignore_ascii_case("websocket"))
+                            .unwrap_or(false);
+                        conn_upgrade && upgrade_ws
+                    };
+                    if is_ws_upgrade {
+                        let (mut parts, _body) = request.into_parts();
+                        use axum::extract::FromRequestParts;
+                        match <WebSocketUpgrade as FromRequestParts<()>>::from_request_parts(
+                            &mut parts,
+                            &(),
+                        )
+                        .await
+                        {
+                            Ok(ws) => {
+                                let path_map = path_params
+                                    .as_ref()
+                                    .map(|Path(m)| m.clone())
+                                    .unwrap_or_default();
+                                let h = Python::attach(|py| ws_state.handler.clone_ref(py));
+                                return dispatch_ws(ws, path_map, &parts, h, ws_state.is_async).await;
+                            }
+                            Err(rej) => return rej.into_response(),
+                        }
+                    }
+                    handle_request(http_state, path_params, query_params, request).await
+                }
+            };
+            new_mr = new_mr.merge(get(get_handler));
+            mr = new_mr;
+        }
 
         // FastAPI-parity: HEAD should NOT auto-route to GET. Axum's default
         // behaviour is to fall through to GET when no HEAD handler is set;
@@ -1109,6 +1203,28 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
             }
         });
         router = router.route(&path, mr);
+    }
+
+    // Register remaining WS-only paths (no HTTP counterpart) on the WS
+    // sub-router — merged into the main router *after* CORS/compression
+    // middleware so the 101 upgrade response stays untouched.
+    for (path, ws_state) in ws_by_path {
+        ws_router = ws_router.route(
+            &path,
+            any(
+                move |ws: WebSocketUpgrade,
+                      path_params: Option<Path<HashMap<String, String>>>,
+                      req_parts: axum::http::request::Parts| {
+                    let state = ws_state.clone();
+                    async move {
+                        let h = Python::attach(|py| state.handler.clone_ref(py));
+                        let is_a = state.is_async;
+                        let path_map = path_params.map(|Path(m)| m).unwrap_or_default();
+                        dispatch_ws(ws, path_map, &req_parts, h, is_a).await
+                    }
+                },
+            ),
+        );
     }
 
     (router, ws_router)
