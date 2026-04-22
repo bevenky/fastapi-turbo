@@ -47,6 +47,20 @@ def _get_model_config(model: type) -> dict[str, Any]:
 ModelNameMap = dict
 Undefined = ...  # Sentinel matching pydantic's PydanticUndefined
 
+
+def _pydantic_version_tuple() -> tuple[int, ...]:
+    try:
+        import pydantic as _pd
+        parts = _pd.VERSION.split(".")
+        return tuple(int(p) for p in parts if p.isdigit())
+    except Exception:
+        return (2, 0, 0)
+
+
+PYDANTIC_VERSION_MINOR_TUPLE = _pydantic_version_tuple()[:2]
+PYDANTIC_VERSION = ".".join(str(p) for p in _pydantic_version_tuple())
+PYDANTIC_V2 = _pydantic_version_tuple()[:1] == (2,)
+
 try:
     from pydantic import field_validator, model_validator  # noqa: F401
 except ImportError:

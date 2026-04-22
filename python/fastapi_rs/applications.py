@@ -1500,14 +1500,17 @@ class FastAPI:
         self.license_info = license_info
         self.openapi_tags = openapi_tags
         self.lifespan = lifespan
-        # Handle deprecated openapi_prefix -> root_path alias (Gap 20)
+        # Handle deprecated openapi_prefix -> root_path alias (Gap 20).
+        # FA parity: uses ``logger.warning`` (not ``warnings.warn``) so
+        # it does NOT trip test suites running with
+        # ``filterwarnings = ["error"]``.
         if openapi_prefix and not root_path:
-            import warnings
-            warnings.warn(
-                "openapi_prefix has been deprecated in favor of root_path, "
-                "which follows more closely the ASGI spec.",
-                DeprecationWarning,
-                stacklevel=2,
+            import logging as _log
+            _log.getLogger("fastapi").warning(
+                '"openapi_prefix" has been deprecated in favor of "root_path", '
+                "which follows more closely the ASGI standard, is simpler, and "
+                "more automatic. Check the docs at "
+                "https://fastapi.tiangolo.com/advanced/sub-applications/"
             )
             root_path = openapi_prefix
         self.openapi_prefix = openapi_prefix

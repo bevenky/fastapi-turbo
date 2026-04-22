@@ -123,7 +123,24 @@ def generate_openapi_schema(
     model_class_by_id: dict[int, Any] = {}
 
     def _register_model(mc) -> None:
-        if mc is None or not hasattr(mc, "model_json_schema"):
+        if mc is None:
+            return
+        if not hasattr(mc, "model_json_schema"):
+            # Python dataclasses are registered without Pydantic-specific
+            # field walking — their fields can still be inspected for
+            # nested BaseModel/dataclass refs.
+            if _is_dataclass_type(mc):
+                mid = id(mc)
+                if mid not in seen_model_classes:
+                    seen_model_classes.add(mid)
+                    model_class_by_id[mid] = mc
+                    try:
+                        import dataclasses as _dc
+                        for f in _dc.fields(mc):
+                            for sub in _flatten_annotation_types(f.type):
+                                _register_model(sub)
+                    except Exception:  # noqa: BLE001
+                        pass
             return
         mid = id(mc)
         if mid not in seen_model_classes:
@@ -333,6 +350,40 @@ def generate_openapi_schema(
             components_schemas[name] = _rewrite_split_refs(components_schemas[name], "Output")
         elif usage == {"input"}:
             components_schemas[name] = _rewrite_split_refs(components_schemas[name], "Input")
+
+    # Rewrite split-model refs that appear inline inside path operations
+    # (e.g. ``list[Item]`` response schema → ``items.$ref`` points at the
+    # bare ``#/components/schemas/Item`` which is now ``Item-Output``).
+    # Response bodies always map to ``-Output``, request bodies to
+    # ``-Input``. Walk each operation and apply the direction-aware
+    # rewriter.
+    if split_models:
+        _paths = schema.get("paths") or {}
+        for _path_key, _path_item in _paths.items():
+            if not isinstance(_path_item, dict):
+                continue
+            for _method, _op in _path_item.items():
+                if not isinstance(_op, dict):
+                    continue
+                rb = _op.get("requestBody")
+                if isinstance(rb, dict):
+                    _op["requestBody"] = _rewrite_split_refs(rb, "Input")
+                resps = _op.get("responses")
+                if isinstance(resps, dict):
+                    _op["responses"] = _rewrite_split_refs(resps, "Output")
+
+        # Also propagate through the split variants themselves: each
+        # ``<Name>-Input`` schema's nested refs point at other split
+        # models' ``-Input`` variants, and ``-Output`` at ``-Output``.
+        for _sname in list(components_schemas.keys()):
+            if _sname.endswith("-Input"):
+                components_schemas[_sname] = _rewrite_split_refs(
+                    components_schemas[_sname], "Input"
+                )
+            elif _sname.endswith("-Output"):
+                components_schemas[_sname] = _rewrite_split_refs(
+                    components_schemas[_sname], "Output"
+                )
 
     # Webhooks: top-level OpenAPI 3.1 field. Each webhook is effectively a
     # path-item object keyed by name rather than URL.
@@ -1583,10 +1634,22 @@ def _build_request_body(param: dict[str, Any]) -> dict[str, Any]:
                 body["description"] = param["description"]
             return body
     ref = _model_ref(model_class, mode="validation") if model_class is not None else None
+    if ref is None and model_class is not None:
+        # ``_TypeAdapterProxy`` wraps non-BaseModel annotations like
+        # dataclasses / Unions. Unwrap so we can still $ref when the
+        # inner annotation is a dataclass.
+        inner = getattr(model_class, "_annotation", None)
+        if inner is not None and _is_dataclass_type(inner):
+            ref = {"$ref": f"#/components/schemas/{inner.__name__}"}
     if ref is not None:
         body_schema = ref
     elif model_class is not None and hasattr(model_class, "model_json_schema"):
         body_schema = model_class.model_json_schema(mode="validation")
+    elif model_class is not None and _is_dataclass_type(model_class):
+        # Python ``@dataclass`` bodies — FA uses a Pydantic TypeAdapter
+        # to produce the JSON schema and registers the dataclass under
+        # ``components.schemas`` with a ``$ref`` back to it.
+        body_schema = {"$ref": f"#/components/schemas/{model_class.__name__}"}
     else:
         body_schema = {"type": "object"}
 
@@ -1786,12 +1849,23 @@ def _model_ref(model_class, mode: str | None = None) -> dict[str, str] | None:
     models keep the plain `<Name>` ref.
     """
     name = getattr(model_class, "__name__", None)
-    if not (name and hasattr(model_class, "model_json_schema")):
+    if not name:
+        return None
+    if not hasattr(model_class, "model_json_schema"):
+        # Python dataclass — still emit a $ref to the shared component
+        # (we register its schema via _collect_model_schemas).
+        if _is_dataclass_type(model_class):
+            return {"$ref": f"#/components/schemas/{name}"}
         return None
     name = _normalize_model_name(name)
     usage = _MODEL_USAGE.get(id(model_class), set())
+    _has_cf = _model_has_computed_fields(model_class)
+    # FA forces split whenever the model has a ``computed_field`` (even
+    # with ``separate_input_output_schemas=False``), because the val/ser
+    # shapes genuinely differ. Otherwise honor the flag.
+    _allow_split = _SEPARATE_INPUT_OUTPUT or _has_cf
     split = (
-        _SEPARATE_INPUT_OUTPUT
+        _allow_split
         and "input" in usage and "output" in usage
         and (
             _model_is_self_recursive(model_class)
@@ -1814,6 +1888,17 @@ def _val_ser_schemas_differ(model_class) -> bool:
         val = model_class.model_json_schema(mode="validation")
         ser = model_class.model_json_schema(mode="serialization")
         return val != ser
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _model_has_computed_fields(model_class) -> bool:
+    """True if the model has any Pydantic ``@computed_field``. FA forces
+    split emission for these regardless of ``separate_input_output_schemas``.
+    """
+    try:
+        cf = getattr(model_class, "model_computed_fields", None)
+        return bool(cf)
     except Exception:  # noqa: BLE001
         return False
 
@@ -1900,6 +1985,20 @@ def _collect_schemas(
             _collect_model_schemas(sub, schemas)
 
 
+def _is_dataclass_type(obj: Any) -> bool:
+    """Return True for a plain ``@dataclass`` class (not a Pydantic model)."""
+    try:
+        import dataclasses as _dc
+
+        return (
+            isinstance(obj, type)
+            and _dc.is_dataclass(obj)
+            and not hasattr(obj, "model_json_schema")
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
     """Extract Pydantic model schema and its $defs into the shared components/schemas bucket.
 
@@ -1908,6 +2007,26 @@ def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
     promotes any ``$defs`` (nested models) into the same flat bucket.
     """
     if model_class is None:
+        return
+    # Python dataclass support — FA runs it through a Pydantic TypeAdapter
+    # which produces a regular JSON schema; surface it under the class
+    # name so body $refs resolve.
+    if _is_dataclass_type(model_class):
+        try:
+            from pydantic import TypeAdapter as _TA
+            schema = _TA(model_class).json_schema(mode="validation")
+            name = model_class.__name__
+            # Hoist $defs so nested models share the components bucket.
+            if isinstance(schema, dict) and "$defs" in schema:
+                for dname, dschema in schema["$defs"].items():
+                    if dname not in schemas:
+                        schemas[dname] = dschema
+                schema = {k: v for k, v in schema.items() if k != "$defs"}
+            schema = _rewrite_defs_refs(schema)
+            if name not in schemas:
+                schemas[name] = schema
+        except Exception:  # noqa: BLE001
+            pass
         return
     if not hasattr(model_class, "model_json_schema"):
         return
@@ -1992,8 +2111,10 @@ def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
     used_as = _MODEL_USAGE.get(id(model_class), set())
     is_self_recursive = _model_is_self_recursive(model_class)
     _differ = _val_ser_schemas_differ(model_class)
+    _has_cf = _model_has_computed_fields(model_class)
+    _allow_split_here = _SEPARATE_INPUT_OUTPUT or _has_cf
     if (
-        _SEPARATE_INPUT_OUTPUT
+        _allow_split_here
         and model_name and ("input" in used_as and "output" in used_as)
         and (is_self_recursive or _differ)
     ):
