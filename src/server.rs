@@ -436,24 +436,31 @@ pub fn run_server(
             ))
         })?;
 
-        // Record declared paths for the redirect_slashes middleware.
-        {
-            use std::collections::HashSet;
-            let set: HashSet<String> = routes.iter().map(|r| r.path.clone()).collect();
-            if let Ok(mut slot) = DECLARED_PATHS.write() {
-                *slot = Some(set);
-            }
-            // Paths with an explicit OPTIONS route — used by
-            // ``non_preflight_options_middleware`` to decide whether to
-            // fall through (explicit handler) vs short-circuit (405).
-            let opts: HashSet<String> = routes
+        // Build per-server declared-paths Arcs for the redirect_slashes
+        // and non_preflight_options middlewares. Each server owns its
+        // own view — sharing a global static across concurrent test apps
+        // caused later-starting servers to overwrite an earlier server's
+        // set (→ 404s on the earlier app's routes).
+        let declared_paths_arc: std::sync::Arc<std::collections::HashSet<String>> = {
+            let set: std::collections::HashSet<String> =
+                routes.iter().map(|r| r.path.clone()).collect();
+            std::sync::Arc::new(set)
+        };
+        let declared_options_paths_arc: std::sync::Arc<std::collections::HashSet<String>> = {
+            let opts: std::collections::HashSet<String> = routes
                 .iter()
                 .filter(|r| r.methods.iter().any(|m| m.eq_ignore_ascii_case("OPTIONS")))
                 .map(|r| r.path.clone())
                 .collect();
-            if let Ok(mut slot) = DECLARED_OPTIONS_PATHS.write() {
-                *slot = Some(opts);
-            }
+            std::sync::Arc::new(opts)
+        };
+        // Also populate the legacy globals for any single-app code paths
+        // (best-effort; authoritative is the per-server Arc).
+        if let Ok(mut slot) = DECLARED_PATHS.write() {
+            *slot = Some((*declared_paths_arc).clone());
+        }
+        if let Ok(mut slot) = DECLARED_OPTIONS_PATHS.write() {
+            *slot = Some((*declared_options_paths_arc).clone());
         }
 
         rt.block_on(async move {
@@ -589,7 +596,13 @@ pub fn run_server(
             // redirect_slashes: trailing-slash redirect middleware.
             // Matches Starlette's `redirect_slashes=True` default.
             if redirect_slashes {
-                app = app.layer(axum::middleware::from_fn(slashes_redirect_middleware));
+                let paths_arc = declared_paths_arc.clone();
+                app = app.layer(axum::middleware::from_fn(
+                    move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                        let paths = paths_arc.clone();
+                        async move { slashes_redirect_middleware_with_paths(req, next, paths).await }
+                    },
+                ));
             }
 
             // Non-preflight OPTIONS: FastAPI/Starlette's CORS intercepts
@@ -598,7 +611,13 @@ pub fn run_server(
             // CorsLayer is more lenient and returns 200 for any OPTIONS.
             // We add a pre-middleware that lets OPTIONS *without* those
             // headers fall through to method routing (→ 405 as expected).
-            app = app.layer(axum::middleware::from_fn(non_preflight_options_middleware));
+            let opts_paths_arc = declared_options_paths_arc.clone();
+            app = app.layer(axum::middleware::from_fn(
+                move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                    let paths = opts_paths_arc.clone();
+                    async move { non_preflight_options_middleware_with_paths(req, next, paths).await }
+                },
+            ));
 
             // max_request_size: 413 Payload Too Large on oversized bodies.
             if let Some(limit) = max_request_size {
@@ -662,9 +681,10 @@ static DECLARED_OPTIONS_PATHS: std::sync::RwLock<Option<std::collections::HashSe
 /// ``Access-Control-Request-Method`` headers). Here we detect the
 /// non-preflight case and strip the method to something the CORS layer
 /// ignores, effectively routing through to the normal method handler.
-async fn non_preflight_options_middleware(
+async fn non_preflight_options_middleware_with_paths(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
+    declared_options_paths: std::sync::Arc<std::collections::HashSet<String>>,
 ) -> axum::response::Response {
     if req.method() == axum::http::Method::OPTIONS {
         let has_origin = req.headers().contains_key("origin");
@@ -674,13 +694,9 @@ async fn non_preflight_options_middleware(
             // route matching this path, let it through — the inner
             // router will dispatch to the user's handler.
             let path = req.uri().path();
-            let has_explicit_opts = DECLARED_OPTIONS_PATHS
-                .read()
-                .ok()
-                .and_then(|guard| guard.as_ref().map(|paths| {
-                    paths.iter().any(|tpl| options_path_matches(tpl, path))
-                }))
-                .unwrap_or(false);
+            let has_explicit_opts = declared_options_paths
+                .iter()
+                .any(|tpl| options_path_matches(tpl, path));
             if !has_explicit_opts {
                 // Not a preflight, no explicit OPTIONS — bypass CORS by
                 // bolting a short-circuit 405 response (the inner router
@@ -705,6 +721,47 @@ async fn non_preflight_options_middleware(
 /// the downstream response carries the Access-Control-Allow-Origin
 /// header (i.e. CORS accepted it), we rewrite the body to "OK" and
 /// set Content-Type to text/plain.
+/// Buffer the (already compressed) response body so we can emit a
+/// Content-Length header. Starlette's GZipMiddleware does this
+/// inherently; tower-http's CompressionLayer streams with
+/// Transfer-Encoding: chunked. We only buffer when content-encoding is
+/// gzip/deflate/br/zstd so unencoded streams (SSE, StreamingResponse)
+/// are left alone.
+async fn gzip_set_content_length_middleware(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let resp = next.run(req).await;
+    let encoded = resp
+        .headers()
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            let s = s.to_ascii_lowercase();
+            s == "gzip" || s == "deflate" || s == "br" || s == "zstd"
+        })
+        .unwrap_or(false);
+    if !encoded {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => {
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            return axum::response::Response::from_parts(parts, axum::body::Body::empty());
+        }
+    };
+    let len = bytes.len();
+    parts.headers.insert(
+        axum::http::header::CONTENT_LENGTH,
+        axum::http::HeaderValue::from_str(&len.to_string()).unwrap(),
+    );
+    // Transfer-Encoding and Content-Length are mutually exclusive.
+    parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+    axum::response::Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
 async fn cors_preflight_ok_body_middleware(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
@@ -746,9 +803,10 @@ fn options_path_matches(template: &str, concrete: &str) -> bool {
 /// alternate form matches a declared route. Matches Starlette's
 /// `redirect_slashes=True` behaviour. Implemented as a pre-filter: we check
 /// the declared-paths set before handing off to the inner router.
-async fn slashes_redirect_middleware(
+async fn slashes_redirect_middleware_with_paths(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
+    declared_paths: std::sync::Arc<std::collections::HashSet<String>>,
 ) -> axum::response::Response {
     // Work with the URI path as a &str — avoid allocating a String on the
     // common hot path where we immediately fall through to next.run.
@@ -766,51 +824,43 @@ async fn slashes_redirect_middleware(
             }
         }
     }
-    // Look up under the lock without holding the guard across an await.
-    // ``check_declared`` returns ``(known, alt_known_if_needed)`` — two
-    // bools and an owned String — all owned/Send, so the guard's
-    // non-Send read-lock stays in a synchronous scope.
-    fn check_declared(path: &str) -> Option<(bool, bool, String)> {
-        let guard = DECLARED_PATHS.read().ok()?;
-        let declared = guard.as_ref()?;
-        // Path templates may carry ``{name}`` placeholders. Match them
-        // segment-by-segment so ``/x/1`` → ``/x/{p}/`` comparison works.
-        fn template_matches(template: &str, concrete: &str) -> bool {
-            let t_segs: Vec<&str> = template.split('/').collect();
-            let c_segs: Vec<&str> = concrete.split('/').collect();
-            if t_segs.len() != c_segs.len() {
-                return false;
-            }
-            for (t, c) in t_segs.iter().zip(c_segs.iter()) {
-                if t.starts_with('{') && t.ends_with('}') {
-                    if c.is_empty() {
-                        return false;
-                    }
-                    continue;
-                }
-                if t != c {
+    if declared_paths.is_empty() {
+        return next.run(req).await;
+    }
+    // Path templates may carry ``{name}`` placeholders. Match them
+    // segment-by-segment so ``/x/1`` → ``/x/{p}/`` comparison works.
+    fn template_matches(template: &str, concrete: &str) -> bool {
+        let t_segs: Vec<&str> = template.split('/').collect();
+        let c_segs: Vec<&str> = concrete.split('/').collect();
+        if t_segs.len() != c_segs.len() {
+            return false;
+        }
+        for (t, c) in t_segs.iter().zip(c_segs.iter()) {
+            if t.starts_with('{') && t.ends_with('}') {
+                if c.is_empty() {
                     return false;
                 }
+                continue;
             }
-            true
+            if t != c {
+                return false;
+            }
         }
-        let matches_any = |p: &str| -> bool {
-            declared.contains(p)
-                || declared.iter().any(|tpl| tpl.contains('{') && template_matches(tpl, p))
-        };
-        let known = matches_any(path);
-        let alternate: String = if path.ends_with('/') {
-            path[..path.len() - 1].to_string()
-        } else {
-            format!("{path}/")
-        };
-        let alt_known = matches_any(&alternate);
-        Some((known, alt_known, alternate))
+        true
     }
-    let (known, alt_known, alternate) = match check_declared(path) {
-        Some(t) => t,
-        None => return next.run(req).await,
+    let matches_any = |p: &str| -> bool {
+        declared_paths.contains(p)
+            || declared_paths
+                .iter()
+                .any(|tpl| tpl.contains('{') && template_matches(tpl, p))
     };
+    let known = matches_any(path);
+    let alternate: String = if path.ends_with('/') {
+        path[..path.len() - 1].to_string()
+    } else {
+        format!("{path}/")
+    };
+    let alt_known = matches_any(&alternate);
     if known || !alt_known {
         return next.run(req).await;
     }
@@ -822,11 +872,36 @@ async fn slashes_redirect_middleware(
     // via the redirect.
 
     // Preserve query string in the redirect target
-    let mut redirect_to = alternate;
+    let mut path_and_query = alternate;
     if let Some(q) = req.uri().query() {
-        redirect_to.push('?');
-        redirect_to.push_str(q);
+        path_and_query.push('?');
+        path_and_query.push_str(q);
     }
+
+    // Starlette's trailing-slash redirect builds an ABSOLUTE URL using
+    // request scheme + Host header. FA tests assert on
+    // `https://example.com/items/` not just `/items/`.
+    let host_hdr = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    let scheme_is_https = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+        || req
+            .uri()
+            .scheme_str()
+            .map(|s| s.eq_ignore_ascii_case("https"))
+            .unwrap_or(false);
+    let redirect_to = if let Some(host) = host_hdr {
+        let scheme = if scheme_is_https { "https" } else { "http" };
+        format!("{scheme}://{host}{path_and_query}")
+    } else {
+        path_and_query
+    };
 
     axum::response::Response::builder()
         .status(axum::http::StatusCode::TEMPORARY_REDIRECT)
@@ -983,6 +1058,12 @@ fn apply_middlewares(
             }
             MiddlewareConfig::Gzip => {
                 app = app.layer(CompressionLayer::new());
+                // Starlette's GZipMiddleware buffers the compressed body
+                // and emits Content-Length. tower-http's CompressionLayer
+                // streams the compressed body with Transfer-Encoding:
+                // chunked. Buffer compressed responses so Content-Length
+                // is present — FA tests assert on it.
+                app = app.layer(axum::middleware::from_fn(gzip_set_content_length_middleware));
             }
             MiddlewareConfig::TrustedHost { allowed_hosts } => {
                 let hosts = allowed_hosts.clone();
