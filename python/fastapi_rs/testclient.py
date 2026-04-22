@@ -396,6 +396,27 @@ class TestClient:
             getattr(self.app, "_ws_server_exceptions", []).clear()
         except Exception:  # noqa: BLE001
             pass
+        # Capture the TEST thread's contextvars and queue them on the
+        # app so the server-side WS handler can replay them before
+        # running the user's coroutine. Enables FA parity for
+        # ``tests/test_dependency_yield_scope_websockets.py`` — values
+        # retrieved via ``ContextVar.get()`` inside yield-dep teardown
+        # (running on the server's async worker thread) mutate the
+        # SAME objects the test holds a reference to.
+        try:
+            import contextvars as _cv
+            _ctx = _cv.copy_context()
+            _q = getattr(self.app, "_ws_pending_test_contexts", None)
+            if _q is None:
+                _q = []
+                try:
+                    self.app._ws_pending_test_contexts = _q
+                except Exception:  # noqa: BLE001
+                    _q = None
+            if _q is not None:
+                _q.append(_ctx)
+        except Exception:  # noqa: BLE001
+            pass
         return _WebSocketTestSession(
             ws_url,
             subprotocols=subprotocols,
