@@ -2473,7 +2473,7 @@ class FastAPI:
                     # via TypeAdapter if a non-str type was declared.
                     val = path_kwargs.get(name)
                     if val is not None and meta is not _inspect.Parameter.empty and meta is not str:
-                        kwargs[name] = _validate_scalar(val, meta, name, "Path")
+                        kwargs[name] = _validate_scalar(val, meta, name, "Path", ws=ws)
                     else:
                         kwargs[name] = val
                 elif kind == "scalar":
@@ -2495,7 +2495,7 @@ class FastAPI:
                     else:
                         kwargs[name] = _validate_scalar(
                             raw_val, inner, name,
-                            marker.__class__.__name__,
+                            marker.__class__.__name__, ws=ws,
                         )
                 elif kind == "dep":
                     kwargs[name] = await _resolve_dep_async(
@@ -2627,6 +2627,12 @@ class FastAPI:
             # Normal exit — drain teardowns (both scopes; no response
             # body to stream for WS).
             await _teardown_generators(generators)
+
+        # Expose the synthetic route + endpoint_ctx as attributes so
+        # that mount-prefixing can patch the path once the full URL
+        # is known (mounted sub-apps are collected with an inner path).
+        _ws_entry._ws_synthetic_route = _synthetic_route  # type: ignore[attr-defined]
+        _ws_entry._ws_endpoint_ctx = _ws_endpoint_ctx  # type: ignore[attr-defined]
 
         # Always return an async entry: Rust treats both sync/async the
         # same way via the worker loop, and this lets us await deps and
@@ -3144,6 +3150,24 @@ class FastAPI:
                     if not r["path"]:
                         r["path"] = "/"
                     r["_from_mount"] = mount_path
+                    # WS endpoints carry a synthetic route + endpoint_ctx
+                    # that were built from the sub-app's internal path.
+                    # Patch them with the full (mount-prefixed) path so
+                    # ``ws.scope["route"].path`` and
+                    # ``WebSocketRequestValidationError.endpoint_path``
+                    # reflect the real URL the client hit.
+                    if r.get("is_websocket"):
+                        ep = r.get("endpoint")
+                        if ep is not None:
+                            try:
+                                rt = getattr(ep, "_ws_synthetic_route", None)
+                                if rt is not None:
+                                    rt.path = r["path"]
+                                ctx = getattr(ep, "_ws_endpoint_ctx", None)
+                                if isinstance(ctx, dict):
+                                    ctx["path"] = r["path"]
+                            except Exception:  # noqa: BLE001
+                                pass
                 all_routes.extend(sub_routes)
                 # Also add a passthrough route so GET <mount>/openapi.json
                 # serves the sub-app's own schema (with `servers: [{"url":

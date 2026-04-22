@@ -686,8 +686,22 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     # ``{}`` when none was declared.
     if _media_type in ("text/html", "text/plain"):
         response_schema = {"type": "string"}
-    elif _media_type is not None and _media_type != "application/json" and not route.get("response_model"):
-        response_schema = {}
+    elif _media_type is not None and _media_type != "application/json":
+        # Custom ``response_class=StreamingResponse`` (or subclass) with a
+        # non-JSON media_type — FA emits ``{"type": "string"}`` to
+        # represent the raw byte / text body. Overrides any auto-derived
+        # response_model (which is typically ``AsyncIterable[bytes]`` for
+        # a streaming endpoint).
+        try:
+            from fastapi_rs.responses import StreamingResponse as _SR
+            _rc_cls = route.get("response_class")
+            if _rc_cls is not None and isinstance(_rc_cls, type) and issubclass(_rc_cls, _SR):
+                response_schema = {"type": "string"}
+            elif not route.get("response_model"):
+                response_schema = {}
+        except Exception:  # noqa: BLE001
+            if not route.get("response_model"):
+                response_schema = {}
     if _suppress_content:
         success_response = {"description": response_desc}
     else:

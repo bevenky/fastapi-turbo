@@ -422,6 +422,28 @@ def _build() -> dict[str, types.ModuleType]:
     )
     _DEFAULT_REDOC_FAVICON = "https://fastapi.tiangolo.com/img/favicon.png"
 
+    swagger_ui_default_parameters: dict = {
+        "dom_id": "#swagger-ui",
+        "layout": "BaseLayout",
+        "deepLinking": True,
+        "showExtensions": True,
+        "showCommonExtensions": True,
+    }
+
+    def _html_safe_json(value) -> str:
+        """HTML-safe JSON encoding — escapes ``< > &`` so the serialized
+        value is safe to embed inside a ``<script>`` tag. Matches FA's
+        helper in ``fastapi.openapi.docs._html_safe_json`` exactly;
+        ``test_swagger_ui_escape.py`` asserts on these escapes.
+        """
+        import json as _json
+        return (
+            _json.dumps(value)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+        )
+
     def get_swagger_ui_html(
         *,
         openapi_url,
@@ -433,21 +455,46 @@ def _build() -> dict[str, types.ModuleType]:
         init_oauth=None,
         swagger_ui_parameters=None,
     ):
+        from fastapi_rs.encoders import jsonable_encoder as _jenc
+        from fastapi_rs.responses import HTMLResponse
         js_url = swagger_js_url
         css_url = swagger_css_url
         favicon = ""
         if swagger_favicon_url:
             favicon = f'<link rel="icon" href="{swagger_favicon_url}">'
+
+        current_params = dict(swagger_ui_default_parameters)
+        if swagger_ui_parameters:
+            current_params.update(swagger_ui_parameters)
+
+        ui_body = f"url: '{openapi_url}',\n"
+        for k, v in current_params.items():
+            ui_body += f"{_html_safe_json(k)}: {_html_safe_json(_jenc(v))},\n"
+        if oauth2_redirect_url:
+            ui_body += (
+                f"oauth2RedirectUrl: window.location.origin + "
+                f"'{oauth2_redirect_url}',\n"
+            )
+
+        init_oauth_block = ""
+        if init_oauth:
+            init_oauth_block = (
+                f"\nui.initOAuth({_html_safe_json(_jenc(init_oauth))})"
+            )
+
         html = (
             f"<!DOCTYPE html><html><head><title>{title}</title>\n"
             f'<link rel="stylesheet" href="{css_url}">\n'
             f"{favicon}</head><body>\n"
             f'<div id="swagger-ui"></div>\n'
             f'<script src="{js_url}"></script>\n'
-            f'<script>SwaggerUIBundle({{url:"{openapi_url}",dom_id:"#swagger-ui"}})</script>\n'
+            f"<script>\nconst ui = SwaggerUIBundle({{\n{ui_body}"
+            "presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],\n"
+            f"}})"
+            f"{init_oauth_block}\n"
+            f"</script>\n"
             f"</body></html>"
         )
-        from fastapi_rs.responses import HTMLResponse
         return HTMLResponse(html)
 
     def get_redoc_html(

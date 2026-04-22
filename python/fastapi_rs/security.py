@@ -299,7 +299,13 @@ class HTTPBearer(HTTPBase):
                 credentials=authorization[7:],
             )
         if self.auto_error:
-            raise HTTPException(status_code=403, detail="Not authenticated")
+            # FA parity: 401 with ``WWW-Authenticate: Bearer`` for both
+            # missing and non-Bearer Authorization headers.
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return None
 
 
@@ -336,7 +342,11 @@ class HTTPDigest:
                 credentials=authorization[7:],
             )
         if self.auto_error:
-            raise HTTPException(status_code=403, detail="Not authenticated")
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "Digest"},
+            )
         return None
 
 
