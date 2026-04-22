@@ -32,6 +32,22 @@ class Depends:
     def __repr__(self) -> str:
         return f"Depends({self.dependency!r}, use_cache={self.use_cache})"
 
+    def __hash__(self) -> int:
+        # FA parity (FA 0.122+): ``Depends`` is hashable so tools like
+        # SQLAlchemy's ``registry.mapped`` can put markers in sets/dicts.
+        # Equality is value-based: same dependency + use_cache + scope.
+        return hash((type(self), self.dependency, self.use_cache, self.scope))
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, Depends):
+            return NotImplemented
+        return (
+            type(self) is type(other)
+            and self.dependency is other.dependency
+            and self.use_cache == other.use_cache
+            and self.scope == other.scope
+        )
+
 
 class Security(Depends):
     """Security dependency — a Depends() variant that carries OAuth2 scopes.
@@ -56,3 +72,20 @@ class Security(Depends):
 
     def __repr__(self) -> str:
         return f"Security({self.dependency!r}, scopes={self.scopes!r}, use_cache={self.use_cache})"
+
+    def __hash__(self) -> int:
+        return hash((
+            type(self), self.dependency, self.use_cache, self.scope,
+            tuple(self.scopes),
+        ))
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, Security):
+            return NotImplemented
+        return (
+            type(self) is type(other)
+            and self.dependency is other.dependency
+            and self.use_cache == other.use_cache
+            and self.scope == other.scope
+            and self.scopes == other.scopes
+        )
