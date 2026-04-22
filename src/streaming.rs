@@ -122,15 +122,30 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
 /// the body task's subsequent `__iter__()` call returns `self` and continues
 /// from the next element. For plain iterables like lists we'd duplicate the
 /// first chunk, so we skip the fast path there.
+///
+/// Non-``StopIteration`` exceptions raised during the first-chunk probe are
+/// captured onto ``app._captured_server_exceptions`` so TestClient surfaces
+/// them (FA parity with streaming-body yield-dep teardown errors).
 fn drain_one_sync_chunk(iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
     let py = iter_bound.py();
     if !iter_bound.hasattr(pyo3::intern!(py, "__next__")).unwrap_or(false) {
         return None;
     }
-    iter_bound
-        .call_method0(pyo3::intern!(py, "__next__"))
-        .ok()
-        .map(|val| python_val_to_bytes(&val))
+    match iter_bound.call_method0(pyo3::intern!(py, "__next__")) {
+        Ok(val) => Some(python_val_to_bytes(&val)),
+        Err(e) => {
+            if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                if let Ok(app_lock) = crate::router::APP_INSTANCE.read() {
+                    if let Some(ref app_obj) = *app_lock {
+                        if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+                            let _ = lst.call_method1(py, "append", (e.value(py),));
+                        }
+                    }
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Drive a single `__anext__` against an async generator without entering an
@@ -191,7 +206,19 @@ fn iterate_sync_generator(
                 if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py_iter.py()) {
                     break;
                 }
-                eprintln!("fastapi-rs: streaming iterator error: {e}");
+                // Capture the exception in ``app._captured_server_exceptions``
+                // so TestClient's ``raise_server_exceptions=True`` mode
+                // surfaces it to the caller (FA parity — streaming-body
+                // failures must reach the test just like synchronous
+                // handler failures).
+                let py = py_iter.py();
+                if let Ok(app_lock) = crate::router::APP_INSTANCE.read() {
+                    if let Some(ref app_obj) = *app_lock {
+                        if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+                            let _ = lst.call_method1(py, "append", (e.value(py),));
+                        }
+                    }
+                }
                 break;
             }
         }

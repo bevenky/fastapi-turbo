@@ -1361,15 +1361,21 @@ async fn handle_request(
     // Only read body if we have body/file/form params — OR if the handler
     // injects `Request`, which vLLM uses to parse bodies manually via
     // `await request.body()` / `await request.json()`.
+    // Also read when the handler wraps an HTTP middleware chain: custom
+    // ASGI middlewares (body-size guards, signing checks) call
+    // ``request.body()`` BEFORE the handler runs and the Python layer
+    // needs the raw bytes in scope.
     let needs_body = state.has_body_params
         || state.has_file_params
         || state.has_form_params
-        || state.has_inject_request;
+        || state.has_inject_request
+        || state.has_http_middleware;
 
-    let (body_bytes, body_json, mut multipart_fields): (
+    let (body_bytes, body_json, mut multipart_fields, raw_body_for_mw): (
         bytes::Bytes,
         Option<serde_json::Value>,
         Option<HashMap<String, Vec<ParsedField>>>,
+        Option<bytes::Bytes>,
     ) = if needs_body {
         let bb = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
             Ok(b) => b,
@@ -1378,10 +1384,19 @@ async fn handle_request(
             }
         };
 
+        // Preserve the raw body bytes for the middleware chain regardless
+        // of whether we also parse them below — multipart/urlencoded
+        // parsing otherwise drops the original bytes.
+        let mw_raw = if state.has_http_middleware {
+            Some(bb.clone())
+        } else {
+            None
+        };
+
         // Multipart path: parse into named fields
         if let Some(ref boundary) = multipart_boundary {
             match parse_multipart(bb.clone(), boundary).await {
-                Ok(fields) => (bytes::Bytes::new(), None, Some(fields)),
+                Ok(fields) => (bytes::Bytes::new(), None, Some(fields), mw_raw),
                 Err(e) => {
                     return (StatusCode::BAD_REQUEST, format!("multipart parse: {e}"))
                         .into_response();
@@ -1402,7 +1417,7 @@ async fn handle_request(
                     },
                 );
             }
-            (bytes::Bytes::new(), None, Some(fields))
+            (bytes::Bytes::new(), None, Some(fields), mw_raw)
         } else {
             // JSON / raw bytes body path (existing behavior)
             let all_have_models = state.params.iter()
@@ -1413,11 +1428,11 @@ async fn handle_request(
             } else {
                 serde_json::from_slice(&bb).ok()
             };
-            (bb, json, None)
+            (bb, json, None, mw_raw)
         }
     } else {
         drop(request);
-        (bytes::Bytes::new(), None, None)
+        (bytes::Bytes::new(), None, None, None)
     };
 
     let path_map = path_params.map(|Path(m)| m).unwrap_or_default();
@@ -1430,7 +1445,17 @@ async fn handle_request(
                 // Middleware wrapper needs metadata kwargs
                 return Python::attach(|py| {
                     let kwargs = PyDict::new(py);
-                    if state.has_http_middleware { inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers); }
+                    if state.has_http_middleware {
+                        inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
+                        if let Some(ref raw) = raw_body_for_mw {
+                            if !raw.is_empty() {
+                                let _ = kwargs.set_item(
+                                    "__fastapi_rs_raw_body_bytes__",
+                                    pyo3::types::PyBytes::new(py, raw),
+                                );
+                            }
+                        }
+                    }
                     match state.handler.call(py, (), Some(&kwargs)) {
                         Ok(py_result) => py_to_response(py, py_result.bind(py)),
                         Err(py_err) => pyerr_to_response(py, &py_err),
@@ -1467,7 +1492,19 @@ async fn handle_request(
                 ) {
                     return pyerr_to_response(py, &e);
                 }
-                if state.has_http_middleware { inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers); }
+                if state.has_http_middleware {
+                    inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
+                    // Seed the middleware Request's ``_body`` cache with
+                    // the raw (pre-multipart-parse) bytes.
+                    if let Some(ref raw) = raw_body_for_mw {
+                        if !raw.is_empty() {
+                            let _ = kwargs.set_item(
+                                "__fastapi_rs_raw_body_bytes__",
+                                pyo3::types::PyBytes::new(py, raw),
+                            );
+                        }
+                    }
+                }
                 match state.handler.call(py, (), Some(&kwargs)) {
                     Ok(py_result) => {
                         drain_background_tasks(py, &kwargs, &state.params);
@@ -1494,7 +1531,17 @@ async fn handle_request(
                 if !state.has_any_params {
                     let kwargs = PyDict::new(py);
                     if state.has_http_middleware {
-                        if state.has_http_middleware { inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers); }
+                        if state.has_http_middleware {
+                        inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
+                        if let Some(ref raw) = raw_body_for_mw {
+                            if !raw.is_empty() {
+                                let _ = kwargs.set_item(
+                                    "__fastapi_rs_raw_body_bytes__",
+                                    pyo3::types::PyBytes::new(py, raw),
+                                );
+                            }
+                        }
+                    }
                     }
                     match crate::handler_bridge::call_async_on_local_loop(
                         py, &state.handler, &kwargs,
@@ -1520,7 +1567,17 @@ async fn handle_request(
                     ) {
                         return pyerr_to_response(py, &e);
                     }
-                    if state.has_http_middleware { inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers); }
+                    if state.has_http_middleware {
+                        inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
+                        if let Some(ref raw) = raw_body_for_mw {
+                            if !raw.is_empty() {
+                                let _ = kwargs.set_item(
+                                    "__fastapi_rs_raw_body_bytes__",
+                                    pyo3::types::PyBytes::new(py, raw),
+                                );
+                            }
+                        }
+                    }
                     match crate::handler_bridge::call_async_on_local_loop(
                         py, &state.handler, &kwargs,
                     ) {
@@ -1550,7 +1607,17 @@ async fn handle_request(
                     ) {
                         return pyerr_to_response(py, &e);
                     }
-                    if state.has_http_middleware { inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers); }
+                    if state.has_http_middleware {
+                        inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
+                        if let Some(ref raw) = raw_body_for_mw {
+                            if !raw.is_empty() {
+                                let _ = kwargs.set_item(
+                                    "__fastapi_rs_raw_body_bytes__",
+                                    pyo3::types::PyBytes::new(py, raw),
+                                );
+                            }
+                        }
+                    }
                     match state.handler.call(py, (), Some(&kwargs)) {
                         Ok(r) => {
                             drain_background_tasks(py, &kwargs, &state.params);
