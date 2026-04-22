@@ -331,6 +331,33 @@ class TestClient:
             return getattr(self._client, name)
         raise AttributeError(name)
 
+    _FORWARD_TO_HTTPX = frozenset({"cookies", "headers", "params", "base_url"})
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # ``client.cookies = [...]`` / ``client.headers = {...}`` is a
+        # common Starlette-TestClient idiom to seed request state. Forward
+        # to the underlying httpx.Client so it actually reaches the wire.
+        # Private attrs and unknown names fall through to the default
+        # object __setattr__.
+        if name in TestClient._FORWARD_TO_HTTPX and not name.startswith("_"):
+            client = self.__dict__.get("_client")
+            if client is None:
+                # Before the server starts, stash on self and replay in
+                # _ensure_started (cookies → _seed_cookies, headers →
+                # _seed_headers). Cookies path goes through _seed_cookies.
+                if name == "cookies":
+                    object.__setattr__(self, "_seed_cookies", value)
+                    return
+                if name == "headers":
+                    object.__setattr__(self, "_seed_headers", value)
+                    return
+                # params/base_url aren't used before start, stash normally
+                object.__setattr__(self, name, value)
+                return
+            setattr(client, name, value)
+            return
+        object.__setattr__(self, name, value)
+
     # ── HTTP verb shortcuts ────────────────────────────────────────
 
     def _check_raised(self) -> None:

@@ -879,6 +879,7 @@ def _try_compile_handler(
                 # even when the handler itself has no dep chain.
                 _pending = kwargs.pop("__fastapi_rs_extraction_errors__", None)
                 _raw_body_str = kwargs.pop("__fastapi_rs_raw_body_str__", None)
+                kwargs.pop("__fastapi_rs_raw_body_bytes__", None)
                 if _pending is not None:
                     from fastapi_rs.responses import JSONResponse as _JSONResp
                     import json as _json
@@ -1028,6 +1029,14 @@ def _try_compile_handler(
                 return result
 
             _compiled_no_deps._fastapi_rs_defers_extraction_errors = True  # type: ignore[attr-defined]
+            # Expose the endpoint-context dict so the mount-prefix path
+            # patcher (``_collect_all_routes``) can rewrite ``ctx["path"]``
+            # to the user-visible mount-prefixed URL — otherwise a
+            # ``RequestValidationError`` / ``ResponseValidationError``
+            # raised from a mounted sub-app shows the sub-app-internal
+            # path (``/items/``) instead of what the client actually hit
+            # (``/sub/items/``).
+            _compiled_no_deps._fastapi_rs_endpoint_ctx = _endpoint_ctx  # type: ignore[attr-defined]
             return _compiled_no_deps
         return None
 
@@ -1233,6 +1242,7 @@ def _try_compile_handler(
         # if any dep raises ``HTTPException`` that response wins; if
         # all deps succeed we then emit the queued 422.
         _raw_body_str_pending = kwargs.pop("__fastapi_rs_raw_body_str__", None)
+        kwargs.pop("__fastapi_rs_raw_body_bytes__", None)
         _pending_extraction_errors_json = kwargs.pop(
             "__fastapi_rs_extraction_errors__", None
         )
@@ -1695,6 +1705,8 @@ def _try_compile_handler(
     # (not raise) 422s and let dep bodies run first — matching FA's
     # "HTTPException from Depends wins over param validation" rule.
     _compiled._fastapi_rs_defers_extraction_errors = True  # type: ignore[attr-defined]
+    # Mount-prefix patching hook — see ``_compiled_no_deps``.
+    _compiled._fastapi_rs_endpoint_ctx = _endpoint_ctx  # type: ignore[attr-defined]
 
     return _compiled
 
@@ -1842,6 +1854,133 @@ from fastapi_rs.requests import Request as _Request
 from fastapi_rs.responses import JSONResponse as _JSONResponse
 
 
+def _make_asgi_middleware_shim(mw_cls, kwargs):
+    """Adapt a raw ASGI3 middleware class (``async __call__(scope, receive, send)``)
+    into an ``@app.middleware("http")`` style callable ``async(request, call_next)``.
+
+    The shim:
+      * Builds a minimal ASGI scope from the ``Request``.
+      * Constructs ``mw_cls(app=_inner_asgi_proxy, **kwargs)`` where the
+        proxy, when called, invokes ``call_next(request)`` and relays the
+        resulting response over the ASGI ``send`` channel.
+      * Lets the middleware wrap ``receive`` (body-size guards,
+        authentication, etc.) — ``HTTPException`` / other exceptions
+        raised from the middleware propagate up and route through the
+        app's ``exception_handlers`` as usual.
+    """
+    from fastapi_rs.exceptions import HTTPException as _MW_HTTPExc
+    from fastapi_rs.responses import Response as _MW_Response
+
+    async def _shim(request, call_next):
+        # Collect body once; hand the cached copy to the middleware's
+        # receive wrapper so it can observe the size or mutate bytes.
+        body_bytes = await request.body() if hasattr(request, "body") else b""
+
+        async def _receive():
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+
+        captured: dict = {}
+        _sent_start = False
+
+        async def _send(message):
+            nonlocal _sent_start
+            mtype = message.get("type")
+            if mtype == "http.response.start":
+                captured["status"] = message.get("status", 200)
+                captured["headers"] = list(message.get("headers") or [])
+                _sent_start = True
+            elif mtype == "http.response.body":
+                chunk = message.get("body", b"") or b""
+                captured.setdefault("body", b"")
+                captured["body"] += chunk
+
+        async def _inner_asgi_proxy(scope, receive, send):
+            # Pull the (possibly rewrapped) body out of ``receive`` so the
+            # middleware can raise on over-size payloads before we invoke
+            # the route handler.
+            msg = await receive()
+            # Pass the resulting response through to ``send`` so the
+            # middleware sees it (headers etc. can be mutated by nesting
+            # middlewares).
+            resp = await call_next(request)
+            # Materialise our Response into ASGI messages.
+            status = getattr(resp, "status_code", 200)
+            raw_headers = getattr(resp, "raw_headers", None) or [
+                (k, v) for k, v in (getattr(resp, "headers", {}) or {}).items()
+            ]
+            header_list = []
+            for k, v in raw_headers:
+                if isinstance(k, str):
+                    k = k.encode("latin-1")
+                if isinstance(v, str):
+                    v = v.encode("latin-1")
+                header_list.append((k, v))
+            body = getattr(resp, "body", b"") or b""
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            await send({
+                "type": "http.response.start",
+                "status": status,
+                "headers": header_list,
+            })
+            await send({
+                "type": "http.response.body",
+                "body": body,
+                "more_body": False,
+            })
+            return resp
+
+        scope = dict(getattr(request, "scope", {}) or {})
+        scope.setdefault("type", "http")
+        try:
+            instance = mw_cls(app=_inner_asgi_proxy, **kwargs)
+        except TypeError:
+            instance = mw_cls(**kwargs)
+        try:
+            await instance(scope, _receive, _send)
+        except _MW_HTTPExc as exc:
+            # Convert to a Response via the app's exception handlers if
+            # one is registered; otherwise emit a generic JSON body.
+            if _MW_HTTPExc in getattr(request, "app", None).exception_handlers:  # type: ignore[union-attr]
+                handler = request.app.exception_handlers[_MW_HTTPExc]  # type: ignore[union-attr]
+                result = handler(request, exc)
+                if hasattr(result, "__await__"):
+                    result = await result
+                return result
+            import json as _json
+            detail = exc.detail
+            if isinstance(detail, (dict, list)):
+                body = _json.dumps({"detail": detail}).encode()
+            else:
+                body = _json.dumps({"detail": str(detail)}).encode()
+            return _MW_Response(
+                content=body,
+                status_code=exc.status_code,
+                media_type="application/json",
+            )
+
+        # Normal path: build a Response out of captured ASGI messages.
+        if "status" in captured:
+            resp = _MW_Response(
+                content=captured.get("body", b""),
+                status_code=captured["status"],
+            )
+            resp.headers.clear()
+            resp.raw_headers.clear()
+            for k, v in captured.get("headers", []):
+                if isinstance(k, bytes):
+                    k = k.decode("latin-1")
+                if isinstance(v, bytes):
+                    v = v.decode("latin-1")
+                resp.headers.append(k, v)
+            return resp
+        # Middleware finished without emitting a response — fall through
+        # to a direct ``call_next`` so the handler still runs.
+        return await call_next(request)
+
+    return _shim
+
+
 def _wrap_with_http_middlewares(endpoint, middlewares, app):
     """Wrap a route endpoint with a chain of @app.middleware("http") functions.
 
@@ -1868,6 +2007,19 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
 
     # Shared scope — recycled per request (shallow copy cheap)
     def _make_scope(kwargs):
+        # Seed the request-level body cache so middlewares can await
+        # ``request.body()`` without having to walk back through Rust.
+        # Custom ASGI middlewares (size limits, signing checks) need the
+        # raw bytes BEFORE the handler runs.  The bytes kwarg is peeked
+        # (not popped) so downstream handlers — RVE formatting, body
+        # revalidation — still see it.
+        _raw_body_bytes = kwargs.get("__fastapi_rs_raw_body_bytes__")
+        if _raw_body_bytes is None:
+            _raw_body_str = kwargs.get("__fastapi_rs_raw_body_str__")
+            if isinstance(_raw_body_str, (bytes, bytearray)):
+                _raw_body_bytes = bytes(_raw_body_str)
+            elif isinstance(_raw_body_str, str):
+                _raw_body_bytes = _raw_body_str.encode("utf-8")
         return {
             "type": "http",
             "app": app,
@@ -1877,6 +2029,7 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
             "headers": kwargs.pop("_request_headers", []),
             "root_path": getattr(app, "root_path", "") or "",
             "_handler_kwargs": kwargs,
+            "_body": _raw_body_bytes or b"",
         }
 
     def _call_handler_sync(kwargs):
@@ -2531,6 +2684,16 @@ class FastAPI:
             self._http_middlewares.append(instance)
             return
 
+        # Rust/Tower-bound middleware (CORS/GZip/TrustedHost/HTTPSRedirect)
+        # carries a non-python_http_ ``_fastapi_rs_middleware_type``.
+        # Record on ``_middleware_stack`` so ``_build_middleware_config``
+        # maps it to the matching Tower layer — do NOT fall through to
+        # the generic ASGI shim (the class has no __call__ on instances
+        # and exists purely as a marker for the Rust side).
+        if mw_type:
+            self._middleware_stack.append((middleware_cls, kwargs))
+            return
+
         # BaseHTTPMiddleware subclass — Qwen uses this for auth middleware.
         # Convert to an @app.middleware("http") function by wrapping dispatch().
         from fastapi_rs.middleware.base import BaseHTTPMiddleware
@@ -2545,6 +2708,29 @@ class FastAPI:
 
             self._http_middlewares.append(_dispatch_wrapper)
             return
+
+        # Generic ASGI middleware class — the class constructor takes
+        # ``app`` as the first argument and instances are ASGI3 callables
+        # ``async def __call__(self, scope, receive, send)``.  Bridge it
+        # through an ``@app.middleware("http")`` shim: build a minimal
+        # ASGI scope from the ``Request``, drive ``instance(scope, receive,
+        # send)`` where the inner ``app`` proxies to ``call_next`` (thus
+        # letting the middleware wrap ``receive`` and observe the body).
+        if (
+            isinstance(middleware_cls, type)
+            and hasattr(middleware_cls, "__call__")
+        ):
+            import inspect as _insp
+            try:
+                _sig = _insp.signature(middleware_cls.__init__)
+                _accepts_app = "app" in _sig.parameters
+            except (TypeError, ValueError):
+                _accepts_app = False
+            if _accepts_app:
+                self._http_middlewares.append(
+                    _make_asgi_middleware_shim(middleware_cls, kwargs)
+                )
+                return
 
         self._middleware_stack.append((middleware_cls, kwargs))
 
@@ -4307,6 +4493,21 @@ class FastAPI:
                                     ctx["path"] = r["path"]
                             except Exception:  # noqa: BLE001
                                 pass
+                    else:
+                        # HTTP endpoints: patch the compiled handler's
+                        # ``_fastapi_rs_endpoint_ctx`` dict so
+                        # ``RequestValidationError`` / ``ResponseValidationError``
+                        # raised from a mounted sub-app surface the full
+                        # mount-prefixed URL (``/sub/items/``) rather than
+                        # the sub-app-internal path (``/items/``).
+                        ep = r.get("endpoint")
+                        if ep is not None:
+                            try:
+                                ctx = getattr(ep, "_fastapi_rs_endpoint_ctx", None)
+                                if isinstance(ctx, dict):
+                                    ctx["path"] = r["path"]
+                            except Exception:  # noqa: BLE001
+                                pass
                 all_routes.extend(sub_routes)
                 # Also add a passthrough route so GET <mount>/openapi.json
                 # serves the sub-app's own schema (with `servers: [{"url":
@@ -4404,7 +4605,19 @@ class FastAPI:
                     if chunk:
                         body_parts.append(chunk)
 
-            await asgi_app(scope, _receive, _send)
+            # a2wsgi / uvloop transitively call the deprecated
+            # ``asyncio.iscoroutinefunction`` on Python 3.14.  Tests that
+            # set ``filterwarnings=error`` convert that into a runtime
+            # exception for the inner app.  Suppress just that specific
+            # deprecation for the duration of the proxied call.
+            import warnings as _warnings
+            with _warnings.catch_warnings():
+                _warnings.filterwarnings(
+                    "ignore",
+                    message=r".*asyncio\.iscoroutinefunction.*",
+                    category=DeprecationWarning,
+                )
+                await asgi_app(scope, _receive, _send)
 
             from fastapi_rs.responses import Response as _Response
             resp = _Response(
