@@ -61,6 +61,12 @@ def _build() -> dict[str, types.ModuleType]:
     starlette_responses.RedirectResponse = _responses.RedirectResponse  # type: ignore[attr-defined]
     starlette_responses.StreamingResponse = _responses.StreamingResponse  # type: ignore[attr-defined]
     starlette_responses.FileResponse = _responses.FileResponse  # type: ignore[attr-defined]
+    # Starlette's ``responses`` module imports ``json`` from the stdlib
+    # at module level. ``test_dump_json_fast_path`` monkey-patches
+    # ``starlette.responses.json.dumps`` to observe when the default
+    # response class uses stdlib JSON vs the orjson fast path.
+    import json as _json_stdlib
+    starlette_responses.json = _json_stdlib  # type: ignore[attr-defined]
     modules["starlette.responses"] = starlette_responses
 
     # ── starlette.routing ──────────────────────────────────────────
