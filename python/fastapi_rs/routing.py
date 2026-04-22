@@ -383,6 +383,7 @@ class APIRouter:
         **kwargs: Any,
     ) -> None:
         """Create an APIRoute and append it to this router."""
+        self._assert_no_pydantic_v1_models(endpoint, kwargs)
         self._assert_path_params_are_scalars(path, endpoint)
         self._assert_query_params_are_supported(endpoint)
         self._assert_response_models_are_valid(kwargs)
@@ -621,6 +622,57 @@ class APIRouter:
                     f"non-scalar container types cannot be used in path "
                     f"parameters (FA/Starlette limitation)."
                 )
+
+    @staticmethod
+    @staticmethod
+    def _assert_no_pydantic_v1_models(endpoint: Callable, kwargs: dict) -> None:
+        """FA 0.120+: raise ``PydanticV1NotSupportedError`` at decoration
+        time when any param annotation, return annotation, response_model,
+        responses[code].model, or Union arm references a
+        ``pydantic.v1.BaseModel`` subclass. fastapi-rs requires v2.
+        """
+        try:
+            from pydantic import v1 as _pd_v1
+        except ImportError:
+            return
+        from fastapi_rs.exceptions import PydanticV1NotSupportedError as _V1Err
+        import typing as _typing
+
+        def _is_v1(t) -> bool:
+            if isinstance(t, type):
+                try:
+                    if issubclass(t, _pd_v1.BaseModel):
+                        return True
+                except TypeError:
+                    return False
+            return False
+
+        def _walk(t) -> None:
+            if t is None or t is _typing.Any:
+                return
+            if _is_v1(t):
+                raise _V1Err(
+                    "Pydantic v1 models are not supported. Migrate to Pydantic v2."
+                )
+            for sub in _typing.get_args(t):
+                _walk(sub)
+
+        # Endpoint signature — params + return annotation.
+        try:
+            sig = _safe_signature(endpoint)
+        except (TypeError, ValueError):
+            return
+        for p in sig.parameters.values():
+            if p.annotation is not p.empty:
+                _walk(p.annotation)
+        if sig.return_annotation is not sig.empty:
+            _walk(sig.return_annotation)
+        # Explicit response_model and responses[code].model kwargs.
+        if "response_model" in kwargs:
+            _walk(kwargs.get("response_model"))
+        for _code, _spec in (kwargs.get("responses") or {}).items():
+            if isinstance(_spec, dict):
+                _walk(_spec.get("model"))
 
     @staticmethod
     def _assert_response_models_are_valid(kwargs: dict) -> None:

@@ -599,6 +599,17 @@ class UJSONResponse(Response):
 
     media_type = "application/json"
 
+    def __init__(self, *args, **kwargs):
+        import warnings as _warnings
+        from fastapi_rs.exceptions import FastAPIDeprecationWarning as _W
+        _warnings.warn(
+            "UJSONResponse is deprecated and will be removed in a future "
+            "version. Use JSONResponse instead.",
+            _W,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
+
     def render(self, content) -> bytes:
         try:
             import ujson
