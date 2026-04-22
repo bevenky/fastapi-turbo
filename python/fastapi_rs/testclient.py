@@ -172,7 +172,7 @@ class TestClient:
             if request.headers.get("user-agent", "").startswith("python-httpx"):
                 request.headers["user-agent"] = "testclient"
 
-        default_headers = {"host": host_header}
+        default_headers = {"host": host_header, "user-agent": "testclient"}
         if self._seed_headers:
             # Let user-supplied defaults win over our injected Host.
             for k, v in dict(self._seed_headers).items():

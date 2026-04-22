@@ -203,8 +203,20 @@ fn inject_framework_objects(
                             pyo3::types::PyBytes::new(py, body_bytes),
                         )?;
                     }
-                    // Client address (host, port) tuple for request.client
-                    if let Some(addr) = client_addr {
+                    // Client address (host, port) tuple for request.client.
+                    // Starlette TestClient parity: when ``User-Agent:
+                    // testclient``, use ``("testclient", 50000)`` so
+                    // ``request.client.host == "testclient"`` matches
+                    // Starlette's fake ASGI client.
+                    let is_testclient = headers
+                        .as_ref()
+                        .and_then(|h| h.get("user-agent"))
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s == "testclient")
+                        .unwrap_or(false);
+                    if is_testclient {
+                        scope.set_item("client", ("testclient", 50000u16))?;
+                    } else if let Some(addr) = client_addr {
                         let client_tuple = (addr.ip().to_string(), addr.port());
                         scope.set_item("client", client_tuple)?;
                     }
