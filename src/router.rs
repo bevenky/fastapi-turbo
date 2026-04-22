@@ -1829,9 +1829,9 @@ fn extract_params_to_pydict_full<'py>(
                             Ok(v) => v,
                             Err(e) => {
                                 if param.name == "_combined_body" {
-                                    return Err(pydantic_error_response_combined(py, &e, "body"));
+                                    return Err(pydantic_error_response_combined_with_body(py, &e, "body", body_bytes));
                                 }
-                                return Err(pydantic_error_response(py, &e, "body"));
+                                return Err(pydantic_error_response_with_body(py, &e, "body", body_bytes));
                             }
                         }
                     } else if let Some(ref json_val) = body_json {
@@ -2542,6 +2542,55 @@ fn coercion_error_response(loc: &str, name: &str, raw: &str, type_hint: &str) ->
 /// error's location.
 fn pydantic_error_response(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Response {
     pydantic_error_response_with_loc_ext(py, err, &[loc_prefix], false)
+}
+
+fn pydantic_error_response_with_body(
+    py: Python<'_>,
+    err: &PyErr,
+    loc_prefix: &str,
+    body_bytes: &[u8],
+) -> Response {
+    pydantic_error_response_with_loc_body(py, err, &[loc_prefix], false, body_bytes)
+}
+
+fn pydantic_error_response_combined_with_body(
+    py: Python<'_>,
+    err: &PyErr,
+    loc_prefix: &str,
+    body_bytes: &[u8],
+) -> Response {
+    pydantic_error_response_with_loc_body(py, err, &[loc_prefix], true, body_bytes)
+}
+
+fn pydantic_error_response_with_loc_body(
+    py: Python<'_>,
+    err: &PyErr,
+    loc_prefix: &[&str],
+    strip_missing_input: bool,
+    body_bytes: &[u8],
+) -> Response {
+    // Re-uses the existing detail builder, then injects ``body`` into
+    // the outer JSON so ``_rust_validation_handler`` can populate
+    // ``RequestValidationError.body`` (FA parity —
+    // ``test_handling_errors/test_tutorial005`` asserts).
+    let details = pydantic_error_details(py, err, loc_prefix, strip_missing_input);
+    let primary_loc = loc_prefix.first().copied().unwrap_or("");
+    if details.is_empty() {
+        return validation_error_response(primary_loc, "", &format!("{err}"));
+    }
+    let mut wrapper = serde_json::Map::new();
+    wrapper.insert("detail".into(), serde_json::Value::Array(details));
+    if !body_bytes.is_empty() {
+        if let Ok(s) = std::str::from_utf8(body_bytes) {
+            let parsed: Option<serde_json::Value> = serde_json::from_str(s).ok();
+            if let Some(v) = parsed {
+                wrapper.insert("body".into(), v);
+            } else {
+                wrapper.insert("body".into(), serde_json::Value::String(s.to_string()));
+            }
+        }
+    }
+    dispatch_validation_error(serde_json::Value::Object(wrapper))
 }
 
 fn pydantic_error_response_combined(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Response {

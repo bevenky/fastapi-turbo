@@ -191,9 +191,18 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             # Use the inner type from Annotated for type resolution
             pass  # annotation already updated above
 
-        # If no marker from Annotated, check if default is a marker
+        # If no marker from Annotated, check if default is a marker.
+        # Also accept stock FastAPI markers (``fastapi.params.Query`` etc.)
+        # which don't subclass our ``_ParamMarker`` but carry the same
+        # attributes (deprecated, title, description, alias, examples).
         if marker is None and isinstance(default, _ParamMarker):
             marker = default
+        elif marker is None and default is not inspect.Parameter.empty:
+            _fa_marker_names = {
+                "Body", "Form", "File", "Header", "Cookie", "Query", "Path", "Security",
+            }
+            if type(default).__name__ in _fa_marker_names:
+                marker = default
 
         if marker is not None:
             # Stock `fastapi.Form` / `fastapi.Query` etc. don't define
@@ -217,7 +226,14 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             # User pattern: `x: Annotated[str | None, Header()] = None` —
             # here `Header()` has default=Ellipsis but the signature default
             # is None, so the effective default is None.
-            if default is not inspect.Parameter.empty and not isinstance(default, _ParamMarker):
+            _fa_marker_cls_names = {
+                "Body", "Form", "File", "Header", "Cookie", "Query", "Path", "Security",
+            }
+            _default_is_marker = isinstance(default, _ParamMarker) or (
+                type(default).__name__ in _fa_marker_cls_names
+                and default is marker
+            )
+            if default is not inspect.Parameter.empty and not _default_is_marker:
                 required = False
                 default_val = default
                 has_default_val = True
@@ -749,6 +765,12 @@ def _maybe_expand_param_models(params: list[dict[str, Any]]) -> list[dict[str, A
                     empty_container_defaults[_alias] = list(dv) if hasattr(dv, "__iter__") else []
                 elif origin in (dict, _bi.dict):
                     empty_container_defaults[_alias] = dict(dv) if hasattr(dv, "items") else {}
+                else:
+                    # Non-None scalar default (``str = "nothing"``, ``int = 0``,
+                    # …). FA surfaces these in the validation ``input`` dict
+                    # when the request omits the field — matches test
+                    # ``test_forms_single_model::test_no_data``.
+                    empty_container_defaults[_alias] = dv
             raw_kw_by_source = {
                 "query": "__fastapi_rs_raw_query__",
                 "header": "__fastapi_rs_raw_headers__",
@@ -945,13 +967,52 @@ def _extract_annotated_marker(annotation) -> tuple[_ParamMarker | None, Any]:
             _fa_marker_names = {
                 "Body", "Form", "File", "Header", "Cookie", "Query", "Path", "Security",
             }
+            # Collect ALL markers in the Annotated metadata. FastAPI supports
+            # multiple markers with the same kind (``Annotated[int, Query(gt=2),
+            # Query(lt=10)]``) — their constraints must be merged so the
+            # generated TypeAdapter enforces BOTH bounds.
+            found_markers: list = []
             for meta in args[1:]:
                 if isinstance(meta, _ParamMarker):
-                    return meta, inner_type
+                    found_markers.append(meta)
+                    continue
                 cls_name = type(meta).__name__
                 if cls_name in _fa_marker_names:
-                    return meta, inner_type  # type: ignore[return-value]
-            return None, inner_type
+                    found_markers.append(meta)
+            if not found_markers:
+                return None, inner_type
+            if len(found_markers) == 1:
+                return found_markers[0], inner_type
+            # Multiple markers: merge their metadata/constraints. Use
+            # Pydantic's ``merge_field_infos`` which keeps only explicitly
+            # set attributes and lets later ones override earlier ones.
+            try:
+                from pydantic.fields import FieldInfo as _FI
+                merged = _FI.merge_field_infos(*found_markers)
+                # Preserve the first marker's subclass identity (Query/Header/…)
+                # and our custom attributes (``_kind``, ``include_in_schema``,
+                # ``convert_underscores``, ``media_type``, ``embed``, ``example``,
+                # ``openapi_examples``, ``regex``, ``pattern``). These aren't
+                # FieldInfo-native so ``merge_field_infos`` drops them.
+                first = found_markers[0]
+                try:
+                    merged.__class__ = type(first)
+                except TypeError:
+                    pass
+                for _attr in (
+                    "_kind", "include_in_schema", "convert_underscores",
+                    "media_type", "embed", "example", "openapi_examples",
+                    "regex", "pattern",
+                ):
+                    for m in found_markers:
+                        if hasattr(m, _attr):
+                            try:
+                                setattr(merged, _attr, getattr(m, _attr))
+                            except Exception:  # noqa: BLE001
+                                pass
+                return merged, inner_type  # type: ignore[return-value]
+            except Exception:  # noqa: BLE001
+                return found_markers[0], inner_type
         return None, args[0] if args else annotation
 
     return None, annotation

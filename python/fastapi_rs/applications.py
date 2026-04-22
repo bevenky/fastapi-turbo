@@ -4051,7 +4051,12 @@ class FastAPI:
                 except Exception:
                     detail_obj = {"detail": detail_json}
                 errors_list = detail_obj.get("detail", [])
-                exc = _RVE(errors_list)
+                # FA parity: populate ``RequestValidationError.body``
+                # when Rust plumbs the raw JSON body alongside the
+                # validation errors. ``test_handling_errors/test_tutorial005``
+                # asserts ``exc.body`` equals the original request body.
+                _body_for_rve = detail_obj.get("body") if isinstance(detail_obj, dict) else None
+                exc = _RVE(errors_list, body=_body_for_rve)
                 req = _Req({
                     "type": "http",
                     "method": "POST",
