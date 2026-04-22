@@ -187,6 +187,14 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
         extraction_keys[canon] = dp["name"]
         return dp["name"]
 
+    def _dep_scope(dep: Depends) -> str:
+        """Effective scope for ``dep``. Default is ``"request"`` —
+        FastAPI 0.120+ introduced ``Depends(..., scope="function" | "request")``,
+        with request being the legacy default (teardown after response).
+        """
+        _s = getattr(dep, "scope", None)
+        return _s if _s in ("function", "request") else "request"
+
     def _resolve_dep(
         param_name: str,
         dep: Depends,
@@ -230,6 +238,7 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
         for dp in dep_params:
             if dp["kind"] == "dependency":
                 _dp_scopes = list(dp.get("_sub_dep_scopes") or [])
+                _sub_marker_scope = dp.get("_dep_scope") or "request"
                 if _dp_scopes:
                     from fastapi_rs.dependencies import Security as _Sec
                     sub_dep = _Sec(
@@ -238,7 +247,39 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
                         use_cache=dp.get("use_cache", True),
                     )
                 else:
-                    sub_dep = Depends(dp["dep_callable"], use_cache=dp.get("use_cache", True))
+                    sub_dep = Depends(
+                        dp["dep_callable"],
+                        use_cache=dp.get("use_cache", True),
+                        scope=_sub_marker_scope,
+                    )
+                # FA 0.120+ scope rule: a ``request``-scope yield dep
+                # cannot depend on a ``function``-scope yield dep.
+                # Non-yield deps have no teardown so scope is a no-op.
+                outer_scope = _dep_scope(dep)
+                _outer_is_yield = (
+                    inspect.isgeneratorfunction(dep_func)
+                    or inspect.isasyncgenfunction(dep_func)
+                )
+                _sub_callable = dp.get("dep_callable")
+                _sub_is_yield = (
+                    _sub_callable is not None
+                    and (
+                        inspect.isgeneratorfunction(_sub_callable)
+                        or inspect.isasyncgenfunction(_sub_callable)
+                    )
+                )
+                if (
+                    _outer_is_yield
+                    and _sub_is_yield
+                    and outer_scope == "request"
+                    and _sub_marker_scope == "function"
+                ):
+                    from fastapi_rs.exceptions import FastAPIError as _FE
+                    _outer_name = getattr(dep_func, "__name__", repr(dep_func))
+                    raise _FE(
+                        f'The dependency "{_outer_name}" has a scope of "request", '
+                        f'it cannot depend on dependencies with scope "function"'
+                    )
                 source_key = _resolve_dep(
                     dp["name"], sub_dep, is_top_level=False,
                     accumulated_scopes=chain_scopes,
@@ -361,6 +402,10 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
             "is_generator_dep": is_generator,
             "dep_input_map": input_map,
             "use_cache": dep.use_cache,
+            # FA 0.120+ scope: teardown ordering marker. ``function`` runs
+            # right after the handler; ``request`` defers until after the
+            # streaming response completes. See _compiled for the split.
+            "_dep_scope": _dep_scope(dep),
             # Cumulative ``Security(..., scopes=[...])`` values along
             # the path from route to this dep. Empty for plain
             # ``Depends()`` chains.
@@ -397,7 +442,11 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
             handler_param_names.add(p["name"])
         elif p["kind"] == "dependency":
             _top_scopes = list(p.get("_security_scopes_top") or [])
-            dep = Depends(p["dep_callable"], use_cache=p.get("use_cache", True))
+            dep = Depends(
+                p["dep_callable"],
+                use_cache=p.get("use_cache", True),
+                scope=p.get("_dep_scope") or "request",
+            )
             _resolve_dep(
                 p["name"], dep, is_top_level=True,
                 accumulated_scopes=_top_scopes,

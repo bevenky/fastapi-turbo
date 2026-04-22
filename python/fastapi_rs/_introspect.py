@@ -125,6 +125,12 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             # top-level (``_security_scopes_top``) and sub-dep paths
             # (``_security_scopes``) read this.
             _sec_scopes = list(getattr(dep_marker, "scopes", None) or [])
+            # Effective scope for FA 0.120+ ``Depends(..., scope=...)`` —
+            # ``"function"`` tears down right after the handler returns,
+            # ``"request"`` (default) defers until after the response.
+            _marker_scope = getattr(dep_marker, "scope", None)
+            if _marker_scope not in ("function", "request"):
+                _marker_scope = "request"
             params.append(
                 {
                     "name": name,
@@ -138,6 +144,7 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
                     "use_cache": dep_marker.use_cache,
                     "_security_scopes_top": _sec_scopes,
                     "_sub_dep_scopes": _sec_scopes,
+                    "_dep_scope": _marker_scope,
                 }
             )
             continue

@@ -203,8 +203,89 @@ class APIRouter:
         self._assert_query_params_are_supported(endpoint)
         self._assert_response_models_are_valid(kwargs)
         self._maybe_require_multipart(endpoint)
+        self._assert_dep_scopes(endpoint)
         route = APIRoute(path, endpoint, methods=methods, **kwargs)
         self.routes.append(route)
+
+    @staticmethod
+    def _assert_dep_scopes(endpoint: Callable) -> None:
+        """FA 0.120+: a ``Depends(..., scope="request")`` dep cannot
+        depend on ``Depends(..., scope="function")`` sub-deps. Raised at
+        decoration time via ``FastAPIError``.
+        """
+        import inspect as _inspect
+        import typing as _typing
+        from fastapi_rs.dependencies import Depends as _Depends
+        from fastapi_rs.exceptions import FastAPIError as _FE
+
+        def _marker_scope(marker) -> str:
+            s = getattr(marker, "scope", None)
+            return s if s in ("function", "request") else "request"
+
+        def _collect_depends(fn):
+            """Yield (param_name, Depends marker) for every Depends on fn's sig."""
+            try:
+                sig = _inspect.signature(fn)
+            except (TypeError, ValueError):
+                return
+            for pname, param in sig.parameters.items():
+                default = param.default
+                if isinstance(default, _Depends):
+                    yield pname, default
+                    continue
+                ann = param.annotation
+                if _typing.get_origin(ann) is _typing.Annotated:
+                    for meta in _typing.get_args(ann)[1:]:
+                        if isinstance(meta, _Depends):
+                            yield pname, meta
+                            break
+
+        seen: set[int] = set()
+
+        def _walk(callable_):
+            if callable_ is None or id(callable_) in seen:
+                return
+            seen.add(id(callable_))
+            for _pn, sub_marker in _collect_depends(callable_):
+                sub_scope = _marker_scope(sub_marker)
+                sub_callable = sub_marker.dependency
+                # Walk deeper so we can match FA's specific "outer request
+                # cannot depend on function" rule at any depth.
+                _walk(sub_callable)
+
+        def _is_yield_dep(fn) -> bool:
+            """True if ``fn`` is a generator/async-generator dep (teardown-carrying)."""
+            if fn is None:
+                return False
+            import inspect as _i
+            if _i.isgeneratorfunction(fn) or _i.isasyncgenfunction(fn):
+                return True
+            # Class instances whose __call__ is a generator.
+            call = getattr(fn, "__call__", None)
+            if call is not None and not isinstance(fn, type):
+                if _i.isgeneratorfunction(call) or _i.isasyncgenfunction(call):
+                    return True
+            return False
+
+        # The scope rule only applies to yield (generator) deps — non-yield
+        # deps have no teardown, so scope is irrelevant. FA enforces this
+        # at decoration time by raising ``FastAPIError`` when a request-
+        # scope yield dep depends on a function-scope yield dep.
+        for _pn, top_marker in _collect_depends(endpoint):
+            outer_scope = _marker_scope(top_marker)
+            outer_callable = top_marker.dependency
+            if outer_callable is None or not _is_yield_dep(outer_callable):
+                continue
+            for _sub_pn, sub_marker in _collect_depends(outer_callable):
+                sub_scope = _marker_scope(sub_marker)
+                sub_callable = sub_marker.dependency
+                if outer_scope == "request" and sub_scope == "function" and _is_yield_dep(sub_callable):
+                    _outer_name = getattr(outer_callable, "__name__", repr(outer_callable))
+                    raise _FE(
+                        f'The dependency "{_outer_name}" has a scope of "request", '
+                        f'it cannot depend on dependencies with scope "function"'
+                    )
+            _walk(outer_callable)
 
     @staticmethod
     def _maybe_require_multipart(endpoint: Callable) -> None:

@@ -171,6 +171,13 @@ def generate_openapi_schema(
                 _register_model(sub)
 
         path = route["path"]
+        # Starlette-style path converter suffixes like ``{file_path:path}``
+        # are internal routing hints — OpenAPI exposes just the
+        # parameter name. Strip ``:<converter>`` segments so the emitted
+        # path matches FA's ``/files/{file_path}``.
+        if ":" in path and "{" in path:
+            import re as _re
+            path = _re.sub(r"\{([^}:]+):[^}]+\}", r"{\1}", path)
 
         # Collect security schemes from route dependencies
         _collect_security_schemes(route, security_schemes)
@@ -461,7 +468,11 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
         _op_id_for_title = route["operation_id"]
     else:
         import re as _re
-        _op_id_for_title = f"{route.get('handler_name', '')}{route.get('path', '')}"
+        # Strip Starlette ``:<converter>`` suffixes from the path before
+        # building the operationId (FA never sees the converter hint).
+        _op_path = route.get("path", "")
+        _op_path = _re.sub(r"\{([^}:]+):[^}]+\}", r"{\1}", _op_path)
+        _op_id_for_title = f"{route.get('handler_name', '')}{_op_path}"
         _op_id_for_title = _re.sub(r"\W", "_", _op_id_for_title)
         _op_id_for_title = f"{_op_id_for_title}_{method.lower()}"
     route = {**route, "operation_id": _op_id_for_title}
@@ -1122,13 +1133,21 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
                 for w in title_source.split("_")
                 if w
             )
-    p["schema"]["title"] = title
+    # Don't overwrite a title on a pure ``$ref`` schema (FA leaves the
+    # referenced component's own title in place). Also skip ``anyOf``
+    # wrappers whose inner is a $ref — FA emits the $ref without title.
+    def _is_pure_ref(sch):
+        return isinstance(sch, dict) and set(sch.keys()) == {"$ref"}
+    _top = p["schema"]
+    if not (_is_pure_ref(_top)):
+        _top["title"] = title
     # Description appears on BOTH the parameter and its inner schema in
     # FastAPI-generated OpenAPI. Keeping them in sync is important for
     # docs frontends (Swagger/Redoc) that render them from either side.
     if param.get("description"):
         p["description"] = param["description"]
-        p["schema"]["description"] = param["description"]
+        if not _is_pure_ref(_top):
+            _top["description"] = param["description"]
     if param.get("deprecated"):
         p["deprecated"] = True
     # OpenAPI: ``Query(example="Alice")`` → ``parameter.example``.

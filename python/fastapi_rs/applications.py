@@ -592,6 +592,12 @@ def _try_compile_handler(
                 if dep.get("_security_scopes_param")
                 else None
             ),
+            # FA 0.120+ scope: ``function`` or ``request``. Used to split
+            # teardown ordering — function-scope runs immediately after
+            # the handler returns (exceptions from yield-after-yield
+            # surface as HTTP errors); request-scope is deferred until
+            # after the response (including streaming body) is sent.
+            dep.get("_dep_scope") or "request",
         ))
 
     handler_func = endpoint
@@ -784,7 +790,7 @@ def _try_compile_handler(
                 _mw_req._pending_teardowns = []
 
         try:
-            for name, func, original_func, input_map, func_id, is_generator, use_cache, sec_scopes_info in dep_chain:
+            for name, func, original_func, input_map, func_id, is_generator, use_cache, sec_scopes_info, dep_scope in dep_chain:
                 # Check dependency_overrides at call time (P0 fix #1)
                 actual_func = func
                 override_used = None
@@ -849,10 +855,10 @@ def _try_compile_handler(
                         from fastapi_rs._async_worker import submit as _submit
                         result = _submit(gen.__anext__())
                         # Sentinel "worker" so teardown knows to route back.
-                        generators_to_cleanup.append((gen, "worker"))
+                        generators_to_cleanup.append((gen, "worker", dep_scope))
                     else:
                         result = next(gen)
-                        generators_to_cleanup.append((gen, None))
+                        generators_to_cleanup.append((gen, None, dep_scope))
                 else:
                     result = actual_func(**dk)
 
@@ -1026,7 +1032,7 @@ def _try_compile_handler(
 
 
 def _run_pending_teardowns(teardowns, throw_exc: BaseException | None = None) -> None:
-    """Drain a reversed-order iterable of (gen, loop) tuples.
+    """Drain a reversed-order iterable of (gen, loop[, scope]) tuples.
 
     Sync yield-deps resume via `next()`; async yield-deps resume on the
     shared worker loop via `_async_worker.submit()` so that asyncpg /
@@ -1039,7 +1045,11 @@ def _run_pending_teardowns(teardowns, throw_exc: BaseException | None = None) ->
     # yield-dep's ``except`` clause observe the error. FA's parity
     # tests assert that a ``try: yield ... except MyError: errors.append
     # (...)`` block runs when the handler raises ``MyError``.
-    for gen, loop in teardowns:
+    for tup in teardowns:
+        if len(tup) == 3:
+            gen, loop, _scope = tup
+        else:
+            gen, loop = tup
         try:
             if loop == "worker":
                 from fastapi_rs._async_worker import submit as _submit
