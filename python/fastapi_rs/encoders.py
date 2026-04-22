@@ -38,6 +38,17 @@ def jsonable_encoder(
         if isinstance(obj, encoder_type):
             return encoder_func(obj)
 
+    # FA 0.120+: reject Pydantic v1 models explicitly with
+    # ``PydanticV1NotSupportedError`` — fastapi-rs requires v2.
+    try:
+        from pydantic import v1 as _pd_v1
+        if isinstance(obj, _pd_v1.BaseModel):
+            from fastapi_rs.exceptions import PydanticV1NotSupportedError as _V1Err
+            raise _V1Err(
+                "Pydantic v1 models are not supported. Migrate to Pydantic v2."
+            )
+    except ImportError:
+        pass
     # Pydantic BaseModel
     try:
         from pydantic import BaseModel
