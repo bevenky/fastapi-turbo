@@ -913,6 +913,7 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
     inner_schema = None
     list_inner_ann = None
     _bare_list = False
+    _annotation_absent = ua is None and pm_field_name is None
     if ua is not None:
         # Peel list containers to get the item annotation.
         import typing as _typing
@@ -929,6 +930,10 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
     if inner_schema is None:
         if _bare_list:
             inner_schema = {"type": "array", "items": {}}
+        elif _annotation_absent:
+            # Unannotated parameter (e.g. ``def f(item_id):``). FA emits a
+            # schema with just ``title`` and no ``type`` in this case.
+            inner_schema = {}
         else:
             inner_schema = _type_hint_to_schema(
                 _schema_type_hint, inner_annotation=list_inner_ann
