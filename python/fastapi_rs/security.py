@@ -291,6 +291,19 @@ class HTTPBearer(HTTPBase):
         if bearerFormat:
             self.model["bearerFormat"] = bearerFormat
 
+    def make_not_authenticated_error(self) -> HTTPException:
+        """FA parity: override hook for custom not-authenticated errors.
+
+        The ``authentication_error_status_code`` tutorial subclasses
+        HTTPBearer and overrides this method to return a 403 instead
+        of the default 401.
+        """
+        return HTTPException(
+            status_code=401,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     async def __call__(self, request: Request = None, **kwargs) -> HTTPAuthorizationCredentials | None:
         authorization = _get_authorization(request, **kwargs)
         if authorization and authorization.startswith("Bearer "):
@@ -299,13 +312,7 @@ class HTTPBearer(HTTPBase):
                 credentials=authorization[7:],
             )
         if self.auto_error:
-            # FA parity: 401 with ``WWW-Authenticate: Bearer`` for both
-            # missing and non-Bearer Authorization headers.
-            raise HTTPException(
-                status_code=401,
-                detail="Not authenticated",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+            raise self.make_not_authenticated_error()
         return None
 
 
@@ -573,15 +580,25 @@ class OAuth2AuthorizationCodeBearer:
 
     async def __call__(self, request: Request = None, **kwargs) -> str | None:
         authorization = _get_authorization(request, **kwargs)
-        if authorization and authorization.startswith("Bearer "):
-            return authorization[7:]
-        if self.auto_error:
-            raise HTTPException(
-                status_code=401,
-                detail="Not authenticated",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        return None
+        # Parse like upstream FastAPI via ``get_authorization_scheme_param``:
+        # splits on the first space, strips the token, and case-insensitively
+        # checks the scheme. This lets ``"Bearer  testtoken "`` (double space
+        # + trailing space) resolve to ``"testtoken"``.
+        scheme = ""
+        param = ""
+        if authorization:
+            s, _, p = authorization.partition(" ")
+            scheme = s
+            param = p.strip()
+        if not authorization or scheme.lower() != "bearer":
+            if self.auto_error:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Not authenticated",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            return None
+        return param
 
 
 # ── OpenID Connect ─────────────────────────────────────────────────
