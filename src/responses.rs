@@ -662,6 +662,17 @@ fn write_any_json(py: Python<'_>, obj: &Bound<'_, PyAny>, buf: &mut String) {
             }
         }
     }
+    // ``@dataclass`` / FA dependency classes
+    // (``OAuth2PasswordRequestForm`` etc.) have no ``model_dump`` but
+    // do have ``__dict__``. Serialize via ``vars(obj)`` so handlers
+    // can ``return form_data`` directly — FA's ``jsonable_encoder``
+    // does the same.
+    if let Ok(d) = obj.getattr("__dict__") {
+        if let Ok(dict) = d.cast::<PyDict>() {
+            write_dict_json(py, dict, buf);
+            return;
+        }
+    }
     // Fallback: str()
     buf.push('"');
     let s = obj.str().map(|s| s.to_string()).unwrap_or_default();

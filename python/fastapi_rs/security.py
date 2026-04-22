@@ -413,7 +413,11 @@ def _make_api_key_call(location: str, name: str, auto_error: bool, self_ref):
         if api_key:
             return api_key
         if auto_error:
-            raise HTTPException(status_code=403, detail="Not authenticated")
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "APIKey"},
+            )
         return None
     return _call
 
