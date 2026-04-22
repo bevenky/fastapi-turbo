@@ -254,13 +254,21 @@ def _wrap_response_class(result, response_class):
     """Wrap a bare handler result (dict/list/str/etc.) in a response_class.
 
     If the handler already returned a Response instance, leave it alone
-    (Starlette semantics: user-returned Response always wins).
+    (Starlette semantics: user-returned Response always wins). Response
+    classes differ in their constructor:
+    ``RedirectResponse(url=...)`` / ``FileResponse(path=...)`` /
+    everything else ``(content=...)``.
     """
     if response_class is None or result is None:
         return result
     # If result is already a Response-like object, don't double-wrap
     if hasattr(result, "status_code") and hasattr(result, "body"):
         return result
+    _name = getattr(response_class, "__name__", "")
+    if _name == "RedirectResponse":
+        return response_class(url=result)
+    if _name == "FileResponse":
+        return response_class(path=result)
     return response_class(content=result)
 
 
@@ -276,10 +284,13 @@ def _apply_status_code(result, status_code: int):
         from fastapi_rs.responses import Response as _R
         return _R(content=b"", status_code=status_code)
     if hasattr(result, "status_code") and hasattr(result, "body"):
-        # Only override if handler didn't explicitly set a non-200 code.
+        # Only override if handler didn't explicitly set a non-default
+        # code. RedirectResponse defaults to 307; ``status_code=302`` on
+        # the route must win over that default.
         try:
             current = int(result.status_code)
-            if current == 200:
+            _default_codes = {200, 307}  # sensible defaults we can override
+            if current in _default_codes:
                 result.status_code = status_code
         except Exception:
             pass
