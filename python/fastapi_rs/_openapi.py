@@ -727,6 +727,7 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     # event, id, retry), with ``contentSchema`` pointing at the yielded
     # item type when the handler annotates it.
     _is_sse = False
+    _is_jsonl = False
     try:
         from fastapi_rs.responses import EventSourceResponse as _ESR
         _rc_cls = route.get("response_class")
@@ -734,9 +735,53 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
             _is_sse = True
     except Exception:  # noqa: BLE001
         pass
+    # JSONL detection: generator endpoint with no explicit SSE response
+    # class and response_model of ``AsyncIterable[X]`` / ``Iterable[X]``.
+    if not _is_sse and not route.get("response_class"):
+        _ret_ann = route.get("response_model")
+        if _ret_ann is not None:
+            try:
+                import typing as _typing
+                from collections.abc import AsyncIterable as _AI, Iterable as _I
+                _orig = _typing.get_origin(_ret_ann)
+                if _orig is _AI or _orig is _I:
+                    _is_jsonl = True
+            except Exception:  # noqa: BLE001
+                pass
 
     if _suppress_content:
         success_response = {"description": response_desc}
+    elif _is_jsonl:
+        # JSONL (application/jsonl) — FA emits ``itemSchema`` pointing at
+        # the inner yielded type when annotated, or empty ``{}`` when
+        # the handler is un-annotated.
+        jsonl_item: dict[str, Any] = {}
+        _ret_ann_jsonl = route.get("response_model")
+        _inner_jsonl = None
+        try:
+            import typing as _typing_jsonl
+            _args_jsonl = _typing_jsonl.get_args(_ret_ann_jsonl)
+            if _args_jsonl:
+                _inner_jsonl = _args_jsonl[0]
+        except Exception:  # noqa: BLE001
+            _inner_jsonl = None
+        if _inner_jsonl is not None:
+            _ref_jsonl = _model_ref(_inner_jsonl, mode="serialization")
+            if _ref_jsonl is not None:
+                jsonl_item = _ref_jsonl
+            else:
+                try:
+                    from pydantic import TypeAdapter as _TA_jsonl
+                    _sch_jsonl = _TA_jsonl(_inner_jsonl).json_schema(mode="serialization")
+                    if "$defs" in _sch_jsonl:
+                        _sch_jsonl = {k: v for k, v in _sch_jsonl.items() if k != "$defs"}
+                    jsonl_item = _sch_jsonl
+                except Exception:  # noqa: BLE001
+                    jsonl_item = {}
+        success_response = {
+            "description": response_desc,
+            "content": {"application/jsonl": {"itemSchema": jsonl_item}},
+        }
     elif _is_sse:
         # Item schema for SSE events. ``data`` may carry a JSON-encoded
         # payload (``contentMediaType: application/json`` +

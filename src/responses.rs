@@ -205,16 +205,17 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
         return response_object_to_response(py, obj, &status_attr);
     }
 
-    // Pydantic BaseModel: call model_dump(by_alias=True) then
-    // serialize as JSON. FA's default response-model dump mode is
-    // ``by_alias=True`` — fields with ``Field(alias=...)`` surface
-    // under the wire alias rather than the Python attribute name.
+    // Pydantic BaseModel: call model_dump(mode="json", by_alias=True)
+    // then serialize as JSON. FA runs responses through
+    // ``jsonable_encoder`` which effectively invokes the same
+    // JSON-mode dump — HttpUrl → string, UUID → str, datetime → ISO.
     // Checked BEFORE primitives because BaseModel instances may also
     // satisfy extract::<String>() via __str__.
     if let Ok(dump) = obj.getattr("model_dump") {
         if dump.is_callable() {
             let kwargs = PyDict::new(py);
             let _ = kwargs.set_item("by_alias", true);
+            let _ = kwargs.set_item("mode", "json");
             if let Ok(dumped) = dump.call((), Some(&kwargs)) {
                 return py_to_response(py, &dumped);
             }
@@ -671,14 +672,15 @@ fn write_any_json(py: Python<'_>, obj: &Bound<'_, PyAny>, buf: &mut String) {
         buf.push('"');
         return;
     }
-    // Pydantic BaseModel: ``obj.model_dump(by_alias=True)`` yields a dict.
-    // Required for nested models (e.g. ``{"item": Item(...)}``) — without
-    // this they fall through to the ``str()`` fallback and serialize as
-    // ``"name='Foo' price=35.4 ..."`` instead of nested JSON.
+    // Pydantic BaseModel: ``obj.model_dump(mode="json", by_alias=True)``
+    // yields a JSON-ready dict. Required for nested models
+    // (e.g. ``{"item": Item(...)}``) so HttpUrl → string, UUID → str,
+    // datetime → ISO. ``mode="json"`` matches ``jsonable_encoder``.
     if let Ok(dump) = obj.getattr("model_dump") {
         if dump.is_callable() {
             let kwargs = PyDict::new(py);
             let _ = kwargs.set_item("by_alias", true);
+            let _ = kwargs.set_item("mode", "json");
             if let Ok(dumped) = dump.call((), Some(&kwargs)) {
                 if let Ok(dict) = dumped.cast::<PyDict>() {
                     write_dict_json(py, dict, buf);
