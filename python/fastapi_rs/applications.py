@@ -162,7 +162,7 @@ def _apply_response_model(
             validated = response_model.model_validate(result)
         elif hasattr(result, "model_dump"):
             if fast_path_ok and type(result) is response_model:
-                return result.model_dump()
+                return result.model_dump(mode="json")
             # If `result` is ALREADY an instance of response_model, use it
             # directly — round-tripping via model_dump()+model_validate()
             # would mark ALL fields as explicitly set, defeating
@@ -192,7 +192,7 @@ def _apply_response_model(
         else:
             return result
 
-        dump_kwargs = {"by_alias": by_alias}
+        dump_kwargs = {"by_alias": by_alias, "mode": "json"}
         if include is not None:
             dump_kwargs["include"] = include
         if exclude is not None:

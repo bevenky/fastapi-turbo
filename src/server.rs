@@ -472,9 +472,15 @@ pub fn run_server(
                 }
             ));
 
-            // Add OpenAPI / documentation routes if enabled
+            // Add OpenAPI / documentation routes if enabled. An empty
+            // ``openapi_url`` means "disable OpenAPI + docs entirely" —
+            // FA behavior tested by ``test_conditional_openapi``.
             if let Some(ref schema_json) = openapi_json {
                 let oa_url = openapi_url.as_deref().unwrap_or("/openapi.json");
+                if oa_url.is_empty() {
+                    // Skip openapi + docs routes; ``/openapi.json`` / ``/docs``
+                    // simply return 404.
+                } else {
 
                 // Serve the OpenAPI JSON schema
                 let json_clone = schema_json.clone();
@@ -525,6 +531,7 @@ pub fn run_server(
                         }),
                     );
                 }
+                } // end: oa_url non-empty
             }
 
             // Register prefixes so the redirect_slashes middleware can
