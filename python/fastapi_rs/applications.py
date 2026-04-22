@@ -2632,6 +2632,24 @@ class FastAPI:
                             if _inspect.iscoroutine(r):
                                 await r
                             handled = True
+                            # Push a disconnect so TestClient surfaces
+                            # the WS close code. The handler will have
+                            # already called ``ws.close(...)`` but our
+                            # testclient runs the client in the same
+                            # test thread and can't observe the close
+                            # frame after the ``__exit__`` hook — so we
+                            # explicitly raise from the capture queue.
+                            try:
+                                from fastapi_rs.exceptions import (
+                                    WebSocketDisconnect as _WD,
+                                )
+                                last = getattr(ws, "_last_close_code", None) or 1000
+                                last_reason = getattr(ws, "_last_close_reason", "") or ""
+                                app_ref._ws_server_exceptions.append(
+                                    _WD(code=last, reason=last_reason)
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
                         except Exception:  # noqa: BLE001
                             pass
                 # Capture for TestClient re-raise semantics BEFORE we

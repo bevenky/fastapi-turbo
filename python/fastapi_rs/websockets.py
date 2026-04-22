@@ -285,9 +285,26 @@ class WebSocket:
 
         Uses the Rust-side close_and_wait() so the caller is guaranteed the
         close frame has been handed to the underlying sink before returning.
+
+        Starlette parity: ``close()`` called BEFORE ``accept()`` accepts
+        the handshake first, then sends the close frame with the given
+        code — otherwise the queued close message would never flush
+        because the writer task isn't running yet.
         """
         if self._app_state == WebSocketState.DISCONNECTED:
             return
+        # Remember the close code/reason so the exception-handler code
+        # path can surface them to the TestClient capture queue.
+        self._last_close_code = code
+        self._last_close_reason = reason or ""
+        pre_accept = self._app_state == WebSocketState.CONNECTING
+        if pre_accept and self._ws is not None:
+            # Accept the upgrade first so the writer task starts.
+            try:
+                self._ws.accept(None, None)
+                self._app_state = WebSocketState.CONNECTED
+            except Exception:  # noqa: BLE001
+                pass
         self._app_state = WebSocketState.DISCONNECTED
         if self._ws is not None:
             try:
