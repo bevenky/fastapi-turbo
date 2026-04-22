@@ -1557,6 +1557,12 @@ class FastAPI:
         # raised during request dispatch). ``TestClient`` drains this after
         # every request when ``raise_server_exceptions=True``.
         self._captured_server_exceptions: list[BaseException] = []
+        # Separate FIFO for WebSocket server-side exceptions. Drained by
+        # ``_WebSocketTestSession.__exit__`` so the expected Starlette
+        # pattern of ``with pytest.raises(WebSocketDisconnect): with
+        # client.websocket_connect(...):`` works when the server handler
+        # raises on client-side close.
+        self._ws_server_exceptions: list[BaseException] = []
         self._on_startup: list[Callable] = []
         self._on_shutdown: list[Callable] = []
         self._included_routers: list[tuple[APIRouter, str, list[str], dict]] = []
@@ -1982,13 +1988,20 @@ class FastAPI:
     # Route collection & introspection
     # ------------------------------------------------------------------
 
-    def _wrap_websocket_endpoint(self, endpoint):
+    def _wrap_websocket_endpoint(self, endpoint, route_path: str = ""):
         """Build a thin wrapper around a WebSocket endpoint that
         - attaches ``ws.app`` so handlers can reach ``app.state``,
-        - resolves ``Depends(...)`` parameters,
+        - resolves ``Depends(...)`` parameters (incl. sub-deps + yield),
+        - validates scalar params via Pydantic TypeAdapter,
         - catches ``WebSocketException`` (before accept → HTTP reject via
           ``ws._reject``; after accept → close with the given code), and
         - invokes the user handler with the right kwargs.
+
+        Captures server-side exceptions onto ``app._ws_server_exceptions``
+        so ``TestClient`` can re-raise them on session close — matches
+        Starlette/FastAPI TestClient behaviour where a handler raising
+        ``WebSocketDisconnect`` on client close propagates out of the
+        ``with client.websocket_connect(...)`` block.
         """
         import inspect as _inspect
         from fastapi_rs.dependencies import Depends as _Depends
@@ -2005,7 +2018,7 @@ class FastAPI:
         # class identity rather than by string name — some handlers
         # pass the WS under different aliases (`websocket`, `conn`…).
         try:
-            type_hints = _inspect.get_type_hints(endpoint)
+            type_hints = _inspect.get_type_hints(endpoint, include_extras=True)
         except Exception:  # noqa: BLE001
             type_hints = {}
 
@@ -2032,7 +2045,7 @@ class FastAPI:
         def _extract_marker(annotation, default):
             """Find a Query/Header/Cookie marker on this param either
             via ``Annotated[T, Query()]`` or ``= Query(...)`` default.
-            Returns (marker, effective_default_value, is_required).
+            Returns (marker, effective_default_value).
             """
             import typing as _t
             marker = None
@@ -2044,10 +2057,29 @@ class FastAPI:
                         marker = m
                         break
             if marker is None:
-                return None, None, False
-            return marker, marker.default, False
+                return None, None
+            return marker, marker.default
 
-        def _resolve_ws_scalar(ws, p_name, marker):
+        def _extract_depends(annotation, default):
+            """Find a ``Depends(...)`` in an ``Annotated[...]`` metadata
+            tuple or as the default value."""
+            import typing as _t
+            if isinstance(default, _Depends):
+                return default
+            if _t.get_origin(annotation) is _t.Annotated:
+                for m in _t.get_args(annotation)[1:]:
+                    if isinstance(m, _Depends):
+                        return m
+            return None
+
+        def _inner_type(annotation):
+            """Strip ``Annotated[T, ...]`` to get the underlying type."""
+            import typing as _t
+            if _t.get_origin(annotation) is _t.Annotated:
+                return _t.get_args(annotation)[0]
+            return annotation
+
+        def _resolve_ws_scalar_raw(ws, p_name, marker):
             """Pull a query/cookie/header value off the WebSocket scope."""
             alias = marker.alias or p_name
             if isinstance(marker, _Query):
@@ -2061,128 +2093,384 @@ class FastAPI:
                 return ws.headers.get(wire)
             return None
 
-        dep_params: list[tuple[str, object, bool]] = []
-        handler_scalars: list[tuple[str, object]] = []  # [(name, marker)]
-        ws_param_name: str | None = None
+        def _validate_scalar(val, ann, p_name, kind):
+            """Validate + coerce ``val`` against ``ann`` using pydantic
+            ``TypeAdapter``. On failure raise ``WebSocketException(1008)``
+            so Starlette semantics apply (handshake → HTTP 403, otherwise
+            close with 1008)."""
+            if val is None or ann is _inspect.Parameter.empty or ann is None:
+                return val
+            from pydantic import TypeAdapter
+            try:
+                return TypeAdapter(ann).validate_python(val)
+            except Exception:
+                # Policy violation on WS param validation.
+                raise _WSExc(
+                    code=1008,
+                    reason=f"{kind} validation error for {p_name!r}",
+                )
+
+        # Extract path parameter names from the route path. Supports both
+        # plain ``{name}`` and Starlette-style ``{name:path}`` converter
+        # syntax. These are injected as kwargs by the Rust router bridge
+        # and must NOT be re-resolved as query/scalar params.
+        import re as _re
+        path_params_names: set[str] = set()
+        if route_path:
+            for m in _re.finditer(r"\{([^{}:]+)(?::[^{}]+)?\}", route_path):
+                path_params_names.add(m.group(1))
+
+        # Classify every handler parameter up-front.
+        # Each entry: ("dep"|"scalar"|"ws"|"path"|"skip", name, meta)
+        param_spec: list[tuple] = []
         if sig is not None:
             for name, param in sig.parameters.items():
                 default = param.default
-                if isinstance(default, _Depends):
-                    dep_func = default.dependency
-                    if dep_func is None:
+                raw_ann = param.annotation
+                resolved_ann = type_hints.get(name, raw_ann)
+
+                # Depends (either annotated or as default)
+                dep_marker = _extract_depends(resolved_ann, default)
+                if dep_marker is not None:
+                    if dep_marker.dependency is None:
+                        # Blank Depends() — resolve via declared type
                         continue
-                    is_async = _inspect.iscoroutinefunction(dep_func)
-                    dep_params.append((name, dep_func, is_async))
+                    param_spec.append(("dep", name, dep_marker))
                     continue
-                if _is_websocket_annotation(name, param.annotation):
-                    ws_param_name = name
+
+                if _is_websocket_annotation(name, raw_ann):
+                    param_spec.append(("ws", name, None))
                     continue
-                marker, _, _ = _extract_marker(param.annotation, default)
+
+                # Path param — injected by the router bridge as kwargs.
+                if name in path_params_names:
+                    param_spec.append(("path", name, _inner_type(resolved_ann)))
+                    continue
+
+                marker, _ = _extract_marker(resolved_ann, default)
                 if marker is not None:
-                    handler_scalars.append((name, marker))
+                    param_spec.append(
+                        ("scalar", name, (marker, _inner_type(resolved_ann))),
+                    )
+                    continue
+
+                # Plain-typed param without marker → Query (FA default for WS).
+                # Skip **kwargs/*args/positional-only oddities.
+                if param.kind in (
+                    _inspect.Parameter.VAR_POSITIONAL,
+                    _inspect.Parameter.VAR_KEYWORD,
+                ):
+                    continue
+
+                # FA treats plain-typed WS params as Query (path params are
+                # injected separately by the router bridge).
+                if resolved_ann is _inspect.Parameter.empty:
+                    # Untyped — best-effort: pass through as Query string.
+                    default_val = None if default is _inspect.Parameter.empty else default
+                    q = _Query(default=default_val if default_val is not None else ...)
+                    param_spec.append(("scalar", name, (q, str)))
+                    continue
+
+                default_val = None if default is _inspect.Parameter.empty else default
+                from pydantic_core import PydanticUndefined as _PU
+                q_default = default_val if default is not _inspect.Parameter.empty else ...
+                q = _Query(default=q_default)
+                param_spec.append(("scalar", name, (q, resolved_ann)))
 
         is_async_endpoint = _inspect.iscoroutinefunction(endpoint)
         app_ref = self
 
-        def _resolve_dep(dep_func, ws, is_async_dep):
-            dep_sig = _inspect.signature(dep_func)
+        # Build scope-mismatch check at decoration time (FastAPI 0.120+):
+        # a ``request``-scope yield dep cannot depend on a ``function``-scope
+        # yield dep. Raise ``FastAPIError`` immediately on violation.
+        def _get_dep_scope(dep) -> str:
+            s = getattr(dep, "scope", None)
+            return s if s in ("function", "request") else "request"
+
+        def _check_scope_mismatch(dep: "_Depends", visited: set):
+            dep_func = dep.dependency
+            if dep_func is None or id(dep_func) in visited:
+                return
+            visited.add(id(dep_func))
             try:
+                dep_sig = _inspect.signature(dep_func)
                 dep_hints = _inspect.get_type_hints(dep_func, include_extras=True)
             except Exception:  # noqa: BLE001
-                dep_hints = {}
-            dep_kwargs: dict = {}
+                return
+            outer_scope = _get_dep_scope(dep)
+            outer_is_yield = (
+                _inspect.isgeneratorfunction(dep_func)
+                or _inspect.isasyncgenfunction(dep_func)
+            )
             for p_name, p in dep_sig.parameters.items():
                 ann = dep_hints.get(p_name, p.annotation)
-                raw = p.annotation
-                if (
-                    ann is _WebSocket
-                    or (isinstance(ann, type) and issubclass(ann, _WebSocket))
-                    or (isinstance(raw, str) and raw in ("WebSocket", "fastapi_rs.websockets.WebSocket"))
-                ):
-                    dep_kwargs[p_name] = ws
+                sub = _extract_depends(ann, p.default)
+                if sub is None or sub.dependency is None:
                     continue
-                marker, default_val, _ = _extract_marker(ann, p.default)
-                if marker is not None:
-                    val = _resolve_ws_scalar(ws, p_name, marker)
-                    if val is None:
-                        from pydantic_core import PydanticUndefined as _PU
-                        if default_val is not _PU and default_val is not ...:
-                            val = default_val
-                    dep_kwargs[p_name] = val
-            if is_async_dep:
-                from fastapi_rs._async_worker import submit as _submit
-                return _submit(dep_func(**dep_kwargs))
-            return dep_func(**dep_kwargs)
+                sub_scope = _get_dep_scope(sub)
+                sub_is_yield = (
+                    _inspect.isgeneratorfunction(sub.dependency)
+                    or _inspect.isasyncgenfunction(sub.dependency)
+                )
+                if (
+                    outer_is_yield
+                    and sub_is_yield
+                    and outer_scope == "request"
+                    and sub_scope == "function"
+                ):
+                    from fastapi_rs.exceptions import FastAPIError as _FE
+                    outer_name = getattr(dep_func, "__name__", repr(dep_func))
+                    raise _FE(
+                        f'The dependency "{outer_name}" has a scope of "request", '
+                        f'it cannot depend on dependencies with scope "function"'
+                    )
+                _check_scope_mismatch(sub, visited)
+
+        for kind, _name, meta in param_spec:
+            if kind == "dep":
+                _check_scope_mismatch(meta, set())
+
+        def _effective_dep_callable(dep_callable):
+            """Honour ``app.dependency_overrides``."""
+            if app_ref is not None and app_ref.dependency_overrides:
+                return app_ref.dependency_overrides.get(dep_callable, dep_callable)
+            return dep_callable
+
+        async def _call_maybe_async(fn, kwargs):
+            """Call ``fn``; await the result if it's a coroutine."""
+            r = fn(**kwargs)
+            if _inspect.iscoroutine(r):
+                return await r
+            return r
+
+        async def _resolve_dep_async(dep, ws, generators, cache):
+            """Recursively resolve a ``Depends(...)`` chain for the WS
+            endpoint. Returns the resolved value. ``generators`` is a
+            list of ``(gen, is_async, scope)`` pushed onto by yield-deps
+            for later teardown. ``cache`` de-duplicates by dep callable
+            when ``use_cache=True``."""
+            original = dep.dependency
+            effective = _effective_dep_callable(original)
+            use_cache = getattr(dep, "use_cache", True)
+            cache_key = id(original)
+            if use_cache and cache_key in cache:
+                return cache[cache_key]
+
+            try:
+                dep_sig = _inspect.signature(effective)
+                dep_hints = _inspect.get_type_hints(effective, include_extras=True)
+            except Exception:  # noqa: BLE001
+                dep_sig = None
+                dep_hints = {}
+
+            dep_kwargs: dict = {}
+            if dep_sig is not None:
+                for p_name, p in dep_sig.parameters.items():
+                    ann = dep_hints.get(p_name, p.annotation)
+                    raw = p.annotation
+                    # WebSocket injection
+                    if (
+                        ann is _WebSocket
+                        or (isinstance(ann, type) and issubclass(ann, _WebSocket))
+                        or (
+                            isinstance(raw, str)
+                            and raw in ("WebSocket", "fastapi_rs.websockets.WebSocket")
+                        )
+                    ):
+                        dep_kwargs[p_name] = ws
+                        continue
+                    # Sub-dependency
+                    sub_dep = _extract_depends(ann, p.default)
+                    if sub_dep is not None and sub_dep.dependency is not None:
+                        dep_kwargs[p_name] = await _resolve_dep_async(
+                            sub_dep, ws, generators, cache,
+                        )
+                        continue
+                    # Scalar (Query/Header/Cookie) with validation
+                    marker, default_val = _extract_marker(ann, p.default)
+                    if marker is not None:
+                        raw_val = _resolve_ws_scalar_raw(ws, p_name, marker)
+                        if raw_val is None:
+                            from pydantic_core import PydanticUndefined as _PU
+                            if default_val is not _PU and default_val is not ...:
+                                dep_kwargs[p_name] = default_val
+                                continue
+                            # Missing required scalar → 1008.
+                            raise _WSExc(
+                                code=1008,
+                                reason=f"missing {marker.__class__.__name__} {p_name!r}",
+                            )
+                        inner = _inner_type(ann)
+                        if inner is _inspect.Parameter.empty:
+                            dep_kwargs[p_name] = raw_val
+                        else:
+                            dep_kwargs[p_name] = _validate_scalar(
+                                raw_val, inner, p_name,
+                                marker.__class__.__name__,
+                            )
+                        continue
+
+            # Invoke the dependency (sync/async, function/generator).
+            scope = _get_dep_scope(dep)
+            is_async_gen = _inspect.isasyncgenfunction(effective)
+            is_gen = _inspect.isgeneratorfunction(effective)
+
+            if is_async_gen:
+                agen = effective(**dep_kwargs)
+                value = await agen.__anext__()
+                generators.append((agen, True, scope))
+            elif is_gen:
+                gen = effective(**dep_kwargs)
+                value = next(gen)
+                generators.append((gen, False, scope))
+            elif _inspect.iscoroutinefunction(effective):
+                value = await effective(**dep_kwargs)
+            else:
+                value = effective(**dep_kwargs)
+
+            if use_cache:
+                cache[cache_key] = value
+            return value
+
+        async def _teardown_generators(generators, scope_filter=None):
+            """Run yield-dep teardown in reverse. When ``scope_filter`` is
+            set, only teardown generators matching that scope."""
+            remaining = []
+            # iterate in reverse so innermost teardown first
+            for gen, is_async, scope in reversed(generators):
+                if scope_filter is not None and scope != scope_filter:
+                    remaining.append((gen, is_async, scope))
+                    continue
+                try:
+                    if is_async:
+                        try:
+                            await gen.__anext__()
+                        except StopAsyncIteration:
+                            pass
+                    else:
+                        try:
+                            next(gen)
+                        except StopIteration:
+                            pass
+                except Exception:
+                    # Teardown errors shouldn't mask primary flow.
+                    pass
+            # remaining is in reversed order; flip back to original order
+            generators[:] = list(reversed(remaining))
 
         def _handle_ws_exc(ws, exc: _WSExc) -> None:
             # Starlette: pre-accept → reject the HTTP handshake with a
             # non-2xx status; post-accept → close with the WS code.
+            code = exc.code if exc.code is not None else 1000
+            reason = exc.reason or ""
+            # Push a WebSocketDisconnect so the testclient surfaces the
+            # ACTUAL close code (e.g. 1008 for POLICY_VIOLATION) rather
+            # than the HTTP rejection status (403). Matches FA parity.
+            try:
+                from fastapi_rs.exceptions import WebSocketDisconnect as _WD
+                app_ref._ws_server_exceptions.append(_WD(code=code, reason=reason))
+            except Exception:  # noqa: BLE001
+                pass
             if ws.application_state == _WSState.CONNECTING:
                 ws._reject(403)
                 return
             try:
-                code = exc.code if exc.code is not None else 1000
-                reason = exc.reason or ""
                 ws._ws.close(code, reason)
             except Exception:  # noqa: BLE001
                 pass
 
-        def _resolve_handler_scalars(ws):
-            from pydantic_core import PydanticUndefined as _PU
-            out: dict = {}
-            for name, marker in handler_scalars:
-                val = _resolve_ws_scalar(ws, name, marker)
-                if val is None:
-                    default_val = marker.default
-                    if default_val is _PU or default_val is ...:
-                        continue
-                    val = default_val
-                out[name] = val
-            return out
-
-        if is_async_endpoint:
-            async def _ws_entry(ws, **path_kwargs):
-                ws._app = app_ref
-                try:
-                    resolved: dict = {}
-                    for name, dep_func, is_async_dep in dep_params:
-                        resolved[name] = _resolve_dep(dep_func, ws, is_async_dep)
-                    kwargs: dict = dict(path_kwargs)
-                    if ws_param_name is not None:
-                        kwargs[ws_param_name] = ws
-                    kwargs.update(_resolve_handler_scalars(ws))
-                    kwargs.update(resolved)
-                    await endpoint(**kwargs)
-                except _WSExc as exc:
-                    _handle_ws_exc(ws, exc)
-                except Exception:
-                    # Abort the handshake cleanly on any unhandled
-                    # exception so the client sees an HTTP 500 instead
-                    # of hanging until the 30-second accept timeout.
-                    if ws.application_state == _WSState.CONNECTING:
-                        ws._reject(500)
-                    raise
-            return _ws_entry
-
-        def _ws_entry_sync(ws, **path_kwargs):
-            ws._app = app_ref
+        def _capture_server_exception(exc):
+            """Push onto the app's capture queues so TestClient can
+            re-raise on session close."""
             try:
-                resolved: dict = {}
-                for name, dep_func, is_async_dep in dep_params:
-                    resolved[name] = _resolve_dep(dep_func, ws, is_async_dep)
-                kwargs: dict = dict(path_kwargs)
-                if ws_param_name is not None:
-                    kwargs[ws_param_name] = ws
-                kwargs.update(_resolve_handler_scalars(ws))
-                kwargs.update(resolved)
-                endpoint(**kwargs)
+                app_ref._ws_server_exceptions.append(exc)
+            except Exception:  # noqa: BLE001
+                pass
+
+        async def _build_kwargs(ws, path_kwargs):
+            """Resolve all handler kwargs. Returns (kwargs, generators).
+            Raises on dep failure — caller decides how to surface."""
+            kwargs: dict = dict(path_kwargs)
+            generators: list = []
+            cache: dict = {}
+            for kind, name, meta in param_spec:
+                if kind == "ws":
+                    kwargs[name] = ws
+                elif kind == "path":
+                    # Path params are injected by the router. Validate
+                    # via TypeAdapter if a non-str type was declared.
+                    val = path_kwargs.get(name)
+                    if val is not None and meta is not _inspect.Parameter.empty and meta is not str:
+                        kwargs[name] = _validate_scalar(val, meta, name, "Path")
+                    else:
+                        kwargs[name] = val
+                elif kind == "scalar":
+                    marker, inner = meta
+                    raw_val = _resolve_ws_scalar_raw(ws, name, marker)
+                    if raw_val is None:
+                        default_val = marker.default
+                        from pydantic_core import PydanticUndefined as _PU
+                        if default_val is _PU or default_val is ...:
+                            # Required — 1008.
+                            raise _WSExc(
+                                code=1008,
+                                reason=f"missing {marker.__class__.__name__} {name!r}",
+                            )
+                        kwargs[name] = default_val
+                        continue
+                    if inner is _inspect.Parameter.empty:
+                        kwargs[name] = raw_val
+                    else:
+                        kwargs[name] = _validate_scalar(
+                            raw_val, inner, name,
+                            marker.__class__.__name__,
+                        )
+                elif kind == "dep":
+                    kwargs[name] = await _resolve_dep_async(
+                        meta, ws, generators, cache,
+                    )
+            return kwargs, generators
+
+        async def _ws_entry(ws, **path_kwargs):
+            ws._app = app_ref
+            generators: list = []
+            try:
+                kwargs, generators = await _build_kwargs(ws, path_kwargs)
+                if is_async_endpoint:
+                    await endpoint(**kwargs)
+                else:
+                    endpoint(**kwargs)
             except _WSExc as exc:
                 _handle_ws_exc(ws, exc)
-            except Exception:
+                # Run teardown even on exception so yield-deps release
+                # resources.
+                await _teardown_generators(generators)
+                return
+            except Exception as exc:
+                # Capture for TestClient re-raise semantics BEFORE we
+                # disturb the WS state.
+                _capture_server_exception(exc)
+                # Abort the handshake cleanly if still pre-accept so the
+                # client sees an HTTP 500 instead of hanging.
                 if ws.application_state == _WSState.CONNECTING:
                     ws._reject(500)
-                raise
-        return _ws_entry_sync
+                else:
+                    # Post-accept unhandled exception — close cleanly so
+                    # the client's ``recv()`` sees a close frame.
+                    try:
+                        ws._ws.close(1006, "")
+                    except Exception:  # noqa: BLE001
+                        pass
+                await _teardown_generators(generators)
+                return
+            # Normal exit — drain teardowns (both scopes; no response
+            # body to stream for WS).
+            await _teardown_generators(generators)
+
+        # Always return an async entry: Rust treats both sync/async the
+        # same way via the worker loop, and this lets us await deps and
+        # teardown uniformly even for sync endpoints.
+        return _ws_entry
 
     def _get_all_dependencies_for_route(
         self, router: APIRouter, route, include_deps: list | None = None,
@@ -2272,7 +2560,7 @@ class FastAPI:
                 # user's handler to resolve deps BEFORE the user code runs.
                 # A pre-accept ``WebSocketException`` aborts the handshake
                 # with the carried code (Starlette normative path).
-                wrapped_ws = self._wrap_websocket_endpoint(route.endpoint)
+                wrapped_ws = self._wrap_websocket_endpoint(route.endpoint, full_path)
                 collected.append(
                     {
                         "path": full_path,

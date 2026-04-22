@@ -556,9 +556,21 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
         # before emitting to OpenAPI). Int codes stay numeric.
         _raw = str(status_key)
         _normalised: str
-        if _raw.lower() in ("1xx", "2xx", "3xx", "4xx", "5xx"):
+        _lo = _raw.lower()
+        if _lo in ("1xx", "2xx", "3xx", "4xx", "5xx"):
             _normalised = _raw.upper()
+        elif _lo == "default":
+            _normalised = "default"
         else:
+            # Validate numeric status code — FA raises ValueError for
+            # non-numeric keys that aren't range codes or "default".
+            try:
+                int(_raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Invalid status code: {status_key!r}. "
+                    "Must be an int, a range code like '5XX', or 'default'."
+                )
             _normalised = _raw
         # Custom response_class with non-JSON media_type (e.g.
         # ``JsonApiResponse`` → ``application/vnd.api+json``) — per
@@ -609,14 +621,19 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
         elif auto_content:
             # FA merges: keys present in user's content take precedence;
             # keys only in auto_content (typically application/json from
-            # response_model) are added. This way, user can declare
-            # additional media types (image/png) while keeping the JSON
-            # schema for response_model.
+            # response_model) are added. Additionally, for media types
+            # present in BOTH, schema from auto_content is merged in when
+            # the user didn't supply one (so ``example`` + response_model
+            # still produces a ``$ref``-ed schema).
             merged: dict[str, Any] = {}
             for mt, obj in auto_content.items():
                 if mt not in existing_content:
                     merged[mt] = obj
             for mt, obj in existing_content.items():
+                if isinstance(obj, dict) and mt in auto_content:
+                    auto_obj = auto_content[mt]
+                    if isinstance(auto_obj, dict) and "schema" not in obj and "schema" in auto_obj:
+                        obj = {"schema": auto_obj["schema"], **obj}
                 merged[mt] = obj
             responses_dict[success_key]["content"] = merged
 
@@ -941,9 +958,28 @@ def _build_response_entry(
             except Exception:  # noqa: BLE001
                 pass
 
-    # Direct content/headers overrides
+    # Direct content/headers overrides. If the user supplies ``content``
+    # AND a ``model`` was provided, FA merges: user's content takes
+    # precedence, but the model-derived schema is added for media types
+    # where the user only supplied metadata (examples/example) without
+    # their own schema.
     if "content" in resp_info:
-        entry["content"] = resp_info["content"]
+        user_content = resp_info["content"]
+        auto_content = entry.get("content") or {}
+        if auto_content and isinstance(user_content, dict):
+            merged: dict[str, Any] = {}
+            for mt, obj in auto_content.items():
+                if mt not in user_content:
+                    merged[mt] = obj
+            for mt, obj in user_content.items():
+                if isinstance(obj, dict) and mt in auto_content:
+                    auto_obj = auto_content[mt]
+                    if isinstance(auto_obj, dict) and "schema" not in obj and "schema" in auto_obj:
+                        obj = {"schema": auto_obj["schema"], **obj}
+                merged[mt] = obj
+            entry["content"] = merged
+        else:
+            entry["content"] = user_content
     if "headers" in resp_info:
         entry["headers"] = resp_info["headers"]
     if "links" in resp_info:
@@ -1739,13 +1775,29 @@ def _model_ref(model_class, mode: str | None = None) -> dict[str, str] | None:
     usage = _MODEL_USAGE.get(id(model_class), set())
     split = (
         "input" in usage and "output" in usage
-        and _model_is_self_recursive(model_class)
+        and (
+            _model_is_self_recursive(model_class)
+            or _val_ser_schemas_differ(model_class)
+        )
     )
     if split and mode == "serialization":
         return {"$ref": f"#/components/schemas/{name}-Output"}
     if split and mode == "validation":
         return {"$ref": f"#/components/schemas/{name}-Input"}
     return {"$ref": f"#/components/schemas/{name}"}
+
+
+def _val_ser_schemas_differ(model_class) -> bool:
+    """True if the model's validation and serialization JSON schemas
+    produce different shapes (e.g. ``json_schema_serialization_defaults_required``
+    or ``computed_field`` on a property).
+    """
+    try:
+        val = model_class.model_json_schema(mode="validation")
+        ser = model_class.model_json_schema(mode="serialization")
+        return val != ser
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _model_is_self_recursive(model_class) -> bool:
@@ -1875,10 +1927,15 @@ def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
         props = schema.get("properties") if isinstance(schema.get("properties"), dict) else None
         if props:
             for _, field_schema in props.items():
+                # Pydantic emits ``format: binary`` for single-mode
+                # ``val_json_bytes``/``ser_json_bytes`` and
+                # ``format: base64url`` when BOTH are set. Both cases
+                # should translate to FA's ``contentEncoding: base64`` +
+                # ``contentMediaType: application/octet-stream``.
                 if (
                     isinstance(field_schema, dict)
                     and field_schema.get("type") == "string"
-                    and field_schema.get("format") == "binary"
+                    and field_schema.get("format") in ("binary", "base64url")
                 ):
                     field_schema.pop("format", None)
                     field_schema["contentEncoding"] = "base64"
@@ -1916,7 +1973,8 @@ def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
     model_name = _normalize_model_name(raw_name) if raw_name else None
     used_as = _MODEL_USAGE.get(id(model_class), set())
     is_self_recursive = _model_is_self_recursive(model_class)
-    if model_name and ("input" in used_as and "output" in used_as) and is_self_recursive:
+    _differ = _val_ser_schemas_differ(model_class)
+    if model_name and ("input" in used_as and "output" in used_as) and (is_self_recursive or _differ):
         # Self-recursive + dual-use — FastAPI emits split `-Input`/`-Output`
         # variants so body vs response can differ (the schemas are usually
         # identical, but the two distinct refs let the spec read cleanly

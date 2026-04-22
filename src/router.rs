@@ -1585,7 +1585,8 @@ fn extract_params_to_pydict_full<'py>(
 
         match param.kind.as_str() {
             "path" => {
-                if let Some(raw) = path_map.get(&param.name) {
+                let p_lookup: &str = param.alias.as_deref().unwrap_or(&param.name);
+                if let Some(raw) = path_map.get(p_lookup) {
                     if param.scalar_validator.is_some() {
                         let raw_py = pyo3::types::PyString::new(py, raw).into_any();
                         let validated = run_scalar_validator(py, param, "path", &raw_py)?;
@@ -1597,7 +1598,7 @@ fn extract_params_to_pydict_full<'py>(
                             }
                             None => {
                                 extraction_errors.push(coercion_error_detail(
-                                    "path", &param.name, raw, &param.type_hint,
+                                    "path", p_lookup, raw, &param.type_hint,
                                 ));
                                 continue;
                             }
@@ -1606,7 +1607,7 @@ fn extract_params_to_pydict_full<'py>(
                 } else if apply_default(py, &kwargs, param) {
                     // Default applied
                 } else if param.required {
-                    extraction_errors.push(missing_error_detail("path", &param.name));
+                    extraction_errors.push(missing_error_detail("path", p_lookup));
                     continue;
                 }
             }

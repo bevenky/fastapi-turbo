@@ -354,10 +354,17 @@ class TestClient:
         if cookie_jar:
             cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_jar.items())
             extra_hdrs.append(("Cookie", cookie_header))
+        # Drain any stale server exceptions from prior sessions BEFORE
+        # opening this one so we don't surface them here.
+        try:
+            getattr(self.app, "_ws_server_exceptions", []).clear()
+        except Exception:  # noqa: BLE001
+            pass
         return _WebSocketTestSession(
             ws_url,
             subprotocols=subprotocols,
             additional_headers=extra_hdrs or None,
+            app=self.app,
             **kwargs,
         )
 
@@ -370,12 +377,14 @@ class _WebSocketTestSession:
         url: str,
         subprotocols: list[str] | None = None,
         additional_headers: list[tuple[str, str]] | None = None,
+        app: Any = None,
         **_: Any,
     ):
         self._url = url
         self._subprotocols = subprotocols
         self._additional_headers = additional_headers
         self._ws = None
+        self._app = app
         from websockets.sync.client import connect as _connect  # noqa: E402
         self._connect = _connect
 
@@ -397,16 +406,58 @@ class _WebSocketTestSession:
                 from websockets.exceptions import InvalidStatus
                 if isinstance(e, InvalidStatus):
                     code = getattr(e.response, "status_code", None) or 1008
+                    # If the server-side handler raised a
+                    # ``WebSocketException`` pre-accept, the Starlette-
+                    # spec HTTP response is 403; but the WS close code
+                    # attached to the exception (e.g. 1008 for
+                    # POLICY_VIOLATION) is what FA tests assert on. Poll
+                    # the app's capture queue for the original exc.
+                    srv_exc = self._pop_server_exception()
+                    if srv_exc is not None and isinstance(srv_exc, WebSocketDisconnect):
+                        raise srv_exc from None
+                    # FA maps HTTP 404 (no route) to WS normal-closure 1000.
+                    if code == 404:
+                        code = 1000
                     raise WebSocketDisconnect(code=code) from None
             except ImportError:
                 pass
             raise
         return self
 
+    def _pop_server_exception(self):
+        """Pop the most recent captured server-side WS exception.
+        Brief poll in case the server thread is still finalising."""
+        import time as _t
+        if self._app is None:
+            return None
+        try:
+            q = getattr(self._app, "_ws_server_exceptions", None)
+            if q is None:
+                return None
+            deadline = _t.monotonic() + 0.25
+            while _t.monotonic() < deadline:
+                if q:
+                    return q.pop(0)
+                _t.sleep(0.01)
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
     def __exit__(self, *args: Any) -> None:
         if self._ws is not None:
-            self._ws.close()
+            try:
+                self._ws.close()
+            except Exception:  # noqa: BLE001
+                pass
             self._ws = None
+        # Starlette's TestClient re-raises server-side exceptions on exit.
+        # Our server thread doesn't share a future, so we poll the
+        # capture queue: when the handler raised ``WebSocketDisconnect``
+        # or another exception, surface it here so ``pytest.raises(WS
+        # Disconnect)`` around the ``with`` block fires.
+        srv_exc = self._pop_server_exception()
+        if srv_exc is not None:
+            raise srv_exc
 
     # ── Send ───────────────────────────────────────────────────────
 
