@@ -4268,7 +4268,15 @@ class FastAPI:
         """Enter every lifespan (app + routers), merging yielded state
         into ``self._app_state`` and ``self.state``. Parent state
         overrides child on key collision.
+
+        Idempotent: if ``_lifespan_cms`` is already populated (e.g.
+        ``TestClient.__enter__`` ran startup before the server thread's
+        ``app.run()`` also called this), skip — otherwise overwriting
+        ``_lifespan_cms`` drops the prior generators, which close on
+        GC and fire ``shutdown`` prematurely.
         """
+        if getattr(self, "_lifespan_cms", None):
+            return
         lifespans = self._collect_lifespans()
         if not lifespans:
             return
