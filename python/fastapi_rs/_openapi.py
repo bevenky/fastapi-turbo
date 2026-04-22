@@ -272,6 +272,13 @@ def generate_openapi_schema(
         # Collect security schemes from route dependencies
         _collect_security_schemes(route, security_schemes)
 
+        # Expose the components/schemas bucket so ``_build_operation``
+        # can pass it down to ``_build_callbacks`` for the
+        # ``Body_<callback_operation_id>`` hoist pass. Collect schemas
+        # FIRST so the callback hoist finds the already-registered
+        # ``Body_<endpoint>`` component to rename.
+        _collect_schemas(route, components_schemas)
+        route["_callback_components_schemas"] = components_schemas
         for method in route["methods"]:
             operation = _build_operation(route, method.lower())
             op_id = operation.get("operationId")
@@ -290,9 +297,6 @@ def generate_openapi_schema(
                 else:
                     _seen_operation_ids[op_id] = (path, method)
             schema["paths"].setdefault(path, {})[method.lower()] = operation
-
-            # Collect Pydantic model schemas into components
-            _collect_schemas(route, components_schemas)
 
             # Hoist any synthesized Body_<handler> form/file schema into
             # components.schemas and replace the inline schema with a $ref
@@ -1147,10 +1151,18 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
         if auto_security:
             operation["security"] = auto_security
 
-    # Callbacks (OpenAPI callbacks as nested operation dicts)
+    # Callbacks (OpenAPI callbacks as nested operation dicts). Thread the
+    # caller-supplied components.schemas through via ``route["_callback_
+    # components_schemas"]`` so the callback's own body/form schemas get
+    # hoisted under ``Body_<callback_operation_id>`` — matches FA's
+    # emission when the callback route declared its own
+    # ``generate_unique_id_function``.
     callbacks = route.get("callbacks") or []
     if callbacks:
-        operation["callbacks"] = _build_callbacks(callbacks)
+        _cb_components = route.get("_callback_components_schemas")
+        operation["callbacks"] = _build_callbacks(
+            callbacks, components_schemas=_cb_components
+        )
 
     # Per-operation servers (OpenAPI 3.1)
     servers = route.get("servers")
@@ -2640,13 +2652,21 @@ def _derive_security_from_deps(route: dict[str, Any]) -> list[dict[str, list[str
     return [{name: by_scheme[name]} for name in order]
 
 
-def _build_callbacks(callbacks: list) -> dict[str, Any]:
+def _build_callbacks(
+    callbacks: list,
+    components_schemas: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Render OpenAPI callbacks.
 
     FA accepts TWO forms here:
       1. list of ``APIRoute`` — routes directly (``callbacks=router.routes``).
       2. list of ``APIRouter`` — full routers (less common).
     Both are rendered as ``{callback_name: {path: {method: operation}}}``.
+
+    When ``components_schemas`` is provided, the callback's own synthesized
+    body schemas are hoisted into it under ``Body_<callback_operation_id>``
+    — matching FA's emission for callback routes with their own
+    ``generate_unique_id_function``.
     """
     from fastapi_rs.routing import APIRouter, APIRoute
 
@@ -2687,7 +2707,13 @@ def _build_callbacks(callbacks: list) -> dict[str, Any]:
         }
         methods_dict: dict[str, Any] = {}
         for method in cb_route.methods:
-            methods_dict[method.lower()] = _build_operation(cb_route_dict, method.lower())
+            _op = _build_operation(cb_route_dict, method.lower())
+            # Hoist the callback's synthesized Body_<handler> into
+            # components.schemas so the emitted body ``$ref`` uses the
+            # callback's operation_id (not the endpoint function name).
+            if components_schemas is not None:
+                _hoist_body_schema(_op, components_schemas)
+            methods_dict[method.lower()] = _op
         return cb_route.name, full_path, methods_dict
 
     result: dict[str, Any] = {}

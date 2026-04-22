@@ -163,7 +163,11 @@ class Request(HTTPConnection):
 
     def __init__(self, scope: dict[str, Any] | None = None, receive=None, send=None):
         super().__init__(scope, receive, send)
-        self._body: bytes | None = None
+        # NOTE: ``_body`` is NOT initialised here — Starlette-parity.
+        # Subclasses like FA's docs ``GzipRequest`` override ``body()``
+        # with an ``if not hasattr(self, "_body"): ...`` guard so the
+        # decompression hook fires exactly once. Initialising
+        # ``self._body = None`` here would short-circuit that pattern.
         self._json: Any = None
         self._form: dict[str, Any] | None = None
 
@@ -249,8 +253,9 @@ class Request(HTTPConnection):
         return URL(base + path)
 
     async def body(self) -> bytes:
-        if self._body is not None:
-            return self._body
+        cached = getattr(self, "_body", None)
+        if cached is not None:
+            return cached
         body = self._scope.get("_body", b"")
         if body:
             self._body = body
@@ -279,9 +284,10 @@ class Request(HTTPConnection):
         Note: calling stream() consumes the body. Subsequent body()/json()/
         form() calls will return what stream already yielded.
         """
-        if self._body is not None:
+        cached = getattr(self, "_body", None)
+        if cached is not None:
             # Body already buffered — yield once and done
-            yield self._body
+            yield cached
             yield b""
             return
         body = self._scope.get("_body", b"")
