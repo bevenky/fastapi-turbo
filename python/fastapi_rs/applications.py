@@ -1207,6 +1207,7 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
             "path": kwargs.pop("_request_path", "/"),
             "query_string": kwargs.pop("_request_query", "").encode(),
             "headers": kwargs.pop("_request_headers", []),
+            "root_path": getattr(app, "root_path", "") or "",
             "_handler_kwargs": kwargs,
         }
 
@@ -2674,14 +2675,48 @@ class FastAPI:
         # Mounted sub-applications
         for mount_path, mounted_app, _name in self._mounts:
             if isinstance(mounted_app, FastAPI):
-                # Collect routes from the mounted FastAPI app with prefix
+                # Collect routes from the mounted FastAPI app with prefix.
+                # Mark them with `_from_mount` so the main app's OpenAPI
+                # schema can exclude them — Starlette/FastAPI treat a
+                # mounted FastAPI as an isolated sub-app whose schema is
+                # served at `<mount>/openapi.json`.
                 sub_routes = mounted_app._collect_all_routes()
                 for r in sub_routes:
                     original = r["path"]
                     r["path"] = mount_path.rstrip("/") + ("" if original == "/" else original)
                     if not r["path"]:
                         r["path"] = "/"
+                    r["_from_mount"] = mount_path
                 all_routes.extend(sub_routes)
+                # Also add a passthrough route so GET <mount>/openapi.json
+                # serves the sub-app's own schema (with `servers: [{"url":
+                # <mount>}]` auto-prefixed via root_path).
+                if mounted_app.openapi_url:
+                    _sub_openapi_path = (
+                        mount_path.rstrip("/") + mounted_app.openapi_url
+                    )
+                    # Force root_path so the sub-app's schema advertises its
+                    # mount point, mirroring Starlette's mount behaviour.
+                    if not mounted_app.root_path:
+                        mounted_app.root_path = mount_path.rstrip("/")
+
+                    def _make_openapi_handler(_app):
+                        def _openapi_endpoint():
+                            return _app.openapi()
+                        _openapi_endpoint.__name__ = "openapi"
+                        return _openapi_endpoint
+
+                    all_routes.append({
+                        "path": _sub_openapi_path,
+                        "methods": ["GET"],
+                        "endpoint": _make_openapi_handler(mounted_app),
+                        "is_async": False,
+                        "handler_name": f"openapi_{id(mounted_app)}",
+                        "params": [],
+                        "is_websocket": False,
+                        "_from_mount": mount_path,
+                        "include_in_schema": False,
+                    })
             elif isinstance(mounted_app, APIRouter):
                 all_routes.extend(
                     self._collect_routes_from_router(mounted_app, prefix=mount_path)
@@ -2734,10 +2769,16 @@ class FastAPI:
         """Return the OpenAPI schema dict (cached after first call)."""
         if not hasattr(self, "_openapi_schema"):
             route_dicts = self._collect_all_routes()
+            # Exclude routes that come from mounted sub-FastAPI apps —
+            # each mounted app owns its own schema at `<mount>/openapi.json`.
+            route_dicts = [r for r in route_dicts if not r.get("_from_mount")]
             # Add root_path to servers if configured (matches run_server() behavior)
             effective_servers = self.servers
-            if self.root_path and self.root_path_in_servers and not effective_servers:
-                effective_servers = [{"url": self.root_path}]
+            if self.root_path and self.root_path_in_servers:
+                if not effective_servers:
+                    effective_servers = [{"url": self.root_path}]
+                elif not any(s.get("url") == self.root_path for s in effective_servers):
+                    effective_servers = [{"url": self.root_path}, *effective_servers]
             webhook_dicts = self._collect_routes_from_router(self.webhooks)
             self._openapi_schema = generate_openapi_schema(
                 title=self.title,
@@ -3001,11 +3042,22 @@ class FastAPI:
         # Generate the OpenAPI schema JSON if docs are enabled
         openapi_json: str | None = None
         if self.openapi_url is not None:
-            http_routes = [r for r in route_dicts if not r.get("is_websocket")]
-            # Auto-add root_path to servers if configured
+            http_routes = [
+                r for r in route_dicts
+                if not r.get("is_websocket") and not r.get("_from_mount")
+            ]
+            # Auto-add root_path to servers if configured.
+            # Matches FA: if root_path_in_servers is True and root_path set,
+            # prepend {"url": root_path}. If no servers present, use only
+            # that. If servers exist and none already match root_path, prepend.
             effective_servers = self.servers
-            if self.root_path and self.root_path_in_servers and not effective_servers:
-                effective_servers = [{"url": self.root_path}]
+            if self.root_path and self.root_path_in_servers:
+                if not effective_servers:
+                    effective_servers = [{"url": self.root_path}]
+                elif not any(
+                    s.get("url") == self.root_path for s in effective_servers
+                ):
+                    effective_servers = [{"url": self.root_path}, *effective_servers]
             webhook_dicts = self._collect_routes_from_router(self.webhooks)
             openapi_schema = generate_openapi_schema(
                 title=self.title,

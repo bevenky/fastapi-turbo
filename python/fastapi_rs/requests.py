@@ -37,6 +37,15 @@ class HTTPConnection:
         self._send = send
         self._cookies: dict[str, str] | None = None
         self._state: State | None = None
+        # Starlette/FastAPI: scope["root_path"] carries the app mount/prefix
+        # (set by reverse-proxy ASGI middleware or TestClient(root_path=...)).
+        # Our Rust-built scope doesn't populate it; mirror it from app.root_path
+        # when available so handlers doing request.scope.get("root_path") work.
+        if "root_path" not in self._scope:
+            app = self._scope.get("app")
+            rp = getattr(app, "root_path", None)
+            if rp:
+                self._scope["root_path"] = rp
 
     @property
     def scope(self) -> dict[str, Any]:
