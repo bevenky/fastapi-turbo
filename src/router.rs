@@ -2018,6 +2018,16 @@ fn extract_params_to_pydict_full<'py>(
                                 let _ = kwargs.set_item(&param.name, wrapped);
                             } else {
                                 let text = String::from_utf8_lossy(&field.data).into_owned();
+                                // FA parity: an empty form field on an
+                                // Optional/non-required param uses the
+                                // default (usually None). Without this,
+                                // ``age=Form(None)`` + ``age=`` fails to
+                                // parse as int and returns 422.
+                                if text.is_empty() && !param.required {
+                                    if apply_default(py, &kwargs, param) {
+                                        continue;
+                                    }
+                                }
                                 if param.scalar_validator.is_some() {
                                     let raw_py = pyo3::types::PyString::new(py, &text).into_any();
                                     let validated = run_scalar_validator(py, param, "body", &raw_py)?;
