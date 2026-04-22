@@ -275,7 +275,30 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
                 if _is_plain_model:
                     model_class = annotation
                 else:
-                    model_class = _make_type_adapter_proxy(annotation)
+                    # For Unions / Annotated-with-Discriminator body types,
+                    # use the ORIGINAL pre-unwrap annotation so Pydantic's
+                    # TypeAdapter sees any ``Discriminator()`` / ``Field(
+                    # discriminator=...)`` metadata on the outer Annotated
+                    # wrapper. Without this, Pydantic's ``oneOf`` schema
+                    # with discriminator mapping is lost.
+                    # FA behaviour: when the marker came from the
+                    # Annotated[...] metadata (flattened in), preserve
+                    # the whole Annotated (incl. Discriminator) so the
+                    # schema emits ``oneOf``. When the marker came from
+                    # the signature default, strip the outer Discriminator
+                    # wrapper so the schema emits plain ``anyOf``.
+                    _ta_ann = annotation
+                    if typing.get_origin(annotation) is typing.Union:
+                        _orig = _original_before_unwrap
+                        if (
+                            typing.get_origin(_orig) is typing.Annotated
+                            and marker in typing.get_args(_orig)[1:]
+                        ):
+                            # Marker was in Annotated (flattened in) —
+                            # preserve the whole thing so Discriminator
+                            # reaches TypeAdapter.
+                            _ta_ann = _orig
+                    model_class = _make_type_adapter_proxy(_ta_ann)
             elif kind == "body":
                 # Scalar body param (`n: int = Body(...)`, `s: str = Body(...)`).
                 # For non-embed scalars, build a TypeAdapter so the Rust
@@ -342,11 +365,15 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             if _is_plain_model:
                 model_class = annotation
             else:
-                # Non-BaseModel body (list[Item], dict, dict[str,X]) —
-                # build a Pydantic TypeAdapter and expose its validator
-                # via a `__pydantic_validator__` attribute so the Rust
-                # body-cache path works uniformly.
-                model_class = _make_type_adapter_proxy(annotation)
+                # Non-BaseModel body (list[Item], dict, dict[str,X],
+                # discriminated Union, …). Prefer the ORIGINAL pre-unwrap
+                # annotation so any outer Annotated[..., Discriminator] /
+                # Field(discriminator=...) reaches Pydantic's TypeAdapter
+                # and emits ``oneOf`` with a discriminator mapping.
+                _ta_ann = annotation
+                if typing.get_origin(_original_before_unwrap) is typing.Annotated:
+                    _ta_ann = _original_before_unwrap
+                model_class = _make_type_adapter_proxy(_ta_ann)
         else:
             kind = "query"
             type_hint = _get_type_name(annotation)
@@ -426,15 +453,26 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
         # constraints. Without this Rust's coerce_str_to_py falls back to
         # returning the raw string, letting invalid `?uid=not-a-uuid` pass
         # through as 200. Mirrors FastAPI's automatic Pydantic validation.
+        _has_validator_meta = _has_validator_metadata(_original_before_unwrap)
         if scalar_validator is None and kind in ("path", "query", "header", "cookie", "form"):
-            _needs_ta = _needs_scalar_validator(annotation) or _is_json_scalar
+            _needs_ta = (
+                _needs_scalar_validator(annotation)
+                or _is_json_scalar
+                or _has_validator_meta
+            )
             if _needs_ta:
                 try:
                     from pydantic import TypeAdapter as _PTypeAdapter
-                    # For Json[T] params, use the Json-bearing annotation
-                    # so Pydantic parses the JSON string into T.
+                    # For Json[T] params OR when the Annotated metadata
+                    # carries a Pydantic validator (``AfterValidator`` /
+                    # ``BeforeValidator`` / ``WrapValidator`` /
+                    # ``PlainValidator``), use the full Annotated form so
+                    # Pydantic invokes the validator (matches FA
+                    # ``docs_src/query_params_str_validations/tutorial015``).
                     ta_annotation = (
-                        _original_before_unwrap if _is_json_scalar else annotation
+                        _original_before_unwrap
+                        if (_is_json_scalar or _has_validator_meta)
+                        else annotation
                     )
                     scalar_validator = _PTypeAdapter(ta_annotation)
                 except Exception:
@@ -467,6 +505,15 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             description_val = getattr(marker, "description", None)
             include_in_schema_val = getattr(marker, "include_in_schema", True)
             deprecated_val = getattr(marker, "deprecated", None)
+        elif _effective_marker is not None:
+            # ``Annotated[str, Field(description="…")]`` — Field is a
+            # FieldInfo, not a FastAPI param marker, but FA still surfaces
+            # its title/description in the OpenAPI parameter schema.
+            title_val = getattr(_effective_marker, "title", None)
+            description_val = getattr(_effective_marker, "description", None)
+            example_val = getattr(_effective_marker, "example", None)
+            examples_val = getattr(_effective_marker, "examples", None)
+            deprecated_val = getattr(_effective_marker, "deprecated", None)
 
         # Detect Optional[T] / Union[T, None] on the original annotation so
         # the OpenAPI layer can emit `anyOf: [<T>, {type: null}]` (FastAPI's
@@ -1234,6 +1281,41 @@ def _probe_enum_class(annotation):
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+def _has_validator_metadata(annotation) -> bool:
+    """True if the annotation is ``Annotated[T, ...]`` with any Pydantic
+    functional validator in the metadata (``AfterValidator``, ``BeforeValidator``,
+    ``WrapValidator``, ``PlainValidator``) — these require a full TypeAdapter
+    invocation, even on primitive scalar types Rust could otherwise coerce
+    directly.
+    """
+    if annotation is inspect.Parameter.empty or annotation is None:
+        return False
+    try:
+        if typing.get_origin(annotation) is not getattr(typing, "Annotated", None):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        from pydantic.functional_validators import (
+            AfterValidator as _AV,
+            BeforeValidator as _BV,
+            WrapValidator as _WV,
+            PlainValidator as _PV,
+        )
+        _validator_types = (_AV, _BV, _WV, _PV)
+    except ImportError:
+        return False
+    args = typing.get_args(annotation)
+    for meta in args[1:]:
+        if isinstance(meta, _validator_types):
+            return True
+        # Duck-type fallback: some third-party libs expose the same shape.
+        mn = type(meta).__name__
+        if mn in ("AfterValidator", "BeforeValidator", "WrapValidator", "PlainValidator"):
+            return True
+    return False
 
 
 def _needs_scalar_validator(annotation) -> bool:

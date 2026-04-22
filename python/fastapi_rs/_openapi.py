@@ -1885,25 +1885,79 @@ def _build_request_body(param: dict[str, Any]) -> dict[str, Any]:
             return body
         except Exception:  # noqa: BLE001
             pass
+    # ``Annotated[<union>, Discriminator(...)]`` / ``Annotated[<union>,
+    # Field(discriminator=...)]`` — hand the full annotation to a
+    # Pydantic TypeAdapter so the emitted schema carries the
+    # ``oneOf`` + ``discriminator.mapping`` block FA produces.
+    if annotation is not None and _typing.get_origin(annotation) is _typing.Annotated:
+        _ann_args = _typing.get_args(annotation)
+        _inner = _ann_args[0] if _ann_args else None
+        _has_disc = False
+        for _m in _ann_args[1:]:
+            _mt = type(_m)
+            if _mt.__name__ == "Discriminator" or (
+                _mt.__name__ == "FieldInfo"
+                and getattr(_m, "discriminator", None) is not None
+            ):
+                _has_disc = True
+                break
+        if _has_disc and _inner is not None and _typing.get_origin(_inner) is _typing.Union:
+            try:
+                from pydantic import TypeAdapter as _TA
+                disc_schema = _TA(annotation).json_schema(mode="validation")
+                disc_schema.pop("$defs", None)
+                disc_schema = _rewrite_defs_refs(disc_schema)
+                pname = param.get("name")
+                if pname:
+                    disc_schema["title"] = (
+                        pname.replace("_", " ").title().replace(" ", "")
+                    )
+                media_type = param.get("media_type") or "application/json"
+                content: dict[str, Any] = {media_type: {"schema": disc_schema}}
+                body: dict[str, Any] = {"content": content}
+                if param.get("required", True):
+                    body["required"] = True
+                if param.get("description"):
+                    body["description"] = param["description"]
+                return body
+            except Exception:  # noqa: BLE001
+                pass
+
     # Handle both ``typing.Union`` and PEP 604 (``X | Y``) — in 3.10+ the
     # latter resolves to ``types.UnionType``. ``get_origin`` returns
     # ``Union`` for the former and ``UnionType`` for the latter.
+    # Also unwrap ``Annotated[Union[...], ...]`` whose outer metadata is
+    # a non-discriminator marker (Body, …) — FA treats that like a plain
+    # ``anyOf`` body.
     import types as _types
     _u_origin = _typing.get_origin(annotation) if annotation is not None else None
+    _union_source = annotation
+    if annotation is not None and _u_origin is _typing.Annotated:
+        _inner = _typing.get_args(annotation)[0] if _typing.get_args(annotation) else None
+        if _inner is not None and _typing.get_origin(_inner) is _typing.Union:
+            _union_source = _inner
+            _u_origin = _typing.Union
     if annotation is not None and _u_origin in (_typing.Union, _types.UnionType):
-        arms = _typing.get_args(annotation)
+        arms = _typing.get_args(_union_source)
         non_none = [a for a in arms if a is not type(None)]
         has_none = any(a is type(None) for a in arms)
         any_of: list[Any] = []
         title_from: Any = None
         for arm in non_none:
-            arm_ref = _model_ref(arm, mode="validation")
+            # Unwrap ``Annotated[Model, Tag(...)]`` / other metadata so
+            # we ref the actual model instead of ``Annotated``.
+            arm_type = arm
+            if _typing.get_origin(arm_type) is _typing.Annotated:
+                _arg0 = _typing.get_args(arm_type)
+                if _arg0:
+                    arm_type = _arg0[0]
+            arm_ref = _model_ref(arm_type, mode="validation")
             if arm_ref is not None:
                 any_of.append(arm_ref)
                 if title_from is None:
-                    title_from = arm
+                    title_from = arm_type
             else:
-                frag = _type_hint_to_schema(_get_type_name(arm))
+                frag = _type_hint_to_schema(_get_type_name(arm_type))
                 if frag and frag != {"type": "object"}:
                     any_of.append(frag)
                 else:
