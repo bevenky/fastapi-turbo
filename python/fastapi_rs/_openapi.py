@@ -561,6 +561,19 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
             return True
         return False
 
+    # Collect names of extraction steps that feed a Starlette security
+    # scheme — those shouldn't count toward 422 (APIKeyHeader reads the
+    # header directly; missing/malformed → 401/403, not 422).
+    _sec_sub_names: set[str] = set()
+    for _p in route.get("_all_params", route.get("params", [])):
+        if _p.get("kind") != "dependency":
+            continue
+        _dc = _p.get("_original_dep_callable") or _p.get("dep_callable")
+        if _dc is not None and hasattr(_dc, "model") and isinstance(_dc.model, dict):
+            for _, _sk in _p.get("dep_input_map") or []:
+                if isinstance(_sk, str):
+                    _sec_sub_names.add(_sk)
+
     # FA emits 422 even when the param is ``include_in_schema=False`` —
     # the hidden param can still fail validation; the error response
     # just references HTTPValidationError (the hidden param doesn't
@@ -569,6 +582,7 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
         _param_can_fail_validation(p)
         for p in route.get("params", [])
         if p.get("_is_handler_param", False)
+        and p.get("name") not in _sec_sub_names
     )
     if has_validated_params and "422" not in responses_dict:
         responses_dict["422"] = {
@@ -615,7 +629,13 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     }
 
     if route.get("tags"):
-        operation["tags"] = route["tags"]
+        # FA allows Enum values (``tags=[Tags.items]``) — emit the
+        # string value rather than the Enum instance so JSON
+        # serialization succeeds.
+        import enum as _enum
+        operation["tags"] = [
+            t.value if isinstance(t, _enum.Enum) else t for t in route["tags"]
+        ]
     if route.get("description"):
         operation["description"] = route["description"]
     if route.get("deprecated"):
@@ -645,7 +665,23 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
                 if isinstance(source_key, str):
                     security_sub_param_names.add(source_key)
 
-    for param in route.get("params", []):
+    # FA groups parameters by kind before emitting: path → query →
+    # header → cookie. Body / form / file remain in declaration order
+    # (they don't go in ``parameters``, so we process them in their
+    # original slot).
+    _kind_order = {"path": 0, "query": 1, "header": 2, "cookie": 3}
+
+    def _param_sort_key(_p):
+        _k = _p.get("kind")
+        if _k in _kind_order:
+            return (0, _kind_order[_k])
+        return (1, 0)  # body/form/file/dependency — original order
+
+    _route_params_sorted = sorted(
+        enumerate(route.get("params", [])),
+        key=lambda _idx_p: (_param_sort_key(_idx_p[1]), _idx_p[0]),
+    )
+    for _, param in _route_params_sorted:
         # Honor param-level include_in_schema
         if not param.get("include_in_schema", True):
             continue

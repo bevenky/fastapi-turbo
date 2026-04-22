@@ -205,12 +205,14 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
         when the dep declares one as a parameter (FA parity).
         """
         # ``Security`` is a ``Depends`` subclass with a ``.scopes`` attr.
-        # Prepend its scopes as we walk down — later pops match FA's
-        # "outer wraps the inner" ordering.
+        # APPEND own scopes to the accumulated outer chain — FA's
+        # ``security`` list emits outer-first, inner-last
+        # (``Security(outer, scopes=["items"])`` wrapping
+        # ``Security(inner, scopes=["me"])`` → ``["items", "me"]``).
         own_scopes = list(getattr(dep, "scopes", None) or [])
         chain_scopes = list(accumulated_scopes or [])
         if own_scopes:
-            chain_scopes = own_scopes + chain_scopes
+            chain_scopes = chain_scopes + own_scopes
 
         dep_func = dep.dependency
         func_id = id(dep_func)

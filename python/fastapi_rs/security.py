@@ -232,8 +232,35 @@ class HTTPBase:
         if description:
             self.model["description"] = description
 
-    async def __call__(self, request: Request = None, **kwargs):  # pragma: no cover
-        raise NotImplementedError
+    async def __call__(self, request: Request = None, **kwargs):
+        """Generic HTTP scheme callable — returns the raw Authorization
+        header as ``HTTPAuthorizationCredentials``. Subclasses override
+        for scheme-specific parsing (Bearer, Basic, Digest).
+
+        Missing header → 401 with ``WWW-Authenticate`` set to the
+        scheme name (``Other`` / ``Bearer`` / ...); FA does the same.
+        """
+        authorization = _get_authorization(request, **kwargs)
+        if authorization:
+            # Split on whitespace — collapse runs so
+            # ``"Other  foobar "`` becomes ``("Other", "foobar")``.
+            parts = authorization.strip().split(None, 1)
+            scheme = parts[0] if parts else ""
+            credentials = parts[1].strip() if len(parts) > 1 else ""
+            return HTTPAuthorizationCredentials(
+                scheme=scheme,
+                credentials=credentials,
+            )
+        if self.auto_error:
+            scheme_name = self.model.get("scheme", "Bearer") if isinstance(
+                getattr(self, "model", None), dict
+            ) else "Bearer"
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": scheme_name.title()},
+            )
+        return None
 
 
 class HTTPBearer(HTTPBase):

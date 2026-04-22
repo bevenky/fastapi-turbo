@@ -1954,11 +1954,16 @@ class FastAPI:
         include_fn: Callable | None,
         router: APIRouter,
     ) -> str | None:
-        """FA's operationId cascade: route → include → router → app."""
+        """FA's operationId cascade: route → router → include → app.
+
+        The router's own ``generate_unique_id_function`` takes
+        precedence over an ``include_router(..., generate_unique_id_function
+        =...)`` override — matches FA's resolution order.
+        """
         fn = (
             getattr(route, "generate_unique_id_function", None)
-            or include_fn
             or getattr(router, "generate_unique_id_function", None)
+            or include_fn
             or getattr(self, "generate_unique_id_function", None)
         )
         if fn is None:
