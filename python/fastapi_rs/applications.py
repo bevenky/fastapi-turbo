@@ -352,6 +352,7 @@ def _try_compile_handler(
     response_class=None,
     status_code=None,
     path=None,
+    route_obj=None,
 ):
     """Compile deps + handler into a SINGLE Python function (1 PyO3 call instead of N+1).
 
@@ -2983,6 +2984,7 @@ class FastAPI:
                     endpoint, params, app=self, response_model=response_model,
                     status_code=route.status_code,
                     path=full_path,
+                    route_obj=route,
                     **rm_kwargs,
                 )
                 if compiled is not None:
@@ -3019,6 +3021,7 @@ class FastAPI:
                     endpoint, params, app=self, response_model=response_model,
                     status_code=route.status_code,
                     path=full_path,
+                    route_obj=route,
                     **rm_kwargs,
                 )
                 if compiled is not None:
