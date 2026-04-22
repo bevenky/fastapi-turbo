@@ -87,13 +87,13 @@ class OAuth2PasswordRequestFormStrict(OAuth2PasswordRequestForm):
         *,
         grant_type: Annotated[str, _Form(pattern="^password$")],
         username: Annotated[str, _Form()],
-        password: Annotated[str, _Form(json_schema_extra={"format": "password"})],
+        # Real FA's Strict form DROPS ``format: password`` (see
+        # site-packages/fastapi/security/oauth2.py:256-258). Only the
+        # non-Strict form adds it.
+        password: Annotated[str, _Form()],
         scope: Annotated[str, _Form()] = "",
         client_id: Annotated[Optional[str], _Form()] = None,
-        client_secret: Annotated[
-            Optional[str],
-            _Form(json_schema_extra={"format": "password"}),
-        ] = None,
+        client_secret: Annotated[Optional[str], _Form()] = None,
     ):
         super().__init__(
             grant_type=grant_type,
