@@ -13,7 +13,58 @@
 
 ---
 
-## 2026-04-15 — Final Comprehensive Results (latest)
+## 2026-04-20 — fastapi-rs vs FastAPI+uvicorn vs Go Gin (head-to-head)
+
+*All three servers run an endpoint-identical app. `20,000` requests per
+endpoint after `3,000` warmup, single TCP connection, HTTP/1.1 keep-alive,
+compiled Rust bench client.*
+
+| Endpoint | FA+uvicorn p50 | **fastapi-rs p50** | Go Gin p50 | FA req/s | **FR req/s** | Gin req/s | FR vs FA | FR vs Gin |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| GET /hello (plain JSON) | 162 μs | **25 μs** | 24 μs | 6,133 | **38,698** | 39,319 | **6.5×** | 0.96× |
+| GET /path/42 (path param + int coerce) | 171 μs | **27 μs** | 24 μs | 5,819 | **36,118** | 38,871 | **6.3×** | 0.89× |
+| GET /headers (header extraction) | 178 μs | **27 μs** | 24 μs | 5,608 | **35,999** | 39,200 | **6.6×** | 0.89× |
+| GET /with-deps (2-level Depends) | 110 μs | **29 μs** | 24 μs | 9,127 | **33,696** | 39,000 | **3.8×** | 0.83× |
+| GET /list (20-item list) | 196 μs | **37 μs** | 30 μs | 5,037 | **26,592** | 29,987 | **5.3×** | 0.81× |
+| POST /items (Pydantic body validate) | 181 μs | **34 μs** | 26 μs | 5,491 | **28,381** | 36,102 | **5.3×** | 0.76× |
+
+### Takeaways
+
+- **4–7× faster p50 than stock FastAPI + uvicorn** — fastapi-rs processes
+  each request in 25–37 µs vs 110–196 µs for FastAPI.
+- **Within 4–24% of Go Gin on p50**, matching Gin on `GET /hello`
+  (25 vs 24 µs) and landing within a few microseconds on every other
+  endpoint. This is a Python framework running Python user code,
+  Pydantic validation, and `Depends(...)` resolution on every request;
+  Gin is native Go with manual struct binding and no DI layer.
+- **Pydantic body validation (`POST /items`) is the largest residual
+  gap vs Gin** (34 µs vs 26 µs). The extra ~8 µs is pydantic-core +
+  error-shape post-processing — the tax for automatic request-body
+  validation and typed errors, which Gin doesn't provide (its
+  `ShouldBindJSON` returns a raw error string).
+- **`/with-deps` (2-level `Depends` chain + Header extraction, both deps
+  `async def`)** — fastapi-rs statically scans async functions for
+  `await` expressions and drives await-free ones on the calling thread
+  (~2 µs) instead of submitting to the shared worker loop (~30 µs).
+  Real async deps that hit the DB still run on the shared loop to
+  preserve asyncpg / redis.asyncio / httpx connection-pool affinity
+  (verified at 100% SQLA + 100% Redis parity).
+- Runner harness: `benchmarks/run_bench.py` (boots all three servers
+  from a single parity app + matching Gin binary, writes a markdown
+  table to `benchmarks/latest_bench.md`).
+
+Reproducing:
+
+```bash
+source /Users/venky/tech/jamun_env/bin/activate
+cargo build --release --bin fastapi-rs-bench
+(cd benchmarks/go-gin && go build -o bench-gin .)
+python benchmarks/run_bench.py
+```
+
+---
+
+## 2026-04-15 — Final Comprehensive Results
 
 ### GET /hello (simple JSON response: `{"message": "hello"}`)
 

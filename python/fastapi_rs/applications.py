@@ -502,6 +502,16 @@ def _try_compile_handler(
                     result = handler_func(**filtered)
                 except Exception as exc:
                     _maybe_print_debug_traceback(_app_ref, exc)
+                    # Capture non-HTTP exceptions for TestClient's
+                    # re-raise path BEFORE invoking handlers (FA
+                    # parity — raise_server_exceptions=True surfaces
+                    # server exceptions regardless of handler output).
+                    try:
+                        from fastapi_rs.exceptions import HTTPException as _HE
+                        if _app_ref is not None and not isinstance(exc, _HE):
+                            _app_ref._captured_server_exceptions.append(exc)
+                    except ImportError:
+                        pass
                     if _app_ref is not None and _app_ref.exception_handlers:
                         handler_result = _app_ref._invoke_exception_handler(exc)
                         if handler_result is not None:
@@ -958,19 +968,21 @@ def _try_compile_handler(
                         reversed(generators_to_cleanup), throw_exc=exc
                     )
                     generators_to_cleanup.clear()
-                if _app is not None and _app.exception_handlers:
-                    handler_result = _app._invoke_exception_handler(exc)
-                    if handler_result is not None:
-                        return handler_result
-                # Capture non-HTTP exceptions so ``TestClient`` with
-                # ``raise_server_exceptions=True`` can re-raise them in
-                # the test thread (FA parity).
+                # Capture non-HTTP exceptions FIRST so ``TestClient``
+                # with ``raise_server_exceptions=True`` can re-raise
+                # them even when an exception handler caught + returned
+                # a response (FA parity: server exceptions surface in
+                # the test thread regardless of what handler returned).
                 try:
                     from fastapi_rs.exceptions import HTTPException as _HE
                     if _app is not None and not isinstance(exc, _HE):
                         _app._captured_server_exceptions.append(exc)
                 except ImportError:
                     pass
+                if _app is not None and _app.exception_handlers:
+                    handler_result = _app._invoke_exception_handler(exc)
+                    if handler_result is not None:
+                        return handler_result
                 raise
             # Apply response_model filtering (P0 fix #5)
             if response_model is not None:

@@ -673,13 +673,38 @@ async fn slashes_redirect_middleware(
     fn check_declared(path: &str) -> Option<(bool, bool, String)> {
         let guard = DECLARED_PATHS.read().ok()?;
         let declared = guard.as_ref()?;
-        let known = declared.contains(path);
+        // Path templates may carry ``{name}`` placeholders. Match them
+        // segment-by-segment so ``/x/1`` → ``/x/{p}/`` comparison works.
+        fn template_matches(template: &str, concrete: &str) -> bool {
+            let t_segs: Vec<&str> = template.split('/').collect();
+            let c_segs: Vec<&str> = concrete.split('/').collect();
+            if t_segs.len() != c_segs.len() {
+                return false;
+            }
+            for (t, c) in t_segs.iter().zip(c_segs.iter()) {
+                if t.starts_with('{') && t.ends_with('}') {
+                    if c.is_empty() {
+                        return false;
+                    }
+                    continue;
+                }
+                if t != c {
+                    return false;
+                }
+            }
+            true
+        }
+        let matches_any = |p: &str| -> bool {
+            declared.contains(p)
+                || declared.iter().any(|tpl| tpl.contains('{') && template_matches(tpl, p))
+        };
+        let known = matches_any(path);
         let alternate: String = if path.ends_with('/') {
             path[..path.len() - 1].to_string()
         } else {
             format!("{path}/")
         };
-        let alt_known = declared.contains(&alternate);
+        let alt_known = matches_any(&alternate);
         Some((known, alt_known, alternate))
     }
     let (known, alt_known, alternate) = match check_declared(path) {

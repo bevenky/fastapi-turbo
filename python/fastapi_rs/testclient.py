@@ -81,6 +81,16 @@ class TestClient:
         self._seed_cookies = cookies
         self._seed_headers = headers
         self._follow_redirects = follow_redirects
+        # Starlette's TestClient accepts root_path to simulate reverse-proxy
+        # mounting; it populates scope["root_path"] so handlers and the
+        # openapi schema see it. We propagate it onto the app (which
+        # baked the openapi at run() time reads self.root_path).
+        if root_path and hasattr(app, "root_path") and not app.root_path:
+            try:
+                app.root_path = root_path
+            except Exception:
+                pass
+        self._root_path = root_path
 
     def _find_free_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
