@@ -503,12 +503,9 @@ def _try_compile_handler(
                     result = handler_func(**filtered)
                 except Exception as exc:
                     _maybe_print_debug_traceback(_app_ref, exc)
-                    # Invoke the user's ``@app.exception_handler(...)`` if one
-                    # is registered. When the handler returns a response,
-                    # Starlette treats the exception as HANDLED and does NOT
-                    # re-raise it to the TestClient — so we only record
-                    # ``_captured_server_exceptions`` when no handler caught
-                    # the exception (or the handler itself failed).
+                    # Handler-response semantics (Starlette parity):
+                    #   - specific exception class handled → NOT re-raised
+                    #   - ``Exception`` catch-all handled → still re-raised
                     handler_result = None
                     handler_raised = False
                     if _app_ref is not None and _app_ref.exception_handlers:
@@ -516,12 +513,22 @@ def _try_compile_handler(
                             handler_result = _app_ref._invoke_exception_handler(exc)
                         except Exception:
                             handler_raised = True
+                    handled_by_specific = False
+                    if handler_result is not None and not handler_raised:
+                        for exc_cls in (
+                            _app_ref.exception_handlers.keys() if _app_ref else []
+                        ):
+                            if exc_cls is Exception:
+                                continue
+                            if isinstance(exc_cls, type) and isinstance(exc, exc_cls):
+                                handled_by_specific = True
+                                break
                     try:
                         from fastapi_rs.exceptions import HTTPException as _HE
                         if (
                             _app_ref is not None
                             and not isinstance(exc, _HE)
-                            and (handler_result is None or handler_raised)
+                            and not handled_by_specific
                         ):
                             _app_ref._captured_server_exceptions.append(exc)
                     except ImportError:
@@ -988,11 +995,11 @@ def _try_compile_handler(
                         exc = _te_exc
                         _raised_exc = _te_exc
                     generators_to_cleanup.clear()
-                # Only capture to ``_captured_server_exceptions`` when no
-                # registered ``@app.exception_handler`` catches the
-                # exception (or the handler itself raises). Starlette's
-                # TestClient considers a handled exception non-server —
-                # it doesn't re-raise one that produced a response.
+                # Handler-response semantics, matching Starlette:
+                #   - specific exception class handled → NOT re-raised
+                #   - ``Exception`` catch-all handled → still re-raised
+                #     (Starlette's ``ServerErrorMiddleware`` returns a
+                #     response AND bubbles up so TestClient can re-raise)
                 handler_result = None
                 handler_raised = False
                 if _app is not None and _app.exception_handlers:
@@ -1000,12 +1007,22 @@ def _try_compile_handler(
                         handler_result = _app._invoke_exception_handler(exc)
                     except Exception:
                         handler_raised = True
+                # ``handled_by_specific`` = matched a handler that is NOT
+                # the generic ``Exception`` catch-all.
+                handled_by_specific = False
+                if handler_result is not None and not handler_raised:
+                    for exc_cls in _app.exception_handlers.keys() if _app else []:
+                        if exc_cls is Exception:
+                            continue
+                        if isinstance(exc_cls, type) and isinstance(exc, exc_cls):
+                            handled_by_specific = True
+                            break
                 try:
                     from fastapi_rs.exceptions import HTTPException as _HE
                     if (
                         _app is not None
                         and not isinstance(exc, _HE)
-                        and (handler_result is None or handler_raised)
+                        and not handled_by_specific
                     ):
                         _app._captured_server_exceptions.append(exc)
                 except ImportError:
