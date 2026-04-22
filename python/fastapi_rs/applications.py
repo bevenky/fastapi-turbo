@@ -730,6 +730,21 @@ def _try_compile_handler(
             cache_obj[sub_key] = sub_val
         return dk
 
+    # When the resolution plan combined multiple body params (handler body
+    # + dep body) into one ``_combined_body`` (see ``build_resolution_plan``),
+    # the compiled handler needs to split the combined model back into
+    # individual named body slots so dep input_maps that reference them by
+    # name still resolve.
+    _combined_body_split_names: list[str] | None = None
+    for _bstep in params:
+        if (
+            _bstep.get("name") == "_combined_body"
+            and _bstep.get("_is_combined_body_for_deps")
+            and _bstep.get("_body_param_names")
+        ):
+            _combined_body_split_names = list(_bstep["_body_param_names"])
+            break
+
     def _compiled(**kwargs):
         # FastAPI semantics: a ``Depends(...)`` that raises
         # ``HTTPException`` short-circuits BEFORE parameter validation
@@ -740,6 +755,17 @@ def _try_compile_handler(
         _pending_extraction_errors_json = kwargs.pop(
             "__fastapi_rs_extraction_errors__", None
         )
+        # If the plan combined body params for the dep chain, unpack the
+        # combined model into the individual names so downstream input_maps
+        # still find ``item`` / ``item2`` / etc.
+        if _combined_body_split_names is not None:
+            _cb = kwargs.get("_combined_body")
+            if _cb is not None:
+                for _bn in _combined_body_split_names:
+                    try:
+                        kwargs[_bn] = getattr(_cb, _bn)
+                    except AttributeError:
+                        pass
         resolved = kwargs
         cache = {}
         generators_to_cleanup: list[tuple] = []
@@ -2392,6 +2418,7 @@ class FastAPI:
                         **kwargs,
                     ):
                         combined_body = kwargs.pop("_combined_body", None)
+                        kwargs.pop("__fastapi_rs_override_request__", None)
                         if combined_body is not None:
                             for bname in _body_names:
                                 kwargs[bname] = getattr(combined_body, bname)
@@ -2406,6 +2433,7 @@ class FastAPI:
                         **kwargs,
                     ):
                         combined_body = kwargs.pop("_combined_body", None)
+                        kwargs.pop("__fastapi_rs_override_request__", None)
                         if combined_body is not None:
                             for bname in _body_names:
                                 kwargs[bname] = getattr(combined_body, bname)

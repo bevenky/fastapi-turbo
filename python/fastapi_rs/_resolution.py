@@ -412,6 +412,74 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
             if not p.get("_param_model_field_name"):
                 handler_param_names.add(p["name"])
 
+    # When handler + sub-dep both declare body params with DIFFERENT names,
+    # FA expects a combined top-level body: ``{"item": {...}, "item2": {...}}``.
+    # After dep resolution, gather all body extraction steps and merge them
+    # into a single ``_combined_body`` if more than one remains — mirrors
+    # ``_maybe_embed_body_params`` but across the full resolution plan.
+    body_steps = [
+        s for s in extraction_steps
+        if s.get("kind") == "body" and s.get("name") != "_combined_body"
+    ]
+    if len(body_steps) > 1:
+        try:
+            from pydantic import create_model
+            from fastapi_rs._introspect import _TypeAdapterProxy as _TAP
+            field_definitions: dict[str, Any] = {}
+            for bp in body_steps:
+                model_cls = bp.get("model_class")
+                if isinstance(model_cls, _TAP):
+                    model_cls = model_cls._annotation
+                if model_cls is not None:
+                    if bp.get("required", True):
+                        field_definitions[bp["name"]] = (model_cls, ...)
+                    else:
+                        field_definitions[bp["name"]] = (model_cls, bp.get("default_value"))
+                else:
+                    type_map = {"int": int, "float": float, "bool": bool, "str": str}
+                    py_type = type_map.get(bp.get("type_hint", ""), Any)
+                    field_definitions[bp["name"]] = (
+                        py_type,
+                        ... if bp.get("required", True) else bp.get("default_value"),
+                    )
+            _endpoint_name = getattr(endpoint, "__name__", "endpoint")
+            CombinedBody = create_model(f"Body_{_endpoint_name}", **field_definitions)
+            body_names = [bp["name"] for bp in body_steps]
+            body_name_set = set(body_names)
+            # Remove the individual body steps, add a single combined one.
+            extraction_steps = [
+                s for s in extraction_steps
+                if not (s.get("kind") == "body" and s.get("name") in body_name_set)
+            ]
+            _combined_required = any(bp.get("required", True) for bp in body_steps)
+            combined_step = {
+                "name": "_combined_body",
+                "kind": "body",
+                "type_hint": "model",
+                "required": _combined_required,
+                "default_value": None,
+                "has_default": not _combined_required,
+                "model_class": CombinedBody,
+                "alias": None,
+                "_embed": False,
+                "_body_param_names": body_names,
+                "_is_handler_param": False,
+                "_is_combined_body_for_deps": True,
+            }
+            extraction_steps.append(combined_step)
+
+            # Rewire dep_input_maps: any ``body:<name>`` source now points
+            # at ``_combined_body`` and the consumer needs to look up the
+            # attribute off it. We encode this by marking the combined step
+            # and letting ``_compiled`` split it before dep invocation.
+            # Update input maps that reference individual body names.
+            # Sub-deps referred to body params by name in input_map — since
+            # the extraction key is ``dp["name"]`` which equals the body
+            # param name, the maps stay intact (the consumer reads the
+            # unpacked attr). We'll unpack in the compiled handler.
+        except Exception:  # noqa: BLE001
+            pass
+
     # The final plan: extractions first, then dep calls in topo order
     plan = extraction_steps + dep_steps
 
