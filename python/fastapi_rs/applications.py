@@ -525,19 +525,25 @@ def _try_compile_handler(
                 # body listing EVERY missing required field" behaviour
                 # even when the handler itself has no dep chain.
                 _pending = kwargs.pop("__fastapi_rs_extraction_errors__", None)
+                _raw_body_str = kwargs.pop("__fastapi_rs_raw_body_str__", None)
                 if _pending is not None:
                     from fastapi_rs.responses import JSONResponse as _JSONResp
                     import json as _json
                     detail = _json.loads(_pending)
-                    # Route through ``@app.exception_handler(
-                    # RequestValidationError)`` — FA parity — capturing
-                    # the exception for ``TestClient`` to re-raise ONLY
-                    # when the user's handler re-raises (FA's semantic).
+                    # FA parity: ``RequestValidationError.body`` holds
+                    # the raw JSON body (dict) so custom exception
+                    # handlers can inspect what the caller sent.
+                    _rve_body = None
+                    if _raw_body_str is not None:
+                        try:
+                            _rve_body = _json.loads(_raw_body_str)
+                        except Exception:  # noqa: BLE001
+                            _rve_body = _raw_body_str
                     try:
                         from fastapi_rs.exceptions import (
                             RequestValidationError as _RVE,
                         )
-                        exc = _RVE(detail, endpoint_ctx=_endpoint_ctx)
+                        exc = _RVE(detail, body=_rve_body, endpoint_ctx=_endpoint_ctx)
                         if (
                             _app_ref is not None
                             and _RVE in _app_ref.exception_handlers
@@ -859,6 +865,7 @@ def _try_compile_handler(
         # them in a private kwarg so we can try running deps first —
         # if any dep raises ``HTTPException`` that response wins; if
         # all deps succeed we then emit the queued 422.
+        _raw_body_str_pending = kwargs.pop("__fastapi_rs_raw_body_str__", None)
         _pending_extraction_errors_json = kwargs.pop(
             "__fastapi_rs_extraction_errors__", None
         )
@@ -1036,7 +1043,13 @@ def _try_compile_handler(
                     from fastapi_rs.exceptions import (
                         RequestValidationError as _RVE,
                     )
-                    exc = _RVE(detail, endpoint_ctx=_endpoint_ctx)
+                    _rve_body2 = None
+                    if _raw_body_str_pending is not None:
+                        try:
+                            _rve_body2 = _json.loads(_raw_body_str_pending)
+                        except Exception:
+                            _rve_body2 = _raw_body_str_pending
+                    exc = _RVE(detail, body=_rve_body2, endpoint_ctx=_endpoint_ctx)
                     if _app is not None and _RVE in _app.exception_handlers:
                         handler_raised = False
                         try:
