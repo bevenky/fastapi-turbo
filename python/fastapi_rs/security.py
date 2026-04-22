@@ -158,7 +158,11 @@ class OAuth2:
         if authorization:
             return authorization
         if self.auto_error:
-            raise HTTPException(status_code=403, detail="Not authenticated")
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return None
 
 

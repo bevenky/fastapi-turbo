@@ -1753,7 +1753,15 @@ def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
     except Exception:
         ser_schema = None
 
-    json_schema = ser_schema if ser_schema is not None else val_schema
+    # Prefer the VALIDATION schema when the model is only used on the
+    # input side (body / form). validation_alias fields emit under
+    # their alias in validation mode and under the python name in
+    # serialization mode; input-only models need the validation shape.
+    used_as = _MODEL_USAGE.get(id(model_class), set())
+    if used_as == {"input"} and val_schema is not None:
+        json_schema = val_schema
+    else:
+        json_schema = ser_schema if ser_schema is not None else val_schema
     if json_schema is None:
         return
 

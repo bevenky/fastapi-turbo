@@ -264,6 +264,23 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
         return (StatusCode::OK, [("content-type", "application/json")], json).into_response();
     }
 
+    // Plain Python class with ``__dict__`` (FA dependency classes like
+    // ``OAuth2PasswordRequestForm``) — serialize via ``vars(obj)`` so
+    // handlers can ``return form_data`` directly. Falls through to the
+    // final ``str()`` fallback for true primitives / lambdas.
+    if let Ok(d) = obj.getattr("__dict__") {
+        if let Ok(dict) = d.cast::<PyDict>() {
+            let mut buf = String::with_capacity(64);
+            write_dict_json(py, dict, &mut buf);
+            return (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                buf,
+            )
+                .into_response();
+        }
+    }
+
     // Fallback: str() it
     let repr = obj.str().map(|s| s.to_string()).unwrap_or_default();
     (StatusCode::OK, [("content-type", "text/plain")], repr).into_response()
