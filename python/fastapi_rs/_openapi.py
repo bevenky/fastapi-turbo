@@ -429,7 +429,30 @@ def _hoist_inline_defs(node: Any, bucket: dict[str, Any]) -> None:
 
 def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     """Build an OpenAPI operation object for a single route+method."""
-    status_code = route.get("status_code") or 200
+    status_code = route.get("status_code")
+    # The route builder defaults ``status_code`` to 200, but if the
+    # response_class has no media_type (e.g. RedirectResponse), FA
+    # uses the response class's ``__init__`` default instead. We only
+    # need to override in the 200 case because user-provided
+    # ``status_code=200`` and a RedirectResponse is an odd combination
+    # that FA likewise inspects and still falls through to 307.
+    if status_code in (None, 200):
+        _rc = route.get("response_class")
+        if _rc is not None and getattr(_rc, "media_type", None) is None:
+            try:
+                import inspect as _inspect
+                _sig = _inspect.signature(_rc.__init__)
+                _sc_p = _sig.parameters.get("status_code")
+                if (
+                    _sc_p is not None
+                    and isinstance(_sc_p.default, int)
+                    and _sc_p.default != 200
+                ):
+                    status_code = _sc_p.default
+            except (TypeError, ValueError):
+                pass
+    if status_code is None:
+        status_code = 200
 
     # Pre-compute the operation_id here so response-schema titling can
     # reference it. FA's ``Response <Title-cased Operation Id>`` uses
@@ -484,9 +507,18 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     # Choose the response media type from the configured response_class.
     # HTMLResponse → text/html, PlainTextResponse → text/plain, etc.
     _resp_cls = route.get("response_class")
-    _media_type = "application/json"
+    _media_type: str | None = "application/json"
+    _suppress_content = False
     if _resp_cls is not None:
-        _media_type = getattr(_resp_cls, "media_type", None) or "application/json"
+        _declared_mt = getattr(_resp_cls, "media_type", None)
+        if _declared_mt is None:
+            # media_type=None response classes (RedirectResponse, plain
+            # Response(), etc.) emit no content in OpenAPI per FA's
+            # ``route_response_media_type`` guard in openapi/utils.py.
+            _suppress_content = True
+            _media_type = None
+        else:
+            _media_type = _declared_mt
     # For plain-text response classes, FA emits ``{type: string}`` as
     # the schema (raw text, no Pydantic serialization). For custom
     # JSON-like classes (``application/vnd.api+json``, etc.) and JSON,
@@ -494,12 +526,15 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     # ``{}`` when none was declared.
     if _media_type in ("text/html", "text/plain"):
         response_schema = {"type": "string"}
-    elif _media_type != "application/json" and not route.get("response_model"):
+    elif _media_type is not None and _media_type != "application/json" and not route.get("response_model"):
         response_schema = {}
-    success_response: dict[str, Any] = {
-        "description": response_desc,
-        "content": {_media_type: {"schema": response_schema}},
-    }
+    if _suppress_content:
+        success_response = {"description": response_desc}
+    else:
+        success_response = {
+            "description": response_desc,
+            "content": {_media_type: {"schema": response_schema}},
+        }
 
     # Build the full responses dict, starting with user-supplied responses
     # merged with the auto-generated success entry
@@ -1777,6 +1812,44 @@ def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
         ser_schema = model_class.model_json_schema(mode="serialization")
     except Exception:
         ser_schema = None
+
+    # FA 0.110+: models with ``model_config={"val_json_bytes": "base64"}``
+    # (or ``ser_json_bytes``) emit ``contentEncoding: base64`` +
+    # ``contentMediaType: application/octet-stream`` on byte fields
+    # instead of the plain ``format: binary`` Pydantic defaults to.
+    # Apply the post-pass here.
+    try:
+        cfg = getattr(model_class, "model_config", None) or {}
+        val_b64 = cfg.get("val_json_bytes") == "base64"
+        ser_b64 = cfg.get("ser_json_bytes") == "base64"
+    except Exception:  # noqa: BLE001
+        val_b64 = False
+        ser_b64 = False
+
+    def _apply_base64_to_bytes(schema: dict[str, Any] | None) -> None:
+        if not isinstance(schema, dict):
+            return
+        props = schema.get("properties") if isinstance(schema.get("properties"), dict) else None
+        if props:
+            for _, field_schema in props.items():
+                if (
+                    isinstance(field_schema, dict)
+                    and field_schema.get("type") == "string"
+                    and field_schema.get("format") == "binary"
+                ):
+                    field_schema.pop("format", None)
+                    field_schema["contentEncoding"] = "base64"
+                    field_schema["contentMediaType"] = "application/octet-stream"
+        # Walk $defs too for nested models
+        defs = schema.get("$defs") if isinstance(schema.get("$defs"), dict) else None
+        if defs:
+            for _, sub in defs.items():
+                _apply_base64_to_bytes(sub)
+
+    if val_b64 and val_schema is not None:
+        _apply_base64_to_bytes(val_schema)
+    if ser_b64 and ser_schema is not None:
+        _apply_base64_to_bytes(ser_schema)
 
     # Prefer the VALIDATION schema when the model is only used on the
     # input side (body / form). validation_alias fields emit under
