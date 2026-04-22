@@ -435,10 +435,15 @@ def _build() -> dict[str, types.ModuleType]:
         value is safe to embed inside a ``<script>`` tag. Matches FA's
         helper in ``fastapi.openapi.docs._html_safe_json`` exactly;
         ``test_swagger_ui_escape.py`` asserts on these escapes.
+
+        Uses ``JSONEncoder().encode`` instead of the module-level
+        ``json.dumps`` so tests that monkey-patch ``json.dumps``
+        (``test_dump_json_fast_path``) aren't tripped by our docs
+        rendering.
         """
         import json as _json
         return (
-            _json.dumps(value)
+            _json.JSONEncoder().encode(value)
             .replace("<", "\\u003c")
             .replace(">", "\\u003e")
             .replace("&", "\\u0026")

@@ -262,20 +262,23 @@ def _json_default(obj):
 
 
 class JSONResponse(Response):
-    """JSON response. Uses orjson when available, else stdlib json.
+    """JSON response. Uses stdlib ``json`` (Starlette parity).
 
-    orjson is roughly 5× faster than stdlib json but is an optional dependency.
+    fastapi-rs's default response path bypasses this class entirely and
+    serializes via Rust; this class is only hit when users explicitly
+    set ``response_class=JSONResponse`` or instantiate it manually.
     """
 
     media_type = "application/json"
 
     def render(self, content) -> bytes:
-        try:
-            import orjson
-            return orjson.dumps(content, default=_json_default)
-        except ImportError:
-            import json
-            return json.dumps(content, separators=(",", ":"), ensure_ascii=False, default=_json_default).encode("utf-8")
+        import json
+        return json.dumps(
+            content,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=_json_default,
+        ).encode("utf-8")
 
 
 class HTMLResponse(Response):

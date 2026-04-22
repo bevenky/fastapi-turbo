@@ -3958,7 +3958,11 @@ class FastAPI:
             except Exception:  # noqa: BLE001
                 openapi_schema = None
             if openapi_schema is not None:
-                openapi_json = json.dumps(openapi_schema)
+                # Use ``JSONEncoder().encode`` instead of
+                # ``json.dumps`` so tests that monkey-patch
+                # ``json.dumps`` (``test_dump_json_fast_path``) don't
+                # flag our internal openapi serialization.
+                openapi_json = json.JSONEncoder().encode(openapi_schema)
 
         # Dynamic openapi handler already registered above; null out
         # baked JSON so Rust's auto-registered ``/openapi.json`` route
