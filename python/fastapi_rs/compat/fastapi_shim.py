@@ -816,13 +816,27 @@ def _build() -> dict[str, types.ModuleType]:
     # path must exist so `fastapi.cli` doesn't blow up. Import fails
     # loudly if someone tries to USE the CLI.
     fastapi_cli = _mod("fastapi.cli")
-    def _cli_stub(*a, **kw):
-        raise NotImplementedError(
-            "fastapi-rs does not ship the `fastapi dev` CLI. "
-            "Run your app with `app.run(host, port)` (sync) or via "
-            "``python -m uvicorn app:app`` (if you want ASGI)."
-        )
-    fastapi_cli.main = _cli_stub  # type: ignore[attr-defined]
+    # ``fastapi_cli.cli_main`` is the optional-install entry point —
+    # tests patch it to ``None`` to exercise the "fastapi[standard] is
+    # missing" branch. Try to import the real one; fall back to None.
+    try:
+        from fastapi_cli.cli import app as _cli_main
+    except Exception:  # noqa: BLE001
+        _cli_main = None
+    fastapi_cli.cli_main = _cli_main  # type: ignore[attr-defined]
+
+    def _cli_main_fn():
+        """Real FA: invoke ``fastapi_cli`` if installed, else raise a
+        RuntimeError directing the user to ``pip install fastapi[standard]``.
+        Matches FA 0.120+'s ``fastapi.cli.main`` semantics exactly.
+        """
+        if getattr(fastapi_cli, "cli_main", None) is None:
+            raise RuntimeError(
+                'To use the fastapi command, please install '
+                '"fastapi[standard]":\n\n\tpip install "fastapi[standard]"\n'
+            )
+        fastapi_cli.cli_main()
+    fastapi_cli.main = _cli_main_fn  # type: ignore[attr-defined]
     modules["fastapi.cli"] = fastapi_cli
 
     # ── Backfill a couple more FA-internal stubs ──────────────────
@@ -887,6 +901,7 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi.concurrency = fastapi_concurrency  # type: ignore[attr-defined]
     fastapi.background = fastapi_background  # type: ignore[attr-defined]
     fastapi.testclient = fastapi_testclient  # type: ignore[attr-defined]
+    fastapi.cli = fastapi_cli  # type: ignore[attr-defined]
     fastapi.websockets = fastapi_websockets  # type: ignore[attr-defined]
     fastapi.sse = fastapi_sse  # type: ignore[attr-defined]
     fastapi.middleware = fastapi_middleware  # type: ignore[attr-defined]
