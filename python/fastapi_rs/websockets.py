@@ -92,6 +92,15 @@ class WebSocket:
     """
 
     def __init__(self, _rust_ws=None, scope=None, receive=None, send=None):
+        # Starlette-compatible signature: when users call
+        # ``WebSocket(scope, receive=..., send=...)`` — as ASGI
+        # middleware/third-party code does — the first positional arg
+        # is the scope dict, NOT a Rust WS. Detect that case so we
+        # don't shove a dict into self._ws (which later breaks
+        # ``if self._ws is not None`` and the bridge paths).
+        if isinstance(_rust_ws, dict) and scope is None:
+            scope = _rust_ws
+            _rust_ws = None
         self._ws = _rust_ws
         # Lazily materialize the full scope dict on first access.
         # If user passed one explicitly (e.g., tests), prefer theirs.
@@ -316,6 +325,23 @@ class WebSocket:
                     self._ws.close(code, reason or "")
                 except Exception:
                     pass
+        elif self._send is not None:
+            # Starlette-compatible path — when constructed via
+            # ``WebSocket(scope, receive=..., send=...)`` (no Rust ws)
+            # the caller expects ``close()`` to dispatch a
+            # ``websocket.close`` ASGI message to the bridge ``send``.
+            # Used by WS middleware that wraps the app with a Starlette-
+            # style ``(scope, receive, send)`` signature.
+            try:
+                r = self._send({
+                    "type": "websocket.close",
+                    "code": code,
+                    "reason": reason or "",
+                })
+                if hasattr(r, "__await__"):
+                    await r
+            except Exception:  # noqa: BLE001
+                pass
 
     # ── Send ──────────────────────────────────────────────────────
 

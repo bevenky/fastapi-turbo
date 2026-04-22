@@ -1332,10 +1332,37 @@ def _try_compile_handler(
                     # one-shot loop here would invalidate pool state.
                     gen = actual_func(**dk)
                     if inspect.isasyncgen(gen):
-                        from fastapi_rs._async_worker import submit as _submit
-                        result = _submit(gen.__anext__())
-                        # Sentinel "worker" so teardown knows to route back.
-                        generators_to_cleanup.append((gen, "worker", dep_scope))
+                        # Try-sync fast path: if the async gen doesn't
+                        # await anything before its first yield, drive it
+                        # via ``.__anext__().send(None)`` in the current
+                        # request thread. This keeps any ContextVar
+                        # changes visible to the handler (which runs in
+                        # the same thread/context) — FA parity via
+                        # ``test_dependency_contextvars``. If the gen
+                        # actually awaits, fall through to the worker
+                        # loop so async I/O libs keep their loop
+                        # affinity.
+                        _anext_coro = gen.__anext__()
+                        _sync_ok = False
+                        try:
+                            _anext_coro.send(None)
+                        except StopIteration as _stop:
+                            result = _stop.value
+                            _sync_ok = True
+                        except BaseException:
+                            _anext_coro.close()
+                            raise
+                        if _sync_ok:
+                            generators_to_cleanup.append((gen, None, dep_scope))
+                        else:
+                            # The coro suspended — we've already driven
+                            # it once, so we can't hand it to a fresh
+                            # worker-loop task. Close this partially-
+                            # driven coro and start fresh on the worker.
+                            _anext_coro.close()
+                            from fastapi_rs._async_worker import submit as _submit
+                            result = _submit(gen.__anext__())
+                            generators_to_cleanup.append((gen, "worker", dep_scope))
                     else:
                         result = next(gen)
                         generators_to_cleanup.append((gen, None, dep_scope))
@@ -1729,7 +1756,44 @@ def _run_pending_teardowns(
                 finally:
                     loop.close()
             else:
-                if throw_exc is not None:
+                # ``loop=None`` — either a plain sync generator, or an
+                # async generator that we drove via ``.send(None)``
+                # (contextvar-preserving fast path). Detect async-gen
+                # and step it via ``__anext__().send(None)``; fall
+                # back to async worker if the teardown step itself
+                # wants to suspend.
+                import inspect as _ins
+                if _ins.isasyncgen(gen):
+                    if throw_exc is not None:
+                        _tcoro = gen.athrow(throw_exc)
+                    else:
+                        _tcoro = gen.__anext__()
+                    try:
+                        _tcoro.send(None)
+                    except StopIteration:
+                        if throw_exc is not None:
+                            swallowed_handler_exc = True
+                    except StopAsyncIteration:
+                        if throw_exc is not None:
+                            swallowed_handler_exc = True
+                    except BaseException:
+                        _tcoro.close()
+                        raise
+                    else:
+                        # Suspended — finish on the worker loop.
+                        _tcoro.close()
+                        from fastapi_rs._async_worker import submit as _submit
+                        try:
+                            if throw_exc is not None:
+                                _submit(gen.athrow(throw_exc))
+                            else:
+                                _submit(gen.__anext__())
+                            if throw_exc is not None:
+                                swallowed_handler_exc = True
+                        except StopAsyncIteration:
+                            if throw_exc is not None:
+                                swallowed_handler_exc = True
+                elif throw_exc is not None:
                     gen.throw(throw_exc)
                     swallowed_handler_exc = True
                 else:
@@ -2999,16 +3063,34 @@ class FastAPI:
 
             dep_kwargs: dict = {}
             if dep_sig is not None:
+                try:
+                    from fastapi_rs.requests import HTTPConnection as _HTTPConn
+                except Exception:  # noqa: BLE001
+                    _HTTPConn = None
                 for p_name, p in dep_sig.parameters.items():
                     ann = dep_hints.get(p_name, p.annotation)
                     raw = p.annotation
-                    # WebSocket injection
+                    # WebSocket / HTTPConnection injection. WS deps can
+                    # accept either ``WebSocket`` or its parent
+                    # ``HTTPConnection`` (Starlette parity — FA apps
+                    # often inject ``HTTPConnection`` so one dep works
+                    # for HTTP + WS routes alike).
                     if (
                         ann is _WebSocket
                         or (isinstance(ann, type) and issubclass(ann, _WebSocket))
                         or (
+                            _HTTPConn is not None
+                            and isinstance(ann, type)
+                            and issubclass(ann, _HTTPConn)
+                        )
+                        or (
                             isinstance(raw, str)
-                            and raw in ("WebSocket", "fastapi_rs.websockets.WebSocket")
+                            and raw in (
+                                "WebSocket",
+                                "fastapi_rs.websockets.WebSocket",
+                                "HTTPConnection",
+                                "fastapi_rs.requests.HTTPConnection",
+                            )
                         )
                     ):
                         dep_kwargs[p_name] = ws
@@ -3209,13 +3291,134 @@ class FastAPI:
                     scope["app"] = app_ref
             except Exception:  # noqa: BLE001
                 pass
-            generators: list = []
+            # Replay the TestClient's captured contextvars. This lets
+            # ``ContextVar``-based state set in the test thread
+            # (e.g. ``global_context.set({}); gs = global_context.get()``)
+            # be observable from the handler/teardown that runs on the
+            # server's async worker thread — mutations to values
+            # retrieved via ``.get()`` from within replayed vars mutate
+            # the SAME objects the test holds a reference to.
             try:
-                kwargs, generators = await _build_kwargs(ws, path_kwargs)
+                q = getattr(app_ref, "_ws_pending_test_contexts", None)
+                if q:
+                    try:
+                        test_ctx = q.pop(0)
+                    except IndexError:
+                        test_ctx = None
+                    if test_ctx is not None:
+                        for _var, _val in test_ctx.items():
+                            try:
+                                _var.set(_val)
+                            except Exception:  # noqa: BLE001
+                                pass
+            except Exception:  # noqa: BLE001
+                pass
+            # WS middleware chain (Starlette-style ``Middleware(cls)`` where
+            # ``cls`` is a factory: ``cls(app) -> wrapped_app``). FA parity:
+            # tests register a ``websocket_middleware`` that wraps the
+            # app in a ``try/except`` and calls ``websocket.close(code)``
+            # on error. Build the chain here so the innermost "app" calls
+            # the real handler logic; the middleware sees a
+            # ``WebSocket(scope, receive, send)`` it can close via our
+            # ``send``-bridge.
+            ws_mw_factories = []
+            try:
+                for _cls, _kw in getattr(app_ref, "_middleware_stack", []):
+                    if callable(_cls) and not isinstance(_cls, type):
+                        ws_mw_factories.append((_cls, _kw))
+            except Exception:  # noqa: BLE001
+                pass
+
+            generators: list = []
+
+            async def _run_handler_inner():
+                nonlocal generators
+                try:
+                    kwargs, generators = await _build_kwargs(ws, path_kwargs)
+                except _WSExc as _vexc:
+                    # FA parity: validation-origin WebSocketException
+                    # (e.g. missing required Header) is handled
+                    # internally — close the WS with its code but do
+                    # NOT let user WS middleware observe it as a raised
+                    # error (test_depend_validation asserts the
+                    # middleware never catches it).
+                    _handle_ws_exc(ws, _vexc)
+                    return
                 if is_async_endpoint:
                     await endpoint(**kwargs)
                 else:
                     endpoint(**kwargs)
+
+            async def _invoke_with_middleware():
+                if not ws_mw_factories:
+                    await _run_handler_inner()
+                    return
+                # Inner ASGI app — delegates to handler, re-raises errors
+                # so middleware can observe/catch them.
+                async def _inner_app(scope, receive, send):
+                    await _run_handler_inner()
+                # Bridge send messages to the real ws
+                async def _bridge_send(message):
+                    mt = message.get("type", "")
+                    if mt == "websocket.close":
+                        code = message.get("code", 1000)
+                        reason = message.get("reason", "") or ""
+                        try:
+                            await ws.close(code=code, reason=reason)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        # Push a ``WebSocketDisconnect`` so the
+                        # TestClient's ``__exit__`` surfaces the close
+                        # code to ``pytest.raises(WebSocketDisconnect)``.
+                        try:
+                            from fastapi_rs.exceptions import (
+                                WebSocketDisconnect as _WD_MW,
+                            )
+                            app_ref._ws_server_exceptions.append(
+                                _WD_MW(code=code, reason=reason)
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    elif mt == "websocket.accept":
+                        try:
+                            await ws.accept(
+                                subprotocol=message.get("subprotocol"),
+                                headers=message.get("headers"),
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    elif mt == "websocket.send":
+                        if message.get("text") is not None:
+                            try:
+                                await ws.send_text(message["text"])
+                            except Exception:  # noqa: BLE001
+                                pass
+                        elif message.get("bytes") is not None:
+                            try:
+                                await ws.send_bytes(bytes(message["bytes"]))
+                            except Exception:  # noqa: BLE001
+                                pass
+                async def _bridge_receive():
+                    try:
+                        return await ws.receive()
+                    except Exception:  # noqa: BLE001
+                        return {"type": "websocket.disconnect", "code": 1000}
+                # Build the chain outermost-first: final_app wraps each.
+                current_app = _inner_app
+                # Reverse: the first middleware added should be outermost.
+                for cls, kw in reversed(ws_mw_factories):
+                    try:
+                        current_app = cls(current_app, **kw)
+                    except TypeError:
+                        try:
+                            current_app = cls(current_app)
+                        except Exception:  # noqa: BLE001
+                            pass
+                mw_scope = ws.scope if isinstance(ws.scope, dict) else {"type": "websocket"}
+                await current_app(mw_scope, _bridge_receive, _bridge_send)
+
+            try:
+                await _invoke_with_middleware()
             except _WSExc as exc:
                 _handle_ws_exc(ws, exc)
                 # Run teardown even on exception so yield-deps release
