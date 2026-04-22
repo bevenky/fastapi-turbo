@@ -1944,6 +1944,14 @@ fn extract_params_to_pydict_full<'py>(
                         match result {
                             Ok(v) => v,
                             Err(e) => {
+                                // FA parity: our FA-body-validator
+                                // raises HTTPException for body-parse
+                                // errors (400 "There was an error
+                                // parsing the body"). Surface it as
+                                // an HTTP error, not a 422.
+                                if e.value(py).getattr("status_code").is_ok() {
+                                    return Err(crate::responses::pyerr_to_response(py, &e));
+                                }
                                 if param.name == "_combined_body" {
                                     return Err(pydantic_error_response_combined_with_body(py, &e, "body", body_bytes));
                                 }

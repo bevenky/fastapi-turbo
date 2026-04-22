@@ -109,6 +109,34 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             except Exception:
                 pass
 
+    # Whole-function ``get_type_hints`` fails with ``NameError`` when
+    # even one annotation references a name defined inside a local scope
+    # (Strawberry's ``GraphQLRouter.__get_context_getter.dependency``
+    # annotates ``custom_context: 'CustomContext | None'`` where
+    # ``CustomContext`` is a TypeVar scoped to the enclosing class).  In
+    # that case ``hints`` ends up empty and we fall back to raw string
+    # annotations, which kills special-injection classification for
+    # sibling params like ``request: 'Request'``.  Provide a per-param
+    # fallback: when the raw annotation is a ``str``, eval it against the
+    # endpoint's ``__globals__`` so ``Request`` / ``Response`` /
+    # ``BackgroundTasks`` / ``HTTPConnection`` still resolve.
+    _endpoint_globals = getattr(endpoint, "__globals__", None)
+    if _endpoint_globals is None and hasattr(endpoint, "__wrapped__"):
+        _endpoint_globals = getattr(endpoint.__wrapped__, "__globals__", None)
+
+    def _resolve_str_ann(name: str, raw: Any) -> Any:
+        resolved = hints.get(name)
+        if resolved is not None:
+            return resolved
+        if not isinstance(raw, str):
+            return raw
+        if _endpoint_globals is None:
+            return raw
+        try:
+            return eval(raw, _endpoint_globals)  # noqa: S307
+        except Exception:  # noqa: BLE001
+            return raw
+
     params: list[dict[str, Any]] = []
 
     for name, param in sig.parameters.items():
@@ -118,6 +146,8 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
         if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
             continue
         annotation = hints.get(name, param.annotation)
+        if isinstance(annotation, str):
+            annotation = _resolve_str_ann(name, annotation)
         # When hints stripped Annotated (some Python builds differ here),
         # fall back to the raw `param.annotation` if it still carries the
         # Annotated wrapper — that's the form that still has the
