@@ -227,22 +227,30 @@ class TestStartupShutdown:
     def test_shutdown_handler_registered(self):
         """Shutdown handlers are stored in _on_shutdown list."""
         from fastapi_rs import FastAPI
+        import warnings
         app = FastAPI()
 
-        @app.on_event("shutdown")
-        def on_shutdown():
-            pass
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+
+            @app.on_event("shutdown")
+            def on_shutdown():
+                pass
 
         assert len(app._on_shutdown) == 1
 
     def test_on_event_returns_decorator(self):
         """on_event returns the original function."""
         from fastapi_rs import FastAPI
+        import warnings
         app = FastAPI()
 
-        @app.on_event("startup")
-        def my_handler():
-            pass
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+
+            @app.on_event("startup")
+            def my_handler():
+                pass
 
         assert my_handler is not None
         assert callable(my_handler)

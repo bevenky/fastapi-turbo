@@ -153,7 +153,6 @@ class TestRouting:
                      data={"username": "admin", "password": "secret"})
         assert_json_match(fa, rs)
 
-    @pytest.mark.xfail(reason="fastapi-rs passes PyUploadFile instead of bytes for File(bytes)")
     def test_P023_file_bytes(self, client, dual_servers):
         fa, rs = hit(client, dual_servers, "post", "/p023-file",
                      files={"file": ("test.txt", b"hello world")})
@@ -252,12 +251,10 @@ class TestResponseTypes:
         fa, rs = hit(client, dual_servers, "post", "/p044-return-model", json=ITEM)
         assert_json_match(fa, rs)
 
-    @pytest.mark.xfail(reason="fastapi-rs returns 204 for None, FastAPI returns 200 with null")
     def test_P045_return_none(self, client, dual_servers):
         fa, rs = hit(client, dual_servers, "get", "/p045-none")
         assert_status_match(fa, rs)
 
-    @pytest.mark.xfail(reason="fastapi-rs returns plain text for str, FastAPI JSON-wraps it")
     def test_P046_return_string(self, client, dual_servers):
         fa, rs = hit(client, dual_servers, "get", "/p046-string")
         assert fa.text == rs.text
@@ -314,7 +311,6 @@ class TestValidation:
                      json={"child": {"value": "not_int"}, "label": "x"})
         assert_status_match(fa, rs)
 
-    @pytest.mark.xfail(reason="fastapi-rs does not coerce string to Enum type")
     def test_P056_enum_query(self, client, dual_servers):
         fa, rs = hit(client, dual_servers, "get", "/p056-enum-query?color=red")
         assert_json_match(fa, rs)

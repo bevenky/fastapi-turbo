@@ -206,7 +206,11 @@ class TestORJSONResponse:
     def test_renders_json(self):
         """ORJSONResponse renders content as JSON bytes."""
         from fastapi_rs.responses import ORJSONResponse
-        r = ORJSONResponse(content={"hello": "world"})
+        from fastapi_rs.exceptions import FastAPIDeprecationWarning
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("ignore", FastAPIDeprecationWarning)
+            r = ORJSONResponse(content={"hello": "world"})
         data = json.loads(r.body)
         assert data == {"hello": "world"}
 
@@ -218,7 +222,11 @@ class TestORJSONResponse:
     def test_status_code(self):
         """ORJSONResponse accepts custom status code."""
         from fastapi_rs.responses import ORJSONResponse
-        r = ORJSONResponse(content={"ok": True}, status_code=201)
+        from fastapi_rs.exceptions import FastAPIDeprecationWarning
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("ignore", FastAPIDeprecationWarning)
+            r = ORJSONResponse(content={"ok": True}, status_code=201)
         assert r.status_code == 201
 
 

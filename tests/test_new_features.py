@@ -271,12 +271,17 @@ class TestPerRouteSecurity:
 class TestExamples:
     def test_param_example(self):
         from fastapi_rs import FastAPI, Query
+        from fastapi_rs.exceptions import FastAPIDeprecationWarning
+        import warnings as _w
 
         app = FastAPI()
 
-        @app.get("/x")
-        def h(name: str = Query(..., example="Alice")):
-            return {}
+        with _w.catch_warnings():
+            _w.simplefilter("ignore", FastAPIDeprecationWarning)
+
+            @app.get("/x")
+            def h(name: str = Query(..., example="Alice")):
+                return {}
 
         schema = app.openapi()
         op = schema["paths"]["/x"]["get"]

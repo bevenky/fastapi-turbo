@@ -464,7 +464,19 @@ fn pydantic_error_details(
                     obj.insert("msg".into(), serde_json::Value::String(fastapi_normalize_error_msg(&m)));
                 }
                 let is_missing = obj.get("type").and_then(|v| v.as_str()).map(|s| s == "missing").unwrap_or(false);
-                if strip_missing_input && is_missing {
+                // FA parity: for combined-body ``missing`` errors, null
+                // the ``input`` only when the missing field is AT THE
+                // TOP of the combined body (loc = ["body", "<field>"]).
+                // For nested missing fields (loc has more than 2
+                // segments) preserve Pydantic's partial input so users
+                // see what they sent. Without this,
+                // ``test_tutorial002::test_post_missing_required_field_in_item``
+                // sees ``None`` instead of ``{"name": "Foo"}``.
+                let loc_len = obj.get("loc")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if strip_missing_input && is_missing && loc_len <= 2 {
                     obj.insert("input".into(), serde_json::Value::Null);
                 } else if let Some(inp) = d.get_item("input").ok().flatten() {
                     let input_val: serde_json::Value = if let Ok(s) = inp.extract::<String>() {
@@ -2503,6 +2515,9 @@ fn pydantic_error_response(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Res
 }
 
 fn pydantic_error_response_combined(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Response {
+    // strip_missing_input=true; the details-builder keeps the input
+    // for NESTED missing errors (loc length > 2) and nulls it only
+    // for top-level missing.
     pydantic_error_response_with_loc_ext(py, err, &[loc_prefix], true)
 }
 
@@ -2580,14 +2595,19 @@ fn pydantic_error_response_with_loc_ext(
                     obj.insert("msg".into(), serde_json::Value::String(m2));
                 }
                 // input field — best-effort serialize to JSON via python's json module.
-                // When called from the combined-body path we mimic FA's
-                // `get_missing_field_error`, which hard-sets `input=None`
-                // on every "missing" error produced per field.
+                // FA parity: null ``input`` for TOP-LEVEL missing body
+                // fields only (``loc.len() <= 2``). For nested missing
+                // errors (``["body","item","price"]``), preserve the
+                // partial input Pydantic provided.
                 let is_missing_err = obj.get("type")
                     .and_then(|v| v.as_str())
                     .map(|s| s == "missing")
                     .unwrap_or(false);
-                if strip_missing_input && is_missing_err {
+                let loc_len_2 = obj.get("loc")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if strip_missing_input && is_missing_err && loc_len_2 <= 2 {
                     obj.insert("input".into(), serde_json::Value::Null);
                 } else if let Some(inp) = d.get_item("input").ok().flatten() {
                     let input_val: serde_json::Value = if let Ok(s) = inp.extract::<String>() {

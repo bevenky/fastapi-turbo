@@ -252,8 +252,12 @@ class TestDebugMode:
 class TestORJSONResponse:
     def test_orjson_response_renders(self):
         from fastapi_rs.responses import ORJSONResponse
+        from fastapi_rs.exceptions import FastAPIDeprecationWarning
+        import warnings
 
-        resp = ORJSONResponse(content={"k": "v", "n": 42})
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FastAPIDeprecationWarning)
+            resp = ORJSONResponse(content={"k": "v", "n": 42})
         # body is bytes
         assert isinstance(resp.body, bytes)
         # valid JSON
