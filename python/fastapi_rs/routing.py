@@ -297,7 +297,10 @@ class APIRouter:
         self._assert_response_models_are_valid(kwargs)
         self._maybe_require_multipart(endpoint)
         self._assert_dep_scopes(endpoint)
-        route = APIRoute(path, endpoint, methods=methods, **kwargs)
+        # Honour ``APIRouter(route_class=...)`` — users subclass APIRoute
+        # to attach custom attrs / override request handling.
+        route_cls = self.route_class or APIRoute
+        route = route_cls(path, endpoint, methods=methods, **kwargs)
         self.routes.append(route)
 
     @staticmethod
