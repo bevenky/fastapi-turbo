@@ -378,6 +378,34 @@ def _apply_status_code(result, status_code: int):
     return _J(content=result, status_code=status_code)
 
 
+def _close_upload_files(kwargs: dict) -> None:
+    """Call ``.close()`` on any UploadFile-like objects passed as kwargs.
+    Matches Starlette's behaviour of closing uploads after the
+    response is built so tests can assert ``file.closed``.
+    """
+    for _v in list(kwargs.values()):
+        _close_one_upload(_v)
+
+
+def _close_one_upload(obj) -> None:
+    if obj is None:
+        return
+    if isinstance(obj, list):
+        for item in obj:
+            _close_one_upload(item)
+        return
+    if hasattr(obj, "close") and hasattr(obj, "filename"):
+        try:
+            _r = obj.close()
+            if hasattr(_r, "__await__"):
+                try:
+                    _r.send(None)
+                except (StopIteration, Exception):
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _try_compile_handler(
     endpoint,
     params,
@@ -620,6 +648,10 @@ def _try_compile_handler(
                     result = _wrap_response_class(result, _response_class)
                 if status_code is not None:
                     result = _apply_status_code(result, status_code)
+                # Close UploadFile(s) handed to the handler — Starlette
+                # parity. ``test_upload_file_is_closed`` asserts the
+                # file is closed after the response is built.
+                _close_upload_files(filtered)
                 return result
 
             _compiled_no_deps._fastapi_rs_defers_extraction_errors = True  # type: ignore[attr-defined]
@@ -1132,6 +1164,36 @@ def _try_compile_handler(
             _final_result_holder[0] = result
             return result
         finally:
+            # Starlette parity: close any UploadFile passed to the handler
+            # once the request is done so server-side tests can assert
+            # ``.file.closed``. Matches Starlette's ``form.close()`` on
+            # ``ExceptionMiddleware``'s ``finally`` block.
+            try:
+                for _v in list(resolved.values()):
+                    if hasattr(_v, "close") and hasattr(_v, "filename"):
+                        try:
+                            _r = _v.close()
+                            if hasattr(_r, "__await__"):
+                                try:
+                                    _r.send(None)
+                                except (StopIteration, Exception):
+                                    pass
+                        except Exception:
+                            pass
+                    elif isinstance(_v, list):
+                        for _iv in _v:
+                            if hasattr(_iv, "close") and hasattr(_iv, "filename"):
+                                try:
+                                    _r = _iv.close()
+                                    if hasattr(_r, "__await__"):
+                                        try:
+                                            _r.send(None)
+                                        except (StopIteration, Exception):
+                                            pass
+                                except Exception:
+                                    pass
+            except Exception:  # noqa: BLE001
+                pass
             # Starlette/FastAPI semantics: yield-dep teardown runs AFTER
             # the middleware chain unwinds, not before. That lets a
             # middleware body read the state mutated during handler
