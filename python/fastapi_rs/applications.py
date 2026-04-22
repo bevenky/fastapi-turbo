@@ -804,8 +804,13 @@ def _try_compile_handler(
 
                 # Respect `use_cache=False` — force a fresh call for each
                 # usage of this dep within the request (FastAPI semantics).
-                if use_cache and func_id is not None and func_id in cache:
-                    resolved[name] = cache[func_id]
+                # Cache key also includes ``dep_scope`` — FA 0.120+ treats
+                # ``scope="function"`` and ``scope="request"`` as separate
+                # instances (so ``function``-scope teardown doesn't tear
+                # down a ``request``-scope sibling).
+                _cache_key = (func_id, dep_scope) if func_id is not None else None
+                if use_cache and _cache_key is not None and _cache_key in cache:
+                    resolved[name] = cache[_cache_key]
                     continue
                 # Skip deps whose required inputs never arrived — when
                 # there are queued extraction errors, a missing input
@@ -863,8 +868,8 @@ def _try_compile_handler(
                     result = actual_func(**dk)
 
                 resolved[name] = result
-                if use_cache and func_id is not None:
-                    cache[func_id] = result
+                if use_cache and _cache_key is not None:
+                    cache[_cache_key] = result
         except Exception as dep_exc:
             # Dependency raised — route through exception_handlers like
             # FastAPI/Starlette does. SGLang depends on this (route-level
@@ -926,6 +931,7 @@ def _try_compile_handler(
                 return _JSONResp(content={"detail": detail}, status_code=422)
 
         _raised_exc = None
+        _final_result_holder: list = [None]
         try:
             try:
                 _hkwargs = {k: resolved[k] for k in handler_param_names if k in resolved}
@@ -1004,6 +1010,7 @@ def _try_compile_handler(
                 result = _wrap_response_class(result, _response_class)
             if status_code is not None:
                 result = _apply_status_code(result, status_code)
+            _final_result_holder[0] = result
             return result
         finally:
             # Starlette/FastAPI semantics: yield-dep teardown runs AFTER
@@ -1015,12 +1022,59 @@ def _try_compile_handler(
             # ``"completed"``. When middleware is present, we stash the
             # teardowns on the middleware request and the outer wrapper
             # drains them post-response. Otherwise run inline.
+            #
+            # FA 0.120+ scope split: ``function``-scope teardowns MUST run
+            # right here (before the response is finalized) — that way an
+            # HTTPException raised after ``yield`` bubbles out as the real
+            # response. ``request``-scope teardowns keep the legacy
+            # deferred behavior (after streaming body completes).
+            _function_scope_tds = [
+                t for t in generators_to_cleanup
+                if (len(t) == 3 and t[2] == "function")
+            ]
+            _request_scope_tds = [
+                t for t in generators_to_cleanup
+                if not (len(t) == 3 and t[2] == "function")
+            ]
+            # Function-scope always inline (including re-raising any
+            # HTTPException from a post-yield statement).
+            if _function_scope_tds:
+                _run_pending_teardowns(
+                    reversed(_function_scope_tds),
+                    propagate_exceptions=True,
+                )
             if _defer_teardown and _mw_req is not None:
                 _mw_req._pending_teardowns.extend(
-                    reversed(generators_to_cleanup)
+                    reversed(_request_scope_tds)
                 )
-            else:
-                _run_pending_teardowns(reversed(generators_to_cleanup))
+            elif _request_scope_tds:
+                # FA 0.120+ ``scope="request"`` for a StreamingResponse must
+                # defer teardown until AFTER the body iterator is fully
+                # consumed (the body peeks at state mutated by the dep).
+                from fastapi_rs.responses import StreamingResponse as _SR2
+                _final_result = _final_result_holder[0]
+                if isinstance(_final_result, _SR2):
+                    _orig_iter = _final_result.body_iterator
+                    _tds = list(reversed(_request_scope_tds))
+                    import inspect as _insp
+                    if _insp.isasyncgen(_orig_iter) or hasattr(_orig_iter, "__anext__"):
+                        async def _wrap_iter(orig=_orig_iter, tds=_tds):
+                            try:
+                                async for item in orig:
+                                    yield item
+                            finally:
+                                _run_pending_teardowns(tds)
+                        _final_result.body_iterator = _wrap_iter()
+                    else:
+                        def _wrap_iter_sync(orig=_orig_iter, tds=_tds):
+                            try:
+                                for item in orig:
+                                    yield item
+                            finally:
+                                _run_pending_teardowns(tds)
+                        _final_result.body_iterator = _wrap_iter_sync()
+                else:
+                    _run_pending_teardowns(reversed(_request_scope_tds))
 
     # Marker for the Rust router: this compiled handler knows how to
     # consume a deferred extraction-errors blob, so Rust should stash
@@ -1031,13 +1085,22 @@ def _try_compile_handler(
     return _compiled
 
 
-def _run_pending_teardowns(teardowns, throw_exc: BaseException | None = None) -> None:
+def _run_pending_teardowns(
+    teardowns,
+    throw_exc: BaseException | None = None,
+    propagate_exceptions: bool = False,
+) -> None:
     """Drain a reversed-order iterable of (gen, loop[, scope]) tuples.
 
     Sync yield-deps resume via `next()`; async yield-deps resume on the
     shared worker loop via `_async_worker.submit()` so that asyncpg /
     redis.asyncio teardown (`await session.close()`, `await conn.close()`)
     runs on the same loop that created the connections.
+
+    When ``propagate_exceptions`` is True (FA 0.120+ function-scope deps),
+    any ``HTTPException`` raised in a yield-dep's post-yield statement is
+    re-raised so the response reflects it. By default (request-scope /
+    legacy) such exceptions are swallowed with Starlette's behavior.
     """
     # Throw-aware teardown: when the handler raised, ``throw_exc`` is
     # set and we push it into each generator via ``gen.throw(...)``
@@ -1085,6 +1148,10 @@ def _run_pending_teardowns(teardowns, throw_exc: BaseException | None = None) ->
             # - otherwise Starlette's default: swallow and log.
             if throw_exc is not None and exc is not throw_exc:
                 # Gen re-raised a different exception — let it surface.
+                raise
+            # FA 0.120+: ``scope="function"`` wants HTTPException raised
+            # from after the ``yield`` to surface as the HTTP response.
+            if propagate_exceptions and throw_exc is None:
                 raise
             # else: swallow silently.
             pass
