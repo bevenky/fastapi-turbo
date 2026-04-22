@@ -770,11 +770,54 @@ def _try_compile_handler(
     }
     _container_ctors = {"set": set, "frozenset": frozenset, "tuple": tuple}
 
+    # For tuple-typed form params, build a TypeAdapter so Pydantic
+    # enforces arity + per-element type coercion. ``tuple[int, int]``
+    # sent as ``values=1&values=2&values=3`` should 422.
+    _tuple_form_adapters: dict = {}
+    for _p in params:
+        if (
+            _p.get("_is_handler_param")
+            and _p.get("container_type") == "tuple"
+            and _p.get("kind") == "form"
+        ):
+            _ann = _p.get("_unwrapped_annotation")
+            import typing as _tp_local
+            if _ann is not None and _tp_local.get_origin(_ann) is tuple:
+                _args = _tp_local.get_args(_ann)
+                # Fixed-arity tuple (``tuple[int, int]``) — TypeAdapter
+                # handles both coercion and arity. Variadic tuples
+                # (``tuple[int, ...]``) are left to the ctor below.
+                if _args and Ellipsis not in _args:
+                    try:
+                        from pydantic import TypeAdapter as _TA
+                        _tuple_form_adapters[_p["name"]] = _TA(_ann)
+                    except Exception:  # noqa: BLE001
+                        pass
+
     def _apply_container_coerce(filtered: dict) -> None:
         if not _container_coerce:
             return
         for _k, _name in _container_coerce.items():
             if _k in filtered:
+                # Tuple form with fixed arity: route through Pydantic so
+                # both arity and per-element types are enforced.
+                _adapter = _tuple_form_adapters.get(_k)
+                if _adapter is not None:
+                    try:
+                        filtered[_k] = _adapter.validate_python(filtered[_k])
+                        continue
+                    except Exception as _exc:  # noqa: BLE001
+                        from pydantic import ValidationError as _PyVE
+                        if isinstance(_exc, _PyVE):
+                            from fastapi_rs.exceptions import (
+                                RequestValidationError as _RVE,
+                            )
+                            _errs = [
+                                {**e, "loc": ("body", _k, *tuple(e.get("loc", ())))}
+                                for e in _exc.errors()
+                            ]
+                            raise _RVE(_errs) from None
+                        raise
                 _ctor = _container_ctors.get(_name)
                 if _ctor is not None and not isinstance(filtered[_k], _ctor):
                     try:
@@ -869,7 +912,21 @@ def _try_compile_handler(
                                 filtered[_ek] = _ecls(filtered[_ek])
                             except (ValueError, KeyError):
                                 pass
-                    _apply_container_coerce(filtered)
+                    try:
+                        _apply_container_coerce(filtered)
+                    except Exception as _ccexc:
+                        from fastapi_rs.exceptions import (
+                            RequestValidationError as _RVE2,
+                        )
+                        if isinstance(_ccexc, _RVE2):
+                            from fastapi_rs.responses import (
+                                JSONResponse as _JRx,
+                            )
+                            return _JRx(
+                                content={"detail": list(_ccexc.errors())},
+                                status_code=422,
+                            )
+                        raise
                     result = handler_func(**filtered)
                 except Exception as exc:
                     _maybe_print_debug_traceback(_app_ref, exc)
@@ -1373,7 +1430,21 @@ def _try_compile_handler(
                             _hkwargs[_ek] = _ecls(_hkwargs[_ek])
                         except (ValueError, KeyError):
                             pass
-                _apply_container_coerce(_hkwargs)
+                try:
+                    _apply_container_coerce(_hkwargs)
+                except Exception as _ccexc2:
+                    from fastapi_rs.exceptions import (
+                        RequestValidationError as _RVE3,
+                    )
+                    if isinstance(_ccexc2, _RVE3):
+                        from fastapi_rs.responses import (
+                            JSONResponse as _JRx2,
+                        )
+                        return _JRx2(
+                            content={"detail": list(_ccexc2.errors())},
+                            status_code=422,
+                        )
+                    raise
                 result = handler_func(**_hkwargs)
             except Exception as exc:
                 _raised_exc = exc
@@ -4310,7 +4381,16 @@ class FastAPI:
             def _openapi_dynamic():
                 _app_ref.openapi_schema = None
                 from fastapi_rs.responses import JSONResponse as _JR
-                return _JR(content=_app_ref.openapi())
+                try:
+                    _schema = _app_ref.openapi()
+                except Exception as _exc:  # noqa: BLE001
+                    # Mirror FA: the openapi builder raises ValueError for
+                    # invalid configs (e.g. non-numeric response status
+                    # keys). TestClient asserts on ``pytest.raises(
+                    # ValueError)`` — capture so it surfaces at the caller.
+                    _app_ref._captured_server_exceptions.append(_exc)
+                    raise
+                return _JR(content=_schema)
 
             _openapi_dynamic.__name__ = "openapi"
             # Drop any existing dynamic route from a prior ``app.run()``
