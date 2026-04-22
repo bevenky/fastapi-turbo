@@ -330,6 +330,7 @@ class APIRouter:
         self._assert_response_models_are_valid(kwargs)
         self._maybe_require_multipart(endpoint)
         self._assert_dep_scopes(endpoint)
+        self._assert_param_annotations(path, endpoint)
         # Honour ``APIRouter(route_class=...)`` — users subclass APIRoute
         # to attach custom attrs / override request handling.
         route_cls = self.route_class or APIRoute
@@ -415,6 +416,66 @@ class APIRouter:
                         f'it cannot depend on dependencies with scope "function"'
                     )
             _walk(outer_callable)
+
+    @staticmethod
+    def _assert_param_annotations(path: str, endpoint: Callable) -> None:
+        """FA parity: raise ``AssertionError`` at decoration time for
+        parameter annotation patterns FA rejects:
+
+        - ``Annotated[T, Path(default=...)]`` on a path param
+        - ``Annotated[T, Query(default=...)]`` (default must be ``=``)
+        - ``Annotated[T, Depends(x)] = Depends(x)`` (doubled marker)
+        - ``Annotated[T, Query(...)] = Depends(x)`` (mixed markers)
+        """
+        import inspect as _inspect
+        import typing as _typing
+        from fastapi_rs.param_functions import _ParamMarker as _PM
+        from fastapi_rs.dependencies import Depends as _Dep
+
+        import re as _re
+        path_param_names = set(_re.findall(r"\{([^}:]+)", path))
+        try:
+            sig = _inspect.signature(endpoint)
+        except (TypeError, ValueError):
+            return
+        from pydantic_core import PydanticUndefined as _Und
+        for pname, p in sig.parameters.items():
+            ann = p.annotation
+            default = p.default
+            if _typing.get_origin(ann) is not _typing.Annotated:
+                continue
+            metas = _typing.get_args(ann)[1:]
+            markers_in_ann = [m for m in metas if isinstance(m, _PM)]
+            depends_in_ann = [m for m in metas if isinstance(m, _Dep)]
+            # Path(default=...) or Query(default=...) in Annotated
+            for m in markers_in_ann:
+                _d = getattr(m, "default", _Und)
+                if _d is _Und or _d is Ellipsis:
+                    continue
+                kind = getattr(m, "_kind", "")
+                if kind == "path":
+                    assert False, (
+                        "Path parameters cannot have a default value"
+                    )
+                if kind in ("query", "header", "cookie"):
+                    assert False, (
+                        f"`{kind.capitalize()}` default value cannot be set "
+                        f"in `Annotated` for {pname!r}. Set the default "
+                        f"value with `=` instead."
+                    )
+            # Depends in Annotated + also Depends as default value
+            if depends_in_ann and isinstance(default, _Dep):
+                assert False, (
+                    f"Cannot specify `Depends` in `Annotated` and default "
+                    f"value together for {pname!r}"
+                )
+            # Query/Path/... in Annotated + Depends as default value
+            if markers_in_ann and isinstance(default, _Dep):
+                assert False, (
+                    f"Cannot specify a FastAPI annotation in `Annotated` "
+                    f"and `Depends` as a default value together for "
+                    f"{pname!r}"
+                )
 
     @staticmethod
     def _maybe_require_multipart(endpoint: Callable) -> None:
