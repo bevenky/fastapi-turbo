@@ -697,6 +697,37 @@ async fn non_preflight_options_middleware(
     next.run(req).await
 }
 
+/// Starlette's CORSMiddleware responds to preflight requests with body
+/// "OK" (Content-Type: text/plain; charset=utf-8). tower-http's
+/// CorsLayer produces an empty-bodied 200. This middleware runs
+/// *outside* the CorsLayer: if the incoming request looks like a CORS
+/// preflight (OPTIONS + Origin + Access-Control-Request-Method) and
+/// the downstream response carries the Access-Control-Allow-Origin
+/// header (i.e. CORS accepted it), we rewrite the body to "OK" and
+/// set Content-Type to text/plain.
+async fn cors_preflight_ok_body_middleware(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_preflight = req.method() == axum::http::Method::OPTIONS
+        && req.headers().contains_key("origin")
+        && req.headers().contains_key("access-control-request-method");
+    let resp = next.run(req).await;
+    if !is_preflight {
+        return resp;
+    }
+    if !resp.headers().contains_key("access-control-allow-origin") {
+        return resp;
+    }
+    let (mut parts, _body) = resp.into_parts();
+    parts.headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    axum::response::Response::from_parts(parts, axum::body::Body::from("OK"))
+}
+
 fn options_path_matches(template: &str, concrete: &str) -> bool {
     let t_segs: Vec<&str> = template.split('/').collect();
     let c_segs: Vec<&str> = concrete.split('/').collect();
@@ -944,6 +975,11 @@ fn apply_middlewares(
                     expose_headers,
                 );
                 app = app.layer(cors);
+                // Starlette's CORSMiddleware returns body "OK" with
+                // Content-Type text/plain for preflight responses.
+                // tower-http's CorsLayer produces empty 200s. Wrap the
+                // outer response so preflights get "OK" body.
+                app = app.layer(axum::middleware::from_fn(cors_preflight_ok_body_middleware));
             }
             MiddlewareConfig::Gzip => {
                 app = app.layer(CompressionLayer::new());
