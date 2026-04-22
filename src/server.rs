@@ -388,7 +388,7 @@ const REDOC_HTML: &str = r#"
 ///
 /// This function blocks until the server shuts down (Ctrl-C).
 #[pyfunction]
-#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![], root_path=None, redirect_slashes=true, max_request_size=None, not_found_handler=None, app=None, validation_handler=None, swagger_ui_oauth2_redirect_url=None))]
+#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![], root_path=None, redirect_slashes=true, max_request_size=None, not_found_handler=None, app=None, validation_handler=None, swagger_ui_oauth2_redirect_url=None, swagger_ui_html=None, redoc_html=None))]
 pub fn run_server(
     py: Python<'_>,
     routes: Vec<RouteInfo>,
@@ -407,6 +407,8 @@ pub fn run_server(
     app: Option<Py<PyAny>>,
     validation_handler: Option<Py<PyAny>>,
     swagger_ui_oauth2_redirect_url: Option<String>,
+    swagger_ui_html: Option<String>,
+    redoc_html: Option<String>,
 ) -> PyResult<()> {
     // Stash the user's 404 handler so the Rust Router fallback can dispatch
     // through Python when nothing else matched. Set once per process.
@@ -495,21 +497,19 @@ pub fn run_server(
                     }),
                 );
 
-                // Swagger UI
+                // Swagger UI — prefer Python-rendered HTML
+                // (``get_swagger_ui_html``) when supplied by the
+                // application; fall back to the embedded default
+                // template. Python rendering honours FA kwargs like
+                // ``swagger_ui_parameters`` and ``swagger_ui_init_oauth``.
                 if let Some(ref docs_path) = docs_url {
-                    // FA parity: ``swagger_ui_oauth2_redirect_url`` from
-                    // the FastAPI app controls the oauth2-redirect path.
-                    //   - ``None`` → omit the ``oauth2RedirectUrl`` JS
-                    //     entry AND skip registering the redirect page.
-                    //   - ``"/custom"`` → embed ``/custom`` in the HTML
-                    //     and serve the redirect page at that path.
-                    let swagger_html = if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
+                    let swagger_final = if let Some(s) = swagger_ui_html.clone() {
+                        s
+                    } else if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
                         SWAGGER_UI_HTML
                             .replace("__OPENAPI_URL__", oa_url)
                             .replace("__OAUTH2_REDIRECT_URL__", oauth_redirect)
                     } else {
-                        // Strip the entire oauth2RedirectUrl line so the
-                        // rendered HTML has no oauth2 machinery.
                         SWAGGER_UI_HTML
                             .replace("__OPENAPI_URL__", oa_url)
                             .lines()
@@ -520,10 +520,9 @@ pub fn run_server(
                     router = router.route(
                         docs_path,
                         get(move || async move {
-                            axum::response::Html(swagger_html.clone())
+                            axum::response::Html(swagger_final.clone())
                         }),
                     );
-                    // OAuth2 redirect page — only register when configured.
                     if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
                         router = router.route(
                             oauth_redirect,
@@ -534,13 +533,15 @@ pub fn run_server(
                     }
                 }
 
-                // ReDoc
+                // ReDoc — similarly prefer Python-rendered HTML.
                 if let Some(ref redoc_path) = redoc_url {
-                    let redoc_html = REDOC_HTML.replace("__OPENAPI_URL__", oa_url);
+                    let redoc_final = redoc_html.clone().unwrap_or_else(|| {
+                        REDOC_HTML.replace("__OPENAPI_URL__", oa_url)
+                    });
                     router = router.route(
                         redoc_path,
                         get(move || async move {
-                            axum::response::Html(redoc_html.clone())
+                            axum::response::Html(redoc_final.clone())
                         }),
                     );
                 }

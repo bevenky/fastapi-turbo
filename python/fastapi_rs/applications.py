@@ -3787,6 +3787,43 @@ class FastAPI:
 
             validation_handler = _rust_validation_handler
 
+        # Render Swagger UI / ReDoc HTML in Python so FA kwargs
+        # (``swagger_ui_parameters``, ``swagger_ui_init_oauth``) are
+        # honoured. Rust serves the rendered string verbatim.
+        swagger_ui_html_str: str | None = None
+        redoc_html_str: str | None = None
+        if self.docs_url is not None and self.openapi_url is not None:
+            try:
+                import fastapi_rs.compat as _c
+                _c.install()
+                import sys
+                _docs_mod = sys.modules.get("fastapi.openapi.docs")
+                if _docs_mod is not None:
+                    resp = _docs_mod.get_swagger_ui_html(
+                        openapi_url=self.openapi_url,
+                        title=self.title + " - Swagger UI",
+                        oauth2_redirect_url=self.swagger_ui_oauth2_redirect_url,
+                        init_oauth=self.swagger_ui_init_oauth,
+                        swagger_ui_parameters=self.swagger_ui_parameters,
+                    )
+                    swagger_ui_html_str = resp.body.decode("utf-8") if hasattr(resp, "body") else None
+            except Exception:  # noqa: BLE001
+                swagger_ui_html_str = None
+        if self.redoc_url is not None and self.openapi_url is not None:
+            try:
+                import fastapi_rs.compat as _c
+                _c.install()
+                import sys
+                _docs_mod = sys.modules.get("fastapi.openapi.docs")
+                if _docs_mod is not None:
+                    resp = _docs_mod.get_redoc_html(
+                        openapi_url=self.openapi_url,
+                        title=self.title + " - ReDoc",
+                    )
+                    redoc_html_str = resp.body.decode("utf-8") if hasattr(resp, "body") else None
+            except Exception:  # noqa: BLE001
+                redoc_html_str = None
+
         run_server(
             route_infos,
             host,
@@ -3804,6 +3841,8 @@ class FastAPI:
             self,
             validation_handler,
             self.swagger_ui_oauth2_redirect_url,
+            swagger_ui_html_str,
+            redoc_html_str,
         )
 
     # ------------------------------------------------------------------
