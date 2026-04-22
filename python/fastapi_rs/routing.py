@@ -176,6 +176,13 @@ class APIRoute:
         self.status_code = status_code
         self.tags = tags or []
         self.summary = summary
+        # FA: when description= isn't set, falls back to the endpoint's
+        # docstring (``inspect.cleandoc(endpoint.__doc__)``).
+        if description is None:
+            _raw_doc = getattr(endpoint, "__doc__", None)
+            if _raw_doc:
+                import inspect as _ins
+                description = _ins.cleandoc(_raw_doc)
         self.description = description
         self.response_description = response_description
         self.responses = responses or {}

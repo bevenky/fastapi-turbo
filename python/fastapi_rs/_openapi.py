@@ -914,10 +914,27 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     if external_docs:
         operation["externalDocs"] = external_docs
 
-    # Merge in openapi_extra (user's custom OpenAPI fields)
+    # Merge in openapi_extra (user's custom OpenAPI fields). For the
+    # ``parameters`` key specifically, FA extends the existing list
+    # rather than replacing it — so the user's openapi_extra parameters
+    # add to the handler's auto-derived ones.
     openapi_extra = route.get("openapi_extra") or {}
     if openapi_extra:
-        operation.update(openapi_extra)
+        for k, v in openapi_extra.items():
+            if k == "parameters" and isinstance(v, list):
+                existing = operation.get("parameters") or []
+                operation["parameters"] = list(existing) + list(v)
+            elif k == "responses" and isinstance(v, dict):
+                existing_r = operation.get("responses") or {}
+                merged: dict[str, Any] = dict(existing_r)
+                for sk, sv in v.items():
+                    if sk in merged and isinstance(merged[sk], dict) and isinstance(sv, dict):
+                        merged[sk] = {**merged[sk], **sv}
+                    else:
+                        merged[sk] = sv
+                operation["responses"] = merged
+            else:
+                operation[k] = v
 
     return operation
 
@@ -1088,17 +1105,22 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
     list_inner_ann = None
     _bare_list = False
     _annotation_absent = ua is None and pm_field_name is None
+    import typing as _typing
+    _is_unique_container = False
     if ua is not None:
         # Peel list containers to get the item annotation.
-        import typing as _typing
         origin = _typing.get_origin(ua)
         if origin in (list, tuple, set, frozenset):
             args = _typing.get_args(ua)
             if args:
                 list_inner_ann = args[0]
+            if origin in (set, frozenset):
+                _is_unique_container = True
         elif ua in (list, tuple, set, frozenset):
             # Bare ``list`` / ``tuple`` / ``set`` — FA emits ``items: {}``.
             _bare_list = True
+            if ua in (set, frozenset):
+                _is_unique_container = True
         else:
             inner_schema = _schema_for_annotation(ua)
     if inner_schema is None:
@@ -1136,6 +1158,13 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
             if _is_float_type and ck in _numeric_keys and isinstance(v, int) and not isinstance(v, bool):
                 v = float(v)
             inner_schema[sk] = v
+
+    # ``set[T]`` / ``frozenset[T]`` query params emit ``uniqueItems: True``
+    # — Pydantic adds it natively for BaseModel fields; we mirror it here
+    # for standalone Query/Header/Cookie/Path parameters.
+    if _is_unique_container and isinstance(inner_schema, dict):
+        if inner_schema.get("type") == "array":
+            inner_schema["uniqueItems"] = True
 
     # Enum params: when the enum class has been hoisted into
     # `components.schemas`, emit `$ref` — FA does this. For `Literal`
