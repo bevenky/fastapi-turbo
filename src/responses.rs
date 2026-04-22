@@ -695,6 +695,56 @@ fn write_any_json(py: Python<'_>, obj: &Bound<'_, PyAny>, buf: &mut String) {
             }
         }
     }
+    // FA-parity: datetime / date / time expose ``.isoformat()``.
+    // timedelta → total_seconds() as JSON number. UUID → str().
+    // ``jsonable_encoder`` folds all of these; we replicate the most
+    // common ones so handlers returning raw datetimes in a dict emit
+    // ISO strings rather than Python ``str(dt)`` output.
+    {
+        let ty = obj.get_type();
+        let name_owned: Option<String> = ty.name().ok().and_then(|n| n.extract::<String>().ok());
+        if let Some(name) = name_owned.as_deref() {
+            match name {
+                "datetime" | "date" | "time" => {
+                    if let Ok(iso) = obj.call_method0("isoformat") {
+                        if let Ok(s) = iso.extract::<String>() {
+                            buf.push('"');
+                            json_escape_to(&s, buf);
+                            buf.push('"');
+                            return;
+                        }
+                    }
+                }
+                "timedelta" => {
+                    if let Ok(secs) = obj.call_method0("total_seconds") {
+                        if let Ok(f) = secs.extract::<f64>() {
+                            use std::fmt::Write;
+                            if f.is_finite() {
+                                // FA emits integers when whole; mimic.
+                                if f.fract() == 0.0 {
+                                    let _ = write!(buf, "{}", f as i64);
+                                } else {
+                                    let _ = write!(buf, "{f}");
+                                }
+                            } else {
+                                buf.push_str("null");
+                            }
+                            return;
+                        }
+                    }
+                }
+                "UUID" => {
+                    if let Ok(s) = obj.str() {
+                        buf.push('"');
+                        json_escape_to(&s.to_string(), buf);
+                        buf.push('"');
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     // ``@dataclass`` / FA dependency classes
     // (``OAuth2PasswordRequestForm`` etc.) have no ``model_dump`` but
     // do have ``__dict__``. Serialize via ``vars(obj)`` so handlers

@@ -2533,17 +2533,34 @@ def _build_callbacks(callbacks: list) -> dict[str, Any]:
 
     def _route_entry(cb_route, prefix: str = "") -> tuple[str, str, dict[str, Any]]:
         full_path = prefix + cb_route.path
+        # Introspect the callback endpoint to surface its body/response
+        # schemas (FA renders the full operation shape for callbacks —
+        # requestBody + responses + 422, same as a regular route).
+        cb_params: list[dict[str, Any]] = []
+        try:
+            from fastapi_rs._introspect import introspect_endpoint as _ie
+            cb_params = _ie(cb_route.endpoint, full_path) or []
+            # Mark them as handler-side params so the 422 emission logic
+            # includes them (FA treats callback endpoint params the same
+            # as regular-route handler params).
+            for _p in cb_params:
+                _p.setdefault("_is_handler_param", True)
+        except Exception:  # noqa: BLE001
+            cb_params = []
         cb_route_dict = {
             "path": full_path,
             "methods": cb_route.methods,
             "handler_name": cb_route.name,
-            "params": [],
+            "params": cb_params,
+            "_all_params": cb_params,
             "tags": cb_route.tags,
             "summary": cb_route.summary,
             "description": cb_route.description,
             "status_code": cb_route.status_code or 200,
             "response_description": cb_route.response_description,
             "responses": cb_route.responses,
+            "response_model": getattr(cb_route, "response_model", None),
+            "response_class": getattr(cb_route, "response_class", None),
             "deprecated": cb_route.deprecated,
             "operation_id": cb_route.operation_id,
             "include_in_schema": cb_route.include_in_schema,
@@ -2572,6 +2589,9 @@ def _build_callbacks(callbacks: list) -> dict[str, Any]:
 def _walk_callback_models(callbacks: list):
     """Yield every ``BaseModel`` reachable from any callback route so the
     ``_register_model`` pass picks them up and emits the component schema.
+    Covers ``responses[*].model`` AND the endpoint's return annotation
+    (``response_model``) AND any body/form Pydantic model in the
+    endpoint signature.
     """
     from fastapi_rs.routing import APIRouter, APIRoute
 
@@ -2581,6 +2601,24 @@ def _walk_callback_models(callbacks: list):
                 m = resp_info.get("model")
                 if m is not None:
                     yield m
+        # Response model (return annotation)
+        rm = getattr(cb_route, "response_model", None)
+        if rm is not None:
+            yield rm
+        # Body/form models from endpoint signature. Use our introspection
+        # pipeline so the inner Pydantic model surfaces.
+        try:
+            from fastapi_rs._introspect import introspect_endpoint as _ie
+            cb_params = _ie(cb_route.endpoint, cb_route.path) or []
+            for p in cb_params:
+                mc = p.get("model_class")
+                if mc is not None:
+                    yield mc
+                pmc = p.get("_param_model_class")
+                if pmc is not None:
+                    yield pmc
+        except Exception:  # noqa: BLE001
+            pass
 
     for cb in callbacks or []:
         if isinstance(cb, APIRouter):
