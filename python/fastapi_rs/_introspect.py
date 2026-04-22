@@ -664,10 +664,23 @@ def _maybe_expand_param_models(params: list[dict[str, Any]]) -> list[dict[str, A
             continue
         ann = p.get("_unwrapped_annotation")
         model_cls = None
+        # Union of BaseModels — supported for ``form`` only. ``data:
+        # Annotated[UserForm | CompanyForm, Form()]`` expands into the
+        # union of all fields; the synthesized builder walks each
+        # model's Pydantic validator in turn and returns the first that
+        # accepts the form data.
+        _union_models: list[type] | None = None
+        if kind == "form" and typing.get_origin(ann) is typing.Union:
+            _u_args = [a for a in typing.get_args(ann) if a is not type(None)]
+            if all(isinstance(a, type) and issubclass(a, _BM) for a in _u_args) and _u_args:
+                _union_models = list(_u_args)
         if isinstance(ann, type) and issubclass(ann, _BM):
             model_cls = ann
-        if model_cls is None:
+        if model_cls is None and _union_models is None:
             out.append(p)
+            continue
+        if _union_models is not None:
+            out.extend(_expand_form_union(p, _union_models))
             continue
 
         # Expand: for each model field, synthesize an extraction param.
@@ -923,6 +936,155 @@ def _maybe_expand_param_models(params: list[dict[str, Any]]) -> list[dict[str, A
         }
         out.append(builder_step)
 
+    return out
+
+
+def _expand_form_union(p: dict[str, Any], union_models: list[type]) -> list[dict[str, Any]]:
+    """Expand ``data: Annotated[ModelA | ModelB, Form()]`` form param
+    into the union of all model fields plus a builder step that tries
+    each model in turn.
+
+    FastAPI parity: form data is collected as a flat dict, then each
+    union arm's ``model_validate`` is invoked. The first model that
+    accepts the payload wins; if none does, a 422 is raised with the
+    errors from the LAST attempted arm.
+    """
+    handler_var = p["name"]
+    kind = p["kind"]
+
+    # Collect unique fields across all models (preserving order of
+    # first appearance). A field that appears in multiple arms gets a
+    # single extraction entry — the builder hands it to each model.
+    seen: dict[str, tuple[type, Any]] = {}
+    for m in union_models:
+        for fn, fi in m.model_fields.items():
+            if fn not in seen:
+                seen[fn] = (m, fi)
+
+    out: list[dict[str, Any]] = []
+    field_inputs: list[tuple[str, str, str]] = []  # (field_name, resolved_key, wire_alias)
+    for field_name, (owner_cls, field_info) in seen.items():
+        val_alias = field_info.validation_alias
+        if isinstance(val_alias, str):
+            wire_alias = val_alias
+        elif field_info.alias:
+            wire_alias = field_info.alias
+        else:
+            wire_alias = field_name
+        resolved_key = f"pm_{handler_var}__{field_name}"
+        field_ann = field_info.annotation
+        schema_type_hint = _get_type_name(field_ann)
+        runtime_type_hint = "list_str" if schema_type_hint.startswith("list_") else "str"
+        sub_param = {
+            "name": resolved_key,
+            "kind": kind,
+            "type_hint": runtime_type_hint,
+            "required": False,
+            "default_value": _PARAM_MODEL_MISSING,
+            "has_default": True,
+            "model_class": None,
+            "alias": wire_alias,
+            "_embed": False,
+            "media_type": None,
+            "example": None,
+            "examples": None,
+            "title": field_info.title,
+            "description": field_info.description,
+            "include_in_schema": True,
+            "deprecated": None,
+            "scalar_validator": None,
+            "enum_class": None,
+            "container_type": None,
+            "_is_optional": False,
+            "_enum_values": None,
+            "_unwrapped_annotation": _unwrap_optional(field_ann),
+            "_raw_marker": None,
+            "_raw_annotation": field_ann,
+            "_is_handler_param": False,
+            "_param_model_field_name": field_name,
+            "_param_model_owner": handler_var,
+            "_param_model_class": owner_cls,
+            "_param_model_schema_type_hint": schema_type_hint,
+            "_param_model_container_type": _get_container_type(field_ann),
+            "_param_model_field_info": field_info,
+            "_param_model_field_ann": field_ann,
+            # Mark so _build_form_file_body knows this came from a union
+            # expansion — avoids the single-model form shortcut.
+            "_form_union_models": tuple(union_models),
+            "_form_union_owner": handler_var,
+        }
+        out.append(sub_param)
+        field_inputs.append((field_name, resolved_key, wire_alias))
+
+    loc_prefix = "body"
+
+    def _make_union_builder(models, fields):
+        wire_aliases_known = {alias for _fn, _r, alias in fields}
+
+        def _build(__raw__=None, **extracted):
+            raw_dict = __raw__ if isinstance(__raw__, dict) else {}
+            supplied: dict = {}
+            for k, v in raw_dict.items():
+                if k in wire_aliases_known:
+                    continue
+                supplied[k] = v
+            for k, v in extracted.items():
+                if v is _PARAM_MODEL_MISSING:
+                    continue
+                # map resolved key back to wire alias
+                for _fn, _rk, _al in fields:
+                    if k == _rk:
+                        supplied[_al] = v
+                        break
+                else:
+                    supplied[k] = v
+            last_exc = None
+            for m in models:
+                try:
+                    return m.model_validate(supplied)
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    continue
+            if last_exc is not None:
+                raise _param_model_build_error(last_exc, loc_prefix)
+            raise _param_model_build_error(
+                ValueError("no union arm matched"), loc_prefix
+            )
+        _build.__name__ = f"_build_union_{handler_var}"
+        _build._fastapi_rs_raw_source = "__fastapi_rs_raw_form__"
+        return _build
+
+    builder_func = _make_union_builder(union_models, field_inputs)
+    dep_input_map_2 = [(rk, rk) for _fn, rk, _al in field_inputs]
+    dep_input_map_2.append(("__raw__", "__fastapi_rs_raw_form__"))
+    builder_step = {
+        "name": handler_var,
+        "kind": "dependency",
+        "type_hint": "any",
+        "required": p.get("required", True),
+        "default_value": None,
+        "has_default": False,
+        "model_class": None,
+        "alias": None,
+        "dep_callable": builder_func,
+        "_original_dep_callable": builder_func,
+        "dep_callable_id": id(builder_func),
+        "is_async_dep": False,
+        "is_generator_dep": False,
+        "dep_input_map": dep_input_map_2,
+        "use_cache": False,
+        "_is_handler_param": True,
+        "_is_param_model_builder": True,
+        "_is_form_union_builder": True,
+        "_param_model_class": union_models[0],
+        "_form_union_models": tuple(union_models),
+        "_param_model_loc_prefix": loc_prefix,
+        "include_in_schema": False,
+        "enum_class": None,
+        "container_type": None,
+        "scalar_validator": None,
+    }
+    out.append(builder_step)
     return out
 
 
@@ -1425,9 +1587,9 @@ class _FABodyValidator:
     polymorphically alongside Pydantic's own SchemaValidator.
     """
 
-    __slots__ = ("_validator", "_is_model")
+    __slots__ = ("_validator", "_is_model", "_combined_body_fields")
 
-    def __init__(self, annotation):
+    def __init__(self, annotation, combined_body_fields=None):
         from pydantic import TypeAdapter
         from pydantic.fields import FieldInfo
         from typing import Annotated as _Annotated
@@ -1444,6 +1606,29 @@ class _FABodyValidator:
             ta = TypeAdapter(annotation)
         self._validator = ta.validator
         self._is_model = is_model
+        # When set, this is a ``_combined_body`` wrapper — a list of
+        # field names that produce per-field ``missing`` errors when
+        # the raw body isn't a dict (FA parity — ``PUT`` with body
+        # ``[]`` on a multi-body endpoint emits one missing per
+        # required param, not ``model_attributes_type``).
+        self._combined_body_fields = combined_body_fields
+
+    def _maybe_combined_body_missing(self, data) -> None:
+        if not self._combined_body_fields or isinstance(data, dict):
+            return
+        from pydantic_core import InitErrorDetails, PydanticCustomError
+        from pydantic import ValidationError
+        details = [
+            InitErrorDetails(
+                type=PydanticCustomError("missing", "Field required", {}),
+                loc=(fname,),
+                input=None,
+            )
+            for fname in self._combined_body_fields
+        ]
+        raise ValidationError.from_exception_data(
+            "combined_body_missing", details
+        ) from None
 
     def validate_json(self, body):
         import json as _json
@@ -1453,6 +1638,7 @@ class _FABodyValidator:
         elif isinstance(body, str):
             raw = body.encode("utf-8")
         else:
+            self._maybe_combined_body_missing(body)
             return self._validator.validate_python(body, from_attributes=True)
         try:
             data = _json.loads(raw)
@@ -1477,21 +1663,31 @@ class _FABodyValidator:
                     )
                 ],
             ) from None
+        self._maybe_combined_body_missing(data)
         return self._validator.validate_python(data, from_attributes=True)
 
     def validate_python(self, value):
+        self._maybe_combined_body_missing(value)
         return self._validator.validate_python(value, from_attributes=True)
 
 
-def _make_fa_body_validator(annotation):
+def _make_fa_body_validator(annotation, combined_body_fields=None):
     # If a ``_TypeAdapterProxy`` was handed in (set by the body-type
     # resolver for ``list[Item]`` / ``dict[str, X]`` / scalar body),
     # unwrap it back to the raw annotation so the FA-style adapter is
     # built on the real type.
     if isinstance(annotation, _TypeAdapterProxy):
         annotation = annotation._annotation
+    # If the model is a combined-body wrapper (built by
+    # ``_maybe_embed_body_params``), pick up its required field names so
+    # validation emits per-field ``missing`` errors instead of a single
+    # ``model_attributes_type`` when the raw body isn't a dict.
+    if combined_body_fields is None:
+        fields = getattr(annotation, "_fastapi_rs_combined_body_fields", None)
+        if fields:
+            combined_body_fields = tuple(fields)
     try:
-        return _FABodyValidator(annotation)
+        return _FABodyValidator(annotation, combined_body_fields=combined_body_fields)
     except Exception:  # noqa: BLE001
         return None
 
@@ -1692,6 +1888,17 @@ def _maybe_embed_body_params(params: list[dict[str, Any]], endpoint) -> list[dic
     # ref (`#/components/schemas/Body_login_form` etc.) across both servers.
     _endpoint_name = getattr(endpoint, "__name__", "endpoint")
     CombinedBody = create_model(f"Body_{_endpoint_name}", **field_definitions)
+    # Mark as a combined body so the FA body validator can emit
+    # per-field ``missing`` errors when the JSON body isn't a dict
+    # (e.g. ``[]`` sent to an endpoint expecting ``item, user,
+    # importance`` as body params). Only REQUIRED fields contribute
+    # — optional fields defaulted to None aren't flagged.
+    try:
+        CombinedBody._fastapi_rs_combined_body_fields = tuple(
+            bp["name"] for bp in body_params if bp.get("required", True)
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
     # Build the new params list: keep non-body params, replace body params
     # with a single combined body param named "_combined_body".

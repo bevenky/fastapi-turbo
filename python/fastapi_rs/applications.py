@@ -2383,6 +2383,7 @@ class FastAPI:
             "include_in_schema": include_in_schema,
             "default_response_class": default_response_class,
             "generate_unique_id_function": generate_unique_id_function,
+            "callbacks": list(callbacks or []),
         }
         self._included_routers.append((router, prefix, tags or [], include_meta))
         # Mirror every effective sub-route onto ``self.router.routes``
@@ -3544,7 +3545,9 @@ class FastAPI:
                     ),
                     "openapi_extra": getattr(route, "openapi_extra", {}),
                     "security": getattr(route, "security", None),
-                    "callbacks": getattr(route, "callbacks", []),
+                    "callbacks": list(include_callbacks or []) + list(
+                        getattr(route, "callbacks", []) or []
+                    ),
                     "servers": getattr(route, "servers", None),
                     "external_docs": getattr(route, "external_docs", None),
                 })
@@ -3927,7 +3930,9 @@ class FastAPI:
                     ),
                     "openapi_extra": getattr(route, "openapi_extra", {}),
                     "security": getattr(route, "security", None),
-                    "callbacks": getattr(route, "callbacks", []),
+                    "callbacks": list(include_callbacks or []) + list(
+                        getattr(route, "callbacks", []) or []
+                    ),
                     "servers": getattr(route, "servers", None),
                     "external_docs": getattr(route, "external_docs", None),
                 }

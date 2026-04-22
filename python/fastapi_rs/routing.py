@@ -982,6 +982,7 @@ class APIRouter:
             "include_in_schema": include_in_schema,
             "default_response_class": default_response_class,
             "generate_unique_id_function": generate_unique_id_function,
+            "callbacks": list(callbacks or []),
         }
         self._included_routers.append((router, prefix, tags or [], include_meta))
 
