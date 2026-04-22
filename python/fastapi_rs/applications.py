@@ -3369,6 +3369,12 @@ class FastAPI:
                     endpoint._fastapi_rs_lax_content_type = True  # type: ignore[attr-defined]
                 except (AttributeError, TypeError):
                     pass
+            # Attach the original route object so Rust can populate
+            # ``request.scope["route"]`` — ``test_route_scope`` asserts.
+            try:
+                endpoint._fastapi_rs_route_obj = route  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                pass
             collected.append(
                 {
                     "path": full_path,

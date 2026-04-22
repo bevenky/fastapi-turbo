@@ -220,6 +220,12 @@ fn inject_framework_objects(
                         let client_tuple = (addr.ip().to_string(), addr.port());
                         scope.set_item("client", client_tuple)?;
                     }
+                    // Starlette/FA: ``request.scope["route"]`` exposes
+                    // the matched APIRoute. Some handlers read it to
+                    // pull route metadata (path template, methods).
+                    if let Some(ref route) = state.route_obj {
+                        scope.set_item("route", route.bind(py))?;
+                    }
 
                     let req = request_cls(py)?.bind(py).call1((scope,))?;
                     kwargs.set_item(&param.name, req)?;
@@ -779,6 +785,9 @@ struct RouteState {
     /// FA 0.120+ ``FastAPI(strict_content_type=False)`` — when True,
     /// JSON body parsing happens regardless of ``Content-Type`` header.
     lax_content_type: bool,
+    /// The original APIRoute object — populated into
+    /// ``request.scope["route"]`` so handlers can introspect the route.
+    route_obj: Option<Py<PyAny>>,
     // Note: body validation stays with Pydantic (Rust-backed) for 100% compatibility.
     // jsonschema crate can't handle custom validators, coercion, defaults, etc.
 }
@@ -969,6 +978,9 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     .getattr(py, "_fastapi_rs_lax_content_type")
                     .and_then(|v| v.extract::<bool>(py))
                     .unwrap_or(false),
+                route_obj: route.handler
+                    .getattr(py, "_fastapi_rs_route_obj")
+                    .ok(),
             })
         });
 
