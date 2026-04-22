@@ -29,6 +29,44 @@ class URLPath(str):
         return base + str(self)
 
 
+def _is_async_callable(func) -> bool:
+    """Return True if ``func`` is async, including when wrapped via ``@wraps``.
+
+    ``@noop_wrap`` / similar sync decorators that call an inner ``async def``
+    produce a SYNC wrapper whose ``__wrapped__`` points at the real async
+    function. ``inspect.iscoroutinefunction`` returns False on the outer
+    wrapper but calling it still returns a coroutine, so treat those as
+    async. Also handles class-instance callables.
+    """
+    if func is None:
+        return False
+    if inspect.iscoroutinefunction(func):
+        return True
+    # Walk __wrapped__ chain
+    probe = func
+    for _ in range(10):
+        nxt = getattr(probe, "__wrapped__", None)
+        if nxt is None or nxt is probe:
+            break
+        probe = nxt
+        if inspect.iscoroutinefunction(probe):
+            return True
+    # Class instance: check __call__ and its wrapped chain.
+    call = getattr(func, "__call__", None)
+    if call is not None and not isinstance(func, type):
+        if inspect.iscoroutinefunction(call):
+            return True
+        probe = call
+        for _ in range(10):
+            nxt = getattr(probe, "__wrapped__", None)
+            if nxt is None or nxt is probe:
+                break
+            probe = nxt
+            if inspect.iscoroutinefunction(probe):
+                return True
+    return False
+
+
 def _apply_response_model(
     result,
     response_model,
@@ -2082,7 +2120,25 @@ class FastAPI:
 
                 endpoint = _json_lines_wrap
 
-            is_async = inspect.iscoroutinefunction(endpoint)
+            # Detect @wraps-wrapped async endpoints — a sync wrapper over an
+            # ``async def`` reports ``iscoroutinefunction = False`` but calling
+            # it returns a coroutine. Treat those as async so we drive them
+            # correctly.
+            _raw_async = inspect.iscoroutinefunction(endpoint)
+            _wrapped_async = (not _raw_async) and _is_async_callable(endpoint)
+            is_async = _raw_async or _wrapped_async
+            if _wrapped_async and not inspect.isasyncgenfunction(endpoint):
+                # Wrap so calling this endpoint returns a proper coroutine
+                # that awaits the inner coroutine (instead of returning one).
+                _user_ep = endpoint
+
+                async def _await_wrapped(_ep=_user_ep, **kwargs):
+                    result = _ep(**kwargs)
+                    if inspect.iscoroutine(result):
+                        return await result
+                    return result
+
+                endpoint = _await_wrapped
             response_model = getattr(route, "response_model", None)
             rm_include = getattr(route, "response_model_include", None)
             rm_exclude = getattr(route, "response_model_exclude", None)

@@ -269,6 +269,17 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
         _probe_call = getattr(_probe, "__call__", None)
         _direct_call = getattr(dep_func, "__call__", None)
 
+        # Also walk ``__wrapped__`` on the bound ``__call__`` itself —
+        # a class instance with ``@noop_wrap`` decorating ``__call__``
+        # has the wrapper chain attached to ``__call__`` (not the
+        # instance), so the outer ``_probe`` loop never sees it.
+        _unwrapped_call = _direct_call
+        for _ in range(10):
+            _nxt = getattr(_unwrapped_call, "__wrapped__", None)
+            if _nxt is None or _nxt is _unwrapped_call:
+                break
+            _unwrapped_call = _nxt
+
         # When ``dep_func`` is a CLASS (``Depends(MyClass)`` /
         # ``instance: MyClass = Depends()``), calling it constructs an
         # instance — NOT a generator or coroutine — regardless of what
@@ -296,6 +307,7 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
                 or inspect.iscoroutinefunction(_probe_call)
                 or inspect.iscoroutinefunction(_partial_probe)
                 or inspect.iscoroutinefunction(_partial_call)
+                or inspect.iscoroutinefunction(_unwrapped_call)
             )
             is_generator = (
                 inspect.isgeneratorfunction(dep_func)
@@ -310,6 +322,8 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
                 or inspect.isasyncgenfunction(_partial_probe)
                 or inspect.isgeneratorfunction(_partial_call)
                 or inspect.isasyncgenfunction(_partial_call)
+                or inspect.isgeneratorfunction(_unwrapped_call)
+                or inspect.isasyncgenfunction(_unwrapped_call)
             )
 
         # Optimization: wrap trivially-async deps in a sync caller.

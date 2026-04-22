@@ -1680,16 +1680,54 @@ fn extract_params_to_pydict_full<'py>(
             }
             "body" => {
                 if !body_bytes.is_empty() {
+                    // FA enforces Content-Type for JSON body params: if the
+                    // header is missing OR doesn't include ``json``, it
+                    // feeds the raw body (as a string) to Pydantic's
+                    // ``validate_python`` which errors with
+                    // ``model_attributes_type`` (input NOT a dict).
+                    // FA's Content-Type match: the MIME subtype must be
+                    // exactly ``json`` or end with ``+json``. Strict —
+                    // ``application/geo+json-seq`` is NOT json. Accept
+                    // ``application/json``, ``application/vnd.x+json``,
+                    // and any ``;charset=...`` suffix.
+                    let ct_is_json = headers
+                        .as_ref()
+                        .and_then(|h| h.get("content-type"))
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| {
+                            let lower = s.to_ascii_lowercase();
+                            // Peel off optional params: ``application/json; charset=utf-8``
+                            let head = lower.split(';').next().unwrap_or("").trim();
+                            if let Some(rest) = head.strip_prefix("application/") {
+                                rest == "json" || rest.ends_with("+json")
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
                     let val = if param.cached_validator.is_some() || param.model_class.is_some() {
-                        // Use cached SchemaValidator.validate_json(bytes) — zero getattr, one call
                         let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
-                        let result = if let Some(ref validator) = param.cached_validator {
-                            validator.call_method1(py, "validate_json", (py_bytes,))
+                        let result = if ct_is_json {
+                            if let Some(ref validator) = param.cached_validator {
+                                validator.call_method1(py, "validate_json", (py_bytes,))
+                            } else {
+                                param.model_class.as_ref().unwrap()
+                                    .getattr(py, "__pydantic_validator__")
+                                    .and_then(|v| v.call_method1(py, "validate_json", (py_bytes,)))
+                            }
                         } else {
-                            // Fallback: getattr if cache missed
-                            param.model_class.as_ref().unwrap()
-                                .getattr(py, "__pydantic_validator__")
-                                .and_then(|v| v.call_method1(py, "validate_json", (py_bytes,)))
+                            // Non-JSON Content-Type — pass raw string to
+                            // validate_python so Pydantic errors with
+                            // model_attributes_type (FA parity).
+                            let raw_str = std::str::from_utf8(body_bytes).unwrap_or("");
+                            let py_str = pyo3::types::PyString::new(py, raw_str).into_any();
+                            if let Some(ref validator) = param.cached_validator {
+                                validator.call_method1(py, "validate_python", (py_str,))
+                            } else {
+                                param.model_class.as_ref().unwrap()
+                                    .getattr(py, "__pydantic_validator__")
+                                    .and_then(|v| v.call_method1(py, "validate_python", (py_str,)))
+                            }
                         };
                         match result {
                             Ok(v) => v,
@@ -2027,18 +2065,50 @@ fn extract_params_to_pydict_full<'py>(
             .iter()
             .any(|p| p.kind == "form" && p.name.starts_with("pm_"));
         if has_query_pm {
+            // FA's error ``input`` dict preserves REPEATED query
+            // values as a list (``?p=a&p=b`` → ``{"p": ["a", "b"]}``).
+            // Use query_multi for that shape; fall back to single-value
+            // for non-repeated keys.
             let qd = pyo3::types::PyDict::new(py);
-            for (k, v) in query_params.iter() {
-                let _ = qd.set_item(k, v);
+            for (k, vs) in query_multi.iter() {
+                if vs.len() == 1 {
+                    let _ = qd.set_item(k, &vs[0]);
+                } else {
+                    let list = pyo3::types::PyList::empty(py);
+                    for v in vs {
+                        let _ = list.append(v.as_str());
+                    }
+                    let _ = qd.set_item(k, list);
+                }
             }
             let _ = kwargs.set_item("__fastapi_rs_raw_query__", qd);
         }
         if has_header_pm {
             if let Some(h) = headers {
+                // Repeated headers (``x-tag: one`` + ``x-tag: two``)
+                // surface as a list in the raw dict — matches FA's
+                // validation ``input`` shape.
                 let hd = pyo3::types::PyDict::new(py);
-                for (k, v) in h.iter() {
-                    if let Ok(s) = v.to_str() {
-                        let _ = hd.set_item(k.as_str(), s);
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for (k, _) in h.iter() {
+                    let key_lower = k.as_str().to_lowercase();
+                    if seen.contains(&key_lower) {
+                        continue;
+                    }
+                    seen.insert(key_lower.clone());
+                    let all: Vec<String> = h
+                        .get_all(k.as_str())
+                        .iter()
+                        .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
+                        .collect();
+                    if all.len() == 1 {
+                        let _ = hd.set_item(k.as_str(), &all[0]);
+                    } else if all.len() > 1 {
+                        let list = pyo3::types::PyList::empty(py);
+                        for v in &all {
+                            let _ = list.append(v.as_str());
+                        }
+                        let _ = hd.set_item(k.as_str(), list);
                     }
                 }
                 let _ = kwargs.set_item("__fastapi_rs_raw_headers__", hd);

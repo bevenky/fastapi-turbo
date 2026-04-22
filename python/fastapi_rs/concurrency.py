@@ -28,7 +28,19 @@ async def run_in_threadpool(func: Callable[..., T], *args: Any, **kwargs: Any) -
         return func(*args)
     if kwargs:
         func = partial(func, **kwargs)  # type: ignore[assignment]
-    return await loop.run_in_executor(None, func, *args)
+    # uvloop on Python 3.14 internally calls the deprecated
+    # ``asyncio.iscoroutinefunction`` during ``run_in_executor``. When the
+    # test runner has ``filterwarnings = ["error"]`` that becomes a crash
+    # in user code. Suppress that specific DeprecationWarning here — our
+    # caller is using ``run_in_executor`` correctly.
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=r".*asyncio\.iscoroutinefunction.*",
+        )
+        return await loop.run_in_executor(None, func, *args)
 
 
 async def run_until_first_complete(
