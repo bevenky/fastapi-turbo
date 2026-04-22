@@ -235,6 +235,8 @@ class UploadFile(metaclass=ABCMeta):
         return b""
 
     async def write(self, data: bytes) -> None:
+        if self.size is not None:
+            self.size += len(data)
         if hasattr(self.file, "write"):
             self.file.write(data)
 
@@ -245,6 +247,15 @@ class UploadFile(metaclass=ABCMeta):
     async def close(self) -> None:
         if self.file is not None and hasattr(self.file, "close"):
             self.file.close()
+
+    @classmethod
+    def _validate(cls, v, _info=None):
+        """Starlette-parity pydantic validator. Reject non-UploadFile
+        inputs with ``ValueError`` — used by ``test_upload_file_invalid_pydantic_v2``.
+        """
+        if not isinstance(v, UploadFile):
+            raise ValueError(f"Expected UploadFile, received: {type(v)}")
+        return v
 
     @classmethod
     def __get_pydantic_core_schema__(cls, source_type, handler):

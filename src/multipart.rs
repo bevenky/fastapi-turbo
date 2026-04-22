@@ -235,6 +235,8 @@ pub struct PyUploadFile {
     cursor: Mutex<usize>,
     /// Headers from the multipart part.
     header_list: Vec<(String, String)>,
+    /// Starlette-parity: ``file.closed`` flips to ``True`` after ``close()``.
+    closed: Mutex<bool>,
 }
 
 #[pymethods]
@@ -273,9 +275,15 @@ impl PyUploadFile {
         Ok(*self.cursor.lock().unwrap())
     }
 
-    /// Async close — no-op for in-memory uploads.
+    /// Async close — no-op for in-memory uploads, but flips ``closed``.
     fn close(&self, py: Python<'_>) -> PyResult<Py<ImmediateNone>> {
+        *self.closed.lock().unwrap() = true;
         Py::new(py, ImmediateNone)
+    }
+
+    #[getter]
+    fn closed(&self) -> bool {
+        *self.closed.lock().unwrap()
     }
 
     /// Async write — not really writable, but matches signature.
@@ -314,6 +322,7 @@ impl PyUploadFile {
             data: field.data,
             cursor: Mutex::new(0),
             header_list: field.headers,
+            closed: Mutex::new(false),
         }
     }
 }

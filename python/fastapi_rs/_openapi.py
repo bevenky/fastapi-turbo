@@ -631,9 +631,20 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
                     )
                     # FA preserves empty segments from double-underscore
                     # splits (``items__get`` → ``Items  Get`` with two
-                    # spaces). Keep empty tokens in the join.
+                    # spaces) AND preserves hyphens in custom op_ids
+                    # (``items-get_items`` → ``Items-Get Items``). Split
+                    # on ``_`` first, then capitalize each chunk while
+                    # preserving the hyphen in token-level splits.
+                    def _title_segment(tok: str) -> str:
+                        if not tok:
+                            return ""
+                        if "-" in tok:
+                            return "-".join(
+                                w.capitalize() for w in tok.split("-")
+                            )
+                        return tok.capitalize()
                     response_schema["title"] = "Response " + " ".join(
-                        w.capitalize() for w in source.replace("-", "_").split("_")
+                        _title_segment(w) for w in source.split("_")
                     )
             except Exception:
                 pass

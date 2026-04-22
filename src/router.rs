@@ -966,6 +966,9 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                 "PATCH" => patch(handler_fn),
                 "HEAD" => head(handler_fn),
                 "OPTIONS" => axum::routing::options(handler_fn),
+                "TRACE" => axum::routing::on(
+                    axum::routing::MethodFilter::TRACE, handler_fn,
+                ),
                 other => {
                     eprintln!("fastapi-rs: unsupported HTTP method '{other}', skipping");
                     continue;

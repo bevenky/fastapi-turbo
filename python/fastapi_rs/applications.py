@@ -1872,7 +1872,21 @@ class FastAPI:
     # ------------------------------------------------------------------
 
     def on_event(self, event_type: str):
-        """Decorator to register startup/shutdown handlers."""
+        """Decorator to register startup/shutdown handlers.
+
+        Deprecated in FA in favor of ``lifespan=`` — emits
+        ``DeprecationWarning`` on registration.
+        """
+        import warnings as _w
+
+        _w.warn(
+            "on_event is deprecated, use lifespan event handlers instead.\n\n"
+            "Read more about it in the "
+            "[FastAPI docs for Lifespan Events]"
+            "(https://fastapi.tiangolo.com/advanced/events/).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
         def decorator(func: Callable) -> Callable:
             if event_type == "startup":
@@ -2106,22 +2120,43 @@ class FastAPI:
                 return ws.headers.get(wire)
             return None
 
+        # Build a cached endpoint context for ValidationException msgs.
+        import inspect as _insp_mod
+        _ws_endpoint_ctx: dict = {}
+        try:
+            _ws_endpoint_ctx["function"] = getattr(endpoint, "__name__", None)
+            _ws_endpoint_ctx["file"] = _insp_mod.getsourcefile(endpoint)
+            _ws_endpoint_ctx["line"] = _insp_mod.getsourcelines(endpoint)[1]
+        except (TypeError, OSError):
+            pass
+        if route_path:
+            _ws_endpoint_ctx["path"] = route_path
+
         def _validate_scalar(val, ann, p_name, kind):
             """Validate + coerce ``val`` against ``ann`` using pydantic
-            ``TypeAdapter``. On failure raise ``WebSocketException(1008)``
-            so Starlette semantics apply (handshake → HTTP 403, otherwise
-            close with 1008)."""
+            ``TypeAdapter``. On failure raise
+            ``WebSocketRequestValidationError`` — routed through app
+            exception_handlers when registered, otherwise translated
+            into a ``WebSocketException(1008)`` by the outer wrapper."""
             if val is None or ann is _inspect.Parameter.empty or ann is None:
                 return val
             from pydantic import TypeAdapter
             try:
                 return TypeAdapter(ann).validate_python(val)
-            except Exception:
-                # Policy violation on WS param validation.
-                raise _WSExc(
-                    code=1008,
-                    reason=f"{kind} validation error for {p_name!r}",
+            except Exception as exc:
+                from fastapi_rs.exceptions import (
+                    WebSocketRequestValidationError as _WRVE,
                 )
+                errors = []
+                try:
+                    errors = exc.errors()  # Pydantic ValidationError
+                except AttributeError:
+                    errors = [{
+                        "loc": (kind.lower(), p_name),
+                        "msg": str(exc),
+                        "type": "value_error",
+                    }]
+                raise _WRVE(errors, endpoint_ctx=dict(_ws_endpoint_ctx)) from exc
 
         # Extract path parameter names from the route path. Supports both
         # plain ``{name}`` and Starlette-style ``{name:path}`` converter
@@ -2463,8 +2498,41 @@ class FastAPI:
                     await _resolve_dep_async(extra_dep, ws, generators, cache)
             return kwargs, generators
 
+        # Build a synthetic route object for ``ws.scope["route"]``. FA
+        # exposes the matched ``APIWebSocketRoute`` here; third-party
+        # code (e.g. route introspection in handlers) uses it to pull
+        # the path template.
+        try:
+            from fastapi_rs.compat import fastapi_shim as _fa_shim
+            _APIWSRoute = getattr(
+                getattr(_fa_shim, "fastapi_routing", None) or object(),
+                "APIWebSocketRoute",
+                None,
+            )
+        except Exception:  # noqa: BLE001
+            _APIWSRoute = None
+        if _APIWSRoute is None:
+            class _APIWSRoute:  # type: ignore[no-redef]
+                def __init__(self, path, endpoint, name=None):
+                    self.path = path
+                    self.endpoint = endpoint
+                    self.name = name or getattr(endpoint, "__name__", "")
+        _synthetic_route = _APIWSRoute(
+            path=route_path,
+            endpoint=endpoint,
+            name=getattr(endpoint, "__name__", ""),
+        )
+
         async def _ws_entry(ws, **path_kwargs):
             ws._app = app_ref
+            # Inject ``route`` into the ASGI-style scope dict.
+            try:
+                scope = ws.scope
+                if isinstance(scope, dict):
+                    scope["route"] = _synthetic_route
+                    scope["app"] = app_ref
+            except Exception:  # noqa: BLE001
+                pass
             generators: list = []
             try:
                 kwargs, generators = await _build_kwargs(ws, path_kwargs)
@@ -2479,6 +2547,53 @@ class FastAPI:
                 await _teardown_generators(generators)
                 return
             except Exception as exc:
+                # Route WebSocketRequestValidationError through the app's
+                # exception handlers if registered. FA parity:
+                # @app.exception_handler(WebSocketRequestValidationError)
+                # receives the validation error; re-raise reaches here.
+                try:
+                    from fastapi_rs.exceptions import (
+                        WebSocketRequestValidationError as _WRVE,
+                    )
+                except ImportError:
+                    _WRVE = None
+                if (
+                    _WRVE is not None
+                    and isinstance(exc, _WRVE)
+                    and app_ref is not None
+                    and getattr(app_ref, "exception_handlers", None)
+                ):
+                    # Capture first so tests checking the exc object see it
+                    # even when the handler re-raises.
+                    _capture_server_exception(exc)
+                    handler = app_ref.exception_handlers.get(_WRVE)
+                    if handler is not None:
+                        try:
+                            r = handler(ws, exc)
+                            if _inspect.iscoroutine(r):
+                                await r
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # Close with 1008 policy-violation regardless of what
+                    # the handler did.
+                    try:
+                        from fastapi_rs.exceptions import (
+                            WebSocketDisconnect as _WD,
+                        )
+                        app_ref._ws_server_exceptions.append(
+                            _WD(code=1008, reason="validation error")
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if ws.application_state == _WSState.CONNECTING:
+                        ws._reject(403)
+                    else:
+                        try:
+                            ws._ws.close(1008, "validation error")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    await _teardown_generators(generators)
+                    return
                 # Capture for TestClient re-raise semantics BEFORE we
                 # disturb the WS state.
                 _capture_server_exception(exc)
