@@ -376,30 +376,31 @@ class HTTPBasic:
         import base64
 
         authorization = _get_authorization(request, **kwargs)
-        if authorization and authorization.startswith("Basic "):
-            try:
-                decoded = base64.b64decode(authorization[6:]).decode("utf-8")
-                # FA rejects Basic payloads that don't contain the
-                # mandatory ``username:password`` colon separator — the
-                # non-basic test sends a single token (no colon) and
-                # expects 401, not a user with empty password.
-                if ":" in decoded:
-                    username, _, password = decoded.partition(":")
-                    return HTTPBasicCredentials(username=username, password=password)
-            except Exception:
-                pass
-        if self.auto_error:
-            realm = f'realm="{self.realm}"' if self.realm else None
-            if realm:
-                www_auth = f"Basic {realm}"
-            else:
-                www_auth = "Basic"
-            raise HTTPException(
+        realm = f'realm="{self.realm}"' if self.realm else None
+        www_auth = f"Basic {realm}" if realm else "Basic"
+
+        def _not_auth() -> HTTPException:
+            return HTTPException(
                 status_code=401,
                 detail="Not authenticated",
                 headers={"WWW-Authenticate": www_auth},
             )
-        return None
+
+        # FA parity: missing or non-basic scheme honours auto_error.
+        # Malformed base64 / missing colon ALWAYS raise 401 (auto_error
+        # only covers the "no header / wrong scheme" branch).
+        if not authorization or not authorization.startswith("Basic "):
+            if self.auto_error:
+                raise _not_auth()
+            return None
+        try:
+            decoded = base64.b64decode(authorization[6:]).decode("utf-8")
+        except Exception as e:
+            raise _not_auth() from e
+        username, sep, password = decoded.partition(":")
+        if not sep:
+            raise _not_auth()
+        return HTTPBasicCredentials(username=username, password=password)
 
 
 def _make_api_key_call(location: str, name: str, auto_error: bool, self_ref):
