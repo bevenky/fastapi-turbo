@@ -46,8 +46,11 @@ def _apply_response_model(
     Field(serialization_alias=...) in output. Critical for APIs that use
     aliased fields (camelCase over snake_case, etc.).
     """
-    if response_model is None or result is None:
+    if response_model is None:
         return result
+    # Still validate ``None`` against the response_model — FA raises
+    # ``ResponseValidationError`` when a non-Optional model gets None,
+    # and for ``Optional[Model]`` Pydantic passes it through.
 
     # Skip when the handler returned a Response object directly —
     # Starlette Response / StreamingResponse / FileResponse etc. are
@@ -113,32 +116,11 @@ def _apply_response_model(
 
         import dataclasses as _dc
         if isinstance(result, dict):
-            # Even in the fast path we need to surface missing-required
-            # / wrong-type errors as ``ResponseValidationError`` — FA's
-            # guarantee is that a handler returning data that doesn't
-            # satisfy ``response_model`` raises, regardless of aliases.
-            # We also must include defaults for optional fields the
-            # handler didn't set (FA's ``model_dump`` includes them).
-            if fast_path_ok:
-                model_fields = response_model.model_fields
-                missing = [
-                    n for n, f in model_fields.items()
-                    if f.is_required() and n not in result
-                ]
-                if not missing:
-                    out: dict = {}
-                    for fname, finfo in model_fields.items():
-                        if fname in result:
-                            out[fname] = result[fname]
-                        elif not finfo.is_required():
-                            try:
-                                out[fname] = finfo.get_default(call_default_factory=True)
-                            except Exception:  # noqa: BLE001
-                                default = getattr(finfo, "default", None)
-                                if default is not None:
-                                    out[fname] = default
-                    return out
-                # Fall through to strict validation so Pydantic raises.
+            # FA always validates the handler's return against
+            # response_model, even in the fast path — a handler that
+            # returns ``{"price": "foo"}`` for a ``price: float`` field
+            # must raise ``ResponseValidationError``. We validate then
+            # re-emit the validated dict (preserving defaults).
             validated = response_model.model_validate(result)
         elif hasattr(result, "model_dump"):
             if fast_path_ok and type(result) is response_model:
