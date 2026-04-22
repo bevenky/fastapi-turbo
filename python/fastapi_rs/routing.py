@@ -973,12 +973,21 @@ class APIRouter:
             "Cannot include the same APIRouter instance into itself. "
             "Did you mean to include a different router?"
         )
+        # If the included router has ``deprecated=True`` on itself, that
+        # should surface on every route reachable through this include.
+        # The explicit ``deprecated=`` kwarg on include_router takes
+        # priority when given.
+        _effective_deprecated = (
+            deprecated
+            if deprecated is not None
+            else getattr(router, "deprecated", None)
+        )
         include_meta = {
             "prefix": prefix,
             "tags": tags or [],
             "dependencies": list(dependencies or []),
             "responses": responses or {},
-            "deprecated": deprecated,
+            "deprecated": _effective_deprecated,
             "include_in_schema": include_in_schema,
             "default_response_class": default_response_class,
             "generate_unique_id_function": generate_unique_id_function,

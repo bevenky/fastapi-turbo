@@ -2388,12 +2388,19 @@ class FastAPI:
                         "Prefix and path cannot be both empty (e.g. "
                         "'' and '')"
                     )
+        # If the included router has ``deprecated=True`` on itself, that
+        # should surface on every route reachable through this include.
+        _effective_deprecated = (
+            deprecated
+            if deprecated is not None
+            else getattr(router, "deprecated", None)
+        )
         include_meta = {
             "prefix": prefix,
             "tags": tags or [],
             "dependencies": list(dependencies or []),
             "responses": responses or {},
-            "deprecated": deprecated,
+            "deprecated": _effective_deprecated,
             "include_in_schema": include_in_schema,
             "default_response_class": default_response_class,
             "generate_unique_id_function": generate_unique_id_function,
@@ -3550,7 +3557,11 @@ class FastAPI:
                     },
                     "response_model": getattr(route, "response_model", None),
                     "response_class": getattr(route, "response_class", None),
-                    "deprecated": route.deprecated or bool(include_deprecated),
+                    "deprecated": (
+                        route.deprecated
+                        or bool(getattr(router, "deprecated", False))
+                        or bool(include_deprecated)
+                    ),
                     "operation_id": (
                         route.operation_id
                         or self._apply_generate_unique_id(
@@ -3930,7 +3941,11 @@ class FastAPI:
                     },
                     "response_model": response_model,
                     "response_class": response_class,
-                    "deprecated": route.deprecated or bool(include_deprecated),
+                    "deprecated": (
+                        route.deprecated
+                        or bool(getattr(router, "deprecated", False))
+                        or bool(include_deprecated)
+                    ),
                     # operation_id cascade: route's own wins, then the
                     # route's explicit generate_unique_id_function, then
                     # include-level, then router-level, then app-level.
