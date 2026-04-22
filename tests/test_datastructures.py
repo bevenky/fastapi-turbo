@@ -59,7 +59,7 @@ def test_query_params():
     from fastapi_rs.datastructures import QueryParams
 
     qp = QueryParams("q=python&limit=10&q=rust")
-    assert qp["q"] == "python"  # first value
+    assert qp["q"] == "rust"  # Starlette semantics: last wins
     assert qp.getlist("q") == ["python", "rust"]
     assert qp["limit"] == "10"
     assert "q" in qp

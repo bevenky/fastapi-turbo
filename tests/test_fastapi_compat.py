@@ -37,7 +37,7 @@ class TestStarletteCookieSignature:
         assert "Domain=example.com" in value
         assert "Secure" in value
         assert "HttpOnly" in value
-        assert "SameSite=Strict" in value
+        assert "SameSite=strict" in value  # Starlette lowercases samesite
 
     def test_delete_cookie_positional(self):
         from fastapi_rs.responses import Response

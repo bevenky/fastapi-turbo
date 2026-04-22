@@ -1091,19 +1091,24 @@ def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
         p["schema"]["description"] = param["description"]
     if param.get("deprecated"):
         p["deprecated"] = True
-    # OpenAPI 3.1: FastAPI emits `examples` as a list on the inner schema,
-    # not the parameter object's dict. `example` (singular) stays on the
-    # parameter.
+    # OpenAPI: ``Query(example="Alice")`` → ``parameter.example``.
+    # ``Query(examples=[...])`` (list) → ``schema.examples`` (FA's
+    # OpenAPI 3.1 inline form). ``Query(examples={"n1": {"value": ...}})``
+    # (named dict) → ``parameter.examples`` (OpenAPI 3.0+ spec).
+    # ``openapi_examples=`` is always the named-dict form at parameter
+    # level.
     if param.get("example") is not None:
         p["example"] = param["example"]
     if param.get("examples") is not None:
         raw = param["examples"]
         if isinstance(raw, dict):
-            p["schema"]["examples"] = [v["value"] if isinstance(v, dict) and "value" in v else v for v in raw.values()]
+            p["examples"] = raw
         elif isinstance(raw, (list, tuple)):
             p["schema"]["examples"] = list(raw)
         else:
             p["schema"]["examples"] = [raw]
+    if param.get("openapi_examples") is not None:
+        p["examples"] = param["openapi_examples"]
     return p
 
 

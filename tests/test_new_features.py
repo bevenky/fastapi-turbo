@@ -38,7 +38,7 @@ class TestCookies:
         assert name == "set-cookie"
         assert "session=abc123" in value
         assert "Path=/" in value
-        assert "SameSite=Lax" in value
+        assert "SameSite=lax" in value
 
     def test_set_cookie_all_options(self):
         from fastapi_rs.responses import Response
@@ -55,7 +55,7 @@ class TestCookies:
         assert "Domain=example.com" in value
         assert "Secure" in value
         assert "HttpOnly" in value
-        assert "SameSite=Strict" in value
+        assert "SameSite=strict" in value
 
     def test_delete_cookie(self):
         from fastapi_rs.responses import Response
@@ -545,4 +545,6 @@ class TestHTTPMiddleware:
 
         routes = app._collect_all_routes()
         routes[0]["endpoint"]()
-        assert call_log == ["mw1_in", "mw2_in", "handler", "mw2_out", "mw1_out"]
+        # FA convention: LAST-decorated middleware is OUTERMOST.
+        # @mw2 is outer → runs first on request, last on response.
+        assert call_log == ["mw2_in", "mw1_in", "handler", "mw1_out", "mw2_out"]
