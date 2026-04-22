@@ -1995,7 +1995,12 @@ class FastAPI:
     # Route collection & introspection
     # ------------------------------------------------------------------
 
-    def _wrap_websocket_endpoint(self, endpoint, route_path: str = ""):
+    def _wrap_websocket_endpoint(
+        self,
+        endpoint,
+        route_path: str = "",
+        extra_dependencies: list | None = None,
+    ):
         """Build a thin wrapper around a WebSocket endpoint that
         - attaches ``ws.app`` so handlers can reach ``app.state``,
         - resolves ``Depends(...)`` parameters (incl. sub-deps + yield),
@@ -2240,6 +2245,10 @@ class FastAPI:
         for kind, _name, meta in param_spec:
             if kind == "dep":
                 _check_scope_mismatch(meta, set())
+        if extra_dependencies:
+            for extra_dep in extra_dependencies:
+                if extra_dep is not None and getattr(extra_dep, "dependency", None) is not None:
+                    _check_scope_mismatch(extra_dep, set())
 
         def _effective_dep_callable(dep_callable):
             """Honour ``app.dependency_overrides``."""
@@ -2443,6 +2452,15 @@ class FastAPI:
                     kwargs[name] = await _resolve_dep_async(
                         meta, ws, generators, cache,
                     )
+            # Resolve extra (app/router/include/route-level) dependencies
+            # AFTER handler params are satisfied. Their values aren't
+            # bound to a kwarg — run for side-effects only (matches FA:
+            # these deps run but their return value is discarded).
+            if extra_dependencies:
+                for extra_dep in extra_dependencies:
+                    if extra_dep is None or getattr(extra_dep, "dependency", None) is None:
+                        continue
+                    await _resolve_dep_async(extra_dep, ws, generators, cache)
             return kwargs, generators
 
         async def _ws_entry(ws, **path_kwargs):
@@ -2574,7 +2592,15 @@ class FastAPI:
                 # user's handler to resolve deps BEFORE the user code runs.
                 # A pre-accept ``WebSocketException`` aborts the handshake
                 # with the carried code (Starlette normative path).
-                wrapped_ws = self._wrap_websocket_endpoint(route.endpoint, full_path)
+                # Merge extra dependencies from app/router/include/route so
+                # test_ws_dependencies patterns (dependencies=[...] on
+                # FastAPI(), APIRouter(), include_router(), @ws()) all run.
+                merged_ws_deps = self._get_all_dependencies_for_route(
+                    router, route, include_deps=include_deps,
+                )
+                wrapped_ws = self._wrap_websocket_endpoint(
+                    route.endpoint, full_path, extra_dependencies=merged_ws_deps,
+                )
                 collected.append(
                     {
                         "path": full_path,
