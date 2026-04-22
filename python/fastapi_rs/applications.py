@@ -944,6 +944,27 @@ def _try_compile_handler(
             # FastAPI/Starlette does. SGLang depends on this (route-level
             # `dependencies=[Depends(...)]` that raise HTTPException).
             _maybe_print_debug_traceback(_app, dep_exc)
+            # Capture non-HTTP dep failures so TestClient re-raises them
+            # (unless a SPECIFIC handler catches — ``Exception`` catch-all
+            # doesn't count, per Starlette's ``raise_server_exceptions``).
+            try:
+                from fastapi_rs.exceptions import HTTPException as _HE
+                _handled_by_specific = False
+                if _app is not None and _app.exception_handlers:
+                    for _cls in _app.exception_handlers.keys():
+                        if _cls is Exception:
+                            continue
+                        if isinstance(_cls, type) and isinstance(dep_exc, _cls):
+                            _handled_by_specific = True
+                            break
+                if (
+                    _app is not None
+                    and not isinstance(dep_exc, _HE)
+                    and not _handled_by_specific
+                ):
+                    _app._captured_server_exceptions.append(dep_exc)
+            except ImportError:
+                pass
             if _app is not None and _app.exception_handlers:
                 handler_result = _app._invoke_exception_handler(dep_exc)
                 if handler_result is not None:
