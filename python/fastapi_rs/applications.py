@@ -12,7 +12,7 @@ from fastapi_rs._introspect import introspect_endpoint
 from fastapi_rs._openapi import generate_openapi_schema
 from fastapi_rs._resolution import build_resolution_plan, _make_sync_wrapper
 from fastapi_rs.datastructures import State
-from fastapi_rs.routing import APIRouter
+from fastapi_rs.routing import APIRouter, APIRoute
 
 
 class URLPath(str):
@@ -3862,6 +3862,41 @@ class FastAPI:
         if self._collect_shutdown_handlers():
             atexit.register(self._run_shutdown_handlers)
 
+        # Register ``/openapi.json`` as a Python handler BEFORE route
+        # collection so ``run_server`` hands it to Rust. The handler
+        # regenerates the schema per-request, so changes to
+        # ``app.root_path`` / ``app.servers`` between TestClient
+        # instances surface immediately
+        # (``test_openapi_cache_root_path``).
+        _openapi_url_val = self.openapi_url
+        if _openapi_url_val is not None:
+            _app_ref = self
+
+            def _openapi_dynamic():
+                _app_ref.openapi_schema = None
+                from fastapi_rs.responses import JSONResponse as _JR
+                return _JR(content=_app_ref.openapi())
+
+            _openapi_dynamic.__name__ = "openapi"
+            # Drop any existing dynamic route from a prior ``app.run()``
+            # (some test suites re-run the same app multiple times).
+            self.router.routes = [
+                r for r in self.router.routes
+                if getattr(r, "endpoint", None).__name__ != "openapi"
+            ] if any(
+                getattr(r, "endpoint", None) and r.endpoint.__name__ == "openapi"
+                for r in self.router.routes
+            ) else self.router.routes
+            self.router.routes.insert(
+                0,
+                APIRoute(
+                    _openapi_url_val,
+                    _openapi_dynamic,
+                    methods=["GET"],
+                    include_in_schema=False,
+                ),
+            )
+
         route_dicts = self._collect_all_routes()
         route_infos: list[RouteInfo] = []
 
@@ -3910,6 +3945,14 @@ class FastAPI:
                 openapi_schema = None
             if openapi_schema is not None:
                 openapi_json = json.dumps(openapi_schema)
+
+        # Dynamic openapi handler already registered above; null out
+        # baked JSON so Rust's auto-registered ``/openapi.json`` route
+        # is skipped. Keep ``openapi_url`` set because swagger/redoc
+        # HTML uses it in the ``fetch('<url>')`` call.
+        if _openapi_url_val is not None:
+            openapi_json = None
+        _openapi_url_for_rust = self.openapi_url
 
         middleware_config = self._build_middleware_config()
 
@@ -4077,7 +4120,7 @@ class FastAPI:
             openapi_json,
             self.docs_url,
             self.redoc_url,
-            self.openapi_url,
+            _openapi_url_for_rust,
             static_mounts,
             self.root_path or None,
             self.redirect_slashes,

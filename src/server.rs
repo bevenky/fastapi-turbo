@@ -478,24 +478,28 @@ pub fn run_server(
             // Add OpenAPI / documentation routes if enabled. An empty
             // ``openapi_url`` means "disable OpenAPI + docs entirely" —
             // FA behavior tested by ``test_conditional_openapi``.
-            if let Some(ref schema_json) = openapi_json {
+            // Docs UI is set up as long as ``openapi_url`` is set;
+            // JSON endpoint is auto-registered only when
+            // ``openapi_json`` is also provided (else Python handles it).
+            if openapi_url.is_some() {
                 let oa_url = openapi_url.as_deref().unwrap_or("/openapi.json");
                 if oa_url.is_empty() {
                     // Skip openapi + docs routes; ``/openapi.json`` / ``/docs``
                     // simply return 404.
                 } else {
 
-                // Serve the OpenAPI JSON schema
-                let json_clone = schema_json.clone();
-                router = router.route(
-                    oa_url,
-                    get(move || async move {
-                        (
-                            [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            json_clone.clone(),
-                        )
-                    }),
-                );
+                if let Some(ref schema_json) = openapi_json {
+                    let json_clone = schema_json.clone();
+                    router = router.route(
+                        oa_url,
+                        get(move || async move {
+                            (
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                json_clone.clone(),
+                            )
+                        }),
+                    );
+                }
 
                 // Swagger UI — prefer Python-rendered HTML
                 // (``get_swagger_ui_html``) when supplied by the
