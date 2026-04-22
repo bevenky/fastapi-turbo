@@ -290,10 +290,14 @@ def generate_openapi_schema(
         return _walk(body)
 
     for mid, mc in model_class_by_id.items():
-        if not separate_input_output_schemas:
-            break
         usage = _MODEL_USAGE.get(mid, set())
         if not ("input" in usage and "output" in usage):
+            continue
+        # FA forces split whenever the model has a ``computed_field``
+        # (val/ser shapes differ), even with
+        # ``separate_input_output_schemas=False``.
+        _has_cf = _model_has_computed_fields(mc)
+        if not (separate_input_output_schemas or _has_cf):
             continue
         if not (_model_is_self_recursive(mc) or _val_ser_schemas_differ(mc)):
             continue
@@ -2092,8 +2096,17 @@ def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
     # input side (body / form). validation_alias fields emit under
     # their alias in validation mode and under the python name in
     # serialization mode; input-only models need the validation shape.
+    # With ``separate_input_output_schemas=False``, FA also prefers the
+    # validation shape when the model is used in both contexts — the
+    # single emitted component reflects the input-side schema.
     used_as = _MODEL_USAGE.get(id(model_class), set())
     if used_as == {"input"} and val_schema is not None:
+        json_schema = val_schema
+    elif (
+        not _SEPARATE_INPUT_OUTPUT
+        and "input" in used_as
+        and val_schema is not None
+    ):
         json_schema = val_schema
     else:
         json_schema = ser_schema if ser_schema is not None else val_schema
