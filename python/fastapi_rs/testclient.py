@@ -83,12 +83,11 @@ class TestClient:
         self._follow_redirects = follow_redirects
         # Starlette's TestClient accepts root_path to simulate reverse-proxy
         # mounting; it populates scope["root_path"] so handlers and the
-        # openapi schema see it. Mirror it onto the app so OpenAPI
-        # generation picks it up — ALWAYS overwrite (security: a second
-        # clean TestClient must erase an earlier spoofed prefix; see
-        # ``test_openapi_cache_root_path``) and invalidate the cache so
-        # subsequent /openapi.json regenerates with the new value.
-        if hasattr(app, "root_path"):
+        # openapi schema see it. Only overwrite the app's root_path when
+        # the test client SUPPLIES one — an app constructed with
+        # ``FastAPI(openapi_prefix=...)`` or ``root_path=...`` should
+        # keep its own value when wrapped by a bare ``TestClient(app)``.
+        if root_path and hasattr(app, "root_path"):
             try:
                 if app.root_path != root_path:
                     app.root_path = root_path

@@ -418,7 +418,7 @@ def _build() -> dict[str, types.ModuleType]:
     )
     _DEFAULT_SWAGGER_FAVICON = "https://fastapi.tiangolo.com/img/favicon.png"
     _DEFAULT_REDOC_JS = (
-        "https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js"
+        "https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js"
     )
     _DEFAULT_REDOC_FAVICON = "https://fastapi.tiangolo.com/img/favicon.png"
 
