@@ -2113,8 +2113,11 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
         # ``response.headers[...]`` assume a real Response. Default is
         # ``JSONResponse`` (matching FA's app-level default) so bare
         # strings get JSON-encoded (``"hello"`` not ``hello``).
-        if result is None or hasattr(result, "status_code"):
+        if hasattr(result, "status_code"):
             return result
+        # None is a valid handler return value — FA encodes it as
+        # JSONResponse(content=None) → body ``null``, status 200.
+        # Middlewares that do ``response.headers[...]`` assume a Response.
         return _JSONResponse(content=result)
 
     # Build a chain of sync callables. Each one drives its middleware via
@@ -2685,12 +2688,15 @@ class FastAPI:
             return
 
         # Rust/Tower-bound middleware (CORS/GZip/TrustedHost/HTTPSRedirect)
-        # carries a non-python_http_ ``_fastapi_rs_middleware_type``.
+        # carries a known Tower-side ``_fastapi_rs_middleware_type``.
         # Record on ``_middleware_stack`` so ``_build_middleware_config``
         # maps it to the matching Tower layer — do NOT fall through to
         # the generic ASGI shim (the class has no __call__ on instances
-        # and exists purely as a marker for the Rust side).
-        if mw_type:
+        # and exists purely as a marker for the Rust side). Exclude
+        # ``base_http`` — that's the BaseHTTPMiddleware marker handled
+        # in the branch below (dispatch()-based, NOT Tower-bound).
+        _TOWER_BOUND_TYPES = {"cors", "gzip", "trustedhost", "httpsredirect"}
+        if mw_type in _TOWER_BOUND_TYPES:
             self._middleware_stack.append((middleware_cls, kwargs))
             return
 

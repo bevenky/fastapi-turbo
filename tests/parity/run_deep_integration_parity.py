@@ -1268,9 +1268,16 @@ def cookie_tests(start_id):
     run_test(tid, cat, "/cookies/read returns session_id", t); tid += 1
 
     def t():
+        # Clear the cookie-jar first — prior /cookies/set left
+        # ``session_id=abc123`` in httpx's jar; without clearing the
+        # test's "no cookie" premise never holds.
+        _client(FA).cookies.clear()
+        _client(FR).cookies.clear()
         fa, fr = both_req("GET", "/cookies/read")
         assert_status_eq(fa, fr, 200)
-        assert fa.json()["session_id"] is None is fr.json()["session_id"]
+        _fa_sj = fa.json()["session_id"]
+        _fr_sj = fr.json()["session_id"]
+        assert _fa_sj is None and _fr_sj is None, f"fa={_fa_sj!r} fr={_fr_sj!r}"
     run_test(tid, cat, "/cookies/read without cookie → null", t); tid += 1
 
     def t():
