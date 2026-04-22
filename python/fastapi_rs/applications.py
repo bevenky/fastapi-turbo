@@ -1494,6 +1494,10 @@ class FastAPI:
         self.docs_url = docs_url
         self.redoc_url = redoc_url
         self.openapi_url = openapi_url
+        # Public FA-compat cache. Populated lazily by ``self.openapi()``;
+        # users may assign to it directly (e.g. after augmenting the
+        # generated schema in a custom ``app.openapi`` override).
+        self.openapi_schema: dict[str, Any] | None = None
         self.servers = servers
         self.terms_of_service = terms_of_service
         self.contact = contact
@@ -3064,36 +3068,42 @@ class FastAPI:
     # ------------------------------------------------------------------
 
     def openapi(self) -> dict[str, Any]:
-        """Return the OpenAPI schema dict (cached after first call)."""
-        if not hasattr(self, "_openapi_schema"):
-            route_dicts = self._collect_all_routes()
-            # Exclude routes that come from mounted sub-FastAPI apps —
-            # each mounted app owns its own schema at `<mount>/openapi.json`.
-            route_dicts = [r for r in route_dicts if not r.get("_from_mount")]
-            # Add root_path to servers if configured (matches run_server() behavior)
-            effective_servers = self.servers
-            if self.root_path and self.root_path_in_servers:
-                if not effective_servers:
-                    effective_servers = [{"url": self.root_path}]
-                elif not any(s.get("url") == self.root_path for s in effective_servers):
-                    effective_servers = [{"url": self.root_path}, *effective_servers]
-            webhook_dicts = self._collect_routes_from_router(self.webhooks)
-            self._openapi_schema = generate_openapi_schema(
-                title=self.title,
-                version=self.version,
-                description=self.description,
-                routes=route_dicts,
-                servers=effective_servers,
-                terms_of_service=self.terms_of_service,
-                contact=self.contact,
-                license_info=self.license_info,
-                openapi_tags=self.openapi_tags,
-                webhooks=webhook_dicts,
-                external_docs=self.external_docs,
-                summary=self.summary,
-                separate_input_output_schemas=self.separate_input_output_schemas,
-            )
-        return self._openapi_schema
+        """Return the OpenAPI schema dict (cached after first call).
+
+        FA convention: ``app.openapi_schema`` is a public, user-mutable
+        cache. Users can either override ``app.openapi`` entirely (custom
+        generator fn) or mutate the cached dict after first call.
+        """
+        if getattr(self, "openapi_schema", None) is not None:
+            return self.openapi_schema
+        route_dicts = self._collect_all_routes()
+        # Exclude routes that come from mounted sub-FastAPI apps —
+        # each mounted app owns its own schema at `<mount>/openapi.json`.
+        route_dicts = [r for r in route_dicts if not r.get("_from_mount")]
+        # Add root_path to servers if configured (matches run_server() behavior)
+        effective_servers = self.servers
+        if self.root_path and self.root_path_in_servers:
+            if not effective_servers:
+                effective_servers = [{"url": self.root_path}]
+            elif not any(s.get("url") == self.root_path for s in effective_servers):
+                effective_servers = [{"url": self.root_path}, *effective_servers]
+        webhook_dicts = self._collect_routes_from_router(self.webhooks)
+        self.openapi_schema = generate_openapi_schema(
+            title=self.title,
+            version=self.version,
+            description=self.description,
+            routes=route_dicts,
+            servers=effective_servers,
+            terms_of_service=self.terms_of_service,
+            contact=self.contact,
+            license_info=self.license_info,
+            openapi_tags=self.openapi_tags,
+            webhooks=webhook_dicts,
+            external_docs=self.external_docs,
+            summary=self.summary,
+            separate_input_output_schemas=self.separate_input_output_schemas,
+        )
+        return self.openapi_schema
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -3337,42 +3347,17 @@ class FastAPI:
                 )
             )
 
-        # Generate the OpenAPI schema JSON if docs are enabled
+        # Generate the OpenAPI schema JSON if docs are enabled. Honour a
+        # user-supplied ``app.openapi = my_function`` override (FA's
+        # extending_openapi tutorial).
         openapi_json: str | None = None
         if self.openapi_url is not None:
-            http_routes = [
-                r for r in route_dicts
-                if not r.get("is_websocket") and not r.get("_from_mount")
-            ]
-            # Auto-add root_path to servers if configured.
-            # Matches FA: if root_path_in_servers is True and root_path set,
-            # prepend {"url": root_path}. If no servers present, use only
-            # that. If servers exist and none already match root_path, prepend.
-            effective_servers = self.servers
-            if self.root_path and self.root_path_in_servers:
-                if not effective_servers:
-                    effective_servers = [{"url": self.root_path}]
-                elif not any(
-                    s.get("url") == self.root_path for s in effective_servers
-                ):
-                    effective_servers = [{"url": self.root_path}, *effective_servers]
-            webhook_dicts = self._collect_routes_from_router(self.webhooks)
-            openapi_schema = generate_openapi_schema(
-                title=self.title,
-                version=self.version,
-                description=self.description,
-                routes=http_routes,
-                servers=effective_servers,
-                terms_of_service=self.terms_of_service,
-                contact=self.contact,
-                license_info=self.license_info,
-                openapi_tags=self.openapi_tags,
-                webhooks=webhook_dicts,
-                external_docs=self.external_docs,
-                summary=self.summary,
-                separate_input_output_schemas=self.separate_input_output_schemas,
-            )
-            openapi_json = json.dumps(openapi_schema)
+            try:
+                openapi_schema = self.openapi()
+            except Exception:  # noqa: BLE001
+                openapi_schema = None
+            if openapi_schema is not None:
+                openapi_json = json.dumps(openapi_schema)
 
         middleware_config = self._build_middleware_config()
 

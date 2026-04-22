@@ -1523,6 +1523,15 @@ def _maybe_embed_body_params(params: list[dict[str, Any]], endpoint) -> list[dic
     # When every embedded body param is optional the whole combined body
     # is optional too — FA accepts an empty body and uses defaults.
     _combined_required = any(bp.get("required", True) for bp in body_params)
+    # FA honours an explicit ``Body(media_type=...)`` even across combined
+    # body params — take the first non-default one so ``application/vnd.api+json``
+    # on both fields still reaches the emitted ``content`` key.
+    _combined_media_type = None
+    for bp in body_params:
+        mt = bp.get("media_type")
+        if mt:
+            _combined_media_type = mt
+            break
     new_params = [p for p in params if p["kind"] != "body"]
     new_params.append({
         "name": "_combined_body",
@@ -1534,6 +1543,7 @@ def _maybe_embed_body_params(params: list[dict[str, Any]], endpoint) -> list[dic
         "model_class": CombinedBody,
         "alias": None,
         "_embed": False,
+        "media_type": _combined_media_type,
         "_body_param_names": [bp["name"] for bp in body_params],
         # The unwrap wrapper needs this to appear in handler_param_names so
         # the filtered kwargs include `_combined_body`, which the wrapper

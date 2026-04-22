@@ -27,6 +27,49 @@ def generate_openapi_schema(
     separate_input_output_schemas: bool = True,
 ) -> dict[str, Any]:
     """Generate an OpenAPI 3.1.0 schema dict from collected route metadata."""
+    # Tolerate callers that pass Starlette/FA ``APIRoute`` objects directly
+    # (``from fastapi.openapi.utils import get_openapi``; ``routes=app.routes``).
+    # Convert each to the internal dict shape our generator expects.
+    if routes:
+        try:
+            from fastapi_rs.routing import APIRoute as _APIRoute
+            from fastapi_rs._introspect import introspect_endpoint as _intro
+        except Exception:  # noqa: BLE001
+            _APIRoute = None  # type: ignore[assignment]
+            _intro = None  # type: ignore[assignment]
+        if _APIRoute is not None and _intro is not None:
+            _converted = []
+            for r in routes:
+                if isinstance(r, dict):
+                    _converted.append(r)
+                elif isinstance(r, _APIRoute):
+                    try:
+                        _params = _intro(r.endpoint, r.path)
+                    except Exception:  # noqa: BLE001
+                        _params = []
+                    _converted.append({
+                        "path": r.path,
+                        "methods": list(r.methods) if r.methods else ["GET"],
+                        "handler_name": r.name,
+                        "is_async": False,
+                        "params": _params,
+                        "status_code": r.status_code or 200,
+                        "summary": r.summary,
+                        "description": r.description,
+                        "response_description": getattr(
+                            r, "response_description", "Successful Response"
+                        ),
+                        "responses": r.responses or {},
+                        "response_model": getattr(r, "response_model", None),
+                        "tags": r.tags or [],
+                        "deprecated": r.deprecated or False,
+                        "operation_id": getattr(r, "operation_id", None),
+                        "include_in_schema": getattr(r, "include_in_schema", True),
+                        "openapi_extra": getattr(r, "openapi_extra", None),
+                    })
+                # silently skip Starlette Mount / WebSocketRoute /
+                # non-HTTP routes
+            routes = _converted
     schema: dict[str, Any] = {
         "openapi": "3.1.0",
         "info": {
@@ -540,6 +583,13 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
         # building the operationId (FA never sees the converter hint).
         _op_path = route.get("path", "")
         _op_path = _re.sub(r"\{([^}:]+):[^}]+\}", r"{\1}", _op_path)
+        # Webhooks: FA stores webhook paths WITHOUT a leading ``/``
+        # (they're event names, not URLs). Our collector prepends ``/``
+        # for consistency with regular routes, but the operationId
+        # derivation needs the FA-shaped form — strip the leading ``/``
+        # for webhook routes.
+        if route.get("_is_webhook"):
+            _op_path = _op_path.lstrip("/")
         _op_id_for_title = f"{route.get('handler_name', '')}{_op_path}"
         _op_id_for_title = _re.sub(r"\W", "_", _op_id_for_title)
         _op_id_for_title = f"{_op_id_for_title}_{method.lower()}"
