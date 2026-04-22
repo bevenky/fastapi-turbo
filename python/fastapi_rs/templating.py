@@ -53,11 +53,13 @@ class Jinja2Templates:
                 **kwargs,
             )
 
-        # Add url_for stub to template globals
-        def _url_for(name: str, /, **path_params: Any) -> str:
+        # Starlette parity: ``url_for`` inside a template delegates to
+        # ``request.url_for(name, **path_params)`` when a request is in
+        # context. ``TemplateResponse`` binds the real function per-render.
+        def _url_for_stub(name: str, /, **path_params: Any) -> str:
             return "#"
 
-        self.env.globals.setdefault("url_for", _url_for)
+        self.env.globals.setdefault("url_for", _url_for_stub)
 
     def get_template(self, name: str):
         """Return a Jinja2 Template object."""
@@ -96,9 +98,13 @@ class Jinja2Templates:
             name = name_or_request
             ctx = name_or_context if isinstance(name_or_context, dict) else (context or {})
         elif name_or_request is None:
-            # Pure keyword style: TemplateResponse(name="index.html", context={...})
+            # Pure keyword style:
+            #   TemplateResponse(request=req, name="index.html", context={...})
             name = kwargs.pop("name", None)
-            ctx = context or {}
+            ctx = dict(context or {})
+            _kw_req = kwargs.pop("request", None)
+            if _kw_req is not None:
+                ctx["request"] = _kw_req
         else:
             # New style: TemplateResponse(request, "name.html", {})
             request = name_or_request
@@ -107,6 +113,18 @@ class Jinja2Templates:
             ctx["request"] = request
 
         template = self.env.get_template(name)
+        # Starlette TemplateResponse parity: bind ``url_for`` to the
+        # request stashed in the context so template authors can use
+        # ``{{ url_for('route_name', param=value) }}`` to produce
+        # absolute URLs honouring the current host + scheme.
+        _req = ctx.get("request")
+        if _req is not None and hasattr(_req, "url_for"):
+            def _url_for(name: str, /, **path_params: Any) -> str:
+                try:
+                    return str(_req.url_for(name, **path_params))
+                except Exception:  # noqa: BLE001
+                    return "#"
+            ctx = {**ctx, "url_for": _url_for}
         content = template.render(**ctx)
         return HTMLResponse(
             content=content,

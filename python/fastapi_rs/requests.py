@@ -62,6 +62,20 @@ class HTTPConnection:
     @property
     def base_url(self) -> URL:
         scheme = self._scope.get("scheme", "http")
+        # Starlette parity: prefer the ``Host`` header over
+        # ``scope["server"]`` for constructing base_url so an
+        # ``Host: testserver`` header produces
+        # ``http://testserver/`` (no port) rather than
+        # ``http://testserver:50009/``. ``scope["server"]`` is a
+        # fallback for raw ASGI dispatch where there's no host header.
+        host_hdr = None
+        for _k, _v in self._scope.get("headers", []):
+            _k_bytes = _k if isinstance(_k, bytes) else str(_k).encode()
+            if _k_bytes.lower() == b"host":
+                host_hdr = _v.decode() if isinstance(_v, bytes) else str(_v)
+                break
+        if host_hdr:
+            return URL(f"{scheme}://{host_hdr}/")
         server = self._scope.get("server")
         host = server[0] if server else "localhost"
         port = server[1] if server else None
