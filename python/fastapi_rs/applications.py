@@ -3395,11 +3395,13 @@ class FastAPI:
         include_in_schema: bool = True,
         include_default_response_class: Any = None,
         include_generate_unique_id_function: Callable | None = None,
+        include_callbacks: list | None = None,
     ) -> list[dict[str, Any]]:
         """Recursively flatten a router tree into a list of route dicts."""
         extra_tags = extra_tags or []
         include_deps = include_deps or []
         include_responses = include_responses or {}
+        include_callbacks = include_callbacks or []
         collected: list[dict[str, Any]] = []
 
         full_prefix = prefix + router.prefix
@@ -3977,6 +3979,13 @@ class FastAPI:
                 child_gfn = getattr(router, "generate_unique_id_function", None)
             if child_gfn is None:
                 child_gfn = include_generate_unique_id_function
+            # Callbacks cascade too: accumulate outer ``include_callbacks``
+            # with the child include's own ``callbacks=`` list so descendant
+            # routes inherit them.
+            merged_callbacks = (
+                list(include_callbacks or [])
+                + list(child_meta.get("callbacks", []) or [])
+            )
             collected.extend(
                 self._collect_routes_from_router(
                     child_router,
@@ -3988,6 +3997,7 @@ class FastAPI:
                     include_in_schema=effective_in_schema,
                     include_default_response_class=effective_drc,
                     include_generate_unique_id_function=child_gfn,
+                    include_callbacks=merged_callbacks,
                 )
             )
 
@@ -4011,6 +4021,7 @@ class FastAPI:
                     include_in_schema=meta.get("include_in_schema", True),
                     include_default_response_class=meta.get("default_response_class"),
                     include_generate_unique_id_function=meta.get("generate_unique_id_function"),
+                    include_callbacks=meta.get("callbacks", []),
                 )
             )
 
