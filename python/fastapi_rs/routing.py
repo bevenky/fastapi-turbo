@@ -160,14 +160,29 @@ class APIRoute:
                 derived = _ra
             except (TypeError, ValueError, NameError):
                 pass
-            # FA parity: ``-> Response`` (or subclass) is a RESPONSE-CLASS
-            # hint, not a Pydantic response_model. Drop it so the route
-            # bypasses response_model filtering.
+            # FA parity: ``-> Response`` (or subclass), and streaming
+            # return types (``AsyncIterable[T]`` / ``Iterable[T]`` /
+            # ``AsyncGenerator`` / ``Generator``) are NOT Pydantic
+            # response models. Drop them so the route bypasses
+            # response_model filtering. Streaming handlers serialize
+            # per-yielded item separately.
             try:
                 from fastapi_rs.responses import Response as _RespCls
                 if isinstance(derived, type) and issubclass(derived, _RespCls):
                     derived = None
             except ImportError:
+                pass
+            _orig = _typing.get_origin(derived) if derived is not None else None
+            try:
+                import collections.abc as _cabc
+                _stream_origins = {
+                    _cabc.AsyncIterable, _cabc.AsyncIterator,
+                    _cabc.AsyncGenerator, _cabc.Iterable,
+                    _cabc.Iterator, _cabc.Generator,
+                }
+                if _orig in _stream_origins:
+                    derived = None
+            except Exception:  # noqa: BLE001
                 pass
             response_model = derived
             # FA parity: validate the DERIVED response_model too —
