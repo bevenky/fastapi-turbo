@@ -776,6 +776,9 @@ struct RouteState {
     /// ``HTTPException`` raised from a dep body wins over accumulated
     /// parameter-validation 422s (FA-normative precedence).
     defers_extraction_errors: bool,
+    /// FA 0.120+ ``FastAPI(strict_content_type=False)`` — when True,
+    /// JSON body parsing happens regardless of ``Content-Type`` header.
+    lax_content_type: bool,
     // Note: body validation stays with Pydantic (Rust-backed) for 100% compatibility.
     // jsonschema crate can't handle custom validators, coercion, defaults, etc.
 }
@@ -960,6 +963,10 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     .unwrap_or(false),
                 defers_extraction_errors: route.handler
                     .getattr(py, "_fastapi_rs_defers_extraction_errors")
+                    .and_then(|v| v.extract::<bool>(py))
+                    .unwrap_or(false),
+                lax_content_type: route.handler
+                    .getattr(py, "_fastapi_rs_lax_content_type")
                     .and_then(|v| v.extract::<bool>(py))
                     .unwrap_or(false),
             })
@@ -1319,6 +1326,7 @@ async fn handle_request(
                     py, &state.params, &path_map, &query_params, &query_multi,
                     &headers, &body_json_opt, &body_bytes, &mut multipart_fields,
                     state.defers_extraction_errors,
+                    state.lax_content_type,
                 ) {
                     Ok(kw) => kw,
                     Err(resp) => return resp,
@@ -1371,6 +1379,7 @@ async fn handle_request(
                         py, &state.params, &path_map, &query_params, &query_multi,
                         &headers, &body_json_opt, &body_bytes, &mut multipart_fields,
                         state.defers_extraction_errors,
+                        state.lax_content_type,
                     ) {
                         Ok(kw) => kw,
                         Err(resp) => return resp,
@@ -1400,6 +1409,7 @@ async fn handle_request(
                         py, &state.params, &path_map, &query_params, &query_multi,
                         &headers, &body_json_opt, &body_bytes, &mut multipart_fields,
                         state.defers_extraction_errors,
+                        state.lax_content_type,
                     ) {
                         Ok(kw) => kw,
                         Err(resp) => return resp,
@@ -1606,11 +1616,13 @@ fn extract_params_to_pydict<'py>(
     body_bytes: &[u8],
     multipart_fields: &mut Option<HashMap<String, Vec<ParsedField>>>,
     defers_extraction_errors: bool,
+    lax_content_type: bool,
 ) -> Result<pyo3::Bound<'py, pyo3::types::PyDict>, Response> {
     extract_params_to_pydict_full(
         py, params, path_map, query_params, &HashMap::new(),
         headers, body_json, body_bytes, multipart_fields,
         defers_extraction_errors,
+        lax_content_type,
     )
 }
 
@@ -1625,6 +1637,7 @@ fn extract_params_to_pydict_full<'py>(
     body_bytes: &[u8],
     multipart_fields: &mut Option<HashMap<String, Vec<ParsedField>>>,
     defers_extraction_errors: bool,
+    lax_content_type: bool,
 ) -> Result<pyo3::Bound<'py, pyo3::types::PyDict>, Response> {
     let kwargs = pyo3::types::PyDict::new(py);
     // Accumulate per-field extraction errors so we can emit FA's
@@ -1756,21 +1769,26 @@ fn extract_params_to_pydict_full<'py>(
                     // ``application/geo+json-seq`` is NOT json. Accept
                     // ``application/json``, ``application/vnd.x+json``,
                     // and any ``;charset=...`` suffix.
-                    let ct_is_json = headers
+                    // Strict mode: Content-Type MUST be JSON.
+                    // Lax mode: missing Content-Type is OK, but a
+                    // declared non-JSON ``Content-Type`` still errors
+                    // (FA parity — ``test_lax_post_with_text_plain_is_still_rejected``).
+                    let ct_header = headers
                         .as_ref()
                         .and_then(|h| h.get("content-type"))
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| {
+                        .and_then(|v| v.to_str().ok());
+                    let ct_is_json = match ct_header {
+                        Some(s) => {
                             let lower = s.to_ascii_lowercase();
-                            // Peel off optional params: ``application/json; charset=utf-8``
                             let head = lower.split(';').next().unwrap_or("").trim();
                             if let Some(rest) = head.strip_prefix("application/") {
                                 rest == "json" || rest.ends_with("+json")
                             } else {
                                 false
                             }
-                        })
-                        .unwrap_or(false);
+                        }
+                        None => lax_content_type,
+                    };
                     let val = if param.cached_validator.is_some() || param.model_class.is_some() {
                         let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
                         let result = if ct_is_json {

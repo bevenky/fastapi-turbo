@@ -3352,6 +3352,23 @@ class FastAPI:
                 endpoint = _wrap_with_http_middlewares(endpoint, self._http_middlewares, self)
                 is_async = False
 
+            # FA 0.120+ ``strict_content_type=False`` — closest-wins
+            # precedence: route → router → app. A strict inner router
+            # overrides a lax app.
+            _route_strict = getattr(route, "strict_content_type", None)
+            _router_strict = getattr(router, "strict_content_type", None)
+            if _route_strict is not None:
+                _strict_effective = _route_strict
+            elif _router_strict is not None:
+                _strict_effective = _router_strict
+            else:
+                _strict_effective = self.strict_content_type
+            _lax = _strict_effective is False
+            if _lax:
+                try:
+                    endpoint._fastapi_rs_lax_content_type = True  # type: ignore[attr-defined]
+                except (AttributeError, TypeError):
+                    pass
             collected.append(
                 {
                     "path": full_path,

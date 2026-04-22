@@ -288,10 +288,12 @@ class APIRouter:
         lifespan: Any = None,
         dependency_overrides_provider: Any = None,
         default: Any = None,
+        strict_content_type: bool | None = None,
         **kwargs: Any,
     ):
         self.routes: list[APIRoute] = []
         self._included_routers: list[tuple[APIRouter, str, list[str], dict]] = []
+        self.strict_content_type = strict_content_type
         self.prefix = prefix
         self.tags = tags or []
         self.dependencies = list(dependencies or [])
