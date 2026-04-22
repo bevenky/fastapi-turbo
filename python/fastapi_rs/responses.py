@@ -67,18 +67,57 @@ class _MutableHeadersDict(dict):
         copy._extras = list(self._extras)
         return copy
 
+    @property
     def raw(self) -> list[tuple[bytes, bytes]]:
-        """Starlette compatibility — raw (bytes, bytes) list view."""
-        seen_keys: set[str] = set()
-        out: list[tuple[bytes, bytes]] = []
-        for k, v in self.items():
-            seen_keys.add(k)
-            out.append((k.encode("latin-1"), v.encode("latin-1")))
-        for k, v in self._extras:
-            if k in seen_keys:
-                # Already emitted via dict canonical; append the extra too
-                out.append((k.encode("latin-1"), v.encode("latin-1")))
-        return out
+        """Starlette compatibility — raw (bytes, bytes) list view.
+
+        Starlette exposes this as a **property** returning the underlying
+        mutable list so middleware can ``response.headers.raw.extend(...)``
+        to splice in headers from a nested response (Strawberry's
+        ``GraphQLRouter.create_response`` does exactly this).
+        """
+        return _LiveRawHeaders(self)
+
+
+class _LiveRawHeaders(list):
+    """A list proxy over a ``_MutableHeadersDict``. Starlette's
+    ``MutableHeaders.raw`` returns the underlying list by reference, so
+    ``raw.extend([(b"k", b"v")])`` pushes headers into the real response.
+    We emulate that: the initial contents are a snapshot of the current
+    headers as (bytes, bytes); on ``append`` / ``extend``, writes flow
+    back into the parent dict + linked raw list so Rust emits them.
+    """
+
+    def __init__(self, headers: "_MutableHeadersDict") -> None:
+        super().__init__()
+        self._headers = headers
+        seen: set[str] = set()
+        for k, v in headers.items():
+            seen.add(k)
+            list.append(self, (k.encode("latin-1"), v.encode("latin-1")))
+        for k, v in headers._extras:
+            if k in seen:
+                list.append(self, (k.encode("latin-1"), v.encode("latin-1")))
+
+    def _decode(self, entry):
+        k, v = entry
+        if isinstance(k, bytes):
+            k = k.decode("latin-1")
+        if isinstance(v, bytes):
+            v = v.decode("latin-1")
+        return str(k).lower(), str(v)
+
+    def append(self, entry):  # type: ignore[override]
+        k_l, val = self._decode(entry)
+        list.append(self, entry)
+        self._headers[k_l] = val
+        self._headers._extras.append((k_l, val))
+        if self._headers._linked_raw is not None:
+            self._headers._linked_raw.append((k_l, val))
+
+    def extend(self, items):  # type: ignore[override]
+        for item in items:
+            self.append(item)
 
 
 class Response:

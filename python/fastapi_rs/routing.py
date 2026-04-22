@@ -14,6 +14,31 @@ def _default_generate_unique_id(route: "APIRoute", method: str) -> str:
     return f"{route.name}_{method.lower()}"
 
 
+def _safe_signature(endpoint):
+    """Like ``inspect.signature(endpoint)``, but on Python 3.14+ falls
+    back to ``FORWARDREF`` annotation format so forward-referenced
+    types (names only defined under ``if TYPE_CHECKING:``) don't blow
+    up at decorator time with a ``NameError``. We only need to walk
+    parameter names / markers here, never evaluate the annotations.
+    """
+    try:
+        try:
+            import annotationlib as _al  # py3.14+
+            return inspect.signature(
+                endpoint, annotation_format=_al.Format.FORWARDREF
+            )
+        except ImportError:
+            return inspect.signature(endpoint)
+    except NameError:
+        # Belt-and-braces: older 3.14 pre-releases or 3.13 PEP 649
+        # back-port may still eagerly eval. In that case we just
+        # skip the check — the resolver handles the annotation
+        # later with ``get_type_hints`` and its own fallbacks.
+        raise
+    except (TypeError, ValueError):
+        raise
+
+
 def _ws_check_scope_mismatch(endpoint: Callable) -> None:
     """Raise ``FastAPIError`` at WS-route decoration time when a
     request-scope yield dep depends on a function-scope yield dep.
@@ -44,8 +69,8 @@ def _ws_check_scope_mismatch(endpoint: Callable) -> None:
             return
         visited.add(id(dep_func))
         try:
-            sig = inspect.signature(dep_func)
-        except (TypeError, ValueError):
+            sig = _safe_signature(dep_func)
+        except (TypeError, ValueError, NameError):
             return
         try:
             hints = typing.get_type_hints(dep_func, include_extras=True)
@@ -388,8 +413,10 @@ class APIRouter:
         def _collect_depends(fn):
             """Yield (param_name, Depends marker) for every Depends on fn's sig."""
             try:
-                sig = _inspect.signature(fn)
+                sig = _safe_signature(fn)
             except (TypeError, ValueError):
+                return
+            except NameError:
                 return
             for pname, param in sig.parameters.items():
                 default = param.default
@@ -468,7 +495,7 @@ class APIRouter:
         import re as _re
         path_param_names = set(_re.findall(r"\{([^}:]+)", path))
         try:
-            sig = _inspect.signature(endpoint)
+            sig = _safe_signature(endpoint)
         except (TypeError, ValueError):
             return
         from pydantic_core import PydanticUndefined as _Und
@@ -522,7 +549,7 @@ class APIRouter:
         import inspect as _inspect
         import typing as _typing
         try:
-            sig = _inspect.signature(endpoint)
+            sig = _safe_signature(endpoint)
         except (TypeError, ValueError):
             return
         from fastapi_rs.param_functions import Form as _Form, File as _File
@@ -569,7 +596,7 @@ class APIRouter:
         if not names:
             return
         try:
-            sig = _inspect.signature(endpoint)
+            sig = _safe_signature(endpoint)
         except (TypeError, ValueError):
             return
         try:
@@ -685,7 +712,7 @@ class APIRouter:
         from fastapi_rs.param_functions import Query as _Query
 
         try:
-            sig = _inspect.signature(endpoint)
+            sig = _safe_signature(endpoint)
         except (TypeError, ValueError):
             return
         try:

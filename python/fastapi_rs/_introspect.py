@@ -51,7 +51,22 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
     Returns a list of dicts, each with keys:
         name, kind, type_hint, required, default_value, model_class, alias
     """
-    sig = inspect.signature(endpoint)
+    # PEP 649 (py3.14+): some forward-referenced types (names defined
+    # only under ``if TYPE_CHECKING:``) would raise ``NameError`` when
+    # inspect evaluates them eagerly. Use ``FORWARDREF`` format where
+    # supported so unresolved names become opaque ``ForwardRef``
+    # objects — we only need param NAMES here; actual types come from
+    # ``get_type_hints`` below which has its own eval_str fallback.
+    try:
+        import annotationlib as _al  # py3.14+
+        try:
+            sig = inspect.signature(
+                endpoint, annotation_format=_al.Format.FORWARDREF
+            )
+        except Exception:  # noqa: BLE001
+            sig = inspect.signature(endpoint)
+    except ImportError:
+        sig = inspect.signature(endpoint)
     path_param_names = _extract_path_params(path)
 
     # Try to resolve type hints; fall back to raw annotations on failure.
@@ -72,6 +87,27 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
                 hints[k] = v
         except Exception:
             pass
+    # For callable INSTANCES (``Depends(Dep())`` where ``Dep.__call__``
+    # carries the real signature), ``get_type_hints(instance)`` returns
+    # an empty dict — it only looks at the instance's own
+    # ``__annotations__``. Fetch hints from ``__call__`` so
+    # ``from __future__ import annotations`` stringified types like
+    # ``request: "Request"`` resolve to the real ``Request`` class.
+    if (
+        not hints
+        and not isinstance(endpoint, type)
+        and not inspect.isfunction(endpoint)
+        and not inspect.ismethod(endpoint)
+    ):
+        _call = getattr(type(endpoint), "__call__", None)
+        if _call is not None:
+            try:
+                call_hints = get_type_hints(_call, include_extras=True)
+                for k, v in call_hints.items():
+                    if k != "return":
+                        hints[k] = v
+            except Exception:
+                pass
 
     params: list[dict[str, Any]] = []
 
@@ -1642,7 +1678,15 @@ class _FABodyValidator:
             return self._validator.validate_python(body, from_attributes=True)
         try:
             data = _json.loads(raw)
-        except _json.JSONDecodeError as e:
+        except Exception as e:
+            # FA parity: a non-JSONDecodeError from json.loads (e.g. a
+            # test patch raising a bare Exception) still maps to a 400
+            # "There was an error parsing the body" response — FastAPI's
+            # request body handler catches the generic exception the
+            # same way.
+            if not isinstance(e, _json.JSONDecodeError):
+                from fastapi_rs.exceptions import HTTPException as _HE
+                raise _HE(status_code=400, detail="There was an error parsing the body") from None
             # Match FastAPI: emit a single `json_invalid` error with
             # loc=("body", byte_pos) and ctx.error = Python's json
             # message. We raise a synthetic ValidationError so the Rust

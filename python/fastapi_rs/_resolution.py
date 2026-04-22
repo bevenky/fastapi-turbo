@@ -140,6 +140,72 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False):
     return _sync_caller
 
 
+def _callable_uses_scopes(
+    call: Any,
+    path: str,
+    _seen: set[int] | None = None,
+) -> bool:
+    """Does ``call`` (or any of its transitive sub-deps) use OAuth2 scopes?
+
+    Mirrors FA's ``Dependant._uses_scopes``. True when:
+      * the dep is a ``SecurityBase`` subclass instance (any scheme), OR
+      * the dep takes ``SecurityScopes`` as a parameter, OR
+      * any sub-dep has own ``Security(..., scopes=[...])`` scopes, OR
+      * any sub-dep transitively uses scopes.
+
+    Used to key the dep cache: only scope-using deps get separate
+    cache entries when the accumulated scope chain differs; plain
+    helpers like ``get_db_session`` stay shared even when pulled
+    through two different Security chains.
+    """
+    if call is None:
+        return False
+    if _seen is None:
+        _seen = set()
+    cid = id(call)
+    if cid in _seen:
+        return False
+    _seen.add(cid)
+
+    # Is this callable itself a SecurityBase instance?
+    try:
+        from fastapi_rs.security import (
+            HTTPBase as _HTTPBase,
+            OAuth2 as _OAuth2,
+            OAuth2PasswordBearer as _O2PB,
+            OAuth2AuthorizationCodeBearer as _O2ACB,
+            OAuth2ClientCredentials as _O2CC,
+            OpenIdConnect as _OIDC,
+        )
+        from fastapi_rs.security import _APIKeyBase  # type: ignore
+        _security_base_types: tuple = (
+            _HTTPBase, _OAuth2, _O2PB, _O2ACB, _O2CC, _OIDC, _APIKeyBase,
+        )
+    except Exception:  # noqa: BLE001
+        _security_base_types = ()
+    try:
+        if _security_base_types and isinstance(call, _security_base_types):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Introspect its params.
+    try:
+        params = introspect_endpoint(call, path)
+    except Exception:  # noqa: BLE001
+        return False
+    for dp in params:
+        if dp.get("kind") == "inject_security_scopes":
+            return True
+        if dp.get("kind") == "dependency":
+            if dp.get("_sub_dep_scopes"):
+                return True
+            sub_call = dp.get("dep_callable")
+            if sub_call is not None and _callable_uses_scopes(sub_call, path, _seen):
+                return True
+    return False
+
+
 def _propagate_scopes_to_descendants(
     dep_steps: list[dict[str, Any]],
     start_key: str,
@@ -207,7 +273,16 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
     # For recursive dep resolution, track which dep functions have been
     # fully resolved (their sub-deps processed). We still create a step
     # for every handler-level usage, but sub-deps are deduplicated.
-    sub_dep_result_keys: dict[int, str] = {}  # id(callable) -> result_key for sub-deps
+    # Key: ``(id(callable), scope_tuple)`` — scope_tuple is ``()`` for
+    # deps that don't transitively use OAuth2 scopes, or the sorted
+    # tuple of accumulated scopes otherwise. This matches FA's
+    # ``Dependant.cache_key`` which incorporates scopes only when the
+    # dep (or a descendant) actually depends on them, so a plain helper
+    # like ``get_db_session`` still dedupes across different
+    # ``Security(..., scopes=[...])`` chains.
+    sub_dep_result_keys: dict[tuple, str] = {}
+    # Cache ``_callable_uses_scopes`` — computing it per dep is O(tree).
+    _uses_scopes_cache: dict[int, bool] = {}
 
     def _ensure_extraction(dp: dict[str, Any]) -> str:
         """Ensure an extraction step exists, return its result key name."""
@@ -257,15 +332,41 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
         dep_func = dep.dependency
         func_id = id(dep_func)
 
+        # Compute whether this dep (or any sub-dep) uses scopes — only
+        # those get scope-aware cache keys. Plain helpers share across
+        # different scope chains. FA semantics: a ``Security(dep,
+        # scopes=[...])`` marker with scopes on THIS level also counts,
+        # even if the callable itself never reads them. Memoised per
+        # callable for the recursive part.
+        if func_id in _uses_scopes_cache:
+            _uses = _uses_scopes_cache[func_id]
+        else:
+            _uses = _callable_uses_scopes(dep_func, path)
+            _uses_scopes_cache[func_id] = _uses
+        # ``own_scopes`` captured above from the marker — if set, this
+        # call-site uses scopes even if the callable doesn't. At
+        # top-level, the marker's scopes arrive via
+        # ``accumulated_scopes`` (the caller repackages Security()
+        # into Depends() and hands its scopes in separately), so also
+        # check those — without it ``Security(dep, scopes=["s"])`` at
+        # the handler level wouldn't be treated as a scope-using site.
+        _site_uses = (
+            _uses
+            or bool(own_scopes)
+            or (is_top_level and bool(accumulated_scopes))
+        )
+        _scope_key = tuple(sorted(set(chain_scopes))) if _site_uses else ()
+        _dedup_key = (func_id, _scope_key)
+
         # For sub-deps (not top-level), deduplicate
-        if not is_top_level and dep.use_cache and func_id in sub_dep_result_keys:
+        if not is_top_level and dep.use_cache and _dedup_key in sub_dep_result_keys:
             # Dedup hit — but propagate scopes forward. FA semantics:
             # when two different Security() chains resolve to the same
             # scheme, the scopes UNION. Without this, a dep resolved
             # via a ``Depends()`` (no scopes) followed by the same dep
             # via ``Security(..., scopes=[...])`` keeps the first
             # (empty) scope list forever.
-            cached_key = sub_dep_result_keys[func_id]
+            cached_key = sub_dep_result_keys[_dedup_key]
             if chain_scopes:
                 # Locate the cached step and union scopes.
                 for _ds in dep_steps:
@@ -344,6 +445,29 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
                 input_map.append((dp["name"], source_key))
 
         result_key = param_name
+        # Sub-dep steps must not collide with top-level handler-param
+        # step names — the handler-kwarg builder looks up ``resolved[
+        # param_name]``, so a sub-dep reusing the same name as a
+        # handler param would silently overwrite the handler's value.
+        # Before scope-aware caching this was papered over by the
+        # func_id dedup (sub-dep and top-level shared a single step);
+        # now that scope chains can split them into distinct steps
+        # we disambiguate the sub-dep's result_key.
+        if not is_top_level:
+            _used_names = {s.get("name") for s in dep_steps if s.get("name")}
+            _used_names |= {
+                s.get("name") for s in extraction_steps if s.get("name")
+            }
+            # Collision with an already-planned step OR with an
+            # as-yet-unplanned top-level handler param. Suffix with a
+            # stable hash of ``(func_id, scope_key)`` so two sub-dep
+            # occurrences of the same ``(func, scopes)`` still share.
+            _top_names = {p.get("name") for p in top_params if p.get("name")}
+            if result_key in _used_names or result_key in _top_names:
+                _suffix = hex(hash((func_id, _scope_key)) & 0xFFFFFFFF)[2:]
+                result_key = f"{param_name}__sd_{_suffix}"
+                while result_key in _used_names:
+                    result_key = f"{result_key}_"
         # A dep can be a bare function OR a callable class instance whose
         # `__call__` is async (e.g., Starlette's HTTPBearer / OAuth2*
         # classes). Check both cases.
@@ -451,7 +575,18 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
             # OpenAPI generator uses this to find `.model` for
             # securitySchemes, and user dependency_overrides look up by id.
             "_original_dep_callable": dep_func,
-            "dep_callable_id": func_id,
+            # Runtime cache key. For plain deps, this is just ``id(call)``
+            # so the Rust-side ``dep_cache`` dedupes across different
+            # handler-level Depends() of the same callable. For deps
+            # that use OAuth2 scopes, the key also incorporates the
+            # accumulated scope set — two ``Security()`` chains with
+            # different scopes must produce separate cached values
+            # (FA's ``Dependant.cache_key`` semantics).
+            "dep_callable_id": (
+                hash((func_id, _scope_key)) & 0xFFFFFFFFFFFFFFFF
+                if _scope_key
+                else func_id
+            ),
             "is_async_dep": mark_as_async,
             "is_generator_dep": is_generator,
             "dep_input_map": input_map,
@@ -469,8 +604,8 @@ def build_resolution_plan(endpoint, path: str, extra_deps=None) -> list[dict[str
         dep_steps.append(dep_step)
 
         # Track for sub-dep dedup
-        if dep.use_cache and func_id not in sub_dep_result_keys:
-            sub_dep_result_keys[func_id] = result_key
+        if dep.use_cache and _dedup_key not in sub_dep_result_keys:
+            sub_dep_result_keys[_dedup_key] = result_key
 
         return result_key
 
