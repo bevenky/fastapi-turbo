@@ -620,7 +620,7 @@ def _try_compile_handler(
             try:
                 sig = inspect.signature(override_func)
             except (TypeError, ValueError):
-                _override_plan_cache[id(override_func)] = {"accepted": None, "subs": {}}
+                _override_plan_cache[id(override_func)] = {"accepted": None, "subs": {}, "sig": None}
                 return original_dk
             accepted: set[str] = set()
             subs: dict[str, tuple[Any, Any]] = {}
@@ -637,7 +637,7 @@ def _try_compile_handler(
                             if isinstance(meta, _Dep):
                                 subs[pname] = (meta.dependency, meta)
                                 break
-            plan = {"accepted": accepted, "subs": subs}
+            plan = {"accepted": accepted, "subs": subs, "sig": sig}
             _override_plan_cache[id(override_func)] = plan
 
         accepted = plan["accepted"]
@@ -645,6 +645,43 @@ def _try_compile_handler(
             return original_dk
 
         dk: dict[str, Any] = {k: v for k, v in original_dk.items() if k in accepted}
+
+        # Pull missing simple-type params (query/header/cookie) from the raw
+        # Request — the override may need params the original dep chain
+        # never declared (so Rust never extracted them). We accept the
+        # Request out of ``resolved_env`` under the synthetic injection
+        # name ``__fastapi_rs_override_request__``.
+        _req = resolved_env.get("__fastapi_rs_override_request__")
+        _sig = plan.get("sig")
+        if _req is not None and _sig is not None:
+            for pname, param in _sig.parameters.items():
+                if pname in dk:
+                    continue
+                if pname in plan["subs"]:
+                    continue
+                # Pull from query string first, then headers, then cookies.
+                try:
+                    qp = _req.query_params
+                    if pname in qp:
+                        dk[pname] = qp[pname]
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    hp = _req.headers
+                    if pname in hp:
+                        dk[pname] = hp[pname]
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    cp = _req.cookies
+                    if pname in cp:
+                        dk[pname] = cp[pname]
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+
         for pname, (sub_callable, _sub_marker) in plan["subs"].items():
             # Respect nested dependency_overrides.
             effective = sub_callable
@@ -2152,6 +2189,44 @@ class FastAPI:
             for p in params:
                 if p["kind"] == "dependency" and "_original_dep_callable" not in p:
                     p["_original_dep_callable"] = p.get("dep_callable")
+
+            # When the route has deps, inject a hidden Request param so the
+            # compiled handler can pull extra query/header values on demand —
+            # needed when ``dependency_overrides`` installs a replacement whose
+            # own sub-deps depend on params the original chain never declared
+            # (FA parity for ``test_dependency_overrides``). Only add if the
+            # route doesn't already expose a Request to the user.
+            if has_deps and not any(
+                p.get("kind") == "inject_request" for p in params
+            ):
+                params.append({
+                    "name": "__fastapi_rs_override_request__",
+                    "kind": "inject_request",
+                    "type_hint": "any",
+                    "required": False,
+                    "default_value": None,
+                    "has_default": True,
+                    "model_class": None,
+                    "alias": None,
+                    "_embed": False,
+                    "media_type": None,
+                    "example": None,
+                    "examples": None,
+                    "openapi_examples": None,
+                    "title": None,
+                    "description": None,
+                    "include_in_schema": False,
+                    "deprecated": None,
+                    "scalar_validator": None,
+                    "enum_class": None,
+                    "container_type": None,
+                    "_is_optional": True,
+                    "_enum_values": None,
+                    "_unwrapped_annotation": None,
+                    "_raw_marker": None,
+                    "_raw_annotation": None,
+                    "_is_handler_param": False,
+                })
 
             # Save all params (including deps) for OpenAPI security scheme detection
             all_params_for_openapi = list(params)
