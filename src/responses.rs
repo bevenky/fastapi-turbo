@@ -130,6 +130,18 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
         )
             .into_response();
     }
+    // Tuples: serialize like lists (JSON array). FA emits a tuple as
+    // a JSON array, so ``return (a, b)`` from a handler works.
+    if obj.is_instance_of::<pyo3::types::PyTuple>() {
+        let mut buf = String::new();
+        write_any_json(py, obj, &mut buf);
+        return (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            buf,
+        )
+            .into_response();
+    }
 
     // None -> 200 with "null" body (matches FastAPI: json-serializes None to null)
     if obj.is_instance_of::<PyNone>() {
