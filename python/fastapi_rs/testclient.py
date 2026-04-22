@@ -170,20 +170,77 @@ class TestClient:
         if parsed.port:
             host_header = f"{host_header}:{parsed.port}"
         _forced_host = host_header
+        # Starlette's TestClient passes scope["scheme"] derived from
+        # base_url. Our server listens on plain http; when base_url
+        # specifies https we forward the scheme via X-Forwarded-Proto
+        # so middleware like HTTPSRedirectMiddleware and code reading
+        # request.url.scheme behave as Starlette does.
+        _forced_scheme = (parsed.scheme or "http").lower()
 
         def _force_host(request: httpx.Request) -> None:
             request.headers["host"] = _forced_host
+            if _forced_scheme == "https" and "x-forwarded-proto" not in request.headers:
+                request.headers["x-forwarded-proto"] = "https"
             # Starlette's TestClient uses ``user-agent: testclient`` — FA
             # tests assert on this exact value in 422 error ``input``
             # dicts. httpx defaults to ``python-httpx/X.Y.Z``.
             if request.headers.get("user-agent", "").startswith("python-httpx"):
                 request.headers["user-agent"] = "testclient"
+            # Starlette's TestClient talks to the ASGI app in-process,
+            # bypassing h11's strict header-value validation. Real-HTTP
+            # tests that send e.g. ``Authorization: "Other  foobar "``
+            # would be rejected by h11 (leading/trailing whitespace),
+            # so we strip outer whitespace from every header value to
+            # mirror the ASGI transport's leniency. The server-side
+            # security code already handles whitespace-collapsed
+            # credentials via ``.split(None, 1)``.
+            for k in list(request.headers.keys()):
+                v = request.headers[k]
+                stripped = v.strip() if isinstance(v, str) else v
+                if stripped != v:
+                    request.headers[k] = stripped
 
         default_headers = {"host": host_header, "user-agent": "testclient"}
         if self._seed_headers:
             # Let user-supplied defaults win over our injected Host.
             for k, v in dict(self._seed_headers).items():
                 default_headers[k] = v
+        # Our trailing-slash redirect middleware emits an ABSOLUTE URL
+        # built from the request's Host header ("testserver" or the
+        # user's base_url hostname). Starlette's in-memory TestClient
+        # transport happily follows that, but real httpx does a DNS
+        # lookup on the hostname and fails (nodename not known). When
+        # a redirect is about to be FOLLOWED we rewrite the Location
+        # header to a relative path so httpx routes it back to our
+        # 127.0.0.1 base_url. When the response will be handed to the
+        # caller as-is (follow_redirects=False) we must leave it alone
+        # so ``response.headers["location"]`` reflects what the server
+        # sent.
+        _base_host_name = urlparse(self._base_url).hostname or "testserver"
+        self._follow_state = threading.local()
+        _follow_state = self._follow_state
+        def _rewrite_redirect_location(response: httpx.Response) -> None:
+            if not (300 <= response.status_code < 400):
+                return
+            will_follow = getattr(_follow_state, "follow", self._follow_redirects)
+            if not will_follow:
+                return
+            loc = response.headers.get("location")
+            if not loc:
+                return
+            parsed_loc = urlparse(loc)
+            if not parsed_loc.netloc:
+                return
+            host_only = parsed_loc.hostname or ""
+            if host_only != _base_host_name and parsed_loc.netloc != _forced_host:
+                return
+            new_path = parsed_loc.path or "/"
+            if parsed_loc.query:
+                new_path = f"{new_path}?{parsed_loc.query}"
+            if parsed_loc.fragment:
+                new_path = f"{new_path}#{parsed_loc.fragment}"
+            response.headers["location"] = new_path
+
         # FA's test suite runs with ``filterwarnings = ["error"]`` —
         # any ``ResourceWarning`` (including unclosed sockets) becomes
         # a test failure. Disable keep-alive so each httpx call closes
@@ -194,7 +251,10 @@ class TestClient:
             follow_redirects=self._follow_redirects,
             headers=default_headers,
             cookies=self._seed_cookies,
-            event_hooks={"request": [_force_host]},
+            event_hooks={
+                "request": [_force_host],
+                "response": [_rewrite_redirect_location],
+            },
             limits=httpx.Limits(
                 max_keepalive_connections=0,
                 max_connections=10,
@@ -291,50 +351,67 @@ class TestClient:
             return
         raise exc
 
+    def _track_follow(self, kwargs: dict) -> None:
+        """Record the effective follow_redirects flag for this call so
+        the response hook can decide whether to rewrite Location headers
+        pointing at our synthetic base_url host."""
+        if hasattr(self, "_follow_state"):
+            self._follow_state.follow = kwargs.get(
+                "follow_redirects", self._follow_redirects
+            )
+
     def get(self, url: str, **kwargs: Any) -> httpx.Response:
         self._ensure_started()
+        self._track_follow(kwargs)
         r = self._client.get(url, **kwargs)
         self._check_raised()
         return r
 
     def post(self, url: str, **kwargs: Any) -> httpx.Response:
         self._ensure_started()
+        self._track_follow(kwargs)
         r = self._client.post(url, **kwargs)
         self._check_raised()
         return r
 
     def put(self, url: str, **kwargs: Any) -> httpx.Response:
         self._ensure_started()
+        self._track_follow(kwargs)
         r = self._client.put(url, **kwargs)
         self._check_raised()
         return r
 
     def delete(self, url: str, **kwargs: Any) -> httpx.Response:
         self._ensure_started()
+        self._track_follow(kwargs)
         r = self._client.delete(url, **kwargs)
         self._check_raised()
         return r
 
     def patch(self, url: str, **kwargs: Any) -> httpx.Response:
         self._ensure_started()
+        self._track_follow(kwargs)
         r = self._client.patch(url, **kwargs)
         self._check_raised()
         return r
 
     def options(self, url: str, **kwargs: Any) -> httpx.Response:
         self._ensure_started()
+        self._track_follow(kwargs)
         r = self._client.options(url, **kwargs)
         self._check_raised()
         return r
 
     def head(self, url: str, **kwargs: Any) -> httpx.Response:
         self._ensure_started()
+        self._track_follow(kwargs)
         r = self._client.head(url, **kwargs)
         self._check_raised()
         return r
 
     def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         self._ensure_started()
+        self._track_follow(kwargs)
         r = self._client.request(method, url, **kwargs)
         self._check_raised()
         return r
@@ -396,25 +473,25 @@ class TestClient:
             getattr(self.app, "_ws_server_exceptions", []).clear()
         except Exception:  # noqa: BLE001
             pass
-        # Capture the TEST thread's contextvars and queue them on the
-        # app so the server-side WS handler can replay them before
-        # running the user's coroutine. Enables FA parity for
-        # ``tests/test_dependency_yield_scope_websockets.py`` — values
-        # retrieved via ``ContextVar.get()`` inside yield-dep teardown
-        # (running on the server's async worker thread) mutate the
-        # SAME objects the test holds a reference to.
+        # Capture the TEST thread's contextvars context and queue it on
+        # the app so the server-side WS handler can replay it before
+        # running the user's coroutine. This makes tests that set a
+        # ``ContextVar`` in the test thread observe mutations performed
+        # by yield-dep teardowns that run on the server's async worker
+        # thread — the teardown replays the captured vars, so they
+        # mutate the SAME underlying objects the test holds.
         try:
             import contextvars as _cv
-            _ctx = _cv.copy_context()
-            _q = getattr(self.app, "_ws_pending_test_contexts", None)
-            if _q is None:
-                _q = []
+            ctx = _cv.copy_context()
+            q = getattr(self.app, "_ws_pending_test_contexts", None)
+            if q is None:
+                q = []
                 try:
-                    self.app._ws_pending_test_contexts = _q
+                    self.app._ws_pending_test_contexts = q
                 except Exception:  # noqa: BLE001
-                    _q = None
-            if _q is not None:
-                _q.append(_ctx)
+                    q = None
+            if q is not None:
+                q.append(ctx)
         except Exception:  # noqa: BLE001
             pass
         return _WebSocketTestSession(
