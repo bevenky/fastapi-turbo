@@ -560,7 +560,15 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
             _normalised = _raw.upper()
         else:
             _normalised = _raw
-        entry = _build_response_entry(resp_info, status_code=_normalised)
+        # Custom response_class with non-JSON media_type (e.g.
+        # ``JsonApiResponse`` → ``application/vnd.api+json``) — per
+        # FA, the additional responses from ``responses={...}`` inherit
+        # that media type when they supply a model but no explicit
+        # ``content``.
+        _default_mt = _media_type if isinstance(_media_type, str) else "application/json"
+        entry = _build_response_entry(
+            resp_info, status_code=_normalised, default_media_type=_default_mt
+        )
         # FA titles generated response schemas ``Response <StatusCode>
         # <Title-cased Operation Id>``. Apply the title if the schema
         # we produced didn't come from a named component (pure
@@ -594,8 +602,23 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
         responses_dict[success_key] = success_response
     else:
         responses_dict[success_key].setdefault("description", response_desc)
-        if "content" not in responses_dict[success_key]:
-            responses_dict[success_key]["content"] = success_response["content"]
+        existing_content = responses_dict[success_key].get("content")
+        auto_content = success_response.get("content") or {}
+        if not existing_content:
+            responses_dict[success_key]["content"] = auto_content
+        elif auto_content:
+            # FA merges: keys present in user's content take precedence;
+            # keys only in auto_content (typically application/json from
+            # response_model) are added. This way, user can declare
+            # additional media types (image/png) while keeping the JSON
+            # schema for response_model.
+            merged: dict[str, Any] = {}
+            for mt, obj in auto_content.items():
+                if mt not in existing_content:
+                    merged[mt] = obj
+            for mt, obj in existing_content.items():
+                merged[mt] = obj
+            responses_dict[success_key]["content"] = merged
 
     # Auto-add 422 Validation Error response. FastAPI's rule
     # (``get_flat_params(dependant)`` in openapi/utils.py): 422 fires
@@ -855,6 +878,7 @@ def _build_response_entry(
     resp_info: dict[str, Any],
     status_code: int | str | None = None,
     op_title: str | None = None,
+    default_media_type: str = "application/json",
 ) -> dict[str, Any]:
     """Convert a user-supplied entry from route.responses into an OpenAPI response object.
 
@@ -890,11 +914,11 @@ def _build_response_entry(
     if model is not None:
         ref = _model_ref(model)
         if ref is not None:
-            entry["content"] = {"application/json": {"schema": ref}}
+            entry["content"] = {default_media_type: {"schema": ref}}
         elif hasattr(model, "model_json_schema"):
             try:
                 model_schema = model.model_json_schema()
-                entry["content"] = {"application/json": {"schema": model_schema}}
+                entry["content"] = {default_media_type: {"schema": model_schema}}
             except Exception:
                 pass
         else:
@@ -913,7 +937,7 @@ def _build_response_entry(
                         k: v for k, v in container_schema.items() if k != "$defs"
                     }
                 container_schema = _rewrite_defs_refs(container_schema)
-                entry["content"] = {"application/json": {"schema": container_schema}}
+                entry["content"] = {default_media_type: {"schema": container_schema}}
             except Exception:  # noqa: BLE001
                 pass
 
@@ -2092,4 +2116,23 @@ def _schema_for_annotation(annotation) -> dict[str, Any] | None:
     }
     if annotation in format_map:
         return dict(format_map[annotation])
+    # For Pydantic-special types (HttpUrl, AnyUrl, EmailStr, SecretStr,
+    # Base64Bytes, etc.), fall back to a TypeAdapter-derived schema. The
+    # adapter produces ``{type: string, format: uri, minLength: 1,
+    # maxLength: 2083}`` for ``HttpUrl`` — byte-matching FA's output.
+    try:
+        _mod = getattr(annotation, "__module__", "") or ""
+        _is_pydantic = _mod.startswith("pydantic") or _mod.startswith("annotated_types")
+        if _is_pydantic:
+            from pydantic import TypeAdapter as _TA
+            sch = _TA(annotation).json_schema()
+            # Strip any ``$defs`` — we only want the concrete fragment.
+            if isinstance(sch, dict) and "$defs" not in sch and "$ref" not in sch:
+                # Don't override if this came back as an object/ref —
+                # those should go through the normal model registration
+                # path, not be inlined as parameter schemas.
+                if sch.get("type") in ("string", "integer", "number", "boolean"):
+                    return sch
+    except Exception:  # noqa: BLE001
+        pass
     return None
