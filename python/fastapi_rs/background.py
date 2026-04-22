@@ -50,17 +50,16 @@ class BackgroundTasks:
     def run_sync(self) -> None:
         """Run all queued tasks synchronously — used by the Rust router
         after the handler returns. Sync tasks run inline; async tasks get
-        driven to completion via a fresh local event loop.
+        submitted to the shared worker event loop so connection pools
+        (SQLAlchemy asyncpg, Redis async, httpx) keep their affinity.
         """
-        import asyncio
         for task in self._tasks:
             if inspect.iscoroutinefunction(task.func):
-                # Run the coroutine to completion on a one-shot loop.
-                loop = asyncio.new_event_loop()
-                try:
-                    loop.run_until_complete(task.func(*task.args, **task.kwargs))
-                finally:
-                    loop.close()
+                # Submit to the shared worker loop (same loop handles all
+                # async deps and request handlers) so async DB / cache /
+                # HTTP clients reuse their existing connections.
+                from fastapi_rs._async_worker import submit
+                submit(task.func(*task.args, **task.kwargs))
             else:
                 task.func(*task.args, **task.kwargs)
         self._tasks.clear()

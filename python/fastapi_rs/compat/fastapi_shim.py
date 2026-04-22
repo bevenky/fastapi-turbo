@@ -145,6 +145,11 @@ def _build() -> dict[str, types.ModuleType]:
             pass
         return app
     fastapi_routing.request_response = request_response  # type: ignore[attr-defined]
+    # FA tests monkeypatch ``fastapi.routing._PING_INTERVAL`` to speed
+    # up keepalive pings. Re-export the value from ``fastapi.sse`` so
+    # ``monkeypatch.setattr("fastapi.routing._PING_INTERVAL", 0.05)``
+    # works.
+    fastapi_routing._PING_INTERVAL = _sse._PING_INTERVAL  # type: ignore[attr-defined]
     # Mount — Airflow uses `from fastapi.routing import Mount`
     try:
         from fastapi_rs._starlette_compat import Mount as _Mount
@@ -189,12 +194,7 @@ def _build() -> dict[str, types.ModuleType]:
         header = "header"
         path = "path"
         cookie = "cookie"
-    class Param:
-        def __init__(self, *, default=..., **kwargs):
-            self.default = default
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-    fastapi_params.Param = Param  # type: ignore[attr-defined]
+    fastapi_params.Param = _params.Param  # type: ignore[attr-defined]
     fastapi_params.ParamTypes = ParamTypes  # type: ignore[attr-defined]
     modules["fastapi.params"] = fastapi_params
 
@@ -239,6 +239,7 @@ def _build() -> dict[str, types.ModuleType]:
     modules["fastapi.security.oauth2"] = fastapi_security_oauth2
 
     fastapi_security_http = _mod("fastapi.security.http")
+    fastapi_security_http.HTTPBase = _security.HTTPBase  # type: ignore[attr-defined]
     fastapi_security_http.HTTPBearer = _security.HTTPBearer  # type: ignore[attr-defined]
     fastapi_security_http.HTTPDigest = _security.HTTPDigest  # type: ignore[attr-defined]
     fastapi_security_http.HTTPBasic = _security.HTTPBasic  # type: ignore[attr-defined]
@@ -299,6 +300,15 @@ def _build() -> dict[str, types.ModuleType]:
             self.value = value
         def __bool__(self) -> bool:
             return bool(self.value)
+        def __eq__(self, other):
+            if not isinstance(other, DefaultPlaceholder):
+                return NotImplemented
+            return self.value == other.value
+        def __hash__(self):
+            try:
+                return hash(self.value)
+            except TypeError:
+                return id(self)
     def Default(value):
         return DefaultPlaceholder(value)
     fastapi_ds.Default = Default  # type: ignore[attr-defined]
@@ -338,6 +348,8 @@ def _build() -> dict[str, types.ModuleType]:
     # ── fastapi.requests ──────────────────────────────────────────
     fastapi_requests_mod = _mod("fastapi.requests")
     fastapi_requests_mod.Request = _requests.Request  # type: ignore[attr-defined]
+    fastapi_requests_mod.HTTPConnection = _requests.HTTPConnection  # type: ignore[attr-defined]
+    fastapi_requests_mod.ClientDisconnect = _requests.ClientDisconnect  # type: ignore[attr-defined]
     modules["fastapi.requests"] = fastapi_requests_mod
 
     # ── fastapi.websockets ─────────────────────────────────────────
@@ -395,19 +407,34 @@ def _build() -> dict[str, types.ModuleType]:
     # Swagger/ReDoc HTML helpers
     fastapi_openapi_docs = _mod("fastapi.openapi.docs")
 
+    # FA uses fixed CDN URLs as the default for these kwargs — tests
+    # assert that the default appears in the rendered body. Keep them
+    # byte-for-byte identical to FA.
+    _DEFAULT_SWAGGER_JS = (
+        "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.29.0/swagger-ui-bundle.js"
+    )
+    _DEFAULT_SWAGGER_CSS = (
+        "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.29.0/swagger-ui.css"
+    )
+    _DEFAULT_SWAGGER_FAVICON = "https://fastapi.tiangolo.com/img/favicon.png"
+    _DEFAULT_REDOC_JS = (
+        "https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js"
+    )
+    _DEFAULT_REDOC_FAVICON = "https://fastapi.tiangolo.com/img/favicon.png"
+
     def get_swagger_ui_html(
         *,
         openapi_url,
         title="API docs",
-        swagger_js_url=None,
-        swagger_css_url=None,
-        swagger_favicon_url=None,
+        swagger_js_url=_DEFAULT_SWAGGER_JS,
+        swagger_css_url=_DEFAULT_SWAGGER_CSS,
+        swagger_favicon_url=_DEFAULT_SWAGGER_FAVICON,
         oauth2_redirect_url=None,
         init_oauth=None,
         swagger_ui_parameters=None,
     ):
-        js_url = swagger_js_url or "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"
-        css_url = swagger_css_url or "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css"
+        js_url = swagger_js_url
+        css_url = swagger_css_url
         favicon = ""
         if swagger_favicon_url:
             favicon = f'<link rel="icon" href="{swagger_favicon_url}">'
@@ -423,8 +450,30 @@ def _build() -> dict[str, types.ModuleType]:
         from fastapi_rs.responses import HTMLResponse
         return HTMLResponse(html)
 
-    def _stub_redoc_html(*, openapi_url, title="API", **_):
-        return f"<!DOCTYPE html><html><body><redoc spec-url='{openapi_url}'></redoc></body></html>"
+    def get_redoc_html(
+        *,
+        openapi_url,
+        title="API docs",
+        redoc_js_url=_DEFAULT_REDOC_JS,
+        redoc_favicon_url=_DEFAULT_REDOC_FAVICON,
+        with_google_fonts=True,
+    ):
+        from fastapi_rs.responses import HTMLResponse
+        fonts = ""
+        if with_google_fonts:
+            fonts = (
+                '<link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">'
+            )
+        html = (
+            f"<!DOCTYPE html><html><head><title>{title}</title>"
+            f'<link rel="shortcut icon" href="{redoc_favicon_url}">'
+            f"{fonts}"
+            f"</head><body>"
+            f"<redoc spec-url='{openapi_url}'></redoc>"
+            f'<script src="{redoc_js_url}"></script>'
+            f"</body></html>"
+        )
+        return HTMLResponse(html)
 
     def get_swagger_ui_oauth2_redirect_html():
         from fastapi_rs.responses import HTMLResponse
@@ -438,7 +487,7 @@ def _build() -> dict[str, types.ModuleType]:
         )
 
     fastapi_openapi_docs.get_swagger_ui_html = get_swagger_ui_html  # type: ignore[attr-defined]
-    fastapi_openapi_docs.get_redoc_html = _stub_redoc_html  # type: ignore[attr-defined]
+    fastapi_openapi_docs.get_redoc_html = get_redoc_html  # type: ignore[attr-defined]
     fastapi_openapi_docs.get_swagger_ui_oauth2_redirect_html = get_swagger_ui_oauth2_redirect_html  # type: ignore[attr-defined]
 
     fastapi_openapi_docs.swagger_ui_default_parameters = {  # type: ignore[attr-defined]
@@ -457,7 +506,7 @@ def _build() -> dict[str, types.ModuleType]:
         "OpenAPI", "Info", "Contact", "License", "Server", "ServerVariable",
         "PathItem", "Operation", "ExternalDocumentation", "Parameter",
         "RequestBody", "MediaType", "Encoding", "Response", "Responses",
-        "Reference", "Discriminator", "XML", "Schema", "Example",
+        "Reference", "Discriminator", "XML", "Example",
         "Link", "Header", "Tag", "Components", "SecurityScheme",
         "OAuthFlow", "OAuthFlows", "SecurityBase", "Callback", "Webhook",
         "OAuthFlowImplicit", "OAuthFlowPassword", "OAuthFlowClientCredentials",
@@ -466,6 +515,28 @@ def _build() -> dict[str, types.ModuleType]:
     ]
     for _oai_name in _openapi_model_names:
         setattr(fastapi_openapi_models, _oai_name, type(_oai_name, (dict,), {}))
+    # ``SchemaType`` is the Literal alias FA 0.115+ uses inside
+    # ``Schema.type`` — third-party OpenAPI plugins import it.
+    import typing as _oai_typing
+    _SCHEMA_TYPE = _oai_typing.Literal[
+        "array", "boolean", "integer", "number", "object", "string", "null"
+    ]
+    fastapi_openapi_models.SchemaType = _SCHEMA_TYPE  # type: ignore[attr-defined]
+    # ``Schema`` — a minimal Pydantic model matching FA 0.115+. Tests
+    # assert ``Schema(type="array").type == "array"`` and that invalid
+    # types raise a ``ValueError``, which requires real validation.
+    try:
+        from pydantic import BaseModel as _OAI_BM, Field as _OAI_Field
+
+        class Schema(_OAI_BM):
+            type: _oai_typing.Optional[  # type: ignore[valid-type]
+                _oai_typing.Union[_SCHEMA_TYPE, list[_SCHEMA_TYPE]]
+            ] = None
+            model_config = {"extra": "allow"}
+
+        fastapi_openapi_models.Schema = Schema  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        fastapi_openapi_models.Schema = type("Schema", (dict,), {})  # type: ignore[attr-defined]
     modules["fastapi.openapi.models"] = fastapi_openapi_models
 
     # ── fastapi.middleware.cors ────────────────────────────────────
@@ -511,20 +582,71 @@ def _build() -> dict[str, types.ModuleType]:
     modules["fastapi.exception_handlers"] = fastapi_exc_handlers
 
     # ── fastapi.dependencies ───────────────────────────────────────
-    # Stub module — real FastAPI has fastapi.dependencies.utils with Dependant
+    # FastAPI's `fastapi.dependencies.utils` is private implementation
+    # detail (Dependant/solve_dependencies/get_dependant/…) that we
+    # don't use — fastapi-rs compiles resolution plans in Rust. Code
+    # that reaches in here is usually introspecting FA's private
+    # resolver. We provide importable no-op shims so the import path
+    # exists; any function call raises ``NotImplementedError`` with a
+    # clear pointer so the failure is loud (not silent, not a confusing
+    # AttributeError on a Mock). Users who hit this should switch to
+    # the public API (``Depends(...)``, ``request.scope["route"]``).
     fastapi_dependencies_mod = _mod("fastapi.dependencies")
     modules["fastapi.dependencies"] = fastapi_dependencies_mod
 
     fastapi_dependencies_utils = _mod("fastapi.dependencies.utils")
+
     class Dependant:
-        """Stub for fastapi.dependencies.utils.Dependant."""
+        """Import-time stub of ``fastapi.dependencies.utils.Dependant``.
+
+        fastapi-rs does not use FA's ``Dependant`` tree — dep
+        resolution happens in Rust. Attribute access returns sentinels
+        so introspecting code runs without exploding; calling into
+        methods raises ``NotImplementedError`` pointing at public API.
+        """
         def __init__(self, **kwargs):
+            # Populate the minimum set of attributes FA tests look at
+            # so ``isinstance(dep, Dependant)`` + ``dep.dependencies``
+            # don't crash when a third-party library pokes at this.
+            self.dependencies = kwargs.pop("dependencies", [])
+            self.path_params = kwargs.pop("path_params", [])
+            self.query_params = kwargs.pop("query_params", [])
+            self.header_params = kwargs.pop("header_params", [])
+            self.cookie_params = kwargs.pop("cookie_params", [])
+            self.body_params = kwargs.pop("body_params", [])
+            self.call = kwargs.pop("call", None)
+            self.name = kwargs.pop("name", None)
+            self.path = kwargs.pop("path", None)
+            self.use_cache = kwargs.pop("use_cache", True)
             for k, v in kwargs.items():
                 setattr(self, k, v)
+
+    def _fa_internal_stub(name: str):
+        """Build a callable that raises with a helpful pointer."""
+        def _raise(*args, **kwargs):
+            raise NotImplementedError(
+                f"fastapi-rs does not implement FastAPI's private "
+                f"`{name}` helper — dependency resolution is compiled "
+                f"in Rust. Use the public `Depends(...)` / "
+                f"`@app.exception_handler(...)` API instead."
+            )
+        _raise.__name__ = name.rsplit(".", 1)[-1]
+        return _raise
+
     fastapi_dependencies_utils.Dependant = Dependant  # type: ignore[attr-defined]
-    fastapi_dependencies_utils.get_dependant = lambda **kw: Dependant(**kw)  # type: ignore[attr-defined]
-    fastapi_dependencies_utils.solve_dependencies = lambda **kw: {}  # type: ignore[attr-defined]
+    fastapi_dependencies_utils.get_dependant = _fa_internal_stub("fastapi.dependencies.utils.get_dependant")  # type: ignore[attr-defined]
+    fastapi_dependencies_utils.solve_dependencies = _fa_internal_stub("fastapi.dependencies.utils.solve_dependencies")  # type: ignore[attr-defined]
+    fastapi_dependencies_utils.get_typed_annotation = _fa_internal_stub("fastapi.dependencies.utils.get_typed_annotation")  # type: ignore[attr-defined]
+    fastapi_dependencies_utils.get_typed_signature = _fa_internal_stub("fastapi.dependencies.utils.get_typed_signature")  # type: ignore[attr-defined]
+    fastapi_dependencies_utils.get_flat_dependant = _fa_internal_stub("fastapi.dependencies.utils.get_flat_dependant")  # type: ignore[attr-defined]
+    fastapi_dependencies_utils.get_parameterless_sub_dependant = _fa_internal_stub("fastapi.dependencies.utils.get_parameterless_sub_dependant")  # type: ignore[attr-defined]
+    fastapi_dependencies_utils.request_body_to_args = _fa_internal_stub("fastapi.dependencies.utils.request_body_to_args")  # type: ignore[attr-defined]
+    fastapi_dependencies_utils.request_params_to_args = _fa_internal_stub("fastapi.dependencies.utils.request_params_to_args")  # type: ignore[attr-defined]
     modules["fastapi.dependencies.utils"] = fastapi_dependencies_utils
+
+    fastapi_dependencies_models = _mod("fastapi.dependencies.models")
+    fastapi_dependencies_models.Dependant = Dependant  # type: ignore[attr-defined]
+    modules["fastapi.dependencies.models"] = fastapi_dependencies_models
 
     # ── fastapi.types ──────────────────────────────────────────────
     import typing as _typing
@@ -549,8 +671,113 @@ def _build() -> dict[str, types.ModuleType]:
     try:
         import fastapi_rs._compat_shim as _compat_mod
         modules["fastapi._compat"] = _compat_mod
+        # Expose as a package so ``from fastapi._compat import shared``
+        # works — needed by FA 0.115+'s own tests.
+        _compat_mod.__path__ = []  # type: ignore[attr-defined]
+        _compat_mod.__package__ = "fastapi._compat"  # type: ignore[attr-defined]
+        # Sub-module ``fastapi._compat.shared`` re-exports the same
+        # annotation helpers at a different path.
+        fastapi_compat_shared = _mod("fastapi._compat.shared")
+        for _name in (
+            "is_uploadfile_or_nonable_uploadfile_annotation",
+            "is_uploadfile_sequence_annotation",
+            "is_bytes_or_nonable_bytes_annotation",
+            "is_bytes_sequence_annotation",
+            "is_sequence_field",
+            "sequence_types",
+            "value_is_sequence",
+            "serialize_sequence_value",
+        ):
+            if hasattr(_compat_mod, _name):
+                setattr(fastapi_compat_shared, _name, getattr(_compat_mod, _name))
+        modules["fastapi._compat.shared"] = fastapi_compat_shared
+        # Sub-module ``fastapi._compat.v2`` — same surface, different path.
+        fastapi_compat_v2 = _mod("fastapi._compat.v2")
+        fastapi_compat_v2.get_missing_field_error = _fa_internal_stub(  # type: ignore[attr-defined]
+            "fastapi._compat.v2.get_missing_field_error"
+        )
+        fastapi_compat_v2.ModelField = Dependant  # type: ignore[attr-defined]
+        modules["fastapi._compat.v2"] = fastapi_compat_v2
+        # Expose submodules as attributes on the package so
+        # ``from fastapi._compat import v2`` / ``import shared`` resolve.
+        _compat_mod.shared = fastapi_compat_shared  # type: ignore[attr-defined]
+        _compat_mod.v2 = fastapi_compat_v2  # type: ignore[attr-defined]
+        # Re-export all _compat_shim symbols on the v2 submodule too —
+        # ``from fastapi._compat.v2 import serialize_sequence_value`` etc.
+        for _name in (
+            "is_uploadfile_or_nonable_uploadfile_annotation",
+            "is_uploadfile_sequence_annotation",
+            "is_bytes_or_nonable_bytes_annotation",
+            "is_bytes_sequence_annotation",
+            "is_sequence_field",
+            "sequence_types",
+            "value_is_sequence",
+            "serialize_sequence_value",
+        ):
+            if hasattr(_compat_mod, _name):
+                setattr(fastapi_compat_v2, _name, getattr(_compat_mod, _name))
     except ImportError:
         pass
+
+    # ── fastapi.cli ───────────────────────────────────────────────
+    # FA ships a CLI (``fastapi dev``) — we don't, but the import
+    # path must exist so `fastapi.cli` doesn't blow up. Import fails
+    # loudly if someone tries to USE the CLI.
+    fastapi_cli = _mod("fastapi.cli")
+    def _cli_stub(*a, **kw):
+        raise NotImplementedError(
+            "fastapi-rs does not ship the `fastapi dev` CLI. "
+            "Run your app with `app.run(host, port)` (sync) or via "
+            "``python -m uvicorn app:app`` (if you want ASGI)."
+        )
+    fastapi_cli.main = _cli_stub  # type: ignore[attr-defined]
+    modules["fastapi.cli"] = fastapi_cli
+
+    # ── Backfill a couple more FA-internal stubs ──────────────────
+    # FA's multipart-install error messages — tests import these to
+    # match against ``pytest.raises(RuntimeError, match=...)``. We ship
+    # the literal strings (not stubs) so the import + match both work.
+    fastapi_dependencies_utils.multipart_not_installed_error = (  # type: ignore[attr-defined]
+        'Form data requires "python-multipart" to be installed. \n'
+        'You can install "python-multipart" with: \n\n'
+        "pip install python-multipart\n"
+    )
+    fastapi_dependencies_utils.multipart_incorrect_install_error = (  # type: ignore[attr-defined]
+        'Form data requires "python-multipart" to be installed. '
+        'It seems you installed "multipart" instead. \n'
+        'You can remove "multipart" with: \n\n'
+        "pip uninstall multipart\n\n"
+        'And then install "python-multipart" with: \n\n'
+        "pip install python-multipart\n"
+    )
+    # FA's ensure_multipart_is_installed raises at decoration time
+    # when Form/File is used without python-multipart. Port the logic:
+    # checks for an incompatible ``multipart`` package first.
+    def _ensure_multipart_is_installed() -> None:
+        # Port of FA's ``ensure_multipart_is_installed``. Tests
+        # monkeypatch ``python_multipart.__version__`` to ``"0.0.12"``
+        # (or delete attrs on the legacy ``multipart`` package) and
+        # expect a ``RuntimeError`` at route decoration time — mirror
+        # that exact check sequence.
+        try:
+            from python_multipart import __version__
+            assert __version__ > "0.0.12"
+        except (ImportError, AssertionError):
+            try:
+                from multipart import __version__  # type: ignore[import-untyped]
+                assert __version__
+                try:
+                    from multipart.multipart import parse_options_header  # type: ignore[import-untyped]  # noqa: F401
+                    assert parse_options_header
+                except (ImportError, AttributeError):
+                    raise RuntimeError(
+                        fastapi_dependencies_utils.multipart_incorrect_install_error
+                    ) from None
+            except ImportError:
+                raise RuntimeError(
+                    fastapi_dependencies_utils.multipart_not_installed_error
+                ) from None
+    fastapi_dependencies_utils.ensure_multipart_is_installed = _ensure_multipart_is_installed  # type: ignore[attr-defined]
 
     # ── starlette.routing.compile_path ────────────────────────────
     # Used by fastapi-jsonrpc and Netflix dispatch

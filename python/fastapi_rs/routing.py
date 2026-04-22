@@ -12,6 +12,12 @@ def _default_generate_unique_id(route: "APIRoute", method: str) -> str:
     return f"{route.name}_{method.lower()}"
 
 
+_UNSET = object()
+"""Sentinel for distinguishing ``response_model=None`` (explicit — skip
+model validation) from ``response_model`` being omitted (auto-derive from
+the return annotation). FA does the same — ``default=Default(None)``."""
+
+
 class APIRoute:
     """Metadata for a single registered route."""
 
@@ -21,7 +27,7 @@ class APIRoute:
         endpoint: Callable,
         *,
         methods: list[str] | None = None,
-        response_model: Any = None,
+        response_model: Any = _UNSET,
         response_model_include: set | None = None,
         response_model_exclude: set | None = None,
         response_model_exclude_unset: bool = False,
@@ -51,6 +57,34 @@ class APIRoute:
         self.path = path
         self.endpoint = endpoint
         self.methods = [m.upper() for m in (methods or ["GET"])]
+        # FastAPI auto-derives `response_model` from the handler's return
+        # annotation when the caller didn't set one explicitly. Mirror that
+        # so OpenAPI for endpoints like `def root() -> dict[str, str]` gets
+        # the full `{type: object, additionalProperties: ...}` schema. Use
+        # `typing.get_type_hints` so string annotations (`from __future__
+        # import annotations`) are resolved to real types.
+        if response_model is _UNSET:
+            # User didn't pass ``response_model`` — auto-derive from the
+            # return annotation.
+            import inspect as _inspect
+            import typing as _typing
+            derived = None
+            try:
+                hints = _typing.get_type_hints(endpoint, include_extras=False)
+                _ra = hints.get("return")
+                if _ra is None:
+                    _ra = _inspect.signature(endpoint).return_annotation
+                    if _ra is _inspect.Signature.empty:
+                        _ra = None
+                derived = _ra
+            except (TypeError, ValueError, NameError):
+                pass
+            response_model = derived
+        elif response_model is None:
+            # Explicit ``response_model=None`` — FA treats this as "skip
+            # response-model filtering entirely, even if the handler has
+            # a return annotation". Keep it as None.
+            pass
         self.response_model = response_model
         self.response_model_include = response_model_include
         self.response_model_exclude = response_model_exclude
@@ -64,7 +98,21 @@ class APIRoute:
         self.description = description
         self.response_description = response_description
         self.responses = responses or {}
-        self.name = name or endpoint.__name__
+        # Endpoints can be ``functools.partial`` wrappers or callable
+        # class instances that don't carry ``__name__``. Fall back to
+        # the wrapped function's name, then the class name, then
+        # "endpoint" — matches FastAPI's ``get_name`` helper.
+        if name:
+            self.name = name
+        else:
+            ep = endpoint
+            inner = getattr(ep, "func", None)
+            if inner is not None:
+                ep = inner
+            self.name = (
+                getattr(ep, "__name__", None)
+                or type(endpoint).__name__
+            )
         self.deprecated = bool(deprecated) if deprecated is not None else False
         self.dependencies = list(dependencies or [])
         self.response_class = response_class
@@ -76,11 +124,19 @@ class APIRoute:
         self.servers = servers  # None = inherit from app
         self.external_docs = external_docs
 
-        # Generate operation_id using the provided function or explicit value
+        # Generate operation_id using the provided function or explicit
+        # value. FA's signature is ``generate_unique_id_function(route)``
+        # — single argument, returns a string.
         if operation_id is not None:
             self.operation_id = operation_id
         elif generate_unique_id_function is not None:
-            self.operation_id = generate_unique_id_function(self, self.methods[0] if self.methods else "get")
+            try:
+                self.operation_id = generate_unique_id_function(self)
+            except TypeError:
+                # Fall back to legacy ``(route, method)`` callers.
+                self.operation_id = generate_unique_id_function(
+                    self, self.methods[0] if self.methods else "get"
+                )
         else:
             self.operation_id = None
         self.generate_unique_id_function = generate_unique_id_function
@@ -143,8 +199,224 @@ class APIRouter:
         **kwargs: Any,
     ) -> None:
         """Create an APIRoute and append it to this router."""
+        self._assert_path_params_are_scalars(path, endpoint)
+        self._assert_query_params_are_supported(endpoint)
+        self._assert_response_models_are_valid(kwargs)
+        self._maybe_require_multipart(endpoint)
         route = APIRoute(path, endpoint, methods=methods, **kwargs)
         self.routes.append(route)
+
+    @staticmethod
+    def _maybe_require_multipart(endpoint: Callable) -> None:
+        """FA raises ``RuntimeError`` at decoration time if the handler
+        uses ``Form()`` / ``File()`` without ``python-multipart``
+        installed. We mirror that check so
+        ``test_multipart_installation`` and other suites that rely on
+        the install-guard behaviour pass. When multipart IS available,
+        this is a no-op.
+        """
+        import inspect as _inspect
+        import typing as _typing
+        try:
+            sig = _inspect.signature(endpoint)
+        except (TypeError, ValueError):
+            return
+        from fastapi_rs.param_functions import Form as _Form, File as _File
+        uses_multipart = False
+        for p in sig.parameters.values():
+            if isinstance(p.default, (_Form, _File)):
+                uses_multipart = True
+                break
+            ann = p.annotation
+            if _typing.get_origin(ann) is _typing.Annotated:
+                for meta in _typing.get_args(ann)[1:]:
+                    if isinstance(meta, (_Form, _File)):
+                        uses_multipart = True
+                        break
+            if uses_multipart:
+                break
+        if not uses_multipart:
+            return
+        try:
+            from fastapi.dependencies.utils import (  # type: ignore[import-not-found]
+                ensure_multipart_is_installed as _ensure,
+            )
+            _ensure()
+        except RuntimeError:
+            raise
+        except Exception:  # noqa: BLE001
+            # Shim unavailable — don't block registration.
+            pass
+
+    @staticmethod
+    def _assert_path_params_are_scalars(path: str, endpoint: Callable) -> None:
+        """FA raises ``AssertionError`` at decoration time when a path
+        parameter is typed as a non-scalar (``list[Item]``,
+        ``tuple[X,Y]``, ``dict[...]``, ``set[...]`` — anything iterable
+        that can't be encoded in a URL segment). Match that surface.
+        """
+        import inspect as _inspect
+        import re as _re
+        import typing as _typing
+        try:
+            names = set(_re.findall(r"\{([^}:/]+)", path))
+        except Exception:  # noqa: BLE001
+            return
+        if not names:
+            return
+        try:
+            sig = _inspect.signature(endpoint)
+        except (TypeError, ValueError):
+            return
+        try:
+            hints = _typing.get_type_hints(endpoint, include_extras=True)
+        except Exception:  # noqa: BLE001
+            hints = {}
+        bad_origins = (list, tuple, set, frozenset, dict)
+        for pname in names:
+            if pname not in sig.parameters:
+                continue
+            ann = hints.get(pname, sig.parameters[pname].annotation)
+            if ann is _inspect.Parameter.empty:
+                continue
+            if _typing.get_origin(ann) is _typing.Annotated:
+                inner = _typing.get_args(ann)
+                if inner:
+                    ann = inner[0]
+            origin = _typing.get_origin(ann)
+            if origin in bad_origins or ann in bad_origins:
+                raise AssertionError(
+                    f"Path parameter {pname!r} has invalid type {ann!r}: "
+                    f"non-scalar container types cannot be used in path "
+                    f"parameters (FA/Starlette limitation)."
+                )
+
+    @staticmethod
+    def _assert_response_models_are_valid(kwargs: dict) -> None:
+        """FA raises ``FastAPIError`` at decoration time when a
+        ``response_model=`` or a ``responses={code: {"model": ...}}``
+        references a non-Pydantic type. Mirror that behaviour.
+        """
+        from fastapi_rs.exceptions import FastAPIError as _FAErr
+        import typing as _typing
+
+        def _valid_response_type(t) -> bool:
+            if t is None:
+                return True
+            try:
+                from pydantic import BaseModel as _BM, TypeAdapter as _TA
+                if isinstance(t, type) and issubclass(t, _BM):
+                    return True
+            except Exception:  # noqa: BLE001
+                return False
+            # Walk generic containers — list[T] / tuple[T, ...] / dict[K,V].
+            origin = _typing.get_origin(t)
+            if origin in (list, set, frozenset, tuple):
+                for sub in _typing.get_args(t):
+                    if sub is type(None) or sub is Ellipsis:
+                        continue
+                    if not _valid_response_type(sub):
+                        return False
+                return True
+            if origin is dict:
+                vs = _typing.get_args(t)
+                if len(vs) == 2 and not _valid_response_type(vs[1]):
+                    return False
+                return True
+            if origin is _typing.Union:
+                for sub in _typing.get_args(t):
+                    if sub is type(None):
+                        continue
+                    if not _valid_response_type(sub):
+                        return False
+                return True
+            # Primitives / Any / forward refs are fine.
+            if isinstance(t, type) and t in (int, float, str, bool, bytes, list, dict, tuple, set, frozenset, type(None)):
+                return True
+            # TypeAdapter round-trip — if it succeeds, Pydantic handles it.
+            try:
+                _TA(t)
+                return True
+            except Exception:  # noqa: BLE001
+                return False
+
+        rm = kwargs.get("response_model")
+        if rm is not None and not _valid_response_type(rm):
+            raise _FAErr(
+                f"Invalid args for response field! Hint: check that "
+                f"{rm!r} is a valid Pydantic field type."
+            )
+        for code, spec in (kwargs.get("responses") or {}).items():
+            if isinstance(spec, dict) and spec.get("model") is not None:
+                m = spec["model"]
+                if not _valid_response_type(m):
+                    raise _FAErr(
+                        f"Invalid args for response field! Hint: check "
+                        f"that {m!r} is a valid Pydantic field type."
+                    )
+
+    @staticmethod
+    def _assert_query_params_are_supported(endpoint: Callable) -> None:
+        """FA raises ``AssertionError`` at decoration time for Query
+        params typed as container of BaseModels (``list[Item]``,
+        ``tuple[Item,Item]``, ``dict[str, Item]``) or bare ``dict``.
+        Only scalar sequences (``list[str]``, ``list[int]``, ...) are
+        allowed. Mirror that behaviour.
+        """
+        import inspect as _inspect
+        import typing as _typing
+        from fastapi_rs.param_functions import Query as _Query
+
+        try:
+            sig = _inspect.signature(endpoint)
+        except (TypeError, ValueError):
+            return
+        try:
+            hints = _typing.get_type_hints(endpoint, include_extras=True)
+        except Exception:  # noqa: BLE001
+            hints = {}
+
+        def _is_query_param(param, ann) -> bool:
+            default = param.default
+            if isinstance(default, _Query):
+                return True
+            if _typing.get_origin(ann) is _typing.Annotated:
+                for meta in _typing.get_args(ann)[1:]:
+                    if isinstance(meta, _Query):
+                        return True
+            return False
+
+        def _container_of_model(ann) -> bool:
+            from pydantic import BaseModel as _BM
+            if _typing.get_origin(ann) is _typing.Annotated:
+                ann = _typing.get_args(ann)[0]
+            origin = _typing.get_origin(ann)
+            if origin in (dict,) or ann is dict:
+                return True  # dict[str, X] / bare dict not allowed as Query
+            if origin in (list, tuple, set, frozenset):
+                for sub in _typing.get_args(ann):
+                    if (
+                        isinstance(sub, type)
+                        and issubclass(sub, _BM)
+                    ):
+                        return True
+            # bare ``dict | None`` — check union of dicts
+            if origin is _typing.Union:
+                for sub in _typing.get_args(ann):
+                    if sub is dict or _typing.get_origin(sub) is dict:
+                        return True
+            return False
+
+        for pname, param in sig.parameters.items():
+            ann = hints.get(pname, param.annotation)
+            if ann is _inspect.Parameter.empty:
+                continue
+            if not _is_query_param(param, ann):
+                continue
+            if _container_of_model(ann):
+                raise AssertionError(
+                    f"Query parameter {pname!r} must be one of the supported types"
+                )
 
     # ------------------------------------------------------------------
     # Decorator helpers (one per HTTP verb)
@@ -380,5 +652,6 @@ class APIRouter:
             "deprecated": deprecated,
             "include_in_schema": include_in_schema,
             "default_response_class": default_response_class,
+            "generate_unique_id_function": generate_unique_id_function,
         }
         self._included_routers.append((router, prefix, tags or [], include_meta))

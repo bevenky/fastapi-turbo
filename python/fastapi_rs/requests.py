@@ -13,6 +13,16 @@ from typing import Any
 from fastapi_rs.datastructures import URL, Address, Headers, QueryParams, State
 
 
+class ClientDisconnect(Exception):
+    """Starlette-compatible: raised when a client drops the connection
+    mid-request (e.g. while streaming a request body or long polling).
+
+    Middleware and endpoints that await ``request.receive()`` / iterate
+    ``request.stream()`` catch this to short-circuit cleanly. Starlette
+    uses plain ``Exception`` as the base; we follow suit.
+    """
+
+
 class HTTPConnection:
     """Starlette-compatible HTTPConnection base class.
 
@@ -73,7 +83,14 @@ class HTTPConnection:
                 sc = SimpleCookie()
                 sc.load(cookie_header)
                 for key, morsel in sc.items():
-                    cookies[key] = morsel.value
+                    # Starlette strips surrounding double quotes from
+                    # cookie values (matches RFC 6265's quoted-string
+                    # encoding). Without this our dict exposes `"quoted"`
+                    # where FastAPI exposes `quoted`.
+                    v = morsel.value
+                    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+                        v = v[1:-1]
+                    cookies[key] = v
             self._cookies = cookies
         return self._cookies
 
@@ -99,7 +116,18 @@ class HTTPConnection:
     @property
     def state(self) -> State:
         if self._state is None:
-            self._state = State()
+            s = State()
+            # Seed with lifespan-yielded state from scope["state"] or the
+            # owning app's ``_app_state`` so handlers can do
+            # ``request.state.<key>`` after a lifespan yielded a dict.
+            seed = self._scope.get("state")
+            if not seed:
+                app = self._scope.get("app")
+                seed = getattr(app, "_app_state", None) if app is not None else None
+            if seed:
+                for k, v in seed.items():
+                    setattr(s, k, v)
+            self._state = s
         return self._state
 
 
@@ -127,7 +155,15 @@ class Request(HTTPConnection):
     @property
     def state(self) -> State:
         if self._state is None:
-            self._state = State()
+            s = State()
+            seed = self._scope.get("state")
+            if not seed:
+                app = self._scope.get("app")
+                seed = getattr(app, "_app_state", None) if app is not None else None
+            if seed:
+                for k, v in seed.items():
+                    setattr(s, k, v)
+            self._state = s
         return self._state
 
     @state.setter
@@ -256,13 +292,14 @@ class Request(HTTPConnection):
     async def form(self, *, max_files: int = 1000, max_fields: int = 1000) -> "FormData":
         if self._form is not None:
             return self._form
-        # Basic form parsing — assumes application/x-www-form-urlencoded
+        # Basic form parsing — assumes application/x-www-form-urlencoded.
+        # Preserve multi-values as separate `(key, value)` entries so
+        # `form.getlist("tag")` surfaces each occurrence individually.
         raw = await self.body()
-        from urllib.parse import parse_qs
+        from urllib.parse import parse_qsl
         from fastapi_rs.datastructures import FormData
-        parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
-        flat = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
-        self._form = FormData(flat)
+        items = parse_qsl(raw.decode("utf-8"), keep_blank_values=True)
+        self._form = FormData(items)
         return self._form
 
     async def close(self) -> None:

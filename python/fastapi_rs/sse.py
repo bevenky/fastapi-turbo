@@ -1,43 +1,79 @@
-"""Server-Sent Events support matching FastAPI 0.136+."""
+"""Server-Sent Events support matching FastAPI 0.136+.
+
+Mirrors ``fastapi.sse`` — the module FA introduced for the ``yield``
+pattern inside an ``EventSourceResponse`` path operation.
+"""
 from __future__ import annotations
-import json
-from typing import Any, AsyncGenerator, Generator
 
-KEEPALIVE_COMMENT = ": keepalive"
+from typing import Any
 
-
-class ServerSentEvent:
-    """Structured SSE event."""
-    def __init__(self, *, data=None, event=None, id=None, retry=None, comment=None, raw_data=None):
-        self.data = data
-        self.event = event
-        self.id = id
-        self.retry = retry
-        self.comment = comment
-        self.raw_data = raw_data
+from pydantic import BaseModel, Field, model_validator
 
 
-def format_sse_event(event: ServerSentEvent | dict | str) -> str:
-    """Format an SSE event to wire format."""
-    if isinstance(event, str):
-        return f"data: {event}\n\n"
-    if isinstance(event, dict):
-        event = ServerSentEvent(**event)
-    lines = []
-    if event.comment:
-        lines.append(f": {event.comment}")
-    if event.event:
-        lines.append(f"event: {event.event}")
-    if event.id is not None:
-        lines.append(f"id: {event.id}")
-    if event.retry is not None:
-        lines.append(f"retry: {event.retry}")
-    data = event.raw_data or event.data
-    if data is not None:
-        if not isinstance(data, str):
-            data = json.dumps(data)
-        for line in data.split("\n"):
+class ServerSentEvent(BaseModel):
+    """Represents a single Server-Sent Event.
+
+    When ``yield``ed from a path operation function that uses
+    ``response_class=EventSourceResponse``, each ``ServerSentEvent`` is
+    encoded into SSE wire format (``text/event-stream``).
+
+    If you yield a plain object (dict, Pydantic model, etc.) instead,
+    it's automatically JSON-encoded and sent as the ``data:`` field.
+    """
+
+    data: Any = None
+    raw_data: str | None = None
+    event: str | None = None
+    id: str | None = None
+    retry: int | None = Field(default=None, ge=0)
+    comment: str | None = None
+
+    @model_validator(mode="after")
+    def _check_id_no_null(self) -> "ServerSentEvent":
+        if self.id is not None and "\0" in self.id:
+            raise ValueError("SSE 'id' must not contain null characters")
+        if self.data is not None and self.raw_data is not None:
+            raise ValueError(
+                "Cannot set both 'data' and 'raw_data' on the same "
+                "ServerSentEvent. Use 'data' for JSON-serialized payloads "
+                "or 'raw_data' for pre-formatted strings."
+            )
+        return self
+
+
+def format_sse_event(
+    *,
+    data_str: str | None = None,
+    event: str | None = None,
+    id: str | None = None,
+    retry: int | None = None,
+    comment: str | None = None,
+) -> bytes:
+    """Build SSE wire-format bytes from pre-serialized data.
+
+    Always ends with ``\\n\\n`` (the event terminator).
+    """
+    lines: list[str] = []
+    if comment is not None:
+        for line in comment.splitlines():
+            lines.append(f": {line}")
+    if event is not None:
+        lines.append(f"event: {event}")
+    if data_str is not None:
+        for line in data_str.splitlines():
             lines.append(f"data: {line}")
+    if id is not None:
+        lines.append(f"id: {id}")
+    if retry is not None:
+        lines.append(f"retry: {retry}")
     lines.append("")
     lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines).encode("utf-8")
+
+
+# Keep-alive comment, per the SSE spec recommendation.
+KEEPALIVE_COMMENT = b": ping\n\n"
+
+# Seconds between keep-alive pings when a generator is idle.
+# Private but importable so tests can monkeypatch it.
+_PING_INTERVAL: float = 15.0

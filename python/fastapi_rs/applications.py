@@ -38,6 +38,7 @@ def _apply_response_model(
     exclude_defaults=False,
     exclude_none=False,
     by_alias=True,
+    endpoint_ctx=None,
 ):
     """Filter a handler result through a response_model Pydantic class.
 
@@ -46,6 +47,25 @@ def _apply_response_model(
     aliased fields (camelCase over snake_case, etc.).
     """
     if response_model is None or result is None:
+        return result
+
+    # Skip when the handler returned a Response object directly —
+    # Starlette Response / StreamingResponse / FileResponse etc. are
+    # pass-through, FA doesn't try to re-serialize them.
+    try:
+        from fastapi_rs.responses import Response as _RespBase
+        if isinstance(result, _RespBase):
+            return result
+    except ImportError:
+        pass
+
+    # Skip for generators / async generators — these flow into a
+    # ``StreamingResponse`` wrapper (via ``response_class``) rather
+    # than through response_model validation. Running TypeAdapter
+    # serialization on an ``Iterable[bytes]`` tries to utf-8-decode
+    # binary chunks and explodes.
+    import inspect as _inspect_mod
+    if _inspect_mod.isgenerator(result) or _inspect_mod.isasyncgen(result):
         return result
 
     has_filters = (
@@ -57,6 +77,34 @@ def _apply_response_model(
         or by_alias is False
     )
 
+    # Generic aliases like `list[UserOut]`, `dict[str, UserOut]`,
+    # `Optional[UserOut]` don't have `.model_validate`. Route them through
+    # Pydantic's TypeAdapter so that lists of SQLAlchemy ORM instances are
+    # dumped via `from_attributes`.
+    from fastapi_rs.exceptions import ResponseValidationError as _RVE
+    if not hasattr(response_model, "model_validate"):
+        from pydantic import TypeAdapter, ValidationError as _PyVE
+        try:
+            ta = TypeAdapter(response_model)
+        except Exception:  # noqa: BLE001
+            return result
+        dump_kwargs = {"by_alias": by_alias, "mode": "json"}
+        if include is not None:
+            dump_kwargs["include"] = include
+        if exclude is not None:
+            dump_kwargs["exclude"] = exclude
+        if exclude_unset:
+            dump_kwargs["exclude_unset"] = True
+        if exclude_defaults:
+            dump_kwargs["exclude_defaults"] = True
+        if exclude_none:
+            dump_kwargs["exclude_none"] = True
+        try:
+            validated = ta.validate_python(result, from_attributes=True)
+        except _PyVE as exc:
+            raise _RVE(errors=exc.errors(), body=result, endpoint_ctx=endpoint_ctx) from None
+        return ta.dump_python(validated, **dump_kwargs)
+
     try:
         # Always go through model_validate + model_dump when by_alias matters —
         # we can't take the fast "strip extra keys" path because field names
@@ -65,9 +113,32 @@ def _apply_response_model(
 
         import dataclasses as _dc
         if isinstance(result, dict):
+            # Even in the fast path we need to surface missing-required
+            # / wrong-type errors as ``ResponseValidationError`` — FA's
+            # guarantee is that a handler returning data that doesn't
+            # satisfy ``response_model`` raises, regardless of aliases.
+            # We also must include defaults for optional fields the
+            # handler didn't set (FA's ``model_dump`` includes them).
             if fast_path_ok:
                 model_fields = response_model.model_fields
-                return {k: v for k, v in result.items() if k in model_fields}
+                missing = [
+                    n for n, f in model_fields.items()
+                    if f.is_required() and n not in result
+                ]
+                if not missing:
+                    out: dict = {}
+                    for fname, finfo in model_fields.items():
+                        if fname in result:
+                            out[fname] = result[fname]
+                        elif not finfo.is_required():
+                            try:
+                                out[fname] = finfo.get_default(call_default_factory=True)
+                            except Exception:  # noqa: BLE001
+                                default = getattr(finfo, "default", None)
+                                if default is not None:
+                                    out[fname] = default
+                    return out
+                # Fall through to strict validation so Pydantic raises.
             validated = response_model.model_validate(result)
         elif hasattr(result, "model_dump"):
             if fast_path_ok and type(result) is response_model:
@@ -92,6 +163,12 @@ def _apply_response_model(
                     as_dict = {k: v for k, v in as_dict.items() if v is not None}
                 return as_dict
             validated = response_model.model_validate(as_dict)
+        elif hasattr(response_model, "model_validate"):
+            # Arbitrary object (typical SQLAlchemy ORM instance) — let
+            # Pydantic `from_attributes=True` pick up columns via attribute
+            # access. FastAPI's default behavior when `response_model` is a
+            # Pydantic model and the returned value is anything else.
+            validated = response_model.model_validate(result)
         else:
             return result
 
@@ -107,8 +184,19 @@ def _apply_response_model(
         if exclude_none:
             dump_kwargs["exclude_none"] = True
         return validated.model_dump(**dump_kwargs)
-    except Exception:
-        pass
+    except _RVE:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # FA raises ``ResponseValidationError`` when the handler's return
+        # can't satisfy ``response_model``. Promote pydantic
+        # ``ValidationError`` to our RVE; swallow anything else (keeps
+        # legacy behaviour for edge cases).
+        try:
+            from pydantic import ValidationError as _PyVE
+            if isinstance(exc, _PyVE):
+                raise _RVE(errors=exc.errors(), body=result, endpoint_ctx=endpoint_ctx) from None
+        except ImportError:
+            pass
     return result
 
 
@@ -232,6 +320,7 @@ def _try_compile_handler(
     response_model_by_alias=True,
     response_class=None,
     status_code=None,
+    path=None,
 ):
     """Compile deps + handler into a SINGLE Python function (1 PyO3 call instead of N+1).
 
@@ -244,6 +333,20 @@ def _try_compile_handler(
     - generator deps (yield): runs generator, captures value, cleans up after handler
     - response_model: filters the response through the model if set
     """
+    # Build the endpoint context FA surfaces in
+    # ``ValidationException.endpoint_ctx`` — file/line/function/path.
+    # Tests assert on ``"get_user" in str(exc)`` which uses this.
+    import inspect as _inspect_mod
+    _endpoint_ctx: dict = {}
+    try:
+        _endpoint_ctx["function"] = getattr(endpoint, "__name__", None)
+        _endpoint_ctx["file"] = _inspect_mod.getsourcefile(endpoint)
+        _endpoint_ctx["line"] = _inspect_mod.getsourcelines(endpoint)[1]
+    except (TypeError, OSError):
+        pass
+    if path is not None:
+        _endpoint_ctx["path"] = path
+
     _rm_include = response_model_include
     _rm_exclude = response_model_exclude
     _rm_exclude_unset = response_model_exclude_unset
@@ -259,6 +362,38 @@ def _try_compile_handler(
         p.get("enum_class") is not None and p.get("_is_handler_param")
         for p in params
     )
+    # Container-type coercion map: list[int] → set/frozenset/tuple when
+    # the handler's annotation is a sequence type other than ``list``.
+    # Rust always produces a ``list`` for repeated query/header params;
+    # we wrap it here so handlers that declare ``frozenset[int]`` get
+    # deduplicated input that matches FA / Pydantic semantics.
+    _container_coerce = {
+        p["name"]: p["container_type"]
+        for p in params
+        if p.get("container_type") and p.get("_is_handler_param")
+    }
+    _container_ctors = {"set": set, "frozenset": frozenset, "tuple": tuple}
+
+    def _apply_container_coerce(filtered: dict) -> None:
+        if not _container_coerce:
+            return
+        for _k, _name in _container_coerce.items():
+            if _k in filtered:
+                _ctor = _container_ctors.get(_name)
+                if _ctor is not None and not isinstance(filtered[_k], _ctor):
+                    try:
+                        filtered[_k] = _ctor(filtered[_k])
+                    except TypeError:
+                        pass
+
+    # Detect required body/form/file params — these want FA's
+    # "collect every missing field in one 422" behaviour, which
+    # needs the compiled wrapper path so Rust can defer extraction
+    # errors rather than returning on the first missing field.
+    _has_form_or_body_params = any(
+        p.get("required") and p.get("kind") in ("body", "form", "file")
+        for p in params
+    )
     if not dep_steps:
         if (
             response_model is not None
@@ -267,6 +402,8 @@ def _try_compile_handler(
             or _debug_on
             or status_code is not None
             or _has_enum_params
+            or _container_coerce
+            or _has_form_or_body_params
         ):
             # Even without deps, we may need response_model filtering or response_class wrapping
             handler_param_names = {p["name"] for p in params if p.get("_is_handler_param")}
@@ -278,11 +415,49 @@ def _try_compile_handler(
             }
             handler_func = endpoint
             if inspect.iscoroutinefunction(handler_func):
-                handler_func = _make_sync_wrapper(handler_func)
+                handler_func = _make_sync_wrapper(handler_func, for_handler=True)
 
             _app_ref = app
 
             def _compiled_no_deps(**kwargs):
+                # Drain any deferred extraction errors from Rust and
+                # surface them as a single 422 — matches FA's "one JSON
+                # body listing EVERY missing required field" behaviour
+                # even when the handler itself has no dep chain.
+                _pending = kwargs.pop("__fastapi_rs_extraction_errors__", None)
+                if _pending is not None:
+                    from fastapi_rs.responses import JSONResponse as _JSONResp
+                    import json as _json
+                    detail = _json.loads(_pending)
+                    # Route through ``@app.exception_handler(
+                    # RequestValidationError)`` — FA parity — capturing
+                    # the exception for ``TestClient`` to re-raise ONLY
+                    # when the user's handler re-raises (FA's semantic).
+                    try:
+                        from fastapi_rs.exceptions import (
+                            RequestValidationError as _RVE,
+                        )
+                        exc = _RVE(detail, endpoint_ctx=_endpoint_ctx)
+                        if (
+                            _app_ref is not None
+                            and _RVE in _app_ref.exception_handlers
+                        ):
+                            handler_raised = False
+                            try:
+                                handler_result = _app_ref._invoke_exception_handler_strict(exc)
+                            except Exception:  # noqa: BLE001
+                                handler_raised = True
+                                handler_result = None
+                            if handler_raised and _app_ref is not None:
+                                _app_ref._captured_server_exceptions.append(exc)
+                            if handler_result is not None:
+                                return handler_result
+                    except ImportError:
+                        pass
+                    return _JSONResp(
+                        content={"detail": detail},
+                        status_code=422,
+                    )
                 try:
                     filtered = {k: kwargs[k] for k in handler_param_names if k in kwargs}
                     # Coerce raw strings to Enum types (FastAPI does this automatically)
@@ -292,6 +467,7 @@ def _try_compile_handler(
                                 filtered[_ek] = _ecls(filtered[_ek])
                             except (ValueError, KeyError):
                                 pass
+                    _apply_container_coerce(filtered)
                     result = handler_func(**filtered)
                 except Exception as exc:
                     _maybe_print_debug_traceback(_app_ref, exc)
@@ -301,20 +477,52 @@ def _try_compile_handler(
                             return handler_result
                     raise
                 if response_model is not None:
-                    result = _apply_response_model(
-                        result, response_model,
-                        include=_rm_include, exclude=_rm_exclude,
-                        exclude_unset=_rm_exclude_unset,
-                        exclude_defaults=_rm_exclude_defaults,
-                        exclude_none=_rm_exclude_none,
-                        by_alias=_rm_by_alias,
-                    )
+                    try:
+                        result = _apply_response_model(
+                            result, response_model,
+                            include=_rm_include, exclude=_rm_exclude,
+                            exclude_unset=_rm_exclude_unset,
+                            exclude_defaults=_rm_exclude_defaults,
+                            exclude_none=_rm_exclude_none,
+                            by_alias=_rm_by_alias,
+                            endpoint_ctx=_endpoint_ctx,
+                        )
+                    except Exception as _rve:  # noqa: BLE001
+                        # Route through
+                        # ``@app.exception_handler(ResponseValidationError)``
+                        # if registered. Capture for TestClient's
+                        # ``raise_server_exceptions`` — if user's
+                        # handler raises, re-raise that. If no handler,
+                        # propagate so the test with ``pytest.raises``
+                        # sees the RVE.
+                        from fastapi_rs.exceptions import (
+                            ResponseValidationError as _RVE2,
+                        )
+                        if (
+                            _app_ref is not None
+                            and _RVE2 in _app_ref.exception_handlers
+                        ):
+                            handler_raised = False
+                            try:
+                                hdl_result = _app_ref._invoke_exception_handler_strict(_rve)
+                            except Exception:  # noqa: BLE001
+                                handler_raised = True
+                                hdl_result = None
+                            if handler_raised and _app_ref is not None:
+                                _app_ref._captured_server_exceptions.append(_rve)
+                                raise
+                            if hdl_result is not None:
+                                return hdl_result
+                        if _app_ref is not None:
+                            _app_ref._captured_server_exceptions.append(_rve)
+                        raise
                 if _response_class is not None:
                     result = _wrap_response_class(result, _response_class)
                 if status_code is not None:
                     result = _apply_status_code(result, status_code)
                 return result
 
+            _compiled_no_deps._fastapi_rs_defers_extraction_errors = True  # type: ignore[attr-defined]
             return _compiled_no_deps
         return None
 
@@ -342,51 +550,212 @@ def _try_compile_handler(
             dep.get("dep_input_map", []),
             dep.get("dep_callable_id"),
             is_generator,
+            # Propagate the user's `use_cache` flag — when False, the same
+            # dep callable is re-invoked for each usage within the request.
+            bool(dep.get("use_cache", True)),
+            # Accumulated Security(..., scopes=[...]) for this dep — used
+            # to populate SecurityScopes kwargs at call time. Tuple of
+            # (param_name, [scopes]) or None.
+            (
+                (dep.get("_security_scopes_param"), dep.get("_security_scopes") or [])
+                if dep.get("_security_scopes_param")
+                else None
+            ),
         ))
 
     handler_func = endpoint
     if inspect.iscoroutinefunction(handler_func):
-        handler_func = _make_sync_wrapper(handler_func)
+        handler_func = _make_sync_wrapper(handler_func, for_handler=True)
 
     # Capture app reference for override lookup at call time
     _app = app
 
+    # Cache of introspected override plans (signature params + nested deps).
+    # Keyed by id(override_callable). Mini-plan lets us filter kwargs to
+    # what the override accepts and resolve any sub-``Depends`` it declares.
+    _override_plan_cache: dict[int, dict[str, Any]] = {}
+
+    def _resolve_override_kwargs(
+        override_func, original_dk, resolved_env, app_obj, cache_obj
+    ):
+        """Shape ``dk`` for an override. Filter to params the override
+        accepts; for its own ``Depends()`` markers, resolve each sub-dep
+        (one level deep — nested overrides propagate through this same
+        path on the next call).
+        """
+        from fastapi_rs.dependencies import Depends as _Dep
+        plan = _override_plan_cache.get(id(override_func))
+        if plan is None:
+            try:
+                sig = inspect.signature(override_func)
+            except (TypeError, ValueError):
+                _override_plan_cache[id(override_func)] = {"accepted": None, "subs": {}}
+                return original_dk
+            accepted: set[str] = set()
+            subs: dict[str, tuple[Any, Any]] = {}
+            for pname, param in sig.parameters.items():
+                accepted.add(pname)
+                default = param.default
+                if isinstance(default, _Dep):
+                    subs[pname] = (default.dependency, default)
+                else:
+                    ann = param.annotation
+                    import typing as _typ
+                    if _typ.get_origin(ann) is _typ.Annotated:
+                        for meta in _typ.get_args(ann)[1:]:
+                            if isinstance(meta, _Dep):
+                                subs[pname] = (meta.dependency, meta)
+                                break
+            plan = {"accepted": accepted, "subs": subs}
+            _override_plan_cache[id(override_func)] = plan
+
+        accepted = plan["accepted"]
+        if accepted is None:
+            return original_dk
+
+        dk: dict[str, Any] = {k: v for k, v in original_dk.items() if k in accepted}
+        for pname, (sub_callable, _sub_marker) in plan["subs"].items():
+            # Respect nested dependency_overrides.
+            effective = sub_callable
+            if app_obj is not None and app_obj.dependency_overrides:
+                effective = app_obj.dependency_overrides.get(sub_callable, sub_callable)
+            sub_key = id(effective)
+            if sub_key in cache_obj:
+                dk[pname] = cache_obj[sub_key]
+                continue
+            # Resolve sub-dep's own kwargs recursively (one level).
+            sub_dk = _resolve_override_kwargs(effective, resolved_env, resolved_env, app_obj, cache_obj)
+            try:
+                if inspect.iscoroutinefunction(effective):
+                    sub_val = _make_sync_wrapper(effective)(**sub_dk)
+                else:
+                    sub_val = effective(**sub_dk)
+            except TypeError as te:
+                # Override's sub-dep needs request-bound params we never
+                # extracted (e.g. a query param ``k`` that the original
+                # chain didn't require). Convert to a FA-shaped 422 —
+                # identifying missing required params from the
+                # signature.
+                msg = str(te)
+                missing = []
+                try:
+                    sig = inspect.signature(effective)
+                    for pn, p in sig.parameters.items():
+                        if pn not in sub_dk and p.default is inspect.Parameter.empty:
+                            missing.append(pn)
+                except Exception:  # noqa: BLE001
+                    pass
+                if missing:
+                    from fastapi_rs.exceptions import HTTPException as _HE
+                    detail = [
+                        {
+                            "type": "missing",
+                            "loc": ["query", m],
+                            "msg": "Field required",
+                            "input": None,
+                        }
+                        for m in missing
+                    ]
+                    raise _HE(status_code=422, detail=detail) from None
+                raise
+            dk[pname] = sub_val
+            cache_obj[sub_key] = sub_val
+        return dk
+
     def _compiled(**kwargs):
+        # FastAPI semantics: a ``Depends(...)`` that raises
+        # ``HTTPException`` short-circuits BEFORE parameter validation
+        # errors surface. Rust collects extraction errors and stashes
+        # them in a private kwarg so we can try running deps first —
+        # if any dep raises ``HTTPException`` that response wins; if
+        # all deps succeed we then emit the queued 422.
+        _pending_extraction_errors_json = kwargs.pop(
+            "__fastapi_rs_extraction_errors__", None
+        )
         resolved = kwargs
         cache = {}
-        generators_to_cleanup = []
+        generators_to_cleanup: list[tuple] = []
+        # Starlette/FastAPI semantics: yield-dep teardown runs AFTER the
+        # response has been built and the middleware chain has unwound.
+        # If this call originates from a middleware-wrapped entry point,
+        # `_middleware_request` is present in kwargs and carries a
+        # `_pending_teardowns` list that the outer wrapper drains once
+        # the MW chain returns. When no middleware is in play we fall back
+        # to running teardown in our own finally block (no deferral
+        # possible).
+        _mw_req = kwargs.get("_middleware_request")
+        _defer_teardown = _mw_req is not None
+        if _defer_teardown:
+            if not hasattr(_mw_req, "_pending_teardowns"):
+                _mw_req._pending_teardowns = []
 
         try:
-            for name, func, original_func, input_map, func_id, is_generator in dep_chain:
+            for name, func, original_func, input_map, func_id, is_generator, use_cache, sec_scopes_info in dep_chain:
                 # Check dependency_overrides at call time (P0 fix #1)
                 actual_func = func
+                override_used = None
                 if _app is not None and _app.dependency_overrides:
                     override = _app.dependency_overrides.get(original_func)
                     if override is not None:
+                        override_used = override
                         actual_func = override
                         if inspect.iscoroutinefunction(actual_func):
                             actual_func = _make_sync_wrapper(actual_func)
 
-                if func_id is not None and func_id in cache:
+                # Respect `use_cache=False` — force a fresh call for each
+                # usage of this dep within the request (FastAPI semantics).
+                if use_cache and func_id is not None and func_id in cache:
                     resolved[name] = cache[func_id]
+                    continue
+                # Skip deps whose required inputs never arrived — when
+                # there are queued extraction errors, a missing input
+                # is what the user will see in the 422 anyway. Running
+                # the dep body with missing kwargs would just raise a
+                # confusing TypeError. But when an override is in play,
+                # run it regardless: the override's signature may not
+                # need the missing inputs at all (FA parity for
+                # ``dependency_overrides``).
+                if (
+                    override_used is None
+                    and _pending_extraction_errors_json is not None
+                    and any(sk not in resolved for _, sk in input_map)
+                ):
                     continue
                 dk = {pn: resolved[sk] for pn, sk in input_map if sk in resolved}
 
+                # Populate this dep's SecurityScopes param with the
+                # accumulated ``Security(..., scopes=[...])`` scopes
+                # from the call chain. Rust injected an empty
+                # SecurityScopes placeholder; we replace it here.
+                if sec_scopes_info is not None:
+                    _ss_param, _ss_list = sec_scopes_info
+                    try:
+                        from fastapi_rs.security import SecurityScopes as _SS
+                        dk[_ss_param] = _SS(scopes=list(_ss_list))
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                if override_used is not None:
+                    # Override may have a different signature from the
+                    # original (fewer params, or its own Depends sub-deps).
+                    # Drop kwargs the override doesn't accept, and resolve
+                    # its sub-deps via a lazily-built mini-plan.
+                    dk = _resolve_override_kwargs(
+                        override_used, dk, resolved, _app, cache
+                    )
+
                 if is_generator:
-                    # Generator dep (yield) support — sync generators drive via
-                    # next(); async generators via anext() on a one-shot loop so
-                    # we stay on the same thread as the rest of the handler.
+                    # Generator dep (yield) support — sync generators drive
+                    # via next(); async generators via the shared worker loop
+                    # so asyncpg / redis.asyncio connection pools (created on
+                    # the worker loop at startup) continue to work. Using a
+                    # one-shot loop here would invalidate pool state.
                     gen = actual_func(**dk)
                     if inspect.isasyncgen(gen):
-                        import asyncio as _asyncio
-                        loop = _asyncio.new_event_loop()
-                        try:
-                            result = loop.run_until_complete(gen.__anext__())
-                        finally:
-                            # Keep the generator for cleanup AFTER the handler.
-                            # Don't close the loop — we'll reuse it for cleanup.
-                            pass
-                        generators_to_cleanup.append((gen, loop))
+                        from fastapi_rs._async_worker import submit as _submit
+                        result = _submit(gen.__anext__())
+                        # Sentinel "worker" so teardown knows to route back.
+                        generators_to_cleanup.append((gen, "worker"))
                     else:
                         result = next(gen)
                         generators_to_cleanup.append((gen, None))
@@ -394,7 +763,7 @@ def _try_compile_handler(
                     result = actual_func(**dk)
 
                 resolved[name] = result
-                if func_id is not None:
+                if use_cache and func_id is not None:
                     cache[func_id] = result
         except Exception as dep_exc:
             # Dependency raised — route through exception_handlers like
@@ -407,6 +776,56 @@ def _try_compile_handler(
                     return handler_result
             raise
 
+        # All deps succeeded without raising. If Rust queued any
+        # extraction errors (missing headers, unparseable path params,
+        # etc.) surface them now — matches FA's post-dep validation
+        # order. BUT when dependency_overrides replace deps whose input
+        # params are what triggered the 422, the override may have
+        # legitimately satisfied the handler — in that case swallow
+        # queued errors that don't correspond to a still-missing
+        # handler param.
+        if _pending_extraction_errors_json is not None:
+            from fastapi_rs.responses import JSONResponse as _JSONResp
+            import json as _json
+            detail = _json.loads(_pending_extraction_errors_json)
+            # Filter: keep only errors whose first non-section loc item
+            # matches a handler param that's STILL unresolved. If the
+            # override made the dep succeed, the error isn't user-visible.
+            if _app is not None and _app.dependency_overrides:
+                kept = []
+                for err in detail:
+                    loc = err.get("loc") or []
+                    leaf = loc[-1] if loc else None
+                    if leaf in handler_param_names and leaf not in resolved:
+                        kept.append(err)
+                detail = kept
+            if detail:
+                # Route through ``@app.exception_handler(RequestValidationError)``
+                # if registered; otherwise fall back to the default
+                # ``{"detail": [...]}`` 422 body. Only capture for
+                # ``TestClient`` re-raise when the handler itself raised
+                # (matching FA's raise-propagates-out semantic).
+                try:
+                    from fastapi_rs.exceptions import (
+                        RequestValidationError as _RVE,
+                    )
+                    exc = _RVE(detail, endpoint_ctx=_endpoint_ctx)
+                    if _app is not None and _RVE in _app.exception_handlers:
+                        handler_raised = False
+                        try:
+                            handler_result = _app._invoke_exception_handler_strict(exc)
+                        except Exception:  # noqa: BLE001
+                            handler_raised = True
+                            handler_result = None
+                        if handler_raised and _app is not None:
+                            _app._captured_server_exceptions.append(exc)
+                        if handler_result is not None:
+                            return handler_result
+                except ImportError:
+                    pass
+                return _JSONResp(content={"detail": detail}, status_code=422)
+
+        _raised_exc = None
         try:
             try:
                 _hkwargs = {k: resolved[k] for k in handler_param_names if k in resolved}
@@ -417,25 +836,69 @@ def _try_compile_handler(
                             _hkwargs[_ek] = _ecls(_hkwargs[_ek])
                         except (ValueError, KeyError):
                             pass
+                _apply_container_coerce(_hkwargs)
                 result = handler_func(**_hkwargs)
             except Exception as exc:
+                _raised_exc = exc
                 # In debug mode, surface the full traceback on non-HTTPException errors.
                 _maybe_print_debug_traceback(_app, exc)
-                # Route through app's exception_handlers if one is registered
+                # Route through app's exception_handlers if one is registered.
+                # Before handling, run yield-dep teardown with the
+                # exception THROWN in — this mirrors FA's behaviour,
+                # letting the yield-dep's ``except`` clause observe the
+                # error (the test suite asserts on this).
+                if generators_to_cleanup:
+                    _run_pending_teardowns(
+                        reversed(generators_to_cleanup), throw_exc=exc
+                    )
+                    generators_to_cleanup.clear()
                 if _app is not None and _app.exception_handlers:
                     handler_result = _app._invoke_exception_handler(exc)
                     if handler_result is not None:
                         return handler_result
+                # Capture non-HTTP exceptions so ``TestClient`` with
+                # ``raise_server_exceptions=True`` can re-raise them in
+                # the test thread (FA parity).
+                try:
+                    from fastapi_rs.exceptions import HTTPException as _HE
+                    if _app is not None and not isinstance(exc, _HE):
+                        _app._captured_server_exceptions.append(exc)
+                except ImportError:
+                    pass
                 raise
             # Apply response_model filtering (P0 fix #5)
             if response_model is not None:
-                result = _apply_response_model(
-                    result, response_model,
-                    include=_rm_include, exclude=_rm_exclude,
-                    exclude_unset=_rm_exclude_unset,
-                    exclude_defaults=_rm_exclude_defaults,
-                    exclude_none=_rm_exclude_none,
-                )
+                try:
+                    result = _apply_response_model(
+                        result, response_model,
+                        include=_rm_include, exclude=_rm_exclude,
+                        exclude_unset=_rm_exclude_unset,
+                        exclude_defaults=_rm_exclude_defaults,
+                        exclude_none=_rm_exclude_none,
+                        endpoint_ctx=_endpoint_ctx,
+                    )
+                except Exception as _rve:  # noqa: BLE001
+                    from fastapi_rs.exceptions import (
+                        ResponseValidationError as _RVE2,
+                    )
+                    if (
+                        _app is not None
+                        and _RVE2 in _app.exception_handlers
+                    ):
+                        handler_raised = False
+                        try:
+                            hdl_result = _app._invoke_exception_handler_strict(_rve)
+                        except Exception:  # noqa: BLE001
+                            handler_raised = True
+                            hdl_result = None
+                        if handler_raised and _app is not None:
+                            _app._captured_server_exceptions.append(_rve)
+                            raise
+                        if hdl_result is not None:
+                            return hdl_result
+                    if _app is not None:
+                        _app._captured_server_exceptions.append(_rve)
+                    raise
             # Wrap in response_class if set
             if _response_class is not None:
                 result = _wrap_response_class(result, _response_class)
@@ -443,23 +906,84 @@ def _try_compile_handler(
                 result = _apply_status_code(result, status_code)
             return result
         finally:
-            # Clean up generator deps in reverse order — sync via next(),
-            # async via anext() on the one-shot loop captured earlier.
-            for gen, loop in reversed(generators_to_cleanup):
-                try:
-                    if loop is not None:
-                        try:
-                            loop.run_until_complete(gen.__anext__())
-                        except StopAsyncIteration:
-                            pass
-                        finally:
-                            loop.close()
-                    else:
-                        next(gen)
-                except StopIteration:
-                    pass
+            # Starlette/FastAPI semantics: yield-dep teardown runs AFTER
+            # the middleware chain unwinds, not before. That lets a
+            # middleware body read the state mutated during handler
+            # execution — e.g.
+            # ``response.headers[x] = state.copy()`` in
+            # ``test_dependency_contextmanager`` sees ``"started"`` not
+            # ``"completed"``. When middleware is present, we stash the
+            # teardowns on the middleware request and the outer wrapper
+            # drains them post-response. Otherwise run inline.
+            if _defer_teardown and _mw_req is not None:
+                _mw_req._pending_teardowns.extend(
+                    reversed(generators_to_cleanup)
+                )
+            else:
+                _run_pending_teardowns(reversed(generators_to_cleanup))
+
+    # Marker for the Rust router: this compiled handler knows how to
+    # consume a deferred extraction-errors blob, so Rust should stash
+    # (not raise) 422s and let dep bodies run first — matching FA's
+    # "HTTPException from Depends wins over param validation" rule.
+    _compiled._fastapi_rs_defers_extraction_errors = True  # type: ignore[attr-defined]
 
     return _compiled
+
+
+def _run_pending_teardowns(teardowns, throw_exc: BaseException | None = None) -> None:
+    """Drain a reversed-order iterable of (gen, loop) tuples.
+
+    Sync yield-deps resume via `next()`; async yield-deps resume on the
+    shared worker loop via `_async_worker.submit()` so that asyncpg /
+    redis.asyncio teardown (`await session.close()`, `await conn.close()`)
+    runs on the same loop that created the connections.
+    """
+    # Throw-aware teardown: when the handler raised, ``throw_exc`` is
+    # set and we push it into each generator via ``gen.throw(...)``
+    # (or ``gen.athrow(...)`` for async generators) — letting the
+    # yield-dep's ``except`` clause observe the error. FA's parity
+    # tests assert that a ``try: yield ... except MyError: errors.append
+    # (...)`` block runs when the handler raises ``MyError``.
+    for gen, loop in teardowns:
+        try:
+            if loop == "worker":
+                from fastapi_rs._async_worker import submit as _submit
+                try:
+                    if throw_exc is not None and hasattr(gen, "athrow"):
+                        _submit(gen.athrow(throw_exc))
+                    else:
+                        _submit(gen.__anext__())
+                except StopAsyncIteration:
+                    pass
+            elif loop is not None:
+                try:
+                    if throw_exc is not None and hasattr(gen, "athrow"):
+                        loop.run_until_complete(gen.athrow(throw_exc))
+                    else:
+                        loop.run_until_complete(gen.__anext__())
+                except StopAsyncIteration:
+                    pass
+                finally:
+                    loop.close()
+            else:
+                if throw_exc is not None:
+                    gen.throw(throw_exc)
+                else:
+                    next(gen)
+        except StopIteration:
+            pass
+        except BaseException as exc:  # noqa: BLE001
+            # Teardown-raised errors:
+            # - if we threw the original exception in and the generator
+            #   re-raised it (or a different one), treat that as the
+            #   new "current" exception to propagate
+            # - otherwise Starlette's default: swallow and log.
+            if throw_exc is not None and exc is not throw_exc:
+                # Gen re-raised a different exception — let it surface.
+                raise
+            # else: swallow silently.
+            pass
 
 
 # Imports hoisted to module-level for the hot path (used by wrapped endpoints)
@@ -469,6 +993,11 @@ from fastapi_rs.responses import JSONResponse as _JSONResponse
 
 def _wrap_with_http_middlewares(endpoint, middlewares, app):
     """Wrap a route endpoint with a chain of @app.middleware("http") functions.
+
+    FastAPI/Starlette semantics: the LAST-decorated middleware is the
+    OUTERMOST (runs first on request, last on response). Reverse the
+    declaration-order list so `middlewares[0]` is outermost after the
+    recursive chain-builder.
 
     FAST PATH: Drive the async middleware chain SYNCHRONOUSLY via coro.send(None).
     Most HTTP middlewares only `await call_next(request)` — they don't do real I/O.
@@ -481,6 +1010,8 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
     """
     if not middlewares:
         return endpoint
+    # FA: reverse declaration order so last-decorated is outermost.
+    middlewares = list(reversed(middlewares))
 
     is_async_endpoint = inspect.iscoroutinefunction(endpoint)
 
@@ -498,10 +1029,10 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
 
     def _call_handler_sync(kwargs):
         """Run the underlying handler, returning a Response-normalized value."""
-        # Replace any Rust-injected Request objects with the middleware's
-        # Request so that request.state set by middleware propagates to the
-        # handler. The middleware Request shares state with the middleware chain.
-        mw_request = kwargs.pop("_middleware_request", None)
+        # Keep `_middleware_request` in kwargs (don't pop) so the compiled
+        # handler can see it and defer yield-dep teardown onto the MW
+        # wrapper's finally block — Starlette's ordering semantics.
+        mw_request = kwargs.get("_middleware_request")
         if mw_request is not None:
             for key in list(kwargs.keys()):
                 val = kwargs.get(key)
@@ -514,23 +1045,72 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
                     # Copy over the state from middleware's Request
                     kwargs[key] = mw_request
                     break
-        if is_async_endpoint:
-            coro = endpoint(**kwargs)
-            try:
-                coro.send(None)
-                # Suspended — fall back
-                coro.close()
-                raise _MiddlewareSuspendedError()
-            except StopIteration as e:
-                result = e.value
-        else:
-            result = endpoint(**kwargs)
-        # Normalize bare dict/list to a Response so middleware can mutate headers
+        # Starlette inserts an `ExceptionMiddleware` layer BETWEEN the user's
+        # `@app.middleware("http")` stack and the route itself. That layer
+        # turns `HTTPException` / registered exception classes into proper
+        # JSON responses before the user MW sees them. Without an equivalent
+        # conversion here, our user-MW `except` clauses would catch
+        # `HTTPException` and mangle it — diverging from FastAPI.
+        # When the endpoint is a RAW user handler (no ``_try_compile_handler``
+        # wrap, which happens for no-deps / no-response-model routes), it
+        # won't accept our framework-private kwargs. Filter them out.
+        _call_kwargs = kwargs
+        if not getattr(endpoint, "_has_http_middleware", False) and not getattr(
+            endpoint, "_fastapi_rs_defers_extraction_errors", False
+        ):
+            # Only strip the internal-only keys — every other kwarg is
+            # a real handler arg resolved by Rust.
+            _PRIVATE = {
+                "_middleware_request",
+                "__fastapi_rs_extraction_errors__",
+                "_request_method",
+                "_request_path",
+                "_request_query",
+                "_request_headers",
+            }
+            if any(k in kwargs for k in _PRIVATE):
+                _call_kwargs = {k: v for k, v in kwargs.items() if k not in _PRIVATE}
+        try:
+            if is_async_endpoint:
+                coro = endpoint(**_call_kwargs)
+                try:
+                    coro.send(None)
+                    # Suspended — fall back
+                    coro.close()
+                    raise _MiddlewareSuspendedError()
+                except StopIteration as e:
+                    result = e.value
+            else:
+                result = endpoint(**_call_kwargs)
+        except _MiddlewareSuspendedError:
+            raise
+        except BaseException as exc:  # noqa: BLE001
+            from fastapi_rs.exceptions import HTTPException as _HTTPExc
+            if isinstance(exc, _HTTPExc):
+                # Build a JSONResponse with the exception's status/detail —
+                # matches Starlette's ExceptionMiddleware conversion.
+                detail = exc.detail if exc.detail is not None else "Internal Server Error"
+                result = _JSONResponse(
+                    content={"detail": detail},
+                    status_code=exc.status_code,
+                    headers=exc.headers,
+                )
+            elif app is not None and app.exception_handlers:
+                handled = app._invoke_exception_handler(exc)
+                if handled is None:
+                    raise
+                result = handled
+            else:
+                raise
+        # Normalize raw handler return values into a ``Response`` before
+        # the middleware chain sees them — FA's ExceptionMiddleware does
+        # the same, and user middlewares that do
+        # ``response.headers[...]`` assume a real Response. Default is
+        # ``JSONResponse`` (matching FA's app-level default) so bare
+        # strings get JSON-encoded (``"hello"`` not ``hello``).
         if result is None or hasattr(result, "status_code"):
             return result
-        if isinstance(result, (dict, list)):
-            return _JSONResponse(content=result)
-        return result
+        return _JSONResponse(content=result)
 
     # Build a chain of sync callables. Each one drives its middleware via
     # coro.send(None) and returns the result. The innermost one calls the handler.
@@ -580,10 +1160,32 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
         # This ensures request.state set by middleware propagates to the handler.
         kwargs["_middleware_request"] = request
         try:
-            return runner(request, kwargs)
-        except _MiddlewareSuspendedError:
-            # Fallback: drive everything through a fresh event loop
-            return _drive_async_fallback(endpoint, middlewares, app, kwargs, is_async_endpoint)
+            try:
+                return runner(request, kwargs)
+            except _MiddlewareSuspendedError:
+                # Fallback: drive everything through a fresh event loop
+                return _drive_async_fallback(endpoint, middlewares, app, kwargs, is_async_endpoint)
+        finally:
+            # Drain deferred yield-dep teardowns AFTER the middleware chain
+            # has unwound, matching FA's scoping. Middleware bodies see
+            # ``state = "started"`` even though teardown would set it to
+            # ``"completed"``. If the handler also registered background
+            # tasks (real user tasks, not our synthetic teardown), run
+            # them HERE inline so user tasks see "started" state
+            # too — then run yield-dep teardowns last (FA parity: bg
+            # tasks observe pre-teardown state).
+            tears = getattr(request, "_pending_teardowns", None)
+            if tears:
+                from fastapi_rs.background import BackgroundTasks as _BGT
+                bg = None
+                for v in kwargs.values():
+                    if isinstance(v, _BGT):
+                        bg = v
+                        break
+                if bg is not None and bg._tasks:
+                    bg.run_sync()
+                _run_pending_teardowns(tears)
+                request._pending_teardowns = []
 
     wrapped_sync._has_http_middleware = True
     return wrapped_sync
@@ -766,6 +1368,11 @@ class FastAPI:
         # @app.middleware("http") registered middlewares — Python-side HTTP middlewares
         # that wrap each user route handler.
         self._http_middlewares: list[Callable] = []
+        # Server-side exceptions worth re-raising in the test thread
+        # (``ResponseValidationError``, ``FastAPIError``, raw ``ValueError``s
+        # raised during request dispatch). ``TestClient`` drains this after
+        # every request when ``raise_server_exceptions=True``.
+        self._captured_server_exceptions: list[BaseException] = []
         self._on_startup: list[Callable] = []
         self._on_shutdown: list[Callable] = []
         self._included_routers: list[tuple[APIRouter, str, list[str], dict]] = []
@@ -874,11 +1481,67 @@ class FastAPI:
 
     @property
     def routes(self) -> list:
-        """Return all collected route objects (Starlette/FastAPI compatibility)."""
+        """Return all collected route objects with their effective paths.
+
+        Matches FastAPI/Starlette: child routers contributed via
+        ``include_router(prefix=...)`` surface as APIRoute instances whose
+        ``.path`` already reflects the merged prefix (so callers — OpenAPI
+        extensions, reverse-lookup helpers, Sentry integrations, etc. —
+        see the same strings they'd see on stock FastAPI).
+        """
         all_routes = list(self.router.routes)
-        for router, _prefix, _tags, _meta in self._included_routers:
-            all_routes.extend(router.routes)
+        for router, include_prefix, _tags, _meta in self._included_routers:
+            # `include_router(prefix=...)` stacks on top of the router's
+            # own `.prefix` attribute. Both need to appear in the final
+            # effective path.
+            effective = (include_prefix or "") + (getattr(router, "prefix", "") or "")
+            all_routes.extend(self._flatten_child_routes(router, effective))
         return all_routes
+
+    @staticmethod
+    def _flatten_child_routes(router, prefix: str) -> list:
+        """Walk a child router recursively, yielding clones of each route
+        whose path has the cumulative prefix prepended. Clones are shallow
+        (we just swap the ``path`` attribute) so the underlying handlers
+        and metadata remain shared.
+        """
+        import copy as _copy
+
+        out: list = []
+        cleaned_prefix = prefix or ""
+
+        def _join(parent_prefix: str, child_path: str) -> str:
+            if not parent_prefix:
+                return child_path
+            trailing = child_path.endswith("/") and child_path != "/"
+            joined = parent_prefix.rstrip("/") + "/" + child_path.lstrip("/")
+            if joined == "":
+                return "/"
+            if trailing and not joined.endswith("/"):
+                joined += "/"
+            return joined
+
+        for route in router.routes:
+            clone = _copy.copy(route)
+            clone.path = _join(cleaned_prefix, getattr(route, "path", ""))
+            out.append(clone)
+
+        # Recurse into nested ``router.include_router(...)`` chains — stack
+        # the include-prefix AND the child router's own ``.prefix`` on top
+        # of whatever prefix we already have.
+        nested = getattr(router, "_included_routers", None)
+        if nested:
+            for entry in nested:
+                if len(entry) >= 2:
+                    child_router, child_include_prefix = entry[0], entry[1]
+                else:
+                    continue
+                stacked = cleaned_prefix
+                for piece in (child_include_prefix or "", getattr(child_router, "prefix", "") or ""):
+                    if piece:
+                        stacked = stacked.rstrip("/") + "/" + piece.lstrip("/")
+                out.extend(FastAPI._flatten_child_routes(child_router, stacked))
+        return out
 
     # ------------------------------------------------------------------
     # Mount sub-applications
@@ -919,6 +1582,7 @@ class FastAPI:
             "deprecated": deprecated,
             "include_in_schema": include_in_schema,
             "default_response_class": default_response_class,
+            "generate_unique_id_function": generate_unique_id_function,
         }
         self._included_routers.append((router, prefix, tags or [], include_meta))
 
@@ -1068,6 +1732,32 @@ class FastAPI:
             return self.exception_handlers[status_code]
         return None
 
+    def _invoke_exception_handler_strict(self, exc: BaseException):
+        """Like ``_invoke_exception_handler`` but LET raised exceptions
+        propagate to the caller. FA's user-registered handler can
+        ``raise exc`` to signal "don't suppress, pass through to
+        TestClient's re-raise path" — and we need to distinguish that
+        from the handler returning a response normally.
+        """
+        handler = self._lookup_exception_handler(exc)
+        if handler is None:
+            return None
+        from fastapi_rs.requests import Request
+        request = Request({"type": "http", "app": self})
+        if inspect.iscoroutinefunction(handler):
+            coro = handler(request, exc)
+            try:
+                coro.send(None)
+            except StopIteration as e:
+                return e.value
+            coro.close()
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(handler(request, exc))
+            finally:
+                loop.close()
+        return handler(request, exc)
+
     def _invoke_exception_handler(self, exc: BaseException):
         """Run a registered exception handler and return its Response-like result.
 
@@ -1108,6 +1798,140 @@ class FastAPI:
     # Route collection & introspection
     # ------------------------------------------------------------------
 
+    def _wrap_websocket_endpoint(self, endpoint):
+        """Build a thin wrapper around a WebSocket endpoint that
+        - attaches ``ws.app`` so handlers can reach ``app.state``,
+        - resolves ``Depends(...)`` parameters,
+        - catches ``WebSocketException`` (before accept → HTTP reject via
+          ``ws._reject``; after accept → close with the given code), and
+        - invokes the user handler with the right kwargs.
+        """
+        import inspect as _inspect
+        from fastapi_rs.dependencies import Depends as _Depends
+        from fastapi_rs.websockets import WebSocket as _WebSocket, WebSocketState as _WSState
+        from fastapi_rs.exceptions import WebSocketException as _WSExc
+
+        try:
+            sig = _inspect.signature(endpoint)
+        except (TypeError, ValueError):
+            sig = None
+
+        # Resolve stringified annotations (`from __future__ import
+        # annotations`) so we can identify the WebSocket parameter by
+        # class identity rather than by string name — some handlers
+        # pass the WS under different aliases (`websocket`, `conn`…).
+        try:
+            type_hints = _inspect.get_type_hints(endpoint)
+        except Exception:  # noqa: BLE001
+            type_hints = {}
+
+        def _is_websocket_annotation(name: str, raw_ann) -> bool:
+            ann = type_hints.get(name, raw_ann)
+            if ann is _WebSocket:
+                return True
+            if isinstance(ann, type) and issubclass(ann, _WebSocket):
+                return True
+            # Fall back to string comparison for deferred-eval
+            # annotations that ``get_type_hints`` couldn't resolve
+            # (e.g. referenced modules that weren't importable).
+            if isinstance(raw_ann, str) and raw_ann in ("WebSocket", "fastapi_rs.websockets.WebSocket"):
+                return True
+            return False
+
+        dep_params: list[tuple[str, object, bool]] = []
+        ws_param_name: str | None = None
+        if sig is not None:
+            for name, param in sig.parameters.items():
+                default = param.default
+                if isinstance(default, _Depends):
+                    dep_func = default.dependency
+                    if dep_func is None:
+                        continue
+                    is_async = _inspect.iscoroutinefunction(dep_func)
+                    dep_params.append((name, dep_func, is_async))
+                    continue
+                if _is_websocket_annotation(name, param.annotation):
+                    ws_param_name = name
+
+        is_async_endpoint = _inspect.iscoroutinefunction(endpoint)
+        app_ref = self
+
+        def _resolve_dep(dep_func, ws, is_async_dep):
+            dep_sig = _inspect.signature(dep_func)
+            try:
+                dep_hints = _inspect.get_type_hints(dep_func)
+            except Exception:  # noqa: BLE001
+                dep_hints = {}
+            dep_kwargs: dict = {}
+            for p_name, p in dep_sig.parameters.items():
+                ann = dep_hints.get(p_name, p.annotation)
+                raw = p.annotation
+                if (
+                    ann is _WebSocket
+                    or (isinstance(ann, type) and issubclass(ann, _WebSocket))
+                    or (isinstance(raw, str) and raw in ("WebSocket", "fastapi_rs.websockets.WebSocket"))
+                ):
+                    dep_kwargs[p_name] = ws
+            if is_async_dep:
+                from fastapi_rs._async_worker import submit as _submit
+                return _submit(dep_func(**dep_kwargs))
+            return dep_func(**dep_kwargs)
+
+        def _handle_ws_exc(ws, exc: _WSExc) -> None:
+            # Starlette: pre-accept → reject the HTTP handshake with a
+            # non-2xx status; post-accept → close with the WS code.
+            if ws.application_state == _WSState.CONNECTING:
+                ws._reject(403)
+                return
+            try:
+                code = exc.code if exc.code is not None else 1000
+                reason = exc.reason or ""
+                ws._ws.close(code, reason)
+            except Exception:  # noqa: BLE001
+                pass
+
+        if is_async_endpoint:
+            async def _ws_entry(ws, **path_kwargs):
+                ws._app = app_ref
+                try:
+                    resolved: dict = {}
+                    for name, dep_func, is_async_dep in dep_params:
+                        resolved[name] = _resolve_dep(dep_func, ws, is_async_dep)
+                    kwargs: dict = dict(path_kwargs)
+                    if ws_param_name is not None:
+                        kwargs[ws_param_name] = ws
+                    kwargs.update(resolved)
+                    await endpoint(**kwargs)
+                except _WSExc as exc:
+                    _handle_ws_exc(ws, exc)
+                except Exception:
+                    # Abort the handshake cleanly on any unhandled
+                    # exception so the client sees an HTTP 500 instead
+                    # of hanging until the 30-second accept timeout.
+                    if ws.application_state == _WSState.CONNECTING:
+                        ws._reject(500)
+                    raise
+            return _ws_entry
+
+        def _ws_entry_sync(ws, **path_kwargs):
+            ws._app = app_ref
+            try:
+                resolved: dict = {}
+                for name, dep_func, is_async_dep in dep_params:
+                    resolved[name] = _resolve_dep(dep_func, ws, is_async_dep)
+                kwargs: dict = dict(path_kwargs)
+                if ws_param_name is not None:
+                    kwargs[ws_param_name] = ws
+                kwargs.update(resolved)
+                endpoint(**kwargs)
+            except _WSExc as exc:
+                _handle_ws_exc(ws, exc)
+            except Exception:
+                if ws.application_state == _WSState.CONNECTING:
+                    ws._reject(500)
+                raise
+        return _ws_entry_sync
+
     def _get_all_dependencies_for_route(
         self, router: APIRouter, route, include_deps: list | None = None,
     ) -> list:
@@ -1124,6 +1948,26 @@ class FastAPI:
         merged.extend(route.dependencies)
         return merged
 
+    def _apply_generate_unique_id(
+        self,
+        route,
+        include_fn: Callable | None,
+        router: APIRouter,
+    ) -> str | None:
+        """FA's operationId cascade: route → include → router → app."""
+        fn = (
+            getattr(route, "generate_unique_id_function", None)
+            or include_fn
+            or getattr(router, "generate_unique_id_function", None)
+            or getattr(self, "generate_unique_id_function", None)
+        )
+        if fn is None:
+            return None
+        try:
+            return fn(route)
+        except TypeError:
+            return fn(route, (route.methods or ["GET"])[0].lower())
+
     def _collect_routes_from_router(
         self,
         router: APIRouter,
@@ -1134,6 +1978,7 @@ class FastAPI:
         include_deprecated: bool | None = None,
         include_in_schema: bool = True,
         include_default_response_class: Any = None,
+        include_generate_unique_id_function: Callable | None = None,
     ) -> list[dict[str, Any]]:
         """Recursively flatten a router tree into a list of route dicts."""
         extra_tags = extra_tags or []
@@ -1150,20 +1995,33 @@ class FastAPI:
 
         for route in router.routes:
             full_path = full_prefix + route.path
-            # Normalise double slashes but keep leading slash
-            full_path = "/" + full_path.strip("/") if full_path != "/" else "/"
+            # Normalise accidental double-slash at a join point (e.g.
+            # prefix="/api/" + route="/items") without losing a trailing
+            # slash that the user declared on purpose — FastAPI/Starlette
+            # treat `/items` and `/items/` as distinct routes, and the
+            # redirect-slashes middleware depends on that distinction.
+            if full_path != "/":
+                had_trailing = full_path.endswith("/")
+                full_path = "/" + full_path.strip("/")
+                if had_trailing:
+                    full_path += "/"
 
             is_websocket = getattr(route, "_is_websocket", False)
 
             if is_websocket:
-                # WebSocket routes don't go through normal param introspection.
-                # The handler receives a single WebSocket argument injected by Rust.
+                # WebSocket endpoints accept the WebSocket object (always
+                # positional) plus optional ``Depends(...)`` parameters.
+                # Rust only injects the WS + path params, so we wrap the
+                # user's handler to resolve deps BEFORE the user code runs.
+                # A pre-accept ``WebSocketException`` aborts the handshake
+                # with the carried code (Starlette normative path).
+                wrapped_ws = self._wrap_websocket_endpoint(route.endpoint)
                 collected.append(
                     {
                         "path": full_path,
                         "methods": ["GET"],
-                        "endpoint": route.endpoint,
-                        "is_async": inspect.iscoroutinefunction(route.endpoint),
+                        "endpoint": wrapped_ws,
+                        "is_async": inspect.iscoroutinefunction(wrapped_ws),
                         "handler_name": route.name,
                         "tags": extra_tags + route.tags,
                         "params": [],
@@ -1195,6 +2053,37 @@ class FastAPI:
             all_params_for_openapi = list(params)
 
             endpoint = route.endpoint
+
+            # FA 0.136+: handlers that are (async) generator functions
+            # auto-wrap into a StreamingResponse with JSON-lines content
+            # type. Encode each yielded item via jsonable_encoder so
+            # BaseModels / dataclasses / bytes / datetimes serialize
+            # correctly. Runs BEFORE dep compilation so downstream
+            # wrappers see a plain sync callable.
+            if (
+                inspect.isasyncgenfunction(endpoint)
+                or inspect.isgeneratorfunction(endpoint)
+            ) and not getattr(route, "response_class", None):
+                _orig_endpoint = endpoint
+                _is_async_gen = inspect.isasyncgenfunction(endpoint)
+
+                def _json_lines_wrap(_orig=_orig_endpoint, _is_a=_is_async_gen, **kwargs):
+                    from fastapi_rs.responses import StreamingResponse as _SR
+                    from fastapi_rs.encoders import jsonable_encoder as _je
+                    import json as _json
+                    if _is_a:
+                        async def _iter_async():
+                            async for item in _orig(**kwargs):
+                                yield (_json.dumps(_je(item)) + "\n").encode("utf-8")
+                        return _SR(_iter_async(), media_type="application/jsonl")
+                    else:
+                        def _iter_sync():
+                            for item in _orig(**kwargs):
+                                yield (_json.dumps(_je(item)) + "\n").encode("utf-8")
+                        return _SR(_iter_sync(), media_type="application/jsonl")
+
+                endpoint = _json_lines_wrap
+
             is_async = inspect.iscoroutinefunction(endpoint)
             response_model = getattr(route, "response_model", None)
             rm_include = getattr(route, "response_model_include", None)
@@ -1229,6 +2118,7 @@ class FastAPI:
                 compiled = _try_compile_handler(
                     endpoint, params, app=self, response_model=response_model,
                     status_code=route.status_code,
+                    path=full_path,
                     **rm_kwargs,
                 )
                 if compiled is not None:
@@ -1244,7 +2134,7 @@ class FastAPI:
                     # Fallback: async wrapper for non-compilable deps
                     if is_async and not inspect.isasyncgenfunction(endpoint):
                         from fastapi_rs._resolution import _make_sync_wrapper
-                        endpoint = _make_sync_wrapper(endpoint)
+                        endpoint = _make_sync_wrapper(endpoint, for_handler=True)
                         is_async = False
             elif (
                 response_model is not None
@@ -1253,12 +2143,18 @@ class FastAPI:
                 or self.exception_handlers
                 or self.debug
                 or any(p.get("enum_class") is not None for p in params)
+                or any(p.get("container_type") is not None for p in params)
+                or any(
+                    p.get("required") and p.get("kind") in ("body", "form", "file")
+                    for p in params
+                )
             ):
                 # No deps but has response_model/response_class/status_code/
                 # exception_handlers/enum params — wrap handler via compile.
                 compiled = _try_compile_handler(
                     endpoint, params, app=self, response_model=response_model,
                     status_code=route.status_code,
+                    path=full_path,
                     **rm_kwargs,
                 )
                 if compiled is not None:
@@ -1352,8 +2248,21 @@ class FastAPI:
                         **getattr(route, "responses", {}),
                     },
                     "response_model": response_model,
+                    "response_class": response_class,
                     "deprecated": route.deprecated or bool(include_deprecated),
-                    "operation_id": route.operation_id,
+                    # operation_id cascade: route's own wins, then the
+                    # route's explicit generate_unique_id_function, then
+                    # include-level, then router-level, then app-level.
+                    # Matches FA's
+                    # ``operation_id or current_generate_unique_id(self)``.
+                    "operation_id": (
+                        route.operation_id
+                        or self._apply_generate_unique_id(
+                            route,
+                            include_generate_unique_id_function,
+                            router,
+                        )
+                    ),
                     "include_in_schema": (
                         getattr(route, "include_in_schema", True) and include_in_schema
                     ),
@@ -1365,18 +2274,63 @@ class FastAPI:
                 }
             )
 
-        # Recurse into child routers
+        # Recurse into child routers — CASCADE include-level metadata
+        # down the chain. FA's parity tests expect x-level1 / x-level2 /
+        # x-level3 dep headers on deeply nested routes, which requires
+        # that an ancestor ``include_router(dependencies=[...])`` apply
+        # to descendant routes. Accumulate deps / responses / tags;
+        # take the nearest non-None for deprecated / default_response_class.
         for child_router, child_prefix, child_tags, child_meta in router._included_routers:
+            # Parent router's own dependencies / responses cascade into
+            # descendant routes, same as FA's eager flatten.
+            merged_deps = (
+                list(include_deps)
+                + list(getattr(router, "dependencies", []) or [])
+                + list(child_meta.get("dependencies", []) or [])
+            )
+            merged_resp = {
+                **(include_responses or {}),
+                **(getattr(router, "responses", {}) or {}),
+                **(child_meta.get("responses", {}) or {}),
+            }
+            child_deprecated = child_meta.get("deprecated")
+            effective_deprecated = (
+                child_deprecated if child_deprecated is not None else include_deprecated
+            )
+            # Cascade: child_include_drc → parent router drc → outer include drc.
+            # Matches FA's ``get_value_or_default(route.response_class,
+            # router.default_response_class, default_response_class,
+            # self.default_response_class)`` evaluated recursively as each
+            # nested include runs.
+            child_drc = child_meta.get("default_response_class")
+            if child_drc is None:
+                child_drc = getattr(router, "default_response_class", None)
+            if child_drc is None:
+                child_drc = include_default_response_class
+            effective_drc = child_drc
+            effective_in_schema = (
+                include_in_schema
+                and child_meta.get("include_in_schema", True)
+            )
+            # Propagate ``generate_unique_id_function`` down the chain.
+            # Precedence: child's include-arg → parent router's own →
+            # outer include arg.
+            child_gfn = child_meta.get("generate_unique_id_function")
+            if child_gfn is None:
+                child_gfn = getattr(router, "generate_unique_id_function", None)
+            if child_gfn is None:
+                child_gfn = include_generate_unique_id_function
             collected.extend(
                 self._collect_routes_from_router(
                     child_router,
                     prefix=full_prefix + child_prefix,
                     extra_tags=extra_tags + child_tags,
-                    include_deps=child_meta.get("dependencies", []),
-                    include_responses=child_meta.get("responses", {}),
-                    include_deprecated=child_meta.get("deprecated"),
-                    include_in_schema=child_meta.get("include_in_schema", True),
-                    include_default_response_class=child_meta.get("default_response_class"),
+                    include_deps=merged_deps,
+                    include_responses=merged_resp,
+                    include_deprecated=effective_deprecated,
+                    include_in_schema=effective_in_schema,
+                    include_default_response_class=effective_drc,
+                    include_generate_unique_id_function=child_gfn,
                 )
             )
 
@@ -1399,6 +2353,7 @@ class FastAPI:
                     include_deprecated=meta.get("deprecated"),
                     include_in_schema=meta.get("include_in_schema", True),
                     include_default_response_class=meta.get("default_response_class"),
+                    include_generate_unique_id_function=meta.get("generate_unique_id_function"),
                 )
             )
 
@@ -1492,50 +2447,182 @@ class FastAPI:
     # ------------------------------------------------------------------
 
     def _run_startup_handlers(self) -> None:
-        """Execute all registered startup handlers (P0 fix #2)."""
-        for handler in self._on_startup:
+        """Execute all registered startup handlers on the shared worker loop
+        so that connection pools / asyncio resources created during startup
+        remain bound to a live event loop for the lifetime of the app
+        (otherwise `asyncio.run(...)` would close the loop immediately,
+        invalidating asyncpg pools / redis.asyncio clients etc.).
+        """
+        from fastapi_rs._async_worker import submit as _submit
+        for handler in self._collect_startup_handlers():
             if inspect.iscoroutinefunction(handler):
-                asyncio.run(handler())
+                _submit(handler())
             else:
                 handler()
 
     def _run_shutdown_handlers(self) -> None:
-        """Execute all registered shutdown handlers (P0 fix #2)."""
-        for handler in self._on_shutdown:
+        """Execute all registered shutdown handlers on the worker loop."""
+        from fastapi_rs._async_worker import submit as _submit
+        for handler in self._collect_shutdown_handlers():
             if inspect.iscoroutinefunction(handler):
-                asyncio.run(handler())
+                _submit(handler())
             else:
                 handler()
 
-    def _run_lifespan_startup(self) -> None:
-        """Run the lifespan context manager startup phase (P0 fix #3).
+    def _collect_startup_handlers(self) -> list:
+        """App-level startup handlers first, then every nested router's."""
+        out = list(self._on_startup)
 
-        Enters the lifespan async context manager, stores any yielded state
-        on app.state, and saves the context manager for cleanup at shutdown.
+        def _walk(r):
+            out.extend(getattr(r, "_on_startup", None) or [])
+            for entry in getattr(r, "_included_routers", None) or []:
+                child = entry[0]
+                _walk(child)
+        _walk(self.router)
+        for entry in self._included_routers:
+            _walk(entry[0])
+        return out
+
+    def _collect_shutdown_handlers(self) -> list:
+        """App + nested-router shutdown handlers, in reverse-startup order."""
+        handlers: list = []
+
+        def _walk(r):
+            for entry in getattr(r, "_included_routers", None) or []:
+                child = entry[0]
+                _walk(child)
+            handlers.extend(getattr(r, "_on_shutdown", None) or [])
+        for entry in self._included_routers:
+            _walk(entry[0])
+        _walk(self.router)
+        handlers.extend(self._on_shutdown)
+        return handlers
+
+    def _collect_lifespans(self) -> list:
+        """Return app + nested-router lifespans in depth-first order.
+
+        Order matters: child lifespans start first (entered before the
+        parent's yielded state is merged in) so the parent's yielded
+        keys win on collision. Shutdown runs in reverse: parent's exit
+        runs first, then children unwind.
         """
-        if not self.lifespan:
+        out: list = []
+
+        def _walk(r):
+            lf = getattr(r, "lifespan", None)
+            if lf is not None:
+                out.append(lf)
+            for entry in getattr(r, "_included_routers", None) or []:
+                _walk(entry[0])
+
+        # router's own routes too
+        inner = getattr(self.router, "_included_routers", None) or []
+        for entry in inner:
+            _walk(entry[0])
+        for entry in self._included_routers:
+            _walk(entry[0])
+
+        # App's lifespan LAST so it merges on top (parent wins on key collision).
+        if self.lifespan is not None:
+            out.append(self.lifespan)
+        return out
+
+    def _run_lifespan_startup(self) -> None:
+        """Enter every lifespan (app + routers), merging yielded state
+        into ``self._app_state`` and ``self.state``. Parent state
+        overrides child on key collision.
+        """
+        lifespans = self._collect_lifespans()
+        if not lifespans:
             return
 
-        lifespan_cm = self.lifespan(self)
-        self._lifespan_cm = lifespan_cm
+        from contextlib import asynccontextmanager as _acm
+        from collections.abc import AsyncGenerator as _AsyncGen
+        from collections.abc import Generator as _Gen
+        import inspect as _inspect
 
-        async def _enter_lifespan():
-            state = await lifespan_cm.__aenter__()
-            if state:
-                for k, v in state.items():
-                    setattr(self.state, k, v)
+        def _wrap(cb):
+            """Coerce (a)sync-generator functions to async context managers."""
+            # Already an @asynccontextmanager — calling it gives us an
+            # async ctx manager. Detect by checking the return.
+            def _probe():
+                return cb(self)
+            try:
+                cm = _probe()
+            except Exception:
+                raise
+            if hasattr(cm, "__aenter__"):
+                return cm
+            if _inspect.isasyncgen(cm):
+                @_acm
+                async def _agen_wrap(app):
+                    it = cb(app)
+                    val = await it.__anext__()
+                    try:
+                        yield val
+                    finally:
+                        try:
+                            await it.__anext__()
+                        except StopAsyncIteration:
+                            pass
+                return _agen_wrap(self)
+            if _inspect.isgenerator(cm):
+                @_acm
+                async def _gen_wrap(app):
+                    it = cb(app)
+                    val = next(it)
+                    try:
+                        yield val
+                    finally:
+                        try:
+                            next(it)
+                        except StopIteration:
+                            pass
+                return _gen_wrap(self)
+            # Plain callable returning a context manager
+            if hasattr(cm, "__enter__"):
+                @_acm
+                async def _sync_cm_wrap():
+                    val = cm.__enter__()
+                    try:
+                        yield val
+                    finally:
+                        cm.__exit__(None, None, None)
+                return _sync_cm_wrap()
+            return cm
 
-        asyncio.run(_enter_lifespan())
+        cms = [_wrap(lf) for lf in lifespans]
+        self._lifespan_cms = cms
+        merged: dict = {}
+
+        async def _enter_all():
+            for cm in cms:
+                state = await cm.__aenter__()
+                if state:
+                    merged.update(state)
+            self._app_state = merged
+            for k, v in merged.items():
+                setattr(self.state, k, v)
+
+        from fastapi_rs._async_worker import submit as _submit
+        _submit(_enter_all())
 
     def _run_lifespan_shutdown(self) -> None:
-        """Run the lifespan context manager shutdown phase (P0 fix #3)."""
-        if not hasattr(self, "_lifespan_cm") or self._lifespan_cm is None:
+        """Exit every lifespan in reverse-start order."""
+        cms = getattr(self, "_lifespan_cms", None)
+        if not cms:
             return
 
-        async def _exit_lifespan():
-            await self._lifespan_cm.__aexit__(None, None, None)
+        async def _exit_all():
+            for cm in reversed(cms):
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
 
-        asyncio.run(_exit_lifespan())
+        from fastapi_rs._async_worker import submit as _submit
+        _submit(_exit_all())
+        self._lifespan_cms = None
 
     # ------------------------------------------------------------------
     # Server launch
@@ -1545,17 +2632,19 @@ class FastAPI:
         """Collect routes, hand them to the Rust core, and start serving."""
         from fastapi_rs._fastapi_rs_core import ParamInfo, RouteInfo, run_server
 
-        # Run lifespan startup phase if lifespan is set (P0 fix #3)
-        if self.lifespan:
+        # Run lifespan startup phase if lifespan is set (P0 fix #3).
+        # Also trigger for router-level lifespans (test_router_events).
+        if self._collect_lifespans():
             self._run_lifespan_startup()
-            # Register lifespan shutdown via atexit
             atexit.register(self._run_lifespan_shutdown)
 
         # Run startup event handlers (P0 fix #2)
         self._run_startup_handlers()
 
-        # Register shutdown handlers via atexit (P0 fix #2)
-        if self._on_shutdown:
+        # Register shutdown handlers via atexit (P0 fix #2). Check the
+        # FULL chain (app + routers) — a router-only shutdown (no
+        # app-level handler) must still run.
+        if self._collect_shutdown_handlers():
             atexit.register(self._run_shutdown_handlers)
 
         route_dicts = self._collect_all_routes()
@@ -1799,7 +2888,7 @@ class FastAPI:
             message = await receive()
             if message["type"] == "lifespan.startup":
                 try:
-                    if self.lifespan:
+                    if self._collect_lifespans():
                         self._run_lifespan_startup()
                     self._run_startup_handlers()
                     await send({"type": "lifespan.startup.complete"})
@@ -1808,7 +2897,7 @@ class FastAPI:
                     return
             elif message["type"] == "lifespan.shutdown":
                 try:
-                    if hasattr(self, "_lifespan_cm") and self._lifespan_cm:
+                    if getattr(self, "_lifespan_cms", None):
                         self._run_lifespan_shutdown()
                     self._run_shutdown_handlers()
                 except Exception:

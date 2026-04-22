@@ -59,10 +59,103 @@ def generate_openapi_schema(
     components_schemas: dict[str, Any] = {}
     security_schemes: dict[str, Any] = {}
 
+    # Reset the per-build model-usage tracker. FastAPI's schema emitter is
+    # called fresh for each build and decides the split on the current set
+    # of routes; do the same.
+    _MODEL_USAGE.clear()
+
+    # Pre-pass: walk every route to classify each Pydantic model as used
+    # in "input" (body / form / file) and/or "output" (response_model,
+    # user `responses[...].model`) contexts. The operation-building pass
+    # then emits `<Name>-Input` / `<Name>-Output` refs accordingly. Also
+    # register standalone Enum classes used as parameter types so we
+    # can emit them under `components.schemas` like FastAPI does.
+    enum_classes_seen: dict[str, type] = {}
+
+    def _collect_enum_class(enum_cls):
+        if enum_cls is None:
+            return
+        try:
+            import enum as _enum_mod
+            if isinstance(enum_cls, type) and issubclass(enum_cls, _enum_mod.Enum):
+                name = enum_cls.__name__
+                if name not in enum_classes_seen:
+                    enum_classes_seen[name] = enum_cls
+        except Exception:  # noqa: BLE001
+            pass
+
+    for route in routes:
+        if not route.get("include_in_schema", True):
+            continue
+        for p in route.get("params", []):
+            if p.get("kind") in ("body", "form", "file"):
+                _note_model_usage(p.get("model_class"), "input")
+            _collect_enum_class(p.get("enum_class"))
+        _note_model_usage(route.get("response_model"), "output")
+        for resp_info in (route.get("responses") or {}).values():
+            if isinstance(resp_info, dict):
+                _note_model_usage(resp_info.get("model"), "output")
+    for wh in (webhooks or []):
+        if not wh.get("include_in_schema", True):
+            continue
+        for p in wh.get("params", []):
+            if p.get("kind") in ("body", "form", "file"):
+                _note_model_usage(p.get("model_class"), "input")
+        _note_model_usage(wh.get("response_model"), "output")
+
+    # Track every Pydantic model class we encounter so the post-pass can
+    # reconsider `-Input`/`-Output` splits for nested recursive models
+    # (e.g. `Forest.roots: list[Node]` — Node only appears as a $defs
+    # entry on Forest's schema, so the direct collect path can't split
+    # it on its own).
+    seen_model_classes: set[int] = set()
+    model_class_by_id: dict[int, Any] = {}
+
+    def _register_model(mc) -> None:
+        if mc is None or not hasattr(mc, "model_json_schema"):
+            return
+        mid = id(mc)
+        if mid not in seen_model_classes:
+            seen_model_classes.add(mid)
+            model_class_by_id[mid] = mc
+            for f in (getattr(mc, "model_fields", None) or {}).values():
+                ann = getattr(f, "annotation", None)
+                for sub in _flatten_annotation_types(ann):
+                    _register_model(sub)
+
+    _seen_operation_ids: dict[str, tuple[str, str]] = {}
     for route in routes:
         # Honor include_in_schema=False — skip route entirely
         if not route.get("include_in_schema", True):
             continue
+
+        # Register every BaseModel reachable from this route so post-pass
+        # has the concrete classes it needs for split emission. If the
+        # param's ``model_class`` is a ``_TypeAdapterProxy`` (e.g. a
+        # Union / generic wrapped for Pydantic), walk the inner
+        # annotation so nested ``BaseModel`` arms are still emitted.
+        for p in route.get("params", []):
+            mc = p.get("model_class")
+            _register_model(mc)
+            _inner_ann = getattr(mc, "_annotation", None)
+            if _inner_ann is not None:
+                for sub in _flatten_annotation_types(_inner_ann):
+                    _register_model(sub)
+        _register_model(route.get("response_model"))
+        for sub in _flatten_annotation_types(route.get("response_model")):
+            _register_model(sub)
+        for resp_info in (route.get("responses") or {}).values():
+            if isinstance(resp_info, dict):
+                _register_model(resp_info.get("model"))
+                for sub in _flatten_annotation_types(resp_info.get("model")):
+                    _register_model(sub)
+        # Callback routes carry their own response models that must be
+        # emitted in components.schemas (FA parity for
+        # ``callbacks=callback_router.routes``).
+        for cb_model in _walk_callback_models(route.get("callbacks")):
+            _register_model(cb_model)
+            for sub in _flatten_annotation_types(cb_model):
+                _register_model(sub)
 
         path = route["path"]
 
@@ -71,10 +164,148 @@ def generate_openapi_schema(
 
         for method in route["methods"]:
             operation = _build_operation(route, method.lower())
+            op_id = operation.get("operationId")
+            # FA emits a UserWarning when two operations share an
+            # operationId — tests rely on this (e.g.
+            # ``test_include_router_defaults_overrides::test_openapi``).
+            if op_id:
+                existing = _seen_operation_ids.get(op_id)
+                if existing is not None:
+                    import warnings as _w
+                    _w.warn(
+                        f"Duplicate Operation ID {op_id} for function "
+                        f"{route['handler_name']}",
+                        stacklevel=1,
+                    )
+                else:
+                    _seen_operation_ids[op_id] = (path, method)
             schema["paths"].setdefault(path, {})[method.lower()] = operation
 
             # Collect Pydantic model schemas into components
             _collect_schemas(route, components_schemas)
+
+            # Hoist any synthesized Body_<handler> form/file schema into
+            # components.schemas and replace the inline schema with a $ref
+            # — matching FastAPI's output format (which always references a
+            # component rather than inlining).
+            _hoist_body_schema(operation, components_schemas)
+
+    # Register enum classes into components.schemas so parameter refs
+    # resolve to a shared `#/components/schemas/<EnumName>` entry,
+    # matching FastAPI's layout.
+    for enum_name, enum_cls in enum_classes_seen.items():
+        if enum_name in components_schemas:
+            continue
+        values = [m.value for m in enum_cls]
+        # int enums surface as `{type: integer}`, str-subclass ones as
+        # `{type: string}`. Fall back to string when unclear.
+        if all(isinstance(v, int) and not isinstance(v, bool) for v in values):
+            inner_type = "integer"
+        else:
+            inner_type = "string"
+        components_schemas[enum_name] = {
+            "enum": values,
+            "title": enum_name,
+            "type": inner_type,
+        }
+
+    # Post-pass A: any self-recursive dual-use model that was collected
+    # via `$defs` promotion (rather than as a direct `model_class`) still
+    # needs to be split into `<Name>-Input` / `<Name>-Output`. Replace
+    # the single `<Name>` entry with the two variants. For self-
+    # referential models Pydantic returns `{"$defs": {"Name": <body>},
+    # "$ref": "#/$defs/Name"}`; we want the `<body>` itself to live
+    # under `components.schemas[Name-Input|Output]` with internal refs
+    # pointing at the same suffixed entry so tools can resolve them
+    # without dereferencing the pop'ed `Name`.
+    split_models: set[str] = set()
+
+    def _flatten_recursive_schema(ms, bare_name: str, variant_ref: str) -> dict[str, Any]:
+        """Return the real `Name` body out of a Pydantic self-ref wrapper,
+        with every inner `#/$defs/<bare_name>` pointer swapped to
+        `#/components/schemas/<variant_ref>` so lookups land on the right
+        split entry.
+        """
+        defs = (ms or {}).get("$defs") or {}
+        body = defs.get(bare_name)
+        if body is None:
+            # Not a recursive wrapper — strip $defs and return.
+            return {k: v for k, v in (ms or {}).items() if k != "$defs"}
+        # Rewrite refs in the body to point at the variant target.
+        target_ref = f"#/components/schemas/{variant_ref}"
+        def _walk(v):
+            if isinstance(v, dict):
+                out = {}
+                for k, vv in v.items():
+                    if k == "$ref" and isinstance(vv, str) and vv.endswith(f"$defs/{bare_name}"):
+                        out[k] = target_ref
+                    else:
+                        out[k] = _walk(vv)
+                return out
+            if isinstance(v, list):
+                return [_walk(x) for x in v]
+            return v
+        return _walk(body)
+
+    for mid, mc in model_class_by_id.items():
+        usage = _MODEL_USAGE.get(mid, set())
+        if not ("input" in usage and "output" in usage):
+            continue
+        if not _model_is_self_recursive(mc):
+            continue
+        raw = getattr(mc, "__name__", None)
+        name = _normalize_model_name(raw) if raw else None
+        if not name or name not in components_schemas:
+            continue
+        try:
+            v_schema = mc.model_json_schema(mode="validation")
+            s_schema = mc.model_json_schema(mode="serialization")
+        except Exception:  # noqa: BLE001
+            continue
+        components_schemas.pop(name, None)
+        components_schemas[f"{name}-Input"] = _flatten_recursive_schema(v_schema, raw, f"{name}-Input")
+        components_schemas[f"{name}-Output"] = _flatten_recursive_schema(s_schema, raw, f"{name}-Output")
+        split_models.add(name)
+
+    # Post-pass B: rewrite refs to split models in container schemas. A
+    # container that's used only as output gets `#/components/schemas/X`
+    # → `X-Output`; input-only gets `X-Input`. For mixed-usage containers
+    # we leave the ref untouched (they'd have been split themselves if
+    # they were self-recursive; non-recursive dual-use stays inline).
+    def _rewrite_split_refs(tree, side: str):
+        if isinstance(tree, dict):
+            out = {}
+            for k, vv in tree.items():
+                if isinstance(vv, str):
+                    for prefix in ("#/components/schemas/", "#/$defs/"):
+                        if vv.startswith(prefix):
+                            tail = vv[len(prefix):]
+                            bare = _normalize_model_name(tail)
+                            if bare in split_models:
+                                out[k] = f"#/components/schemas/{bare}-{side}"
+                                break
+                    else:
+                        out[k] = _rewrite_split_refs(vv, side)
+                        continue
+                    continue
+                out[k] = _rewrite_split_refs(vv, side)
+            return out
+        if isinstance(tree, list):
+            return [_rewrite_split_refs(x, side) for x in tree]
+        return tree
+
+    # Each container schema's context is determined by which model class
+    # it belongs to, via _MODEL_USAGE.
+    for mid, mc in list(model_class_by_id.items()):
+        raw = getattr(mc, "__name__", None)
+        name = _normalize_model_name(raw) if raw else None
+        if not name or name in split_models or name not in components_schemas:
+            continue
+        usage = _MODEL_USAGE.get(mid, set())
+        if usage == {"output"}:
+            components_schemas[name] = _rewrite_split_refs(components_schemas[name], "Output")
+        elif usage == {"input"}:
+            components_schemas[name] = _rewrite_split_refs(components_schemas[name], "Input")
 
     # Webhooks: top-level OpenAPI 3.1 field. Each webhook is effectively a
     # path-item object keyed by name rather than URL.
@@ -92,17 +323,22 @@ def generate_openapi_schema(
         if wh_dict:
             schema["webhooks"] = wh_dict
 
-    # Check if any operation references the 422 ValidationError schema.
-    # If so, ensure the standard ValidationError + HTTPValidationError
-    # schemas are present in components/schemas.
-    _needs_validation_schemas = False
-    for _path_ops in schema["paths"].values():
-        for _op in _path_ops.values():
-            if "422" in _op.get("responses", {}):
-                _needs_validation_schemas = True
-                break
-        if _needs_validation_schemas:
-            break
+    # Check if any operation actually references ``HTTPValidationError``
+    # (or ``ValidationError``) — FA only emits those component schemas
+    # when used. User-overridden ``responses={422: {"model": CustomErr}}``
+    # points at a different component, so we skip the default ones.
+    def _uses_validation_ref(node) -> bool:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.endswith(
+                ("/HTTPValidationError", "/ValidationError")
+            ):
+                return True
+            return any(_uses_validation_ref(v) for v in node.values())
+        if isinstance(node, list):
+            return any(_uses_validation_ref(v) for v in node)
+        return False
+    _needs_validation_schemas = _uses_validation_ref(schema["paths"])
     if _needs_validation_schemas:
         components_schemas.setdefault("ValidationError", {
             "title": "ValidationError",
@@ -118,6 +354,12 @@ def generate_openapi_schema(
                 },
                 "msg": {"title": "Message", "type": "string"},
                 "type": {"title": "Error Type", "type": "string"},
+                # Pydantic v2 includes `input` (the offending value the
+                # validator saw) and `ctx` (the constraint metadata, e.g.
+                # `{"ge": 0}`). FastAPI advertises both in its OpenAPI so
+                # downstream codegen tools can type the detail payload.
+                "input": {"title": "Input"},
+                "ctx": {"title": "Context", "type": "object"},
             },
         })
         components_schemas.setdefault("HTTPValidationError", {
@@ -140,7 +382,36 @@ def generate_openapi_schema(
     if components:
         schema["components"] = components
 
+    # Final pass: hoist inline Pydantic `$defs` blocks up to the shared
+    # `components.schemas` bucket. This mutates `schema` in place. The
+    # subsequent `_rewrite_defs_refs` traverses `schema` (which now holds
+    # the merged components) rewriting `$ref: #/$defs/X` →
+    # `#/components/schemas/X` and dropping Pydantic-emitted `default:
+    # null` leaves that FastAPI strips from its own generated spec.
+    if components_schemas:
+        schema.setdefault("components", {})["schemas"] = components_schemas
+    _hoist_inline_defs(schema, components_schemas)
+    schema = _rewrite_defs_refs(schema)
+
     return schema
+
+
+def _hoist_inline_defs(node: Any, bucket: dict[str, Any]) -> None:
+    """Walk a schema tree, move any `$defs` entries into `bucket`, and
+    delete them in place. Subsequent `_rewrite_defs_refs` re-points
+    `$ref: #/$defs/X` at the hoisted component.
+    """
+    if isinstance(node, dict):
+        if "$defs" in node:
+            defs = node.pop("$defs")
+            if isinstance(defs, dict):
+                for name, defn in defs.items():
+                    bucket.setdefault(name, defn)
+        for v in node.values():
+            _hoist_inline_defs(v, bucket)
+    elif isinstance(node, list):
+        for v in node:
+            _hoist_inline_defs(v, bucket)
 
 
 def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
@@ -149,21 +420,57 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     response_desc = route.get("response_description") or "Successful Response"
 
     # Success response skeleton — overridable by route.responses[status]
-    # Use $ref for response_model if it's a Pydantic model
+    # Use $ref for response_model if it's a Pydantic model. For generic
+    # aliases (`dict[str, X]`, `list[X]`, `Optional[X]`), go through a
+    # Pydantic TypeAdapter so the generated schema matches FastAPI exactly.
     response_model = route.get("response_model")
     response_schema: dict[str, Any] = {}
     if response_model is not None:
-        ref = _model_ref(response_model)
+        ref = _model_ref(response_model, mode="serialization")
         if ref is not None:
             response_schema = ref
         elif hasattr(response_model, "model_json_schema"):
             try:
-                response_schema = response_model.model_json_schema()
+                response_schema = response_model.model_json_schema(mode="serialization")
             except Exception:
                 pass
+        else:
+            try:
+                from pydantic import TypeAdapter
+                response_schema = TypeAdapter(response_model).json_schema(mode="serialization")
+                # FastAPI labels the generated success schema with the
+                # operation title (`Response Root Index`).
+                if "title" not in response_schema:
+                    # FA uses ``Response <Title-cased Operation Id>``;
+                    # fall back to handler name when no operationId.
+                    source = (
+                        route.get("operation_id")
+                        or route.get("handler_name")
+                        or "response"
+                    )
+                    response_schema["title"] = "Response " + " ".join(
+                        w.capitalize() for w in source.replace("-", "_").split("_") if w
+                    )
+            except Exception:
+                pass
+    # Choose the response media type from the configured response_class.
+    # HTMLResponse → text/html, PlainTextResponse → text/plain, etc.
+    _resp_cls = route.get("response_class")
+    _media_type = "application/json"
+    if _resp_cls is not None:
+        _media_type = getattr(_resp_cls, "media_type", None) or "application/json"
+    # For plain-text response classes, FA emits ``{type: string}`` as
+    # the schema (raw text, no Pydantic serialization). For custom
+    # JSON-like classes (``application/vnd.api+json``, etc.) and JSON,
+    # FA keeps whatever the response_model produced — or an empty
+    # ``{}`` when none was declared.
+    if _media_type in ("text/html", "text/plain"):
+        response_schema = {"type": "string"}
+    elif _media_type != "application/json" and not route.get("response_model"):
+        response_schema = {}
     success_response: dict[str, Any] = {
         "description": response_desc,
-        "content": {"application/json": {"schema": response_schema}},
+        "content": {_media_type: {"schema": response_schema}},
     }
 
     # Build the full responses dict, starting with user-supplied responses
@@ -171,22 +478,80 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     responses_dict: dict[str, Any] = {}
     user_responses = route.get("responses") or {}
     for status_key, resp_info in user_responses.items():
-        responses_dict[str(status_key)] = _build_response_entry(resp_info)
+        # Normalise range-code keys: ``"5xx"`` → ``"5XX"`` (FA does this
+        # before emitting to OpenAPI). Int codes stay numeric.
+        _raw = str(status_key)
+        _normalised: str
+        if _raw.lower() in ("1xx", "2xx", "3xx", "4xx", "5xx"):
+            _normalised = _raw.upper()
+        else:
+            _normalised = _raw
+        entry = _build_response_entry(resp_info, status_code=_normalised)
+        # FA titles generated response schemas ``Response <StatusCode>
+        # <Title-cased Operation Id>``. Apply the title if the schema
+        # we produced didn't come from a named component (pure
+        # container like list[Message] returns an inline schema).
+        content = entry.get("content")
+        if isinstance(content, dict):
+            for mt, mobj in content.items():
+                sch = mobj.get("schema") if isinstance(mobj, dict) else None
+                if isinstance(sch, dict) and "$ref" not in sch and "title" not in sch:
+                    op_source = route.get("operation_id") or route.get("handler_name") or ""
+                    op_title = " ".join(
+                        w.capitalize() for w in op_source.replace("-", "_").split("_") if w
+                    )
+                    try:
+                        status_txt = str(int(status_key))
+                    except (TypeError, ValueError):
+                        status_txt = str(status_key)
+                    if op_title:
+                        sch["title"] = f"Response {status_txt} {op_title}"
+        responses_dict[_normalised] = entry
 
-    # Always include success response (route.responses may override it)
+    # Always include success response (route.responses may override it).
+    # FastAPI's exact behavior: user-supplied entry at the success code
+    # is merged with the auto-generated entry — the user can override
+    # `description`, but the `content` schema from `response_model` is
+    # still added if the user didn't supply one. Without this, a route
+    # with `responses={200: {"description": "OK"}}` loses its entire
+    # response schema.
     success_key = str(status_code)
     if success_key not in responses_dict:
         responses_dict[success_key] = success_response
     else:
-        # Merge user-supplied entry at success code with auto-generated description
         responses_dict[success_key].setdefault("description", response_desc)
+        if "content" not in responses_dict[success_key]:
+            responses_dict[success_key]["content"] = success_response["content"]
 
-    # Auto-add 422 Validation Error response if the endpoint has
-    # validated parameters (body, path, or constrained query).
+    # Auto-add 422 Validation Error response. FastAPI's rule
+    # (``get_flat_params(dependant)`` in openapi/utils.py): 422 fires
+    # whenever the route has any user-declared parameter OR a body
+    # field. Framework-injected security dependencies (APIKeyHeader,
+    # APIKeyCookie, APIKeyQuery, HTTPBearer, OAuth2*) don't appear
+    # in that list because they read ``request.headers`` etc. directly
+    # — they never surface a 422, they return 401/403. We match by
+    # only counting params that are user-visible (``_is_handler_param``)
+    # AND have a validator, a constraint, or are a body-side type.
+    def _param_can_fail_validation(p: dict[str, Any]) -> bool:
+        kind = p.get("kind")
+        if kind in ("body", "form", "file"):
+            return True
+        if kind == "path":
+            # Path params always coerce to type_hint; mismatched type → 422.
+            return True
+        if kind in ("query", "header", "cookie"):
+            # A user-level Query/Header/Cookie — the type itself is
+            # enough to generate 422 when the handler declares it.
+            # FA's ``get_flat_params`` includes these even when they
+            # have a default, because supplying ``?n=abc`` where
+            # ``n: int | None = None`` still produces a 422.
+            return True
+        return False
+
     has_validated_params = any(
-        p.get("kind") in ("body", "path", "query", "header", "cookie")
+        _param_can_fail_validation(p)
         for p in route.get("params", [])
-        if p.get("include_in_schema", True)
+        if p.get("include_in_schema", True) and p.get("_is_handler_param", False)
     )
     if has_validated_params and "422" not in responses_dict:
         responses_dict["422"] = {
@@ -200,9 +565,35 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
             },
         }
 
+    # Drop the auto-generated `content` block for empty responses (204 /
+    # 304 etc.) — FastAPI omits `content` for those status codes because
+    # the HTTP spec forbids a body. Without this we emit
+    # `{"application/json": {"schema": {}}}` which is harmless but diffs.
+    for _empty_code in ("204", "304"):
+        if _empty_code in responses_dict and isinstance(responses_dict[_empty_code], dict):
+            responses_dict[_empty_code].pop("content", None)
+
+    # FastAPI auto-titles the handler's function name (`root_index` →
+    # `"Root Index"`) when the user didn't set an explicit `summary=`. Match
+    # that so downstream OpenAPI consumers see the same operation label.
+    _auto_summary = route.get("summary")
+    if not _auto_summary:
+        _auto_summary = " ".join(
+            w.capitalize() for w in route["handler_name"].replace("-", "_").split("_") if w
+        )
+    if route.get("operation_id"):
+        _op_id = route["operation_id"]
+    else:
+        # Mirror FA's ``generate_unique_id``: name + path (non-word
+        # chars → underscore) + method lowercased. So route
+        # ``@app.post("/foo") def foo()`` → ``foo_foo_post``.
+        import re as _re
+        _op_id = f"{route['handler_name']}{route['path']}"
+        _op_id = _re.sub(r"\W", "_", _op_id)
+        _op_id = f"{_op_id}_{method}"
     operation: dict[str, Any] = {
-        "summary": route.get("summary") or route["handler_name"],
-        "operationId": route.get("operation_id") or f"{route['handler_name']}_{method}",
+        "summary": _auto_summary,
+        "operationId": _op_id,
         "responses": responses_dict,
     }
 
@@ -216,17 +607,61 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     # Parameters (path, query, header, cookie) and request body
     parameters: list[dict[str, Any]] = []
     request_body: dict[str, Any] | None = None
+    form_params: list[dict[str, Any]] = []
+    file_params: list[dict[str, Any]] = []
+
+    # Collect names of params that came from Security() dep resolution —
+    # FastAPI surfaces those only under `operation.security`, never in
+    # `parameters`. A dep whose callable has a `.model` attribute is a
+    # Starlette security scheme (APIKeyHeader / OAuth2PasswordBearer /
+    # HTTPBearer etc.); its listed sub-param names are the extraction
+    # steps we need to hide.
+    security_sub_param_names: set[str] = set()
+    for p in route.get("_all_params", route.get("params", [])):
+        if p.get("kind") != "dependency":
+            continue
+        dep_callable = p.get("_original_dep_callable") or p.get("dep_callable")
+        if dep_callable is None:
+            continue
+        if hasattr(dep_callable, "model") and isinstance(dep_callable.model, dict):
+            for _, source_key in p.get("dep_input_map") or []:
+                if isinstance(source_key, str):
+                    security_sub_param_names.add(source_key)
 
     for param in route.get("params", []):
         # Honor param-level include_in_schema
         if not param.get("include_in_schema", True):
+            continue
+        if param.get("name") in security_sub_param_names:
             continue
         kind = param.get("kind", "")
         if kind in ("path", "query", "header", "cookie"):
             parameters.append(_build_parameter(param))
         elif kind == "body":
             request_body = _build_request_body(param)
+        elif kind == "form":
+            form_params.append(param)
+        elif kind == "file":
+            file_params.append(param)
         # Skip "dependency" params — they are internal
+
+    # Form / File params share a single `Body_<handler>` component and live
+    # under `requestBody.content[multipart/form-data | application/x-www-
+    # form-urlencoded].schema`. Matches FastAPI's generated schema so
+    # OpenAPI consumers see the same canonical body model name.
+    # Keep declaration order of the handler signature — FastAPI emits the
+    # properties in the exact order the user defined them.
+    if request_body is None and (form_params or file_params):
+        ordered_mixed: list[tuple[str, dict[str, Any]]] = []  # ("form" | "file", param)
+        for p in route.get("params", []):
+            if not p.get("include_in_schema", True):
+                continue
+            k = p.get("kind")
+            if k == "form":
+                ordered_mixed.append(("form", p))
+            elif k == "file":
+                ordered_mixed.append(("file", p))
+        request_body = _build_form_file_body(route, form_params, file_params, ordered_mixed)
 
     if parameters:
         operation["parameters"] = parameters
@@ -265,18 +700,78 @@ def _build_operation(route: dict[str, Any], method: str) -> dict[str, Any]:
     return operation
 
 
-def _build_response_entry(resp_info: dict[str, Any]) -> dict[str, Any]:
+_DEFAULT_STATUS_DESCRIPTIONS = {
+    100: "Continue", 101: "Switching Protocols", 102: "Processing",
+    200: "Successful Response", 201: "Created", 202: "Accepted",
+    203: "Non-Authoritative Information", 204: "No Content", 205: "Reset Content",
+    206: "Partial Content", 207: "Multi-Status", 208: "Already Reported",
+    226: "IM Used",
+    300: "Multiple Choices", 301: "Moved Permanently", 302: "Found",
+    303: "See Other", 304: "Not Modified", 305: "Use Proxy", 307: "Temporary Redirect",
+    308: "Permanent Redirect",
+    400: "Bad Request", 401: "Unauthorized", 402: "Payment Required",
+    403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
+    406: "Not Acceptable", 407: "Proxy Authentication Required", 408: "Request Timeout",
+    409: "Conflict", 410: "Gone", 411: "Length Required",
+    412: "Precondition Failed", 413: "Content Too Large", 414: "URI Too Long",
+    415: "Unsupported Media Type", 416: "Range Not Satisfiable", 417: "Expectation Failed",
+    418: "I'm a teapot", 421: "Misdirected Request", 422: "Unprocessable Entity",
+    423: "Locked", 424: "Failed Dependency", 425: "Too Early", 426: "Upgrade Required",
+    428: "Precondition Required", 429: "Too Many Requests",
+    431: "Request Header Fields Too Large", 451: "Unavailable For Legal Reasons",
+    500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway",
+    503: "Service Unavailable", 504: "Gateway Timeout",
+    505: "HTTP Version Not Supported", 506: "Variant Also Negotiates",
+    507: "Insufficient Storage", 508: "Loop Detected",
+    510: "Not Extended", 511: "Network Authentication Required",
+}
+
+
+_RANGE_STATUS_DESCRIPTIONS = {
+    "1XX": "Information",
+    "2XX": "Success",
+    "3XX": "Redirection",
+    "4XX": "Client Error",
+    "5XX": "Server Error",
+    "default": "Default Response",
+}
+
+
+def _build_response_entry(
+    resp_info: dict[str, Any],
+    status_code: int | str | None = None,
+    op_title: str | None = None,
+) -> dict[str, Any]:
     """Convert a user-supplied entry from route.responses into an OpenAPI response object.
 
     Accepts forms like:
         {"description": "Not found"}
         {"description": "Error", "model": MyError}
+        {"description": "Error", "model": list[MyError]}
         {"description": "X", "content": {"application/json": {"schema": {...}}}}
     """
     entry: dict[str, Any] = {}
-    entry["description"] = resp_info.get("description", "Response")
+    # Match FA: HTTP status codes get the canonical reason phrase when
+    # the user didn't set an explicit description (``404`` → ``Not Found``;
+    # ``"5XX"`` → ``"Server Error"``; ``"default"`` → ``"Default Response"``).
+    default_desc = "Response"
+    try:
+        if status_code is not None:
+            raw_key = str(status_code)
+            # ``"5xx"`` / ``"4XX"`` both normalise to the upper form.
+            range_key = raw_key.upper()
+            if raw_key == "default":
+                default_desc = _RANGE_STATUS_DESCRIPTIONS["default"]
+            elif range_key in _RANGE_STATUS_DESCRIPTIONS:
+                default_desc = _RANGE_STATUS_DESCRIPTIONS[range_key]
+            else:
+                status_int = int(status_code)
+                default_desc = _DEFAULT_STATUS_DESCRIPTIONS.get(status_int, default_desc)
+    except (TypeError, ValueError):
+        pass
+    entry["description"] = resp_info.get("description", default_desc)
 
-    # If model is provided, build content automatically using $ref if possible
+    # If model is provided, build content automatically.
     model = resp_info.get("model")
     if model is not None:
         ref = _model_ref(model)
@@ -287,6 +782,25 @@ def _build_response_entry(resp_info: dict[str, Any]) -> dict[str, Any]:
                 model_schema = model.model_json_schema()
                 entry["content"] = {"application/json": {"schema": model_schema}}
             except Exception:
+                pass
+        else:
+            # Container-typed responses (``list[MyError]`` /
+            # ``dict[str, Model]`` / Union etc.). Use a TypeAdapter to
+            # produce the inner schema and rewrite any ``#/$defs/`` refs
+            # to components-relative — matches FA's emission.
+            try:
+                from pydantic import TypeAdapter as _TA
+                container_schema = _TA(model).json_schema(mode="validation")
+                # Flatten nested $defs — we rely on _register_model to
+                # have already surfaced referenced BaseModel arms to
+                # ``components.schemas``.
+                if "$defs" in container_schema:
+                    container_schema = {
+                        k: v for k, v in container_schema.items() if k != "$defs"
+                    }
+                container_schema = _rewrite_defs_refs(container_schema)
+                entry["content"] = {"application/json": {"schema": container_schema}}
+            except Exception:  # noqa: BLE001
                 pass
 
     # Direct content/headers overrides
@@ -301,37 +815,507 @@ def _build_response_entry(resp_info: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_parameter(param: dict[str, Any]) -> dict[str, Any]:
-    """Build an OpenAPI parameter object (path/query/header/cookie)."""
+    """Build an OpenAPI parameter object (path/query/header/cookie).
+
+    FastAPI populates `schema.title` automatically from the parameter name
+    (`offset` → `"Offset"`) and pushes `description` + numeric/length
+    constraints onto the schema too. Matching that keeps us byte-identical
+    in the generated openapi.json.
+    """
+    # For parameter-model synthetic fields (FA 0.115+ feature where
+    # ``Annotated[BaseModel, Query()]`` expands into individual query
+    # params) the OpenAPI name is the model's FIELD name, not the
+    # internal ``__pm_<owner>__<field>`` bookkeeping key, and the
+    # schema type must come from the FIELD annotation (``list[str]``
+    # → ``type: array``) rather than the wire runtime-coercion hint.
+    pm_field_name = param.get("_param_model_field_name")
+    if pm_field_name is not None:
+        p_name = param.get("alias") or pm_field_name
+        _schema_type_hint = param.get("_param_model_schema_type_hint") or "str"
+        _required_for_schema = param.get("_param_model_field_info").is_required() if param.get("_param_model_field_info") else False
+    else:
+        p_name = param.get("alias") or param["name"]
+        _schema_type_hint = param.get("type_hint", "str")
+        _required_for_schema = param["required"]
+    # Prefer a richer inline schema when we recognize the (unwrapped)
+    # annotation (UUID, datetime, date, etc.). Falls back to the plain
+    # type-hint mapping. For `list[T]` we dig into the inner annotation
+    # so `list[UUID]` picks up `items.format = uuid`.
+    ua = param.get("_unwrapped_annotation")
+    inner_schema = None
+    list_inner_ann = None
+    if ua is not None:
+        # Peel list containers to get the item annotation.
+        import typing as _typing
+        origin = _typing.get_origin(ua)
+        if origin in (list, tuple, set, frozenset):
+            args = _typing.get_args(ua)
+            if args:
+                list_inner_ann = args[0]
+        else:
+            inner_schema = _schema_for_annotation(ua)
+    if inner_schema is None:
+        inner_schema = _type_hint_to_schema(
+            _schema_type_hint, inner_annotation=list_inner_ann
+        )
+
+    # Apply constraint metadata to the INNER schema first, then decide
+    # whether to wrap it in an anyOf for Optional[...] params. FA
+    # coerces numeric ``ge``/``gt``/``le``/``lt`` values to the param
+    # type (``Path(gt=3)`` on a ``float`` param → ``3.0``). Mirror that
+    # so the emitted schema matches byte-for-byte.
+    _numeric_keys = {"ge", "gt", "le", "lt", "multiple_of"}
+    _is_float_type = inner_schema.get("type") == "number"
+    for ck, sk in (
+        ("ge", "minimum"),
+        ("gt", "exclusiveMinimum"),
+        ("le", "maximum"),
+        ("lt", "exclusiveMaximum"),
+        ("min_length", "minLength"),
+        ("max_length", "maxLength"),
+        ("pattern", "pattern"),
+        ("regex", "pattern"),
+        ("multiple_of", "multipleOf"),
+    ):
+        v = param.get(ck)
+        if v is not None:
+            if _is_float_type and ck in _numeric_keys and isinstance(v, int) and not isinstance(v, bool):
+                v = float(v)
+            inner_schema[sk] = v
+
+    # Enum params: when the enum class has been hoisted into
+    # `components.schemas`, emit `$ref` — FA does this. For `Literal`
+    # (which has no class) or pending pre-pass, inline the `{enum,
+    # type, title}` form.
+    if param.get("_enum_values") is not None:
+        enum_cls = param.get("enum_class")
+        if enum_cls is not None and isinstance(enum_cls, type):
+            inner_schema = {"$ref": f"#/components/schemas/{enum_cls.__name__}"}
+        else:
+            _inner_type = inner_schema.get("type", "string")
+            inner_schema = {
+                "enum": list(param["_enum_values"]),
+                "type": _inner_type,
+                "title": p_name,
+            }
+
+    # Optional[...] params → `anyOf: [<inner>, {type: null}]`
+    if param.get("_is_optional"):
+        schema = {"anyOf": [inner_schema, {"type": "null"}]}
+    else:
+        schema = inner_schema
+
     p: dict[str, Any] = {
-        "name": param.get("alias") or param["name"],
+        "name": p_name,
         "in": param["kind"],
-        "required": param["required"],
-        "schema": _type_hint_to_schema(param.get("type_hint", "str")),
+        "required": _required_for_schema,
+        "schema": schema,
     }
-    if param.get("default_value") is not None:
-        p["schema"]["default"] = param["default_value"]
-    if param.get("title"):
-        p["schema"]["title"] = param["title"]
+    # Only emit `schema.default` for plain scalar defaults. Pydantic
+    # `default_factory=list` / `default_factory=dict` produce runtime
+    # values that FastAPI doesn't surface in OpenAPI (to mirror what FA
+    # does, we skip any empty collection default).
+    _dv = param.get("default_value")
+    # Parameter-model synthetic field params store a sentinel "missing"
+    # placeholder as default_value — the real default lives on the
+    # Pydantic FieldInfo. Pull it from there for the schema.
+    if param.get("_param_model_field_info") is not None:
+        from fastapi_rs._introspect import _PARAM_MODEL_MISSING as _PMM
+        from pydantic_core import PydanticUndefined as _PU
+        if _dv is _PMM:
+            _field_info = param["_param_model_field_info"]
+            raw_default = getattr(_field_info, "default", _PU)
+            df = getattr(_field_info, "default_factory", None)
+            if df is not None:
+                try:
+                    _dv = df()
+                except Exception:  # noqa: BLE001
+                    _dv = None
+            elif raw_default is _PU:
+                _dv = None
+            else:
+                _dv = raw_default
+    if _dv is not None:
+        # Avoid putting non-JSON-serializable sentinels in the schema.
+        try:
+            import json as _json
+            _json.dumps(_dv, default=str)
+            p["schema"]["default"] = _dv
+        except Exception:  # noqa: BLE001
+            pass
+    # Title: user-provided (via Query(title=...)) wins. For Enum params
+    # FastAPI surfaces the enum class name (e.g. `Color`). For Header
+    # params the on-the-wire name is the alias (`X-Request-Id`), which FA
+    # uses verbatim as the title. Otherwise auto-derive from the
+    # parameter name (`offset` → `"Offset"`).
+    title = param.get("title")
+    if not title:
+        enum_cls = param.get("enum_class")
+        if enum_cls is not None and isinstance(enum_cls, type):
+            title = enum_cls.__name__
+    if not title and param.get("kind") == "header" and param.get("alias"):
+        # FA preserves hyphens in header aliases when the user declared
+        # the header directly (``Header(alias="user-agent")`` →
+        # ``"User-Agent"``). For **param-model fields**, title comes
+        # from the Pydantic ``validation_alias`` (if set) or the raw
+        # field name — either way split on ``_`` into space-separated
+        # words (``x_tag`` → ``"X Tag"``, ``p_val_alias`` → ``"P Val Alias"``).
+        pm_field = param.get("_param_model_field_name")
+        if pm_field:
+            _pm_fi = param.get("_param_model_field_info")
+            _val_alias = None
+            if _pm_fi is not None:
+                _va = getattr(_pm_fi, "validation_alias", None)
+                if isinstance(_va, str):
+                    _val_alias = _va
+            title_src = _val_alias or pm_field
+            title = " ".join(
+                w.capitalize() for w in title_src.split("_") if w
+            )
+        else:
+            raw_alias = param["alias"]
+            if "-" in raw_alias:
+                title = "-".join(w.capitalize() for w in raw_alias.split("-") if w)
+            else:
+                title = " ".join(
+                    w.capitalize() for w in raw_alias.split("_") if w
+                )
+    if not title:
+        # Title derivation priority (matches FA):
+        #  1. Parameter-model synthetic field → the emitted param
+        #     name (already resolved above: alias if set, else field).
+        #  2. Alias (``Query(alias="p_alias")`` → ``"P Alias"``).
+        #  3. Param Python variable name.
+        # Header titles were already computed above from the alias
+        # (hyphen-preserving), so only cookies / queries hit this path.
+        if param.get("_param_model_field_name"):
+            title_source = p_name
+        else:
+            title_source = param.get("alias") or param["name"]
+        # FA's rule: title splits on ``_`` into space-separated words but
+        # PRESERVES hyphens (``item-query`` → ``"Item-Query"``, not
+        # ``"Item Query"``). Matches Pydantic v2 model_json_schema
+        # behaviour for aliased fields.
+        if "-" in title_source:
+            title = "-".join(
+                " ".join(w.capitalize() for w in seg.split("_") if w) or seg
+                for seg in title_source.split("-")
+            )
+        else:
+            title = " ".join(
+                w.capitalize()
+                for w in title_source.split("_")
+                if w
+            )
+    p["schema"]["title"] = title
+    # Description appears on BOTH the parameter and its inner schema in
+    # FastAPI-generated OpenAPI. Keeping them in sync is important for
+    # docs frontends (Swagger/Redoc) that render them from either side.
     if param.get("description"):
         p["description"] = param["description"]
+        p["schema"]["description"] = param["description"]
     if param.get("deprecated"):
         p["deprecated"] = True
-    # OpenAPI 3.1 example/examples
+    # OpenAPI 3.1: FastAPI emits `examples` as a list on the inner schema,
+    # not the parameter object's dict. `example` (singular) stays on the
+    # parameter.
     if param.get("example") is not None:
         p["example"] = param["example"]
     if param.get("examples") is not None:
-        p["examples"] = _normalize_examples(param["examples"])
+        raw = param["examples"]
+        if isinstance(raw, dict):
+            p["schema"]["examples"] = [v["value"] if isinstance(v, dict) and "value" in v else v for v in raw.values()]
+        elif isinstance(raw, (list, tuple)):
+            p["schema"]["examples"] = list(raw)
+        else:
+            p["schema"]["examples"] = [raw]
     return p
+
+
+def _hoist_body_schema(operation: dict[str, Any], components_schemas: dict[str, Any]) -> None:
+    """Pull inline `Body_<handler>` schemas out of `requestBody.content` and
+    register them in `components.schemas`, rewriting the inline schema to a
+    `$ref`. This matches FastAPI's generated openapi.json, which always
+    references a named component instead of inlining.
+
+    FA actually names the body ``Body_<operation_id>`` (where operation_id
+    is whatever ``generate_unique_id_function`` returned — e.g.
+    ``foo_post_root``). Our introspection-time name uses the endpoint
+    function name because the operationId cascade isn't resolved yet.
+    Rename here so custom ``generate_unique_id_function`` flows through.
+    """
+    rb = operation.get("requestBody")
+    if not isinstance(rb, dict):
+        return
+    op_id = operation.get("operationId")
+    content = rb.get("content") or {}
+    for media_type, media_obj in content.items():
+        sch = (media_obj or {}).get("schema")
+        if not isinstance(sch, dict):
+            continue
+        # Case 1: schema is ``$ref`` to an existing Body_* component.
+        # Rename the component to ``Body_<operation_id>`` and rewrite
+        # the $ref to match.
+        ref = sch.get("$ref")
+        if isinstance(ref, str) and "/Body_" in ref:
+            old_name = ref.split("/")[-1]
+            if old_name in components_schemas:
+                target_name = old_name
+                if isinstance(op_id, str) and op_id:
+                    target_name = f"Body_{op_id}"
+                if target_name != old_name:
+                    body_schema = components_schemas.pop(old_name)
+                    if isinstance(body_schema, dict) and body_schema.get("title") == old_name:
+                        body_schema["title"] = target_name
+                    components_schemas[target_name] = body_schema
+                    media_obj["schema"] = {"$ref": f"#/components/schemas/{target_name}"}
+            continue
+        # Case 2: inline ``Body_<handler>`` schema — promote to
+        # components/schemas with the operationId-derived name.
+        title = sch.get("title")
+        if not (isinstance(title, str) and title.startswith("Body_")):
+            continue
+        target_title = title
+        if isinstance(op_id, str) and op_id:
+            target_title = f"Body_{op_id}"
+            if target_title != title:
+                sch["title"] = target_title
+        components_schemas.setdefault(target_title, sch)
+        media_obj["schema"] = {"$ref": f"#/components/schemas/{target_title}"}
+
+
+def _build_form_file_body(
+    route: dict[str, Any],
+    form_params: list[dict[str, Any]],
+    file_params: list[dict[str, Any]],
+    ordered_mixed: list[tuple[str, dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Synthesize a `Body_<handler>` request body for Form/File endpoints
+    by building a Pydantic model at schema-generation time. Going through
+    Pydantic gives us `anyOf: [<T>, {type: null}]` for Optional fields,
+    `format: "password"` (via SecretStr), exact `pattern` / `minLength` /
+    `maxLength` emission, and matches FA's generated schema byte-for-byte.
+    """
+    from pydantic import create_model, Field as _PField
+    from typing import Optional, Any as _Any
+
+    type_map = {"int": int, "float": float, "bool": bool, "str": str, "bytes": bytes}
+    field_defs: dict[str, Any] = {}
+
+    def _to_py_type(th: str) -> Any:
+        if th.startswith("list_"):
+            inner = th[5:]
+            return list[type_map.get(inner, str)]
+        return type_map.get(th, str)
+
+    import copy as _copy
+    for fp in form_params:
+        # For parameter-model synthetic fields (``pm_<owner>__<field>``)
+        # use the ORIGINAL field name so the emitted schema uses the
+        # user's model's field names, not our internal synthesized ones.
+        # Also for param-model fields, the synthetic extraction entry
+        # is always ``required=False`` (so we can collect missing-value
+        # errors uniformly) — but for SCHEMA emission we must defer
+        # to the underlying model's ``FieldInfo.is_required()``.
+        pm_field_info = fp.get("_param_model_field_info")
+        if pm_field_info is not None:
+            name = fp.get("_param_model_field_name") or fp["name"]
+            ann = fp.get("_param_model_field_ann") or pm_field_info.annotation or str
+            field_defs[name] = (ann, pm_field_info)
+            continue
+        name = fp["name"]
+        raw_marker = fp.get("_raw_marker")
+        raw_ann = fp.get("_raw_annotation")
+        if raw_marker is not None:
+            # Use the UNWRAPPED annotation (strip Annotated so Pydantic
+            # doesn't double-merge the FieldInfo inside Annotated with
+            # our explicit default). Clone the marker and set `default`
+            # from the signature so required-ness matches FastAPI.
+            import typing as _typing
+            if raw_ann is not None and _typing.get_origin(raw_ann) is _typing.Annotated:
+                use_ann = _typing.get_args(raw_ann)[0]
+            else:
+                use_ann = raw_ann if raw_ann is not None else str
+            m = _copy.copy(raw_marker)
+            if fp.get("has_default") and not fp.get("required", True):
+                try:
+                    m.default = fp.get("default_value")
+                    if getattr(m, "default_factory", None) is not None:
+                        m.default_factory = None
+                except Exception:  # noqa: BLE001
+                    pass
+            field_defs[name] = (use_ann, m)
+            continue
+        py_type = _to_py_type(fp.get("type_hint", "str"))
+        if fp.get("_is_optional"):
+            py_type = Optional[py_type]
+        kwargs = {}
+        for ck in ("gt", "ge", "lt", "le", "min_length", "max_length",
+                   "pattern", "regex", "multiple_of"):
+            v = fp.get(ck)
+            if v is not None:
+                kwargs["pattern" if ck == "regex" else ck] = v
+        if fp.get("description"):
+            kwargs["description"] = fp["description"]
+        if fp.get("title"):
+            kwargs["title"] = fp["title"]
+        if fp.get("required", True):
+            default_sentinel = ...
+        else:
+            default_sentinel = fp.get("default_value")
+        field_defs[name] = (py_type, _PField(default_sentinel, **kwargs))
+
+    body_title = f"Body_{route.get('handler_name', 'endpoint')}"
+    BodyModel = create_model(body_title, **field_defs) if field_defs else None
+    try:
+        # ``by_alias=True`` makes Pydantic emit ``Form(alias="p_alias")``
+        # as ``properties.p_alias`` (FA's shape). Without this the
+        # schema uses the Python parameter name and diverges.
+        body_schema = (
+            BodyModel.model_json_schema(mode="validation", by_alias=True)
+            if BodyModel is not None
+            else {"properties": {}, "type": "object", "title": body_title}
+        )
+    except Exception:  # noqa: BLE001
+        body_schema = {"properties": {}, "type": "object", "title": body_title}
+    # Strip nested $defs — the outer hoisting pass will move them.
+    body_schema.pop("$defs", None)
+
+    # File params: FastAPI emits JSON-Schema `contentMediaType:
+    # application/octet-stream` (no `format: binary`) for UploadFile
+    # fields, and wraps `list[UploadFile]` as `type: array, items:
+    # {type: string, contentMediaType: ...}`. Our Pydantic-based builder
+    # doesn't know about UploadFile semantics, so we splice them in
+    # directly after the fact.
+    body_schema.setdefault("properties", {})
+    body_schema.setdefault("required", [])
+    for fp in file_params:
+        # ``File(alias="p_alias")`` → emit the on-the-wire ``p_alias``
+        # as the property name (and ``"P Alias"`` as the title), not
+        # the Python param name. FA does the same.
+        field_name = fp.get("_param_model_field_name")
+        if field_name is not None:
+            name = field_name
+        elif fp.get("alias"):
+            name = fp["alias"]
+        else:
+            name = fp["name"]
+        base_item = {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+        }
+        if fp.get("type_hint", "").startswith("list_"):
+            schema = {"items": base_item, "type": "array"}
+        else:
+            schema = dict(base_item)
+        # Optional File / UploadFile → FA emits ``anyOf: [<base>, {type: null}]``.
+        if fp.get("_is_optional"):
+            schema = {"anyOf": [schema, {"type": "null"}]}
+        title_words = " ".join(w.capitalize() for w in name.split("_") if w)
+        schema["title"] = title_words
+        if fp.get("description"):
+            schema["description"] = fp["description"]
+        body_schema["properties"][name] = schema
+        if fp.get("required", True) and name not in body_schema["required"]:
+            body_schema["required"].append(name)
+    if not body_schema["required"]:
+        body_schema.pop("required", None)
+
+    # Reorder properties to match the handler's signature declaration
+    # order (FastAPI preserves that — our Pydantic-generated body puts
+    # form fields first then file fields, which differs when the user
+    # wrote `title, description, file, tags`).
+    if ordered_mixed:
+        props = body_schema.get("properties", {})
+        ordered_keys: list[str] = []
+        for _, p in ordered_mixed:
+            if p["name"] in props and p["name"] not in ordered_keys:
+                ordered_keys.append(p["name"])
+        # Append any keys that weren't in ordered_mixed (defensive).
+        for k in props:
+            if k not in ordered_keys:
+                ordered_keys.append(k)
+        body_schema["properties"] = {k: props[k] for k in ordered_keys}
+
+    media_type = "multipart/form-data" if file_params else "application/x-www-form-urlencoded"
+    return {
+        "required": True,
+        "content": {media_type: {"schema": body_schema}},
+    }
 
 
 def _build_request_body(param: dict[str, Any]) -> dict[str, Any]:
     """Build an OpenAPI requestBody from a body parameter."""
     model_class = param.get("model_class")
-    ref = _model_ref(model_class) if model_class is not None else None
+    # ``Model | None`` / ``Optional[Model]`` body params surface as a
+    # ``_TypeAdapterProxy`` wrapping the Union; FA emits
+    # ``anyOf: [{$ref: Model}, {type: null}]`` for them. Unwrap the
+    # Union so we can hand each arm through ``_model_ref`` / a plain
+    # type fragment.
+    annotation = getattr(model_class, "_annotation", None)
+    import typing as _typing
+    # Container body params — ``list[Item]``, ``dict[str, Item]``, etc.
+    # Pydantic's TypeAdapter emits the correct JSON schema (array/obj
+    # with ``$ref`` items); use it directly and normalise ``$defs``.
+    _origin = _typing.get_origin(annotation) if annotation is not None else None
+    if _origin in (list, tuple, set, frozenset, dict):
+        try:
+            from pydantic import TypeAdapter as _TA
+            container_schema = _TA(annotation).json_schema(mode="validation")
+            # Drop nested $defs — the outer
+            # ``_collect_model_schemas`` pass surfaces those to
+            # components.schemas and we want internal refs rewritten.
+            container_schema.pop("$defs", None)
+            container_schema = _rewrite_defs_refs(container_schema)
+            # FA titles the body ``Images`` (matching the handler param
+            # name capitalized); mirror that if Pydantic didn't already.
+            if "title" not in container_schema and param.get("name"):
+                container_schema["title"] = param["name"].replace("_", " ").title()
+            media_type = param.get("media_type") or "application/json"
+            content: dict[str, Any] = {media_type: {"schema": container_schema}}
+            body: dict[str, Any] = {"content": content}
+            if param.get("required", True):
+                body["required"] = True
+            if param.get("description"):
+                body["description"] = param["description"]
+            return body
+        except Exception:  # noqa: BLE001
+            pass
+    if annotation is not None and _typing.get_origin(annotation) is _typing.Union:
+        arms = _typing.get_args(annotation)
+        non_none = [a for a in arms if a is not type(None)]
+        has_none = any(a is type(None) for a in arms)
+        if non_none and has_none:
+            any_of: list[Any] = []
+            title_from: Any = None
+            for arm in non_none:
+                arm_ref = _model_ref(arm, mode="validation")
+                if arm_ref is not None:
+                    any_of.append(arm_ref)
+                    title_from = arm
+                else:
+                    frag = _type_hint_to_schema(_get_type_name(arm))
+                    if frag and frag != {"type": "object"}:
+                        any_of.append(frag)
+                    else:
+                        any_of.append({"type": "object"})
+            any_of.append({"type": "null"})
+            body_schema: dict[str, Any] = {"anyOf": any_of}
+            if title_from is not None:
+                body_schema["title"] = getattr(title_from, "__name__", "Body")
+            media_type = param.get("media_type") or "application/json"
+            content: dict[str, Any] = {media_type: {"schema": body_schema}}
+            body: dict[str, Any] = {"content": content}
+            if param.get("required", True):
+                body["required"] = True
+            if param.get("description"):
+                body["description"] = param["description"]
+            return body
+    ref = _model_ref(model_class, mode="validation") if model_class is not None else None
     if ref is not None:
         body_schema = ref
     elif model_class is not None and hasattr(model_class, "model_json_schema"):
-        body_schema = model_class.model_json_schema()
+        body_schema = model_class.model_json_schema(mode="validation")
     else:
         body_schema = {"type": "object"}
 
@@ -344,10 +1328,11 @@ def _build_request_body(param: dict[str, Any]) -> dict[str, Any]:
     if param.get("examples") is not None:
         content[media_type]["examples"] = _normalize_examples(param["examples"])
 
-    body: dict[str, Any] = {
-        "required": param.get("required", True),
-        "content": content,
-    }
+    # Match FA's ``get_openapi_operation_request_body``: emit
+    # ``"required"`` only when the body is required, not always.
+    body: dict[str, Any] = {"content": content}
+    if param.get("required", True):
+        body["required"] = True
     if param.get("description"):
         body["description"] = param["description"]
     return body
@@ -376,44 +1361,227 @@ def _normalize_examples(examples: Any) -> dict[str, Any]:
 
 
 def _rewrite_defs_refs(obj: Any) -> Any:
-    """Recursively rewrite ``$ref: #/$defs/Foo`` to ``$ref: #/components/schemas/Foo``."""
+    """Recursively rewrite any ``#/$defs/Foo`` reference (as either a
+    `$ref` key or a bare string value like `discriminator.mapping`
+    entries) into ``#/components/schemas/Foo``. Also drops Pydantic-
+    emitted ``default: null`` entries that FastAPI strips in its own
+    post-processing pass AND normalises generic class names
+    (`Page[Item]` → `Page_Item_`) in the rewritten ref targets.
+    """
+
+    def _rewrite_ref(v: str) -> str:
+        if v.startswith("#/$defs/"):
+            tail = v[len("#/$defs/"):]
+            return "#/components/schemas/" + _normalize_model_name(tail)
+        if v.startswith("#/components/schemas/"):
+            tail = v[len("#/components/schemas/"):]
+            # Handle optional `-Input` / `-Output` suffix on split models
+            for suffix in ("-Input", "-Output"):
+                if tail.endswith(suffix):
+                    base = tail[: -len(suffix)]
+                    return "#/components/schemas/" + _normalize_model_name(base) + suffix
+            return "#/components/schemas/" + _normalize_model_name(tail)
+        return v
+
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            if k == "$ref" and isinstance(v, str) and v.startswith("#/$defs/"):
-                out[k] = v.replace("#/$defs/", "#/components/schemas/", 1)
+            # Strip ``default: null`` on Optional fields — FA omits it
+            # from the served schema. Preserve ``default: []`` /
+            # ``default: {}`` etc. (FA's serialization_defaults_required
+            # pydantic mode keeps those).
+            if k == "default" and v is None:
+                continue
+            if isinstance(v, str) and (v.startswith("#/$defs/") or v.startswith("#/components/schemas/")):
+                out[k] = _rewrite_ref(v)
             else:
                 out[k] = _rewrite_defs_refs(v)
         return out
     if isinstance(obj, list):
         return [_rewrite_defs_refs(item) for item in obj]
+    if isinstance(obj, str) and (obj.startswith("#/$defs/") or obj.startswith("#/components/schemas/")):
+        return _rewrite_ref(obj)
     return obj
 
 
-def _model_ref(model_class) -> dict[str, str] | None:
-    """Return a ``{"$ref": "#/components/schemas/Name"}`` dict for a Pydantic model."""
+def _json_encode_fallback(obj) -> str:
+    import json
+    try:
+        return json.dumps(obj, default=str)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# Usage tracker: id(model_class) → set of {"input", "output"}. Populated
+# during operation building so _collect_schemas knows whether to emit
+# `<Name>-Input` / `<Name>-Output` split variants for dual-use models.
+_MODEL_USAGE: dict[int, set[str]] = {}
+
+
+def _normalize_model_name(name: str) -> str:
+    """FastAPI rewrites generic parameter class names from Pydantic's
+    `Name[T]` form into `Name_T_` so they're valid JSON Schema component
+    names (which must match `^[a-zA-Z0-9.\\-_]+$`). Apply the same
+    transformation to match the generated openapi.json byte-for-byte.
+    """
+    if not isinstance(name, str):
+        return name
+    # `Page[Item]` → `Page_Item_`; `Box[str, int]` → `Box_str_int_`; etc.
+    return name.replace("[", "_").replace("]", "_").replace(", ", "_").replace(",", "_").replace(" ", "")
+
+
+def _note_model_usage(model_class, ctx: str) -> None:
+    """Record that `model_class` is referenced in `ctx` ("input" or
+    "output"), then recurse into its fields so nested models inherit the
+    same usage. This mirrors FastAPI's logic: a model used as an output
+    root propagates the "output" usage through every nested model it
+    references, so deep `List[Node]` style graphs split correctly.
+    """
+    if model_class is None or not hasattr(model_class, "model_json_schema"):
+        return
+    existing = _MODEL_USAGE.setdefault(id(model_class), set())
+    if ctx in existing:
+        return
+    existing.add(ctx)
+    # Walk nested model references.
+    fields = getattr(model_class, "model_fields", None) or {}
+    import typing as _typing
+    try:
+        from pydantic import BaseModel as _BM
+    except ImportError:  # pragma: no cover
+        return
+    for finfo in fields.values():
+        ann = getattr(finfo, "annotation", None)
+        _walk_annotation_for_usage(ann, ctx, _typing, _BM)
+
+
+def _walk_annotation_for_usage(ann, ctx, _typing, _BM) -> None:
+    if ann is None:
+        return
+    origin = _typing.get_origin(ann)
+    if origin is not None:
+        for sub in _typing.get_args(ann):
+            _walk_annotation_for_usage(sub, ctx, _typing, _BM)
+        return
+    try:
+        if isinstance(ann, type) and issubclass(ann, _BM):
+            _note_model_usage(ann, ctx)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _flatten_annotation_types(ann):
+    """Yield every concrete type that appears in a (possibly generic)
+    annotation — used to seed the schema-registration pass."""
+    import typing as _typing
+    if ann is None:
+        return
+    origin = _typing.get_origin(ann)
+    if origin is not None:
+        for sub in _typing.get_args(ann):
+            yield from _flatten_annotation_types(sub)
+        return
+    if isinstance(ann, type):
+        yield ann
+
+
+def _model_ref(model_class, mode: str | None = None) -> dict[str, str] | None:
+    """Return a ``{"$ref": "#/components/schemas/Name"}`` dict for a Pydantic model.
+
+    FastAPI splits a model into `<Name>-Input` + `<Name>-Output` when
+    (1) it is referenced from BOTH an input (request body) and an output
+    (response) context, AND (2) the model is self-recursive (has a
+    field referring back to itself, directly or transitively). Other
+    models keep the plain `<Name>` ref.
+    """
     name = getattr(model_class, "__name__", None)
-    if name and hasattr(model_class, "model_json_schema"):
-        return {"$ref": f"#/components/schemas/{name}"}
-    return None
+    if not (name and hasattr(model_class, "model_json_schema")):
+        return None
+    name = _normalize_model_name(name)
+    usage = _MODEL_USAGE.get(id(model_class), set())
+    split = (
+        "input" in usage and "output" in usage
+        and _model_is_self_recursive(model_class)
+    )
+    if split and mode == "serialization":
+        return {"$ref": f"#/components/schemas/{name}-Output"}
+    if split and mode == "validation":
+        return {"$ref": f"#/components/schemas/{name}-Input"}
+    return {"$ref": f"#/components/schemas/{name}"}
+
+
+def _model_is_self_recursive(model_class) -> bool:
+    """True if the model contains a field whose annotation references the
+    same class, directly or transitively via nested containers / Unions.
+    """
+    try:
+        fields = getattr(model_class, "model_fields", None) or {}
+    except Exception:  # noqa: BLE001
+        return False
+    import typing as _typing
+
+    def _refs(ann, seen):
+        if ann is None:
+            return False
+        origin = _typing.get_origin(ann)
+        if origin is not None:
+            return any(_refs(a, seen) for a in _typing.get_args(ann))
+        try:
+            if isinstance(ann, type) and ann is model_class:
+                return True
+            if isinstance(ann, type) and hasattr(ann, "model_fields") and ann not in seen:
+                seen.add(ann)
+                for f in (getattr(ann, "model_fields", None) or {}).values():
+                    if _refs(getattr(f, "annotation", None), seen):
+                        return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
+    for finfo in fields.values():
+        if _refs(getattr(finfo, "annotation", None), {model_class}):
+            return True
+    return False
 
 
 def _collect_schemas(
     route: dict[str, Any], schemas: dict[str, Any]
 ) -> None:
     """Extract Pydantic model ``$defs`` into the shared components/schemas bucket."""
-    # From route params (body models)
+    # From route params (body models). ``_TypeAdapterProxy`` wraps
+    # non-BaseModel annotations (``list[Item]``, ``Foo | None``); walk
+    # the inner annotation too so inner ``BaseModel`` arms surface in
+    # components.schemas.
     for param in route.get("params", []):
         model_class = param.get("model_class")
         _collect_model_schemas(model_class, schemas)
+        inner = getattr(model_class, "_annotation", None)
+        if inner is not None:
+            for sub in _flatten_annotation_types(inner):
+                _collect_model_schemas(sub, schemas)
 
-    # From route.responses (extra status codes with models)
+    # From route.responses (extra status codes with models).
+    # ``responses={404: {"model": list[Message]}}`` — walk container
+    # annotations too so the inner ``Message`` model lands in
+    # components.schemas.
     for resp_info in (route.get("responses") or {}).values():
         if isinstance(resp_info, dict):
-            _collect_model_schemas(resp_info.get("model"), schemas)
+            resp_model = resp_info.get("model")
+            _collect_model_schemas(resp_model, schemas)
+            for sub in _flatten_annotation_types(resp_model):
+                _collect_model_schemas(sub, schemas)
 
-    # response_model
-    _collect_model_schemas(route.get("response_model"), schemas)
+    # response_model — same container-walk.
+    resp_m = route.get("response_model")
+    _collect_model_schemas(resp_m, schemas)
+    for sub in _flatten_annotation_types(resp_m):
+        _collect_model_schemas(sub, schemas)
+
+    # Callback routes' response models
+    for cb_model in _walk_callback_models(route.get("callbacks")):
+        _collect_model_schemas(cb_model, schemas)
+        for sub in _flatten_annotation_types(cb_model):
+            _collect_model_schemas(sub, schemas)
 
 
 def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
@@ -427,18 +1595,53 @@ def _collect_model_schemas(model_class, schemas: dict[str, Any]) -> None:
         return
     if not hasattr(model_class, "model_json_schema"):
         return
+    # Pydantic v2 splits a model into two JSON schemas whenever its
+    # validation and serialization shapes differ (`computed_field`,
+    # recursive forward refs, validation-only aliases, etc.) AND FastAPI
+    # emits both when the model is used in both input and output contexts
+    # anywhere in the app. We record both variants proactively — the
+    # `_used_as` hint at schema-resolution time picks the right ref.
     try:
-        json_schema = model_class.model_json_schema()
+        val_schema = model_class.model_json_schema(mode="validation")
     except Exception:
+        val_schema = None
+    try:
+        ser_schema = model_class.model_json_schema(mode="serialization")
+    except Exception:
+        ser_schema = None
+
+    json_schema = ser_schema if ser_schema is not None else val_schema
+    if json_schema is None:
         return
 
-    # Promote nested $defs into components/schemas
+    # Promote nested $defs into components/schemas, normalising `Name[T]`
+    # generic names to the `Name_T_` form FastAPI uses.
     if "$defs" in json_schema:
         for name, defn in json_schema["$defs"].items():
-            schemas.setdefault(name, defn)
+            schemas.setdefault(_normalize_model_name(name), defn)
 
-    # Register the top-level model itself
-    model_name = getattr(model_class, "__name__", None)
+    raw_name = getattr(model_class, "__name__", None)
+    model_name = _normalize_model_name(raw_name) if raw_name else None
+    used_as = _MODEL_USAGE.get(id(model_class), set())
+    is_self_recursive = _model_is_self_recursive(model_class)
+    if model_name and ("input" in used_as and "output" in used_as) and is_self_recursive:
+        # Self-recursive + dual-use — FastAPI emits split `-Input`/`-Output`
+        # variants so body vs response can differ (the schemas are usually
+        # identical, but the two distinct refs let the spec read cleanly
+        # when tools traverse them separately).
+        for mname, ms in (
+            (f"{model_name}-Input", val_schema),
+            (f"{model_name}-Output", ser_schema),
+        ):
+            if ms is None:
+                continue
+            clean_split = {k: v for k, v in ms.items() if k != "$defs"}
+            schemas.setdefault(mname, clean_split)
+            if "$defs" in ms:
+                for n, d in ms["$defs"].items():
+                    schemas.setdefault(_normalize_model_name(n), d)
+        return
+
     if model_name and model_name not in schemas:
         # Build a clean schema without $defs (they live in components/schemas)
         clean = {k: v for k, v in json_schema.items() if k != "$defs"}
@@ -473,7 +1676,14 @@ def _collect_security_schemes(
 
 
 def _derive_security_from_deps(route: dict[str, Any]) -> list[dict[str, list[str]]]:
-    """Auto-derive operation security list from detected security-scheme deps."""
+    """Auto-derive operation security list from detected security-scheme
+    deps.
+
+    FastAPI emits `{scheme_name: []}` by default — scopes are populated
+    only when the user used `Security(scheme, scopes=["read", ...])`. A
+    scheme's own scope catalog (`OAuth2PasswordBearer(scopes={...})`)
+    advertises what scopes exist, not what each endpoint requires.
+    """
     all_params = route.get("_all_params", route.get("params", []))
     out: list[dict[str, list[str]]] = []
     seen: set[str] = set()
@@ -486,62 +1696,132 @@ def _derive_security_from_deps(route: dict[str, Any]) -> list[dict[str, list[str
             if scheme_name in seen:
                 continue
             seen.add(scheme_name)
-            # Scopes for OAuth2 are the keys of the flow's scopes dict
-            scopes: list[str] = []
-            scheme_scopes = getattr(dep_callable, "scopes", None)
-            if isinstance(scheme_scopes, dict):
-                scopes = list(scheme_scopes.keys())
+            # Scopes are the scopes REQUIRED by this specific Security()
+            # call (empty list = just "must be authenticated"). Our resolver
+            # stashes the user-supplied scopes on the dep step under
+            # `_security_scopes` when it sees `Security(scheme, scopes=...)`.
+            scopes = list(param.get("_security_scopes") or [])
             out.append({scheme_name: scopes})
     return out
 
 
 def _build_callbacks(callbacks: list) -> dict[str, Any]:
-    """Render OpenAPI callbacks from a list of APIRouter instances.
+    """Render OpenAPI callbacks.
 
-    Each callback router becomes a nested entry under operation.callbacks:
-        {router.name: {path: {method: operation}}}
+    FA accepts TWO forms here:
+      1. list of ``APIRoute`` — routes directly (``callbacks=router.routes``).
+      2. list of ``APIRouter`` — full routers (less common).
+    Both are rendered as ``{callback_name: {path: {method: operation}}}``.
     """
-    from fastapi_rs.routing import APIRouter
+    from fastapi_rs.routing import APIRouter, APIRoute
+
+    def _route_entry(cb_route, prefix: str = "") -> tuple[str, str, dict[str, Any]]:
+        full_path = prefix + cb_route.path
+        cb_route_dict = {
+            "path": full_path,
+            "methods": cb_route.methods,
+            "handler_name": cb_route.name,
+            "params": [],
+            "tags": cb_route.tags,
+            "summary": cb_route.summary,
+            "description": cb_route.description,
+            "status_code": cb_route.status_code or 200,
+            "response_description": cb_route.response_description,
+            "responses": cb_route.responses,
+            "deprecated": cb_route.deprecated,
+            "operation_id": cb_route.operation_id,
+            "include_in_schema": cb_route.include_in_schema,
+            "openapi_extra": cb_route.openapi_extra,
+        }
+        methods_dict: dict[str, Any] = {}
+        for method in cb_route.methods:
+            methods_dict[method.lower()] = _build_operation(cb_route_dict, method.lower())
+        return cb_route.name, full_path, methods_dict
 
     result: dict[str, Any] = {}
     for idx, cb in enumerate(callbacks):
-        if not isinstance(cb, APIRouter):
-            continue
-        cb_name = getattr(cb, "name", None) or f"callback_{idx}"
-        paths: dict[str, Any] = {}
-        for cb_route in cb.routes:
-            full_path = cb.prefix + cb_route.path
-            methods_dict: dict[str, Any] = {}
-            # Build a minimal route dict compatible with _build_operation
-            cb_route_dict = {
-                "path": full_path,
-                "methods": cb_route.methods,
-                "handler_name": cb_route.name,
-                "params": [],
-                "tags": cb_route.tags,
-                "summary": cb_route.summary,
-                "description": cb_route.description,
-                "status_code": cb_route.status_code or 200,
-                "response_description": cb_route.response_description,
-                "responses": cb_route.responses,
-                "deprecated": cb_route.deprecated,
-                "operation_id": cb_route.operation_id,
-                "include_in_schema": cb_route.include_in_schema,
-                "openapi_extra": cb_route.openapi_extra,
-            }
-            for method in cb_route.methods:
-                methods_dict[method.lower()] = _build_operation(cb_route_dict, method.lower())
-            paths[full_path] = methods_dict
-        result[cb_name] = paths
+        if isinstance(cb, APIRouter):
+            cb_name = getattr(cb, "name", None) or f"callback_{idx}"
+            paths: dict[str, Any] = {}
+            for cb_route in cb.routes:
+                _n, full_path, methods_dict = _route_entry(cb_route, prefix=cb.prefix)
+                paths[full_path] = methods_dict
+            result[cb_name] = paths
+        elif isinstance(cb, APIRoute):
+            name, full_path, methods_dict = _route_entry(cb)
+            result.setdefault(name or f"callback_{idx}", {})[full_path] = methods_dict
     return result
 
 
-def _type_hint_to_schema(type_hint: str) -> dict[str, Any]:
-    """Map a simple type-hint string to an OpenAPI schema fragment."""
+def _walk_callback_models(callbacks: list):
+    """Yield every ``BaseModel`` reachable from any callback route so the
+    ``_register_model`` pass picks them up and emits the component schema.
+    """
+    from fastapi_rs.routing import APIRouter, APIRoute
+
+    def _from_route(cb_route):
+        for resp_info in (getattr(cb_route, "responses", None) or {}).values():
+            if isinstance(resp_info, dict):
+                m = resp_info.get("model")
+                if m is not None:
+                    yield m
+
+    for cb in callbacks or []:
+        if isinstance(cb, APIRouter):
+            for cb_route in cb.routes:
+                yield from _from_route(cb_route)
+        elif isinstance(cb, APIRoute):
+            yield from _from_route(cb)
+
+
+def _type_hint_to_schema(type_hint: str, inner_annotation=None) -> dict[str, Any]:
+    """Map a simple type-hint string to an OpenAPI schema fragment.
+
+    When ``type_hint`` is ``list_<inner>`` and ``inner_annotation`` is the
+    original inner Python type (e.g. ``UUID``/``datetime``), we emit the
+    matching JSON-Schema ``items`` (``{type: string, format: uuid}`` /
+    ``{type: string, format: date-time}``) to match FastAPI.
+    """
     mapping: dict[str, dict[str, Any]] = {
         "int": {"type": "integer"},
         "float": {"type": "number"},
         "bool": {"type": "boolean"},
         "str": {"type": "string"},
+        "bytes": {"type": "string", "format": "binary"},
     }
+    # `list_<inner>` — FastAPI emits `{type: "array", items: {type: ...}}`
+    if type_hint.startswith("list_"):
+        inner = type_hint[5:]
+        item_schema: dict[str, Any]
+        # Prefer the annotation-derived schema when available so `UUID`
+        # / `datetime` items land with their proper `format`.
+        rich = _schema_for_annotation(inner_annotation) if inner_annotation is not None else None
+        if rich is not None:
+            item_schema = rich
+        else:
+            item_schema = mapping.get(inner, {"type": "string"})
+        return {"type": "array", "items": item_schema}
     return dict(mapping.get(type_hint, {"type": "string"}))
+
+
+def _schema_for_annotation(annotation) -> dict[str, Any] | None:
+    """Best-effort inline JSON schema fragment for a Python type annotation.
+
+    Used when the parameter type carries richer schema info than the plain
+    `type_hint` string can convey — e.g. `UUID`, `datetime`, `HttpUrl`.
+    Falls back to `None` so the caller can use the existing mapping.
+    """
+    import datetime as _dt
+    import uuid as _uuid
+    from decimal import Decimal as _Dec
+    format_map = {
+        _uuid.UUID: {"type": "string", "format": "uuid"},
+        _dt.datetime: {"type": "string", "format": "date-time"},
+        _dt.date: {"type": "string", "format": "date"},
+        _dt.time: {"type": "string", "format": "time"},
+        _dt.timedelta: {"type": "string", "format": "duration"},
+        _Dec: {"type": "string", "format": "decimal"},
+    }
+    if annotation in format_map:
+        return dict(format_map[annotation])
+    return None

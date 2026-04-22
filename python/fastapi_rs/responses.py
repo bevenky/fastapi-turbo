@@ -11,19 +11,74 @@ class _MutableHeadersDict(dict):
     """A dict subclass with Starlette MutableHeaders-compatible methods.
 
     Keeps full C-level dict compatibility (for Rust PyO3 access) while
-    adding append() and getlist() that Starlette's MutableHeaders provides.
+    adding append() / getlist() / mutablecopy() etc. that Starlette's
+    MutableHeaders provides. Duplicate values for the same header name
+    (e.g. two `Vary:` headers, multiple `Set-Cookie:`) are preserved in
+    `_extras` and reflected in `raw`, `items()`, iteration, and Rust-side
+    emission via the owning Response's `raw_headers`.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Each entry is a (lowercased-key, raw-value) tuple. Mirror to the
+        # owning Response's `raw_headers` via `_link_response()` so the Rust
+        # renderer emits multi-value headers verbatim.
+        self._extras: list[tuple[str, str]] = []
+        self._linked_raw: list[tuple[str, str]] | None = None
+
+    def _link_raw_headers(self, raw: list[tuple[str, str]]) -> None:
+        self._linked_raw = raw
+
     def append(self, key: str, value: str) -> None:
-        """Add a header value. Overwrites if key exists (simplified single-value)."""
-        self[key.lower()] = str(value)
+        """Add a header value, preserving duplicates (Starlette-compatible).
+
+        Starlette's `MutableHeaders.append()` pushes a new (key, value) onto
+        the raw headers list — so two `append("X-Dup", "a")`+`append("X-Dup",
+        "b")` calls produce TWO `X-Dup` headers. The dict view still
+        reflects the latest value (so `.get(key)` stays predictable).
+        """
+        key_l = key.lower()
+        val = str(value)
+        self[key_l] = val
+        self._extras.append((key_l, val))
+        if self._linked_raw is not None:
+            self._linked_raw.append((key_l, val))
 
     def getlist(self, key: str) -> list[str]:
         """Return all values for a header key as a list."""
-        val = self.get(key.lower())
-        if val is None:
-            return []
-        return [val]
+        key_l = key.lower()
+        vals: list[str] = []
+        # Capture the single-valued canonical plus any extras that share the
+        # name. Iteration order matches insertion order.
+        if key_l in self and not any(k == key_l for k, _ in self._extras):
+            vals.append(self[key_l])
+        for k, v in self._extras:
+            if k == key_l:
+                vals.append(v)
+        return vals
+
+    def mutablecopy(self) -> "_MutableHeadersDict":
+        """Return a new MutableHeaders instance with identical entries.
+
+        Starlette exposes this so middleware can hand a detachable copy to
+        downstream code without sharing state with the live response.
+        """
+        copy = _MutableHeadersDict(self)
+        copy._extras = list(self._extras)
+        return copy
+
+    def raw(self) -> list[tuple[bytes, bytes]]:
+        """Starlette compatibility — raw (bytes, bytes) list view."""
+        seen_keys: set[str] = set()
+        out: list[tuple[bytes, bytes]] = []
+        for k, v in self.items():
+            seen_keys.add(k)
+            out.append((k.encode("latin-1"), v.encode("latin-1")))
+        for k, v in self._extras:
+            if k in seen_keys:
+                # Already emitted via dict canonical; append the extra too
+                out.append((k.encode("latin-1"), v.encode("latin-1")))
+        return out
 
 
 class Response:
@@ -41,16 +96,26 @@ class Response:
     ):
         self.status_code = status_code
         self.headers = _MutableHeadersDict(headers or {})
-        # raw_headers preserves duplicate keys (needed for multiple Set-Cookie).
-        # Rust side reads this list with header.append() instead of insert().
+        # raw_headers preserves duplicate keys (needed for multiple Set-Cookie
+        # and `response.headers.append("X-Dup", ...)` duplicates). Rust side
+        # reads this list with header.append() instead of insert().
         self.raw_headers: list[tuple[str, str]] = []
+        # Link the headers object so `.append()` reflects duplicates into
+        # `raw_headers` automatically.
+        self.headers._link_raw_headers(self.raw_headers)
         self.background = background
 
         if media_type is not None:
             self.media_type = media_type
 
         if self.media_type:
-            self.headers.setdefault("content-type", self.media_type)
+            # Starlette auto-appends "; charset=utf-8" to text/* media
+            # types. FA tests expect ``text/html; charset=utf-8`` on
+            # HTMLResponse etc. — match that behaviour.
+            ct = self.media_type
+            if ct.startswith("text/") and "charset=" not in ct.lower():
+                ct = f"{ct}; charset={getattr(self, 'charset', 'utf-8')}"
+            self.headers.setdefault("content-type", ct)
 
         self.body = self.render(content)
 
@@ -100,24 +165,49 @@ class Response:
 
         All parameters are positional-or-keyword to match Starlette exactly.
         """
-        parts: list[str] = [f"{key}={value}"]
-        if max_age is not None:
-            parts.append(f"Max-Age={int(max_age)}")
-        if expires is not None:
-            if isinstance(expires, (int, float)):
-                parts.append(f"Expires={email.utils.formatdate(float(expires), usegmt=True)}")
-            else:
-                parts.append(f"Expires={expires}")
-        if path is not None:
-            parts.append(f"Path={path}")
+        # Starlette's http.cookies-compatible builder emits attributes in
+        # canonical alphabetic order (Domain, expires, HttpOnly, Max-Age,
+        # Path, SameSite, Secure). Emitting the same order avoids
+        # byte-level diffs with FA.
+        import time as _time
+        # Wrap values that contain spaces, commas, semicolons etc. per
+        # RFC 6265 quoted-string encoding — otherwise the Set-Cookie
+        # header is malformed and cookie jars drop the value.
+        _encoded_value = str(value)
+        if any(ch in _encoded_value for ch in ' ",;\\') and not (
+            _encoded_value.startswith('"') and _encoded_value.endswith('"')
+        ):
+            _encoded_value = '"' + _encoded_value.replace('\\', r'\\').replace('"', r'\"') + '"'
+        parts: list[str] = [f"{key}={_encoded_value}"]
         if domain is not None:
             parts.append(f"Domain={domain}")
-        if secure:
-            parts.append("Secure")
+        if expires is not None:
+            if isinstance(expires, (int, float)):
+                # Newer Starlette interprets an int `expires` as
+                # seconds-from-now. Add the current epoch so the emitted
+                # HTTP-date points at a future instant (matches FA).
+                ts = float(expires)
+                if ts < 315532800:  # < 1980-01-01 → treat as offset
+                    ts = _time.time() + ts
+                parts.append(
+                    f"expires={email.utils.formatdate(ts, usegmt=True)}"
+                )
+            else:
+                parts.append(f"expires={expires}")
         if httponly:
             parts.append("HttpOnly")
+        if max_age is not None:
+            parts.append(f"Max-Age={int(max_age)}")
+        if path is not None:
+            parts.append(f"Path={path}")
         if samesite is not None:
-            parts.append(f"SameSite={samesite.capitalize()}")
+            # Starlette emits the samesite value lowercased on the wire
+            # (`SameSite=lax`). Match that so parsers that do a strict
+            # case-sensitive equality (some CDN / proxy bindings) behave
+            # identically under stock FastAPI and fastapi-rs.
+            parts.append(f"SameSite={samesite.lower()}")
+        if secure:
+            parts.append("Secure")
         if partitioned:
             parts.append("Partitioned")
         cookie_str = "; ".join(parts)
@@ -146,6 +236,17 @@ class Response:
         )
 
 
+def _json_default(obj):
+    """json.dumps ``default=`` callback for types that aren't JSON-native.
+
+    Handles ``bytes`` by UTF-8 decoding (matches FA's ``jsonable_encoder``)
+    and falls back to ``str()`` for everything else.
+    """
+    if isinstance(obj, (bytes, bytearray)):
+        return bytes(obj).decode("utf-8", errors="replace")
+    return str(obj)
+
+
 class JSONResponse(Response):
     """JSON response. Uses orjson when available, else stdlib json.
 
@@ -157,10 +258,10 @@ class JSONResponse(Response):
     def render(self, content) -> bytes:
         try:
             import orjson
-            return orjson.dumps(content, default=float)
+            return orjson.dumps(content, default=_json_default)
         except ImportError:
             import json
-            return json.dumps(content, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8")
+            return json.dumps(content, separators=(",", ":"), ensure_ascii=False, default=_json_default).encode("utf-8")
 
 
 class HTMLResponse(Response):
@@ -198,12 +299,21 @@ class StreamingResponse(Response):
         self.status_code = status_code
         self.headers = _MutableHeadersDict(headers or {})
         self.raw_headers: list[tuple[str, str]] = []
-        self.media_type = media_type
+        # Preserve the class-level ``media_type`` (``PNGStreamingResponse
+        # .media_type = "image/png"``) when the caller didn't pass one
+        # — otherwise user subclasses lose their default content-type.
+        if media_type is not None:
+            self.media_type = media_type
         self.background = background
         self.body = b""  # placeholder — Rust handles streaming
 
         if self.media_type:
-            self.headers.setdefault("content-type", self.media_type)
+            # Same charset-appending rule as ``Response`` — FA sends
+            # ``text/event-stream; charset=utf-8`` for SSE streams.
+            ct = self.media_type
+            if ct.startswith("text/") and "charset=" not in ct.lower():
+                ct = f"{ct}; charset={getattr(self, 'charset', 'utf-8')}"
+            self.headers.setdefault("content-type", ct)
 
     async def listen_for_disconnect(self):
         """Wait until the client disconnects.
@@ -216,21 +326,98 @@ class StreamingResponse(Response):
 
 
 class EventSourceResponse(StreamingResponse):
-    """SSE response — wraps an async/sync generator of events."""
+    """SSE response — wraps an async/sync generator of events.
+
+    Matches FA 0.136+ behaviour: yielded items (``ServerSentEvent``,
+    Pydantic models, dicts, strings) are encoded to the SSE wire format
+    (``data: <json>\\n\\n``) before being streamed. Plain strings and
+    other scalars are JSON-encoded so the wire data field is a JSON
+    literal (``"hello"`` becomes ``data: "hello"`` on the wire — FA's
+    explicit contract).
+    """
     media_type = "text/event-stream"
 
     def __init__(self, content, *, status_code=200, headers=None, media_type=None, background=None, ping=None, sep=None):
         _headers = dict(headers or {})
-        _headers.setdefault("Cache-Control", "no-store")
+        _headers.setdefault("Cache-Control", "no-cache")
         _headers.setdefault("Connection", "keep-alive")
         _headers.setdefault("X-Accel-Buffering", "no")
+        wrapped = self._encode_stream(content)
         super().__init__(
-            content=content,
+            content=wrapped,
             status_code=status_code,
             headers=_headers,
             media_type=media_type or self.media_type,
             background=background,
         )
+
+    @staticmethod
+    def _encode_stream(content):
+        """Wrap the generator/iterable so each yielded item becomes SSE
+        wire-format bytes — matches FA's streaming encoder exactly.
+        """
+        import inspect as _inspect
+        if _inspect.isasyncgen(content):
+            async def _async_wrap():
+                async for item in content:
+                    yield EventSourceResponse._encode_item(item)
+            return _async_wrap()
+        if _inspect.isgenerator(content) or hasattr(content, "__iter__"):
+            def _sync_wrap():
+                for item in content:
+                    yield EventSourceResponse._encode_item(item)
+            return _sync_wrap()
+        return content
+
+    @staticmethod
+    def _encode_item(item) -> bytes:
+        """Encode one yielded item into SSE wire-format bytes.
+
+        Accepts ``ServerSentEvent``, Pydantic models, dicts, lists,
+        strings, and bytes. Everything non-bytes goes through
+        ``json.dumps`` for the ``data:`` field (so strings end up
+        quoted: ``"hello"``).
+        """
+        import json as _json
+        try:
+            from fastapi_rs.sse import ServerSentEvent, format_sse_event
+        except ImportError:
+            ServerSentEvent = None
+            format_sse_event = None
+        if isinstance(item, bytes):
+            return item
+        if ServerSentEvent is not None and isinstance(item, ServerSentEvent):
+            if item.raw_data is not None:
+                data_str = item.raw_data
+            elif item.data is not None:
+                try:
+                    data_str = _json.dumps(
+                        item.data.model_dump(by_alias=True)
+                        if hasattr(item.data, "model_dump")
+                        else item.data
+                    )
+                except (TypeError, ValueError):
+                    data_str = _json.dumps(str(item.data))
+            else:
+                data_str = None
+            return format_sse_event(
+                data_str=data_str,
+                event=item.event,
+                id=item.id,
+                retry=item.retry,
+                comment=item.comment,
+            )
+        # Pydantic model, dict, list, str, number — JSON-encode.
+        try:
+            if hasattr(item, "model_dump"):
+                data_str = _json.dumps(item.model_dump(by_alias=True))
+            else:
+                data_str = _json.dumps(item)
+        except (TypeError, ValueError):
+            data_str = _json.dumps(str(item))
+        if format_sse_event is not None:
+            return format_sse_event(data_str=data_str)
+        return f"data: {data_str}\n\n".encode("utf-8")
 
 
 class ORJSONResponse(Response):

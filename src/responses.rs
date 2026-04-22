@@ -205,12 +205,17 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
         return response_object_to_response(py, obj, &status_attr);
     }
 
-    // Pydantic BaseModel: call model_dump() then serialize as JSON.
-    // Checked BEFORE primitives because BaseModel instances may also satisfy
-    // extract::<String>() via __str__.
+    // Pydantic BaseModel: call model_dump(by_alias=True) then
+    // serialize as JSON. FA's default response-model dump mode is
+    // ``by_alias=True`` — fields with ``Field(alias=...)`` surface
+    // under the wire alias rather than the Python attribute name.
+    // Checked BEFORE primitives because BaseModel instances may also
+    // satisfy extract::<String>() via __str__.
     if let Ok(dump) = obj.getattr("model_dump") {
         if dump.is_callable() {
-            if let Ok(dumped) = dump.call0() {
+            let kwargs = PyDict::new(py);
+            let _ = kwargs.set_item("by_alias", true);
+            if let Ok(dumped) = dump.call((), Some(&kwargs)) {
                 return py_to_response(py, &dumped);
             }
         }
@@ -280,6 +285,21 @@ fn response_object_to_response(
     let status =
         StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
+    // Collect raw_headers keys first so we can skip them in the headers
+    // dict pass (duplicates must come from raw_headers only — the dict
+    // just carries the canonical latest value, which `MutableHeaders.
+    // append` already pushed into raw_headers too).
+    let mut raw_header_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(raw_attr) = obj.getattr("raw_headers") {
+        if let Ok(list) = raw_attr.cast::<PyList>() {
+            for item in list.iter() {
+                if let Ok(tup) = item.extract::<(String, String)>() {
+                    raw_header_keys.insert(tup.0.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+
     let mut headers = HeaderMap::new();
     if let Ok(hdr_obj) = obj.getattr("headers") {
         // Support both plain dict and MutableHeaders (which has .items())
@@ -287,6 +307,9 @@ fn response_object_to_response(
             if !dict.is_empty() {
                 for (k, v) in dict.iter() {
                     if let (Ok(key), Ok(val)) = (k.extract::<String>(), v.extract::<String>()) {
+                        if raw_header_keys.contains(&key.to_ascii_lowercase()) {
+                            continue;
+                        }
                         if let (Ok(hname), Ok(hval)) = (
                             HeaderName::try_from(key),
                             HeaderValue::from_str(&val),
@@ -300,6 +323,9 @@ fn response_object_to_response(
             if let Ok(list) = items_list.downcast::<pyo3::types::PyList>() {
                 for item in list.iter() {
                     if let Ok((key, val)) = item.extract::<(String, String)>() {
+                        if raw_header_keys.contains(&key.to_ascii_lowercase()) {
+                            continue;
+                        }
                         if let (Ok(hname), Ok(hval)) = (
                             HeaderName::try_from(key),
                             HeaderValue::from_str(&val),
@@ -361,8 +387,36 @@ fn response_object_to_response(
         .body(axum::body::Body::from(body_bytes))
         .expect("build response");
     let hmap = resp.headers_mut();
+    // `append` preserves duplicate keys (X-Dup / multi Set-Cookie). Using
+    // `insert` here would collapse multi-valued headers into one, losing
+    // the entries we just accumulated via raw_headers.
     for (k, v) in headers.iter() {
-        hmap.insert(k, v.clone());
+        hmap.append(k, v.clone());
+    }
+
+    // Drain `Response(..., background=BackgroundTask(...))` or
+    // `Response.background = BackgroundTasks()`. Matches FastAPI /
+    // Starlette: tasks fire after the response is sent to the client.
+    if let Ok(bg) = obj.getattr("background") {
+        if !bg.is_none() {
+            let bg_py: Py<PyAny> = bg.unbind();
+            tokio::task::spawn_blocking(move || {
+                Python::attach(|py| {
+                    let bound = bg_py.bind(py);
+                    // BackgroundTasks has `run_sync`; bare BackgroundTask
+                    // is an awaitable, so fall back to `__call__()` to run
+                    // the task synchronously on this worker thread.
+                    if bound.call_method0("run_sync").is_ok() {
+                        return;
+                    }
+                    // Not a BackgroundTasks — treat as single BackgroundTask
+                    // (`__call__` returns a coroutine we must drive).
+                    if let Ok(coro) = bound.call0() {
+                        let _ = coro.call_method1("send", (py.None(),));
+                    }
+                });
+            });
+        }
     }
     resp
 }
@@ -379,11 +433,31 @@ pub fn pyerr_to_response(py: Python<'_>, err: &PyErr) -> Response {
     // HTTPException path: has explicit status_code + detail
     if let Ok(status_attr) = err_value.getattr("status_code") {
         if let Ok(status_code) = status_attr.extract::<u16>() {
-            let detail = err_value
-                .getattr("detail")
-                .ok()
-                .and_then(|a| a.extract::<String>().ok())
-                .unwrap_or_else(|| format!("{err}"));
+            // `detail` may be a string (most common), a dict, a list, or
+            // any JSON-serializable value. FastAPI embeds whatever the
+            // user supplied verbatim inside `{"detail": ...}`. Coercing to
+            // String here turned dict details into repr strings — fix by
+            // routing through json.dumps for non-string values.
+            let detail_json: serde_json::Value = if let Ok(d_attr) = err_value.getattr("detail") {
+                if d_attr.is_none() {
+                    serde_json::Value::String("Internal Server Error".to_string())
+                } else if let Ok(s) = d_attr.extract::<String>() {
+                    serde_json::Value::String(s)
+                } else if let Ok(b) = d_attr.extract::<bool>() {
+                    serde_json::Value::Bool(b)
+                } else if let Ok(i) = d_attr.extract::<i64>() {
+                    serde_json::Value::Number(i.into())
+                } else {
+                    py.import("json")
+                        .and_then(|j| j.call_method1("dumps", (&d_attr,)))
+                        .and_then(|s| s.extract::<String>())
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| serde_json::Value::String(format!("{err}")))
+                }
+            } else {
+                serde_json::Value::String(format!("{err}"))
+            };
 
             let status =
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -400,7 +474,7 @@ pub fn pyerr_to_response(py: Python<'_>, err: &PyErr) -> Response {
                 }
             }
 
-            let body = serde_json::json!({ "detail": detail });
+            let body = serde_json::json!({ "detail": detail_json });
             let mut resp = axum::response::Response::builder()
                 .status(status)
                 .header("content-type", "application/json")
@@ -518,6 +592,75 @@ fn write_any_json(py: Python<'_>, obj: &Bound<'_, PyAny>, buf: &mut String) {
     if let Ok(list) = obj.cast::<PyList>() {
         write_list_json(py, list, buf);
         return;
+    }
+    if let Ok(tup) = obj.cast::<pyo3::types::PyTuple>() {
+        buf.push('[');
+        let mut first = true;
+        for item in tup.iter() {
+            if !first { buf.push(','); }
+            first = false;
+            write_any_json(py, &item, buf);
+        }
+        buf.push(']');
+        return;
+    }
+    if obj.is_instance_of::<pyo3::types::PySet>()
+        || obj.is_instance_of::<pyo3::types::PyFrozenSet>()
+    {
+        buf.push('[');
+        let mut first = true;
+        if let Ok(iter) = obj.try_iter() {
+            for item in iter {
+                if let Ok(item) = item {
+                    if !first { buf.push(','); }
+                    first = false;
+                    write_any_json(py, &item, buf);
+                }
+            }
+        }
+        buf.push(']');
+        return;
+    }
+    // ``bytes`` / ``bytearray`` — UTF-8 decode to a JSON string. FA's
+    // ``jsonable_encoder`` does the same; without this handlers that
+    // return uploaded file contents as ``bytes`` serialize as the
+    // Python repr (``"b'foo'"``) instead of the decoded value.
+    if let Ok(b) = obj.cast::<pyo3::types::PyBytes>() {
+        buf.push('"');
+        let s = String::from_utf8_lossy(b.as_bytes());
+        json_escape_to(&s, buf);
+        buf.push('"');
+        return;
+    }
+    if let Ok(b) = obj.cast::<pyo3::types::PyByteArray>() {
+        buf.push('"');
+        let data = unsafe { b.as_bytes() };
+        let s = String::from_utf8_lossy(data);
+        json_escape_to(&s, buf);
+        buf.push('"');
+        return;
+    }
+    // Pydantic BaseModel: ``obj.model_dump(by_alias=True)`` yields a dict.
+    // Required for nested models (e.g. ``{"item": Item(...)}``) — without
+    // this they fall through to the ``str()`` fallback and serialize as
+    // ``"name='Foo' price=35.4 ..."`` instead of nested JSON.
+    if let Ok(dump) = obj.getattr("model_dump") {
+        if dump.is_callable() {
+            let kwargs = PyDict::new(py);
+            let _ = kwargs.set_item("by_alias", true);
+            if let Ok(dumped) = dump.call((), Some(&kwargs)) {
+                if let Ok(dict) = dumped.cast::<PyDict>() {
+                    write_dict_json(py, dict, buf);
+                    return;
+                }
+                if let Ok(list) = dumped.cast::<PyList>() {
+                    write_list_json(py, list, buf);
+                    return;
+                }
+                write_any_json(py, &dumped, buf);
+                return;
+            }
+        }
     }
     // Fallback: str()
     buf.push('"');

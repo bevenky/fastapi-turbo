@@ -73,17 +73,15 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
 
     // Pre-drain the first chunk synchronously so hyper can coalesce the
     // response headers and the first data frame into a single TCP write.
-    // This closes the TTFB gap vs Go (which calls Flush() after writing
-    // headers + first chunk) — clients observe the first byte earlier
-    // because the kernel flushes both writes together.
-    //
-    // For typical LLM chat-stream generators the first `__anext__` is a
-    // no-suspend coroutine (generates `data: {"idx":0,...}\n\n`), so this
-    // costs ~5μs — strictly better than waiting for the body task to warm
-    // up. If the first step DOES suspend or the iterator is exhausted we
-    // fall through to the regular stream.
+    // For async generators we skip this optimization entirely: probing
+    // `__anext__()` with a partial `send(None)` leaves the generator in
+    // a non-recoverable state if it suspends on real I/O (asyncio.sleep,
+    // DB reads) — subsequent `__anext__()` calls then raise "asynchronous
+    // generator already running" and the body ends up empty. The
+    // thread-local loop in `iterate_async_generator` handles chunk #0
+    // reliably, at the cost of ~5µs extra TTFB vs the fast path.
     let first_chunk: Option<bytes::Bytes> = if is_async {
-        drain_one_async_chunk_sync(py, &iter_bound)
+        None
     } else {
         drain_one_sync_chunk(&iter_bound)
     };

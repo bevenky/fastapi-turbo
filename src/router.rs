@@ -22,11 +22,26 @@ static RESPONSE_CLS: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new()
 /// The FastAPI application instance — set at `app.run()` so injected
 /// Request objects can expose `request.app`. vLLM/SGLang read
 /// `request.app.state.*` from every handler, so this is required.
-pub static APP_INSTANCE: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+/// Mutable slot so successive ``run_server()`` calls (test suites spin up
+/// many ephemeral apps in sequence) rebind rather than silently keeping the
+/// first one's handler forever. Uses ``RwLock<Option<...>>`` instead of
+/// ``OnceLock`` so we can reassign.
+pub static APP_INSTANCE: std::sync::RwLock<Option<Py<PyAny>>> =
+    std::sync::RwLock::new(None);
 /// Python callable invoked when Rust-side parameter/body validation fails.
 /// Called only when the app registers `@exception_handler(RequestValidationError)`
 /// — otherwise we use the default 422 body path.
-pub static VALIDATION_HANDLER: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+pub static VALIDATION_HANDLER: std::sync::RwLock<Option<Py<PyAny>>> =
+    std::sync::RwLock::new(None);
+
+/// (host, port) the server bound to — published by `server.rs` so request
+/// scopes can populate `scope["server"]` / `request.url.hostname` / `.port`
+/// just like uvicorn's ASGI scope.
+pub static SERVER_ADDR: std::sync::OnceLock<(String, u16)> = std::sync::OnceLock::new();
+
+pub fn set_server_addr(host: String, port: u16) -> Result<(), (String, u16)> {
+    SERVER_ADDR.set((host, port))
+}
 
 fn bg_tasks_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     if let Some(c) = BG_TASKS_CLS.get() { return Ok(c); }
@@ -147,10 +162,37 @@ fn inject_framework_objects(
                         qp.set_item(k, v)?;
                     }
                     scope.set_item("query_params", qp)?;
+                    // ASGI scope fields: scheme + server + http_version.
+                    // FastAPI reads `request.url.hostname` / `.port` off
+                    // these, and many apps reflect the original Host back.
+                    scope.set_item("scheme", "http")?;
+                    scope.set_item("http_version", "1.1")?;
+                    if let Some((host, port)) = SERVER_ADDR.get() {
+                        // Starlette uses the Host header as the authoritative
+                        // source when present, falling back to the bound
+                        // address. Match that behavior so apps behind a
+                        // proxy see the external host.
+                        let (effective_host, effective_port) = headers
+                            .as_ref()
+                            .and_then(|h| h.get("host"))
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| {
+                                if let Some((h, p)) = s.rsplit_once(':') {
+                                    let p = p.parse::<u16>().unwrap_or(*port);
+                                    (h.to_string(), p)
+                                } else {
+                                    (s.to_string(), *port)
+                                }
+                            })
+                            .unwrap_or_else(|| (host.clone(), *port));
+                        scope.set_item("server", (effective_host, effective_port))?;
+                    }
                     // Starlette/FastAPI: request.app -> scope["app"]. vLLM and
                     // SGLang read `request.app.state.<field>` on every request.
-                    if let Some(app) = APP_INSTANCE.get() {
-                        scope.set_item("app", app.bind(py))?;
+                    if let Ok(guard) = APP_INSTANCE.read() {
+                        if let Some(app) = guard.as_ref() {
+                            scope.set_item("app", app.bind(py))?;
+                        }
                     }
                     // Pre-populate the body so `await request.body()` / .json()
                     // / .form() return the already-buffered bytes without needing
@@ -261,12 +303,28 @@ fn apply_injected_response(
                 }
             }
         }
-        // Merge headers dict (iterate .headers)
+        // Collect raw_headers keys up-front so we can suppress the dict
+        // entry for the same name (raw_headers already carries the full
+        // ordered list including duplicates).
+        let mut raw_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(raw) = obj.getattr("raw_headers") {
+            if let Ok(list) = raw.cast::<pyo3::types::PyList>() {
+                for item in list.iter() {
+                    if let Ok((ks, _)) = item.extract::<(String, String)>() {
+                        raw_keys.insert(ks.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        // Merge headers dict (iterate .headers), skipping keys owned by raw_headers.
         if let Ok(hdr) = obj.getattr("headers") {
             if let Ok(dict) = hdr.cast::<PyDict>() {
                 let _ = py;
                 for (k, v) in dict.iter() {
                     if let (Ok(ks), Ok(vs)) = (k.extract::<String>(), v.extract::<String>()) {
+                        if raw_keys.contains(&ks.to_ascii_lowercase()) {
+                            continue;
+                        }
                         if let (Ok(hn), Ok(hv)) =
                             (HeaderName::try_from(ks), HeaderValue::from_str(&vs))
                         {
@@ -276,12 +334,31 @@ fn apply_injected_response(
                 }
             }
         }
+        // Merge raw_headers list — preserves duplicates like multiple
+        // Set-Cookie entries that `response.set_cookie(...)` appends inside
+        // the handler. Without this, cookies set on the injected Response
+        // shell never reach the client.
+        if let Ok(raw) = obj.getattr("raw_headers") {
+            if let Ok(list) = raw.cast::<pyo3::types::PyList>() {
+                for item in list.iter() {
+                    if let Ok((ks, vs)) = item.extract::<(String, String)>() {
+                        if let (Ok(hn), Ok(hv)) =
+                            (HeaderName::try_from(ks.as_str()), HeaderValue::from_str(&vs))
+                        {
+                            response.headers_mut().append(hn, hv);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
-/// Run a per-param Pydantic TypeAdapter against the coerced value. If
+/// Run a per-param Pydantic TypeAdapter against the raw string value. If
 /// validation fails, return a 422 with a FastAPI-compatible error body
-/// built from Pydantic's own errors.
+/// built from Pydantic's own errors — matching FastAPI's `input` field
+/// (the raw string, not the coerced value) and `loc` (including the param
+/// name in its on-the-wire form — alias when set, e.g. `x-count`).
 fn run_scalar_validator<'py>(
     py: Python<'py>,
     param: &ParamInfo,
@@ -293,8 +370,146 @@ fn run_scalar_validator<'py>(
     };
     match adapter.call_method1(py, "validate_python", (value,)) {
         Ok(v) => Ok(v.into_bound(py)),
-        Err(e) => Err(pydantic_error_response(py, &e, loc)),
+        Err(e) => {
+            // For headers the on-the-wire name is the alias (`X-Count`) or
+            // the underscored Python identifier. FastAPI emits the
+            // hyphenated lowercase form in `loc`; match that.
+            let name = param.alias.as_deref().unwrap_or(&param.name);
+            Err(pydantic_error_response_with_loc(py, &e, &[loc, name]))
+        }
     }
+}
+
+/// Variant of `run_scalar_validator` that returns per-error detail
+/// objects (to be pushed into the multi-error accumulator) rather than a
+/// pre-packaged 422 response.
+fn run_scalar_validator_detail<'py>(
+    py: Python<'py>,
+    param: &ParamInfo,
+    loc: &str,
+    value: &Bound<'py, PyAny>,
+) -> Result<Bound<'py, PyAny>, Vec<serde_json::Value>> {
+    let Some(ref adapter) = param.scalar_validator else {
+        return Ok(value.clone());
+    };
+    match adapter.call_method1(py, "validate_python", (value,)) {
+        Ok(v) => Ok(v.into_bound(py)),
+        Err(e) => {
+            let name = param.alias.as_deref().unwrap_or(&param.name);
+            Err(pydantic_error_details(py, &e, &[loc, name], false))
+        }
+    }
+}
+
+/// Convert a Pydantic ValidationError into a list of FA-shaped detail
+/// dicts (mirrors `pydantic_error_response_with_loc_ext` but returns
+/// the details instead of wrapping in a response).
+fn pydantic_error_details(
+    py: Python<'_>,
+    err: &PyErr,
+    loc_prefix: &[&str],
+    strip_missing_input: bool,
+) -> Vec<serde_json::Value> {
+    let err_obj = err.value(py);
+    let Ok(errors_method) = err_obj.getattr("errors") else {
+        return vec![serde_json::json!({
+            "type": "value_error",
+            "loc": loc_prefix.iter().map(|s| serde_json::Value::String((*s).to_string())).collect::<Vec<_>>(),
+            "msg": format!("{err}"),
+            "input": serde_json::Value::Null,
+        })];
+    };
+    let Ok(errors_list) = errors_method.call0() else {
+        return Vec::new();
+    };
+    let mut details = Vec::new();
+    if let Ok(list) = errors_list.cast::<pyo3::types::PyList>() {
+        for item in list.iter() {
+            if let Ok(d) = item.cast::<PyDict>() {
+                let mut obj = serde_json::Map::new();
+                let err_type_str = d.get_item("type").ok().flatten()
+                    .and_then(|v| v.extract::<String>().ok());
+                if let Some(t) = err_type_str {
+                    obj.insert("type".into(), serde_json::Value::String(t));
+                }
+                let mut loc: Vec<serde_json::Value> = loc_prefix
+                    .iter()
+                    .map(|s| serde_json::Value::String((*s).to_string()))
+                    .collect();
+                if let Some(l) = d.get_item("loc").ok().flatten() {
+                    if let Ok(tup) = l.cast::<pyo3::types::PyTuple>() {
+                        for item in tup.iter() {
+                            if let Ok(s) = item.extract::<String>() {
+                                loc.push(serde_json::Value::String(s));
+                            } else if let Ok(i) = item.extract::<i64>() {
+                                loc.push(serde_json::Value::Number(i.into()));
+                            }
+                        }
+                    }
+                }
+                obj.insert("loc".into(), serde_json::Value::Array(loc));
+                if let Some(m) = d.get_item("msg").ok().flatten().and_then(|v| v.extract::<String>().ok()) {
+                    obj.insert("msg".into(), serde_json::Value::String(fastapi_normalize_error_msg(&m)));
+                }
+                let is_missing = obj.get("type").and_then(|v| v.as_str()).map(|s| s == "missing").unwrap_or(false);
+                if strip_missing_input && is_missing {
+                    obj.insert("input".into(), serde_json::Value::Null);
+                } else if let Some(inp) = d.get_item("input").ok().flatten() {
+                    let input_val: serde_json::Value = if let Ok(s) = inp.extract::<String>() {
+                        serde_json::Value::String(s)
+                    } else if let Ok(b) = inp.extract::<bool>() {
+                        serde_json::Value::Bool(b)
+                    } else if let Ok(n) = inp.extract::<i64>() {
+                        serde_json::Value::Number(n.into())
+                    } else if inp.is_none() {
+                        serde_json::Value::Null
+                    } else {
+                        py.import("json")
+                            .and_then(|j| j.call_method1("dumps", (&inp,)))
+                            .and_then(|s| s.extract::<String>())
+                            .ok()
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or(serde_json::Value::Null)
+                    };
+                    obj.insert("input".into(), input_val);
+                }
+                if let Some(cx) = d.get_item("ctx").ok().flatten() {
+                    if let Ok(cx_dict) = cx.cast::<PyDict>() {
+                        let mut ctx_map = serde_json::Map::new();
+                        for (k, v) in cx_dict.iter() {
+                            let key = match k.extract::<String>() { Ok(s) => s, Err(_) => continue };
+                            let val: serde_json::Value = if let Ok(s) = v.extract::<String>() {
+                                serde_json::Value::String(s)
+                            } else if let Ok(b) = v.extract::<bool>() {
+                                serde_json::Value::Bool(b)
+                            } else if let Ok(i) = v.extract::<i64>() {
+                                serde_json::Value::Number(i.into())
+                            } else if let Ok(f) = v.extract::<f64>() {
+                                serde_json::Number::from_f64(f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+                            } else if v.is_none() {
+                                serde_json::Value::Null
+                            } else if v.is_instance_of::<pyo3::exceptions::PyException>() {
+                                serde_json::Value::Object(serde_json::Map::new())
+                            } else {
+                                py.import("json")
+                                    .and_then(|j| j.call_method1("dumps", (&v,)))
+                                    .and_then(|s| s.extract::<String>())
+                                    .ok()
+                                    .and_then(|s| serde_json::from_str(&s).ok())
+                                    .unwrap_or(serde_json::Value::Null)
+                            };
+                            ctx_map.insert(key, val);
+                        }
+                        if !ctx_map.is_empty() {
+                            obj.insert("ctx".into(), serde_json::Value::Object(ctx_map));
+                        }
+                    }
+                }
+                details.push(serde_json::Value::Object(obj));
+            }
+        }
+    }
+    details
 }
 
 /// Apply a parameter's default to the kwargs dict. Honors `has_default`:
@@ -524,6 +739,12 @@ struct RouteState {
     has_file_params: bool,
     has_form_params: bool,
     has_http_middleware: bool,
+    /// True when the Python handler advertises
+    /// ``_fastapi_rs_defers_extraction_errors = True`` — the compile
+    /// pipeline sets this on routes with `Depends(...)` so that
+    /// ``HTTPException`` raised from a dep body wins over accumulated
+    /// parameter-validation 422s (FA-normative precedence).
+    defers_extraction_errors: bool,
     // Note: body validation stays with Pydantic (Rust-backed) for 100% compatibility.
     // jsonschema crate can't handle custom validators, coercion, defaults, etc.
 }
@@ -611,6 +832,21 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                                 .map(|(k, v)| (k.clone(), v.clone()))
                                 .collect();
 
+                            // Parse client-offered subprotocols from the
+                            // ``Sec-WebSocket-Protocol`` header (comma-
+                            // separated list of tokens).
+                            let subprotocols: Vec<String> = req_parts
+                                .headers
+                                .get("sec-websocket-protocol")
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| {
+                                    s.split(',')
+                                        .map(|t| t.trim().to_string())
+                                        .filter(|t| !t.is_empty())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+
                             let scope = crate::websocket::WsScopeInfo {
                                 path,
                                 raw_path,
@@ -620,6 +856,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                                 scheme,
                                 host,
                                 path_params: ws_path_params,
+                                subprotocols,
                             };
 
                             // Deferred-upgrade: the handler returns the Response
@@ -646,12 +883,30 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
         let state = Python::attach(|py| {
             // Pre-cache pydantic validators at startup (saves ~0.3μs getattr per POST request)
             let mut params = route.params.clone();
+            // Build an FA-compatible body validator that parses JSON then
+            // calls `validate_python(data, from_attributes=True)`. This
+            // matches stock FastAPI's error shape (`model_attributes_type`
+            // instead of `model_type`, FA-style messages, no ctx).
+            let fa_factory = py.import("fastapi_rs._introspect")
+                .and_then(|m| m.getattr("_make_fa_body_validator"))
+                .ok();
             for param in &mut params {
                 if param.kind == "body" {
                     if let Some(ref model_cls) = param.model_class {
-                        if let Ok(validator) = model_cls.getattr(py, "__pydantic_validator__") {
-                            param.cached_validator = Some(validator);
+                        let mut cached: Option<Py<PyAny>> = None;
+                        if let Some(ref factory) = fa_factory {
+                            if let Ok(v) = factory.call1((model_cls.bind(py),)) {
+                                if !v.is_none() {
+                                    cached = Some(v.unbind());
+                                }
+                            }
                         }
+                        if cached.is_none() {
+                            if let Ok(validator) = model_cls.getattr(py, "__pydantic_validator__") {
+                                cached = Some(validator);
+                            }
+                        }
+                        param.cached_validator = cached;
                     }
                 }
             }
@@ -670,6 +925,10 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                 has_form_params: has_form,
                 has_http_middleware: route.handler
                     .getattr(py, "_has_http_middleware")
+                    .and_then(|v| v.extract::<bool>(py))
+                    .unwrap_or(false),
+                defers_extraction_errors: route.handler
+                    .getattr(py, "_fastapi_rs_defers_extraction_errors")
                     .and_then(|v| v.extract::<bool>(py))
                     .unwrap_or(false),
             })
@@ -795,15 +1054,22 @@ pub fn with_not_found_fallback(router: Router) -> Router {
 /// Expected signature: ``fn(method: str, path: str) -> bytes`` where the
 /// returned bytes is a ready-to-send JSON body. The shim in
 /// ``applications.py`` wraps the user's handler into this shape.
-pub static NOT_FOUND_HANDLER: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+pub static NOT_FOUND_HANDLER: std::sync::RwLock<Option<Py<PyAny>>> =
+    std::sync::RwLock::new(None);
 
 async fn dispatch_404(req: axum::http::Request<axum::body::Body>) -> Response {
-    if NOT_FOUND_HANDLER.get().is_some() {
+    let has_handler = NOT_FOUND_HANDLER
+        .read()
+        .ok()
+        .map(|g| g.is_some())
+        .unwrap_or(false);
+    if has_handler {
         let path = req.uri().path().to_string();
         let method = req.method().as_str().to_string();
         let out = tokio::task::spawn_blocking(move || {
             Python::attach(|py| -> Option<(u16, Vec<u8>)> {
-                let handler = NOT_FOUND_HANDLER.get()?;
+                let guard = NOT_FOUND_HANDLER.read().ok()?;
+                let handler = guard.as_ref()?;
                 let result = handler
                     .call1(py, (method.as_str(), path.as_str()))
                     .ok()?;
@@ -998,6 +1264,7 @@ async fn handle_request(
                 let kwargs = match extract_params_to_pydict_full(
                     py, &state.params, &path_map, &query_params, &query_multi,
                     &headers, &body_json_opt, &body_bytes, &mut multipart_fields,
+                    state.defers_extraction_errors,
                 ) {
                     Ok(kw) => kw,
                     Err(resp) => return resp,
@@ -1049,6 +1316,7 @@ async fn handle_request(
                     let kwargs = match extract_params_to_pydict_full(
                         py, &state.params, &path_map, &query_params, &query_multi,
                         &headers, &body_json_opt, &body_bytes, &mut multipart_fields,
+                        state.defers_extraction_errors,
                     ) {
                         Ok(kw) => kw,
                         Err(resp) => return resp,
@@ -1077,6 +1345,7 @@ async fn handle_request(
                     let kwargs = match extract_params_to_pydict_full(
                         py, &state.params, &path_map, &query_params, &query_multi,
                         &headers, &body_json_opt, &body_bytes, &mut multipart_fields,
+                        state.defers_extraction_errors,
                     ) {
                         Ok(kw) => kw,
                         Err(resp) => return resp,
@@ -1282,10 +1551,12 @@ fn extract_params_to_pydict<'py>(
     body_json: &Option<&serde_json::Value>,
     body_bytes: &[u8],
     multipart_fields: &mut Option<HashMap<String, Vec<ParsedField>>>,
+    defers_extraction_errors: bool,
 ) -> Result<pyo3::Bound<'py, pyo3::types::PyDict>, Response> {
     extract_params_to_pydict_full(
         py, params, path_map, query_params, &HashMap::new(),
         headers, body_json, body_bytes, multipart_fields,
+        defers_extraction_errors,
     )
 }
 
@@ -1299,8 +1570,15 @@ fn extract_params_to_pydict_full<'py>(
     body_json: &Option<&serde_json::Value>,
     body_bytes: &[u8],
     multipart_fields: &mut Option<HashMap<String, Vec<ParsedField>>>,
+    defers_extraction_errors: bool,
 ) -> Result<pyo3::Bound<'py, pyo3::types::PyDict>, Response> {
     let kwargs = pyo3::types::PyDict::new(py);
+    // Accumulate per-field extraction errors so we can emit FA's
+    // multi-error 422 shape (`?a=x&b=y&c=z` → three int_parsing
+    // entries) in a single response. We only stop extracting early
+    // when a body-level error fires (it short-circuits the whole
+    // request).
+    let mut extraction_errors: Vec<serde_json::Value> = Vec::new();
 
     for param in params {
         if !param.is_handler_param { continue; }
@@ -1308,55 +1586,96 @@ fn extract_params_to_pydict_full<'py>(
         match param.kind.as_str() {
             "path" => {
                 if let Some(raw) = path_map.get(&param.name) {
-                    match try_coerce_str_to_py(py, raw, &param.type_hint) {
-                        Some(v) => {
-                            let bound = v.bind(py);
-                            let validated = run_scalar_validator(py, param, "path", bound)?;
-                            let _ = kwargs.set_item(&param.name, validated);
+                    if param.scalar_validator.is_some() {
+                        let raw_py = pyo3::types::PyString::new(py, raw).into_any();
+                        let validated = run_scalar_validator(py, param, "path", &raw_py)?;
+                        let _ = kwargs.set_item(&param.name, validated);
+                    } else {
+                        match try_coerce_str_to_py(py, raw, &param.type_hint) {
+                            Some(v) => {
+                                let _ = kwargs.set_item(&param.name, v.bind(py));
+                            }
+                            None => {
+                                extraction_errors.push(coercion_error_detail(
+                                    "path", &param.name, raw, &param.type_hint,
+                                ));
+                                continue;
+                            }
                         }
-                        None => return Err(coercion_error_response("path", &param.name, raw, &param.type_hint)),
                     }
                 } else if apply_default(py, &kwargs, param) {
                     // Default applied
                 } else if param.required {
-                    return Err(validation_error_response("path", &param.name, "field required"));
+                    extraction_errors.push(missing_error_detail("path", &param.name));
+                    continue;
                 }
             }
             "query" => {
+                // Honor Query(alias=...) if the user set one; fall back to
+                // the Python parameter name otherwise. Redis-py patterns
+                // like `Annotated[list[str], Query(alias="v")]` rely on
+                // this.
+                let q_lookup: &str = param.alias.as_deref().unwrap_or(&param.name);
                 // List types collect ALL values for repeated `?k=a&k=b`
                 if param.type_hint.starts_with("list_") {
                     let values = query_multi
-                        .get(&param.name)
+                        .get(q_lookup)
                         .cloned()
                         .unwrap_or_default();
                     if values.is_empty() {
                         if !apply_default(py, &kwargs, param) && param.required {
-                            return Err(validation_error_response("query", &param.name, "field required"));
+                            extraction_errors.push(missing_error_detail("query", q_lookup));
+                            continue;
                         }
                     } else {
                         let inner = &param.type_hint[5..]; // strip "list_"
                         let list = pyo3::types::PyList::empty(py);
-                        for v in &values {
+                        let mut any_err = false;
+                        for (idx, v) in values.iter().enumerate() {
                             match try_coerce_str_to_py(py, v, inner) {
                                 Some(coerced) => { let _ = list.append(coerced.bind(py)); }
-                                None => return Err(coercion_error_response("query", &param.name, v, inner)),
+                                None => {
+                                    extraction_errors.push(coercion_error_detail_indexed(
+                                        "query", q_lookup, idx, v, inner,
+                                    ));
+                                    any_err = true;
+                                }
                             }
                         }
-                        let _ = kwargs.set_item(&param.name, list);
-                    }
-                } else if let Some(raw) = query_params.get(&param.name) {
-                    match try_coerce_str_to_py(py, raw, &param.type_hint) {
-                        Some(v) => {
-                            let bound = v.bind(py);
-                            let validated = run_scalar_validator(py, param, "query", bound)?;
-                            let _ = kwargs.set_item(&param.name, validated);
+                        if !any_err {
+                            let _ = kwargs.set_item(&param.name, list);
                         }
-                        None => return Err(coercion_error_response("query", &param.name, raw, &param.type_hint)),
+                    }
+                } else if let Some(raw) = query_params.get(q_lookup) {
+                    // When a Pydantic scalar_validator exists, feed the RAW
+                    // string to Pydantic so its `input` field matches
+                    // FastAPI (which passes the unparsed string). Pydantic
+                    // handles string→int coercion AND constraint checking
+                    // in one step. If no validator, use Rust's coerce.
+                    if param.scalar_validator.is_some() {
+                        let raw_py = pyo3::types::PyString::new(py, raw).into_any();
+                        match run_scalar_validator_detail(py, param, "query", &raw_py) {
+                            Ok(validated) => { let _ = kwargs.set_item(&param.name, validated); }
+                            Err(mut errs) => { extraction_errors.append(&mut errs); continue; }
+                        }
+                    } else {
+                        match try_coerce_str_to_py(py, raw, &param.type_hint) {
+                            Some(v) => {
+                                let _ = kwargs.set_item(&param.name, v.bind(py));
+                            }
+                            None => {
+                                extraction_errors.push(coercion_error_detail(
+                                    "query", q_lookup, raw, &param.type_hint,
+                                ));
+                                continue;
+                            }
+                        }
                     }
                 } else if apply_default(py, &kwargs, param) {
                     // Default applied
                 } else if param.required {
-                    return Err(validation_error_response("query", &param.name, "field required"));
+                    extraction_errors.push(missing_error_detail("query", q_lookup));
+                    continue;
                 }
             }
             "body" => {
@@ -1375,6 +1694,9 @@ fn extract_params_to_pydict_full<'py>(
                         match result {
                             Ok(v) => v,
                             Err(e) => {
+                                if param.name == "_combined_body" {
+                                    return Err(pydantic_error_response_combined(py, &e, "body"));
+                                }
                                 return Err(pydantic_error_response(py, &e, "body"));
                             }
                         }
@@ -1390,23 +1712,86 @@ fn extract_params_to_pydict_full<'py>(
                 } else if apply_default(py, &kwargs, param) {
                     // Default applied
                 } else if param.required {
-                    return Err(validation_error_response("body", &param.name, "field required"));
+                    // Empty body + required: FA behaviour depends on whether
+                    // we have a single body field (scalar/model) or an
+                    // embedded/combined body with per-field required errors.
+                    if param.name == "_combined_body" {
+                        if let Some(ref validator) = param.cached_validator {
+                            // Feed `{}` so Pydantic emits per-field missing
+                            // errors with loc=(field,).
+                            let empty = pyo3::types::PyBytes::new(py, b"{}");
+                            match validator.call_method1(py, "validate_json", (empty,)) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    return Err(pydantic_error_response_combined(py, &e, "body"));
+                                }
+                            }
+                        }
+                    }
+                    return Err(missing_body_error());
                 }
             }
             "header" => {
                 let lookup = param.alias.as_deref().unwrap_or(&param.name).to_lowercase();
+                let wants_list = param.type_hint.starts_with("list_");
+                // For list-typed headers, collect ALL occurrences of
+                // the header (``get_all``) — FA expands ``x-tag: a``
+                // + ``x-tag: b`` into ``["a","b"]``.
+                if wants_list {
+                    let list = pyo3::types::PyList::empty(py);
+                    let mut any = false;
+                    if let Some(hm) = headers.as_ref() {
+                        for hv in hm.get_all(lookup.as_str()).iter() {
+                            if let Ok(s) = hv.to_str() {
+                                let _ = list.append(pyo3::types::PyString::new(py, s));
+                                any = true;
+                            }
+                        }
+                    }
+                    if any {
+                        let _ = kwargs.set_item(&param.name, list);
+                    } else if apply_default(py, &kwargs, param) {
+                        // default
+                    } else if param.required {
+                        let loc_name = param.alias.as_deref().unwrap_or(&param.name);
+                        extraction_errors.push(missing_error_detail("header", loc_name));
+                        continue;
+                    }
+                    continue;
+                }
                 let header_val = headers.as_ref()
                     .and_then(|h| h.get(lookup.as_str()))
                     .and_then(|v| v.to_str().ok());
                 if let Some(raw) = header_val {
-                    match try_coerce_str_to_py(py, raw, &param.type_hint) {
-                        Some(v) => { let _ = kwargs.set_item(&param.name, v.bind(py)); }
-                        None => return Err(coercion_error_response("header", &param.name, raw, &param.type_hint)),
+                    if param.scalar_validator.is_some() {
+                        let raw_py = pyo3::types::PyString::new(py, raw).into_any();
+                        match run_scalar_validator_detail(py, param, "header", &raw_py) {
+                            Ok(validated) => { let _ = kwargs.set_item(&param.name, validated); }
+                            Err(mut errs) => { extraction_errors.append(&mut errs); continue; }
+                        }
+                    } else {
+                        match try_coerce_str_to_py(py, raw, &param.type_hint) {
+                            Some(v) => {
+                                let _ = kwargs.set_item(&param.name, v.bind(py));
+                            }
+                            None => {
+                                // Use the alias (hyphenated wire name)
+                                // rather than the underscored Python
+                                // identifier so `loc` matches FastAPI.
+                                let loc_name = param.alias.as_deref().unwrap_or(&param.name);
+                                extraction_errors.push(coercion_error_detail(
+                                    "header", loc_name, raw, &param.type_hint,
+                                ));
+                                continue;
+                            }
+                        }
                     }
                 } else if apply_default(py, &kwargs, param) {
                     // Default applied
                 } else if param.required {
-                    return Err(validation_error_response("header", &param.name, "field required"));
+                    let loc_name = param.alias.as_deref().unwrap_or(&param.name);
+                    extraction_errors.push(missing_error_detail("header", loc_name));
+                    continue;
                 }
             }
             "cookie" => {
@@ -1419,33 +1804,54 @@ fn extract_params_to_pydict_full<'py>(
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| parse_cookie_value(s, lookup));
                 if let Some(raw) = cookie_val {
-                    match try_coerce_str_to_py(py, &raw, &param.type_hint) {
-                        Some(v) => { let _ = kwargs.set_item(&param.name, v.bind(py)); }
-                        None => return Err(coercion_error_response("cookie", &param.name, &raw, &param.type_hint)),
+                    if param.scalar_validator.is_some() {
+                        let raw_py = pyo3::types::PyString::new(py, &raw).into_any();
+                        let validated = run_scalar_validator(py, param, "cookie", &raw_py)?;
+                        let _ = kwargs.set_item(&param.name, validated);
+                    } else {
+                        match try_coerce_str_to_py(py, &raw, &param.type_hint) {
+                            Some(v) => {
+                                let _ = kwargs.set_item(&param.name, v.bind(py));
+                            }
+                            None => return Err(coercion_error_response("cookie", &param.name, &raw, &param.type_hint)),
+                        }
                     }
                 } else if apply_default(py, &kwargs, param) {
                     // Default applied
                 } else if param.required {
-                    return Err(validation_error_response("cookie", &param.name, "field required"));
+                    let loc_name = param.alias.as_deref().unwrap_or(&param.name);
+                    if defers_extraction_errors {
+                        extraction_errors.push(missing_error_detail("cookie", loc_name));
+                        continue;
+                    }
+                    return Err(validation_error_response("cookie", loc_name, "field required"));
                 }
             }
             "file" => {
                 // Multipart file param — when the type annotation is `bytes`,
                 // return raw bytes instead of wrapping in UploadFile (FastAPI parity).
-                let wants_raw_bytes = param.type_hint == "bytes";
+                // ``list[bytes]`` variants (type_hint = ``list_bytes``) should
+                // produce ``[bytes, bytes, ...]`` not ``[UploadFile, ...]``.
+                // Look up by alias (File(alias=...) / File(validation_alias=...)
+                // — our introspect resolves to ``alias``) so the wire-side
+                // field name wins over the Python parameter identifier.
+                let wants_raw_bytes =
+                    param.type_hint == "bytes" || param.type_hint == "list_bytes";
+                let wants_list = param.type_hint.starts_with("list_");
+                let alias_name = param.alias.as_deref().unwrap_or(&param.name);
                 let fields = multipart_fields
                     .as_mut()
-                    .and_then(|m| m.remove(&param.name));
+                    .and_then(|m| m.remove(alias_name));
                 match fields {
                     Some(mut fs) if !fs.is_empty() => {
-                        if fs.len() == 1 {
+                        if !wants_list && fs.len() == 1 {
                             if wants_raw_bytes {
                                 let field = fs.remove(0);
                                 let py_bytes = pyo3::types::PyBytes::new(py, &field.data);
                                 let _ = kwargs.set_item(&param.name, py_bytes);
                             } else {
                                 let wrapped = make_upload_file(py, fs.remove(0)).map_err(|_e| {
-                                    validation_error_response("file", &param.name, "alloc")
+                                    validation_error_response("body", alias_name, "alloc")
                                 })?;
                                 let _ = kwargs.set_item(&param.name, wrapped);
                             }
@@ -1457,7 +1863,7 @@ fn extract_params_to_pydict_full<'py>(
                                     let _ = list.append(py_bytes);
                                 } else {
                                     let wrapped = make_upload_file(py, f).map_err(|_e| {
-                                        validation_error_response("file", &param.name, "alloc")
+                                        validation_error_response("body", alias_name, "alloc")
                                     })?;
                                     let _ = list.append(wrapped);
                                 }
@@ -1466,10 +1872,27 @@ fn extract_params_to_pydict_full<'py>(
                         }
                     }
                     _ => {
-                        if let Some(ref default) = param.default_value {
-                            let _ = kwargs.set_item(&param.name, default.bind(py));
+                        if param.has_default {
+                            // Distinguish "default IS Python None" from
+                            // "no default supplied" — when the user
+                            // writes ``File(default=None)`` we must
+                            // pass literal ``None`` to the handler;
+                            // otherwise the signature falls back to
+                            // the marker object (``File()``).
+                            let v = match &param.default_value {
+                                Some(d) => d.clone_ref(py),
+                                None => py.None(),
+                            };
+                            let _ = kwargs.set_item(&param.name, v);
                         } else if param.required {
-                            return Err(validation_error_response("file", &param.name, "field required"));
+                            // Collect all missing-field errors before
+                            // surfacing — FA emits one 422 with every
+                            // missing form/file field in the detail list.
+                            if defers_extraction_errors {
+                                extraction_errors.push(missing_error_detail("body", alias_name));
+                                continue;
+                            }
+                            return Err(validation_error_response("body", alias_name, "field required"));
                         }
                     }
                 }
@@ -1477,30 +1900,72 @@ fn extract_params_to_pydict_full<'py>(
             "form" => {
                 // Multipart form field — could be a plain string OR a file.
                 // If it has a filename, treat as UploadFile; else as str/int/etc.
+                // Look up by alias when set (param-model expansion sets the
+                // alias to the field name; Form(alias=...) users also rely
+                // on alias being honoured on the wire).
+                let alias_name = param.alias.as_deref().unwrap_or(&param.name);
                 let fields = multipart_fields
                     .as_mut()
-                    .and_then(|m| m.remove(&param.name));
+                    .and_then(|m| m.remove(alias_name));
+                let wants_list = param.type_hint.starts_with("list_");
                 match fields {
                     Some(mut fs) if !fs.is_empty() => {
-                        let field = fs.remove(0);
-                        if field.filename.is_some() {
-                            let wrapped = make_upload_file(py, field).map_err(|_e| {
-                                validation_error_response("form", &param.name, "alloc")
-                            })?;
-                            let _ = kwargs.set_item(&param.name, wrapped);
+                        if wants_list {
+                            // Collect every occurrence into a Python list
+                            // so ``tags=a&tags=b`` hydrates a list field
+                            // (or a BaseModel ``tags: list[str]`` when the
+                            // form body is a parameter-model expansion).
+                            let list = pyo3::types::PyList::empty(py);
+                            for f in fs.drain(..) {
+                                if f.filename.is_some() {
+                                    let wrapped = make_upload_file(py, f).map_err(|_e| {
+                                        validation_error_response("body", alias_name, "alloc")
+                                    })?;
+                                    let _ = list.append(wrapped);
+                                } else {
+                                    let text = String::from_utf8_lossy(&f.data).into_owned();
+                                    let _ = list.append(pyo3::types::PyString::new(py, &text));
+                                }
+                            }
+                            let _ = kwargs.set_item(&param.name, list);
                         } else {
-                            let text = String::from_utf8_lossy(&field.data).into_owned();
-                            let _ = kwargs.set_item(
-                                &param.name,
-                                coerce_str_to_py(py, &text, &param.type_hint).bind(py),
-                            );
+                            let field = fs.remove(0);
+                            if field.filename.is_some() {
+                                let wrapped = make_upload_file(py, field).map_err(|_e| {
+                                    validation_error_response("body", alias_name, "alloc")
+                                })?;
+                                let _ = kwargs.set_item(&param.name, wrapped);
+                            } else {
+                                let text = String::from_utf8_lossy(&field.data).into_owned();
+                                if param.scalar_validator.is_some() {
+                                    let raw_py = pyo3::types::PyString::new(py, &text).into_any();
+                                    let validated = run_scalar_validator(py, param, "body", &raw_py)?;
+                                    let _ = kwargs.set_item(&param.name, validated);
+                                } else {
+                                    match try_coerce_str_to_py(py, &text, &param.type_hint) {
+                                        Some(v) => {
+                                            let _ = kwargs.set_item(&param.name, v.bind(py));
+                                        }
+                                        None => {
+                                            return Err(coercion_error_response(
+                                                "body", alias_name, &text, &param.type_hint,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     _ => {
-                        if let Some(ref default) = param.default_value {
-                            let _ = kwargs.set_item(&param.name, default.bind(py));
+                        if param.has_default {
+                            let v = match &param.default_value {
+                                Some(d) => d.clone_ref(py),
+                                None => py.None(),
+                            };
+                            let _ = kwargs.set_item(&param.name, v);
                         } else if param.required {
-                            return Err(validation_error_response("form", &param.name, "field required"));
+                            extraction_errors.push(missing_error_detail("body", alias_name));
+                            continue;
                         }
                     }
                 }
@@ -1517,6 +1982,102 @@ fn extract_params_to_pydict_full<'py>(
                 // Leave unset — injected in `inject_framework_objects`.
             }
             _ => {}
+        }
+    }
+
+    if !extraction_errors.is_empty() {
+        // FastAPI semantics: a ``Depends(...)`` that raises
+        // ``HTTPException`` short-circuits ahead of parameter
+        // validation. When the handler was compiled into our
+        // deferred-errors wrapper (routes with any ``Depends(...)``),
+        // hand the collected errors through so Python can run each
+        // dep first — an exception from a dep body wins over the
+        // accumulated 422. Otherwise short-circuit here, saving the
+        // Python round-trip.
+        if !defers_extraction_errors {
+            return Err(dispatch_validation_error(serde_json::json!({
+                "detail": extraction_errors,
+            })));
+        }
+        let err_json = serde_json::Value::Array(extraction_errors).to_string();
+        let _ = kwargs.set_item("__fastapi_rs_extraction_errors__", err_json);
+    }
+
+    // Expose RAW request dicts so param-model builders can feed them
+    // to ``model_validate`` — FA's error.input for a param-model
+    // includes the WHOLE request dict, not just the fields the model
+    // declares. Only populate when at least one synthetic
+    // parameter-model extraction step is present (names start with
+    // ``pm_``), so routes without param-models don't spend cycles
+    // serializing raw dicts into kwargs.
+    let has_param_model = params
+        .iter()
+        .any(|p| p.name.starts_with("pm_") && p.name.contains("__"));
+    if has_param_model {
+        let has_query_pm = params
+            .iter()
+            .any(|p| p.kind == "query" && p.name.starts_with("pm_"));
+        let has_header_pm = params
+            .iter()
+            .any(|p| p.kind == "header" && p.name.starts_with("pm_"));
+        let has_cookie_pm = params
+            .iter()
+            .any(|p| p.kind == "cookie" && p.name.starts_with("pm_"));
+        let has_form_pm = params
+            .iter()
+            .any(|p| p.kind == "form" && p.name.starts_with("pm_"));
+        if has_query_pm {
+            let qd = pyo3::types::PyDict::new(py);
+            for (k, v) in query_params.iter() {
+                let _ = qd.set_item(k, v);
+            }
+            let _ = kwargs.set_item("__fastapi_rs_raw_query__", qd);
+        }
+        if has_header_pm {
+            if let Some(h) = headers {
+                let hd = pyo3::types::PyDict::new(py);
+                for (k, v) in h.iter() {
+                    if let Ok(s) = v.to_str() {
+                        let _ = hd.set_item(k.as_str(), s);
+                    }
+                }
+                let _ = kwargs.set_item("__fastapi_rs_raw_headers__", hd);
+            }
+        }
+        if has_cookie_pm {
+            if let Some(h) = headers {
+                let cd = pyo3::types::PyDict::new(py);
+                if let Some(cookie_hdr) = h.get("cookie").and_then(|v| v.to_str().ok()) {
+                    for piece in cookie_hdr.split(';') {
+                        let piece = piece.trim();
+                        if let Some((k, v)) = piece.split_once('=') {
+                            let _ = cd.set_item(k.trim(), v.trim());
+                        }
+                    }
+                }
+                let _ = kwargs.set_item("__fastapi_rs_raw_cookies__", cd);
+            }
+        }
+        if has_form_pm {
+            if let Some(m) = multipart_fields.as_ref() {
+                let fd = pyo3::types::PyDict::new(py);
+                for (k, vs) in m.iter() {
+                    if vs.len() == 1 {
+                        if let Ok(s) = std::str::from_utf8(&vs[0].data) {
+                            let _ = fd.set_item(k.as_str(), s);
+                        }
+                    } else if !vs.is_empty() {
+                        let list = pyo3::types::PyList::empty(py);
+                        for v in vs {
+                            if let Ok(s) = std::str::from_utf8(&v.data) {
+                                let _ = list.append(s);
+                            }
+                        }
+                        let _ = fd.set_item(k.as_str(), list);
+                    }
+                }
+                let _ = kwargs.set_item("__fastapi_rs_raw_form__", fd);
+            }
         }
     }
 
@@ -1548,7 +2109,8 @@ fn extract_single_param(
             }
         }
         "query" => {
-            if let Some(raw) = query_params.get(&param.name) {
+            let q_lookup: &str = param.alias.as_deref().unwrap_or(&param.name);
+            if let Some(raw) = query_params.get(q_lookup) {
                 resolved.insert(param.name.clone(), coerce_str_to_py(py, raw, &param.type_hint));
             } else if param.has_default {
                 let v = match &param.default_value {
@@ -1635,12 +2197,38 @@ fn validation_error_response(loc: &str, name: &str, _msg: &str) -> Response {
     dispatch_validation_error(body)
 }
 
+/// Single-field missing body error (FA's ``get_missing_field_error`` with
+/// loc=("body",) and input=None). Used when the request body is empty
+/// and the handler declares a single scalar/model body param.
+fn missing_body_error() -> Response {
+    let body = serde_json::json!({
+        "detail": [{
+            "type": "missing",
+            "loc": ["body"],
+            "msg": "Field required",
+            "input": serde_json::Value::Null,
+        }]
+    });
+    dispatch_validation_error(body)
+}
+
 /// Return a 422 response. When the app has registered a handler for
 /// `RequestValidationError`, the detail is passed to Python so the user's
 /// handler shapes the final body. Otherwise, the default JSON body is used.
 pub fn dispatch_validation_error(detail_json: serde_json::Value) -> Response {
-    if let Some(handler) = VALIDATION_HANDLER.get() {
+    let has_handler = VALIDATION_HANDLER
+        .read()
+        .ok()
+        .map(|g| g.is_some())
+        .unwrap_or(false);
+    if has_handler {
         let result: PyResult<(u16, Vec<u8>, String)> = Python::attach(|py| {
+            let guard = VALIDATION_HANDLER
+                .read()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("lock"))?;
+            let handler = guard
+                .as_ref()
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("gone"))?;
             let s = detail_json.to_string();
             let ret = handler.call1(py, (s,))?;
             let t = ret.bind(py);
@@ -1671,6 +2259,88 @@ pub fn dispatch_validation_error(detail_json: serde_json::Value) -> Response {
         .into_response()
 }
 
+/// Return a single error-detail object for a missing required param.
+/// Callers push these into an accumulator so multiple missing fields
+/// surface as separate entries in the 422 detail list.
+fn missing_error_detail(loc: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "missing",
+        "loc": [loc, name],
+        "msg": "Field required",
+        "input": serde_json::Value::Null,
+    })
+}
+
+/// Return a single error-detail object for a str→type coercion failure.
+fn coercion_error_detail(
+    loc: &str,
+    name: &str,
+    raw: &str,
+    type_hint: &str,
+) -> serde_json::Value {
+    let (err_type, msg) = match type_hint {
+        "int" => ("int_parsing", "Input should be a valid integer, unable to parse string as an integer"),
+        "float" => ("float_parsing", "Input should be a valid number, unable to parse string as a number"),
+        "bool" => ("bool_parsing", "Input should be a valid boolean, unable to interpret input"),
+        _ => ("value_error", "Value error"),
+    };
+    serde_json::json!({
+        "type": err_type,
+        "loc": [loc, name],
+        "msg": msg,
+        "input": raw,
+    })
+}
+
+/// Return a single error-detail object for a str→type coercion failure
+/// at a specific list index.
+fn coercion_error_detail_indexed(
+    loc: &str,
+    name: &str,
+    index: usize,
+    raw: &str,
+    type_hint: &str,
+) -> serde_json::Value {
+    let (err_type, msg) = match type_hint {
+        "int" => ("int_parsing", "Input should be a valid integer, unable to parse string as an integer"),
+        "float" => ("float_parsing", "Input should be a valid number, unable to parse string as a number"),
+        "bool" => ("bool_parsing", "Input should be a valid boolean, unable to interpret input"),
+        _ => ("value_error", "Value error"),
+    };
+    serde_json::json!({
+        "type": err_type,
+        "loc": [loc, name, index],
+        "msg": msg,
+        "input": raw,
+    })
+}
+
+/// Build a 422 response for a str→type coercion failure at a specific
+/// list index (loc = [location, field, index]).
+fn coercion_error_response_indexed(
+    loc: &str,
+    name: &str,
+    index: usize,
+    raw: &str,
+    type_hint: &str,
+) -> Response {
+    let (err_type, msg) = match type_hint {
+        "int" => ("int_parsing", "Input should be a valid integer, unable to parse string as an integer"),
+        "float" => ("float_parsing", "Input should be a valid number, unable to parse string as a number"),
+        "bool" => ("bool_parsing", "Input should be a valid boolean, unable to interpret input"),
+        _ => ("value_error", "Value error"),
+    };
+    let body = serde_json::json!({
+        "detail": [{
+            "type": err_type,
+            "loc": [loc, name, index],
+            "msg": msg,
+            "input": raw,
+        }]
+    });
+    dispatch_validation_error(body)
+}
+
 /// Build a 422 response for a str→type coercion failure (int_parsing, etc.),
 /// in Pydantic-v2 format.
 fn coercion_error_response(loc: &str, name: &str, raw: &str, type_hint: &str) -> Response {
@@ -1695,18 +2365,36 @@ fn coercion_error_response(loc: &str, name: &str, raw: &str, type_hint: &str) ->
 /// FastAPI-style 422 response. Prepends `loc_prefix` (e.g. "body") to each
 /// error's location.
 fn pydantic_error_response(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Response {
+    pydantic_error_response_with_loc_ext(py, err, &[loc_prefix], false)
+}
+
+fn pydantic_error_response_combined(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Response {
+    pydantic_error_response_with_loc_ext(py, err, &[loc_prefix], true)
+}
+
+fn pydantic_error_response_with_loc(py: Python<'_>, err: &PyErr, loc_prefix: &[&str]) -> Response {
+    pydantic_error_response_with_loc_ext(py, err, loc_prefix, false)
+}
+
+fn pydantic_error_response_with_loc_ext(
+    py: Python<'_>,
+    err: &PyErr,
+    loc_prefix: &[&str],
+    strip_missing_input: bool,
+) -> Response {
     // Access the ValidationError object and call .errors()
+    let primary_loc = loc_prefix.first().copied().unwrap_or("");
     let err_obj = err.value(py);
     let errors_method = match err_obj.getattr("errors") {
         Ok(m) => m,
         Err(_) => {
             // Not a ValidationError — fall back to generic
-            return validation_error_response(loc_prefix, "", &format!("{err}"));
+            return validation_error_response(primary_loc, "", &format!("{err}"));
         }
     };
     let errors_list = match errors_method.call0() {
         Ok(l) => l,
-        Err(_) => return validation_error_response(loc_prefix, "", &format!("{err}")),
+        Err(_) => return validation_error_response(primary_loc, "", &format!("{err}")),
     };
 
     let mut details = Vec::new();
@@ -1719,54 +2407,16 @@ fn pydantic_error_response(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Res
                     .flatten()
                     .and_then(|v| v.extract::<String>().ok());
 
-                // FastAPI/Starlette surface pydantic's `json_invalid` with a
-                // canonical shape that differs from pydantic's raw output. In
-                // particular `ctx.error` must match Python's stdlib json error
-                // message (e.g. "Expecting value"), not pydantic-core's Rust
-                // message ("expected ident"). We re-parse the input with
-                // Python's `json.loads` to get the matching message.
-                if err_type_str.as_deref() == Some("json_invalid") {
-                    let raw_input = d
-                        .get_item("input")
-                        .ok()
-                        .flatten()
-                        .and_then(|v| {
-                            v.extract::<Vec<u8>>().ok()
-                                .or_else(|| v.extract::<String>().ok().map(|s| s.into_bytes()))
-                        });
-
-                    let ctx_error = if let Some(bytes) = raw_input.as_ref() {
-                        let json_mod = py.import("json");
-                        let msg_opt = json_mod
-                            .and_then(|j| j.call_method1("loads", (bytes.clone(),)).map(|_| String::new()).or_else(|e| {
-                                let v = e.value(py);
-                                let msg = v.getattr("msg")
-                                    .and_then(|m| m.extract::<String>())
-                                    .unwrap_or_else(|_| format!("{e}"));
-                                Ok::<String, PyErr>(msg)
-                            }))
-                            .ok();
-                        msg_opt.unwrap_or_else(|| "Expecting value".to_string())
-                    } else {
-                        "Expecting value".to_string()
-                    };
-                    let obj = serde_json::json!({
-                        "type": "json_invalid",
-                        "loc": [loc_prefix, 0],
-                        "msg": "JSON decode error",
-                        "input": {},
-                        "ctx": {"error": ctx_error},
-                    });
-                    details.push(obj);
-                    continue;
-                }
-
                 let mut obj = serde_json::Map::new();
                 if let Some(t) = err_type_str {
                     obj.insert("type".into(), serde_json::Value::String(t));
                 }
-                // Prepend loc_prefix to location
-                let mut loc = vec![serde_json::Value::String(loc_prefix.to_string())];
+                // Start loc with the provided prefix (may be multi-segment:
+                // e.g. ["query", "my_param"] for scalar query param errors).
+                let mut loc: Vec<serde_json::Value> = loc_prefix
+                    .iter()
+                    .map(|s| serde_json::Value::String((*s).to_string()))
+                    .collect();
                 if let Some(l) = d.get_item("loc").ok().flatten() {
                     if let Ok(tup) = l.cast::<pyo3::types::PyTuple>() {
                         for item in tup.iter() {
@@ -1788,10 +2438,24 @@ fn pydantic_error_response(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Res
                 }
                 obj.insert("loc".into(), serde_json::Value::Array(loc));
                 if let Some(m) = d.get_item("msg").ok().flatten().and_then(|v| v.extract::<String>().ok()) {
-                    obj.insert("msg".into(), serde_json::Value::String(m));
+                    // FastAPI post-processes a handful of Pydantic-v2
+                    // wordings to match its historical error strings
+                    // (array→list, object→dictionary, duration→timedelta,
+                    // etc.). Apply the same substitutions here.
+                    let m2 = fastapi_normalize_error_msg(&m);
+                    obj.insert("msg".into(), serde_json::Value::String(m2));
                 }
-                // input field — best-effort serialize to JSON via python's json module
-                if let Some(inp) = d.get_item("input").ok().flatten() {
+                // input field — best-effort serialize to JSON via python's json module.
+                // When called from the combined-body path we mimic FA's
+                // `get_missing_field_error`, which hard-sets `input=None`
+                // on every "missing" error produced per field.
+                let is_missing_err = obj.get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "missing")
+                    .unwrap_or(false);
+                if strip_missing_input && is_missing_err {
+                    obj.insert("input".into(), serde_json::Value::Null);
+                } else if let Some(inp) = d.get_item("input").ok().flatten() {
                     let input_val: serde_json::Value = if let Ok(s) = inp.extract::<String>() {
                         serde_json::Value::String(s)
                     } else if let Ok(b) = inp.extract::<bool>() {
@@ -1811,29 +2475,97 @@ fn pydantic_error_response(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Res
                     };
                     obj.insert("input".into(), input_val);
                 }
+                // ctx field (constraint metadata: {"ge": 0}, {"max_length":
+                // 5}, etc.). FastAPI surfaces this verbatim; we forward
+                // Pydantic's ctx dict when present.
+                if let Some(cx) = d.get_item("ctx").ok().flatten() {
+                    if let Ok(cx_dict) = cx.cast::<PyDict>() {
+                        let mut ctx_map = serde_json::Map::new();
+                        for (k, v) in cx_dict.iter() {
+                            let key = match k.extract::<String>() {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            let val: serde_json::Value = if let Ok(s) = v.extract::<String>() {
+                                serde_json::Value::String(s)
+                            } else if let Ok(b) = v.extract::<bool>() {
+                                serde_json::Value::Bool(b)
+                            } else if let Ok(i) = v.extract::<i64>() {
+                                serde_json::Value::Number(i.into())
+                            } else if let Ok(f) = v.extract::<f64>() {
+                                serde_json::Number::from_f64(f)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::Null)
+                            } else if v.is_none() {
+                                serde_json::Value::Null
+                            } else if v.is_instance_of::<pyo3::exceptions::PyException>() {
+                                // FastAPI serializes exception ctx values
+                                // (e.g. the `error` in `value_error` /
+                                // `assertion_error`) as `{}`.
+                                serde_json::Value::Object(serde_json::Map::new())
+                            } else {
+                                py.import("json")
+                                    .and_then(|j| j.call_method1("dumps", (&v,)))
+                                    .and_then(|s| s.extract::<String>())
+                                    .ok()
+                                    .and_then(|s| serde_json::from_str(&s).ok())
+                                    .unwrap_or(serde_json::Value::Null)
+                            };
+                            ctx_map.insert(key, val);
+                        }
+                        if !ctx_map.is_empty() {
+                            obj.insert("ctx".into(), serde_json::Value::Object(ctx_map));
+                        }
+                    }
+                }
                 details.push(serde_json::Value::Object(obj));
             }
         }
     }
 
     if details.is_empty() {
-        return validation_error_response(loc_prefix, "", &format!("{err}"));
+        return validation_error_response(primary_loc, "", &format!("{err}"));
     }
 
     let body = serde_json::json!({ "detail": details });
     dispatch_validation_error(body)
 }
 
+/// FastAPI overrides a handful of Pydantic-v2 error message wordings for
+/// backward compatibility with its v1 error strings.
+fn fastapi_normalize_error_msg(msg: &str) -> String {
+    let mut s = msg.to_string();
+    s = s.replace("valid array", "valid list");
+    s = s.replace("valid object", "valid dictionary");
+    s = s.replace("an object", "a dictionary");
+    s = s.replace("valid duration", "valid timedelta");
+    s = s.replace("valid set", "valid set");      // no-op (Pydantic already uses "set")
+    s = s.replace("valid frozenset", "valid frozenset"); // same
+    s
+}
+
 fn parse_cookie_value(cookie_header: &str, name: &str) -> Option<String> {
+    // Starlette uses SimpleCookie parsing where duplicate keys
+    // resolve to the LAST value (dict-assignment semantics).
+    let mut found: Option<String> = None;
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
         if let Some((key, value)) = pair.split_once('=') {
             if key.trim() == name {
-                return Some(value.trim().to_string());
+                let raw = value.trim();
+                let unquoted = if raw.len() >= 2
+                    && raw.starts_with('"')
+                    && raw.ends_with('"')
+                {
+                    &raw[1..raw.len() - 1]
+                } else {
+                    raw
+                };
+                found = Some(unquoted.to_string());
             }
         }
     }
-    None
+    found
 }
 
 /// Coerce a string value to a Python object of the given type.
@@ -1847,18 +2579,22 @@ fn coerce_str_to_py(py: Python<'_>, raw: &str, type_hint: &str) -> Py<PyAny> {
 /// target type (rather than silently returning the raw string).
 fn try_coerce_str_to_py(py: Python<'_>, raw: &str, type_hint: &str) -> Option<Py<PyAny>> {
     match type_hint {
-        "int" => raw.parse::<i64>()
+        "int" => raw.trim().parse::<i64>()
             .ok()
             .map(|i| i.into_pyobject(py).expect("int").into_any().unbind()),
-        "float" => raw.parse::<f64>()
+        "float" => raw.trim().parse::<f64>()
             .ok()
             .map(|f| f.into_pyobject(py).expect("float").into_any().unbind()),
         "bool" => {
-            match raw {
-                "true" | "True" | "1" | "yes" | "on" => Some(
+            // Pydantic-v2's bool coercion accepts `t/f/y/n` and capitalized
+            // forms in addition to the usual true/false spellings. Match
+            // that set so FastAPI and fastapi-rs agree on `?flag=t`.
+            let lower = raw.to_ascii_lowercase();
+            match lower.as_str() {
+                "true" | "t" | "1" | "yes" | "y" | "on" => Some(
                     pyo3::types::PyBool::new(py, true).to_owned().into_any().unbind(),
                 ),
-                "false" | "False" | "0" | "no" | "off" => Some(
+                "false" | "f" | "0" | "no" | "n" | "off" => Some(
                     pyo3::types::PyBool::new(py, false).to_owned().into_any().unbind(),
                 ),
                 _ => None,

@@ -49,6 +49,7 @@ def _build() -> dict[str, types.ModuleType]:
     starlette_requests = _mod("starlette.requests")
     starlette_requests.Request = _requests.Request  # type: ignore[attr-defined]
     starlette_requests.HTTPConnection = _requests.HTTPConnection  # type: ignore[attr-defined]
+    starlette_requests.ClientDisconnect = _requests.ClientDisconnect  # type: ignore[attr-defined]
     modules["starlette.requests"] = starlette_requests
 
     # ── starlette.responses ────────────────────────────────────────

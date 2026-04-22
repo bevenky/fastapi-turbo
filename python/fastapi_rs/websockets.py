@@ -266,6 +266,20 @@ class WebSocket:
             self._ws.accept(subprotocol, rust_headers if rust_headers else None)
         self._app_state = WebSocketState.CONNECTED
 
+    def _reject(self, status: int = 403) -> None:
+        """Abort the upgrade BEFORE any ``accept()``. Starlette's path for
+        pre-accept ``WebSocketException``: the handshake HTTP response
+        becomes an error status (defaults to 403) and no WS frames are
+        sent. Safe to call at most once; subsequent calls no-op because
+        the underlying oneshot channel has already fired.
+        """
+        self._app_state = WebSocketState.DISCONNECTED
+        if self._ws is not None:
+            try:
+                self._ws.reject(status)
+            except Exception:
+                pass
+
     async def close(self, code: int = 1000, reason: str | None = None) -> None:
         """Close the WebSocket and wait for the frame to flush.
 

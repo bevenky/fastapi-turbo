@@ -237,40 +237,152 @@ where
 
 // ── OpenAPI / documentation HTML templates ─────────────────────────
 
-const SWAGGER_UI_HTML: &str = r#"<!DOCTYPE html>
-<html>
-<head>
+const SWAGGER_UI_HTML: &str = r######"
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link type="text/css" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+    <link rel="shortcut icon" href="https://fastapi.tiangolo.com/img/favicon.png">
     <title>fastapi-rs - Swagger UI</title>
-    <meta charset="utf-8"/>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
-</head>
-<body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    </head>
+    <body>
+    <div id="swagger-ui">
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <!-- `SwaggerUIBundle` is now available on the page -->
     <script>
-        SwaggerUIBundle({
-            url: '__OPENAPI_URL__',
-            dom_id: '#swagger-ui',
-            presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
-            layout: 'StandaloneLayout',
-        });
+    const ui = SwaggerUIBundle({
+        url: '__OPENAPI_URL__',
+    "dom_id": "#swagger-ui",
+    "layout": "BaseLayout",
+    "deepLinking": true,
+    "showExtensions": true,
+    "showCommonExtensions": true,
+    oauth2RedirectUrl: window.location.origin + '__OAUTH2_REDIRECT_URL__',
+    presets: [
+        SwaggerUIBundle.presets.apis,
+        SwaggerUIBundle.SwaggerUIStandalonePreset
+        ],
+    })
     </script>
-</body>
-</html>"#;
+    </body>
+    </html>
+    "######;
 
-const REDOC_HTML: &str = r#"<!DOCTYPE html>
-<html>
-<head>
+const SWAGGER_OAUTH2_REDIRECT_HTML: &str = r######"
+    <!doctype html>
+    <html lang="en-US">
+    <head>
+        <title>Swagger UI: OAuth2 Redirect</title>
+    </head>
+    <body>
+    <script>
+        'use strict';
+        function run () {
+            var oauth2 = window.opener.swaggerUIRedirectOauth2;
+            var sentState = oauth2.state;
+            var redirectUrl = oauth2.redirectUrl;
+            var isValid, qp, arr;
+
+            if (/code|token|error/.test(window.location.hash)) {
+                qp = window.location.hash.substring(1).replace('?', '&');
+            } else {
+                qp = location.search.substring(1);
+            }
+
+            arr = qp.split("&");
+            arr.forEach(function (v,i,_arr) { _arr[i] = '"' + v.replace('=', '":"') + '"';});
+            qp = qp ? JSON.parse('{' + arr.join() + '}',
+                    function (key, value) {
+                        return key === "" ? value : decodeURIComponent(value);
+                    }
+            ) : {};
+
+            isValid = qp.state === sentState;
+
+            if ((
+              oauth2.auth.schema.get("flow") === "accessCode" ||
+              oauth2.auth.schema.get("flow") === "authorizationCode" ||
+              oauth2.auth.schema.get("flow") === "authorization_code"
+            ) && !oauth2.auth.code) {
+                if (!isValid) {
+                    oauth2.errCb({
+                        authId: oauth2.auth.name,
+                        source: "auth",
+                        level: "warning",
+                        message: "Authorization may be unsafe, passed state was changed in server. The passed state wasn't returned from auth server."
+                    });
+                }
+
+                if (qp.code) {
+                    delete oauth2.state;
+                    oauth2.auth.code = qp.code;
+                    oauth2.callback({auth: oauth2.auth, redirectUrl: redirectUrl});
+                } else {
+                    let oauthErrorMsg;
+                    if (qp.error) {
+                        oauthErrorMsg = "["+qp.error+"]: " +
+                            (qp.error_description ? qp.error_description+ ". " : "no accessCode received from the server. ") +
+                            (qp.error_uri ? "More info: "+qp.error_uri : "");
+                    }
+
+                    oauth2.errCb({
+                        authId: oauth2.auth.name,
+                        source: "auth",
+                        level: "error",
+                        message: oauthErrorMsg || "[Authorization failed]: no accessCode received from the server."
+                    });
+                }
+            } else {
+                oauth2.callback({auth: oauth2.auth, token: qp, isValid: isValid, redirectUrl: redirectUrl});
+            }
+            window.close();
+        }
+
+        if (document.readyState !== 'loading') {
+            run();
+        } else {
+            document.addEventListener('DOMContentLoaded', function () {
+                run();
+            });
+        }
+    </script>
+    </body>
+    </html>
+        "######;
+
+const REDOC_HTML: &str = r#"
+    <!DOCTYPE html>
+    <html>
+    <head>
     <title>fastapi-rs - ReDoc</title>
+    <!-- needed for adaptive design -->
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-</head>
-<body>
-    <redoc spec-url='__OPENAPI_URL__'></redoc>
-    <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
-</body>
-</html>"#;
+
+    <link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
+
+    <link rel="shortcut icon" href="https://fastapi.tiangolo.com/img/favicon.png">
+    <!--
+    ReDoc doesn't change outer page styles
+    -->
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+      }
+    </style>
+    </head>
+    <body>
+    <noscript>
+        ReDoc requires Javascript to function. Please enable it to browse the documentation.
+    </noscript>
+    <redoc spec-url="__OPENAPI_URL__"></redoc>
+    <script src="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js"> </script>
+    </body>
+    </html>
+    "#;
 
 /// Start the Axum HTTP server.  Called from Python.
 ///
@@ -297,18 +409,18 @@ pub fn run_server(
 ) -> PyResult<()> {
     // Stash the user's 404 handler so the Rust Router fallback can dispatch
     // through Python when nothing else matched. Set once per process.
-    if let Some(h) = not_found_handler {
-        let _ = crate::router::NOT_FOUND_HANDLER.set(h);
+    // Always overwrite (RwLock, not OnceLock) so successive app.run()
+    // calls — dozens of ephemeral apps in a test suite — each rebind
+    // their own handlers rather than silently inheriting the first
+    // one's. Passing ``None`` clears the slot.
+    if let Ok(mut slot) = crate::router::NOT_FOUND_HANDLER.write() {
+        *slot = not_found_handler;
     }
-    // Stash the FastAPI app instance so Request objects injected into handlers
-    // expose request.app (vLLM / SGLang read request.app.state heavily).
-    if let Some(a) = app {
-        let _ = crate::router::APP_INSTANCE.set(a);
+    if let Ok(mut slot) = crate::router::APP_INSTANCE.write() {
+        *slot = app;
     }
-    // Stash the validation-error dispatcher so body/query/path validation
-    // failures route through `@exception_handler(RequestValidationError)`.
-    if let Some(h) = validation_handler {
-        let _ = crate::router::VALIDATION_HANDLER.set(h);
+    if let Ok(mut slot) = crate::router::VALIDATION_HANDLER.write() {
+        *slot = validation_handler;
     }
     // Parse middleware config while we still have the GIL
     let mw_configs = parse_middleware_configs(py, &middlewares)?;
@@ -325,7 +437,9 @@ pub fn run_server(
         {
             use std::collections::HashSet;
             let set: HashSet<String> = routes.iter().map(|r| r.path.clone()).collect();
-            let _ = DECLARED_PATHS.set(set);
+            if let Ok(mut slot) = DECLARED_PATHS.write() {
+                *slot = Some(set);
+            }
         }
 
         rt.block_on(async move {
@@ -365,11 +479,27 @@ pub fn run_server(
 
                 // Swagger UI
                 if let Some(ref docs_path) = docs_url {
-                    let swagger_html = SWAGGER_UI_HTML.replace("__OPENAPI_URL__", oa_url);
+                    // FA default oauth2_redirect_url is ``/docs/oauth2-redirect``;
+                    // derive ours from the docs path so custom docs URLs still
+                    // produce the right redirect path.
+                    let oauth_redirect = format!(
+                        "{}/oauth2-redirect",
+                        docs_path.trim_end_matches('/')
+                    );
+                    let swagger_html = SWAGGER_UI_HTML
+                        .replace("__OPENAPI_URL__", oa_url)
+                        .replace("__OAUTH2_REDIRECT_URL__", &oauth_redirect);
                     router = router.route(
                         docs_path,
                         get(move || async move {
                             axum::response::Html(swagger_html.clone())
+                        }),
+                    );
+                    // OAuth2 redirect page (FA default at /docs/oauth2-redirect)
+                    router = router.route(
+                        &oauth_redirect,
+                        get(|| async {
+                            axum::response::Html(SWAGGER_OAUTH2_REDIRECT_HTML)
                         }),
                     );
                 }
@@ -446,6 +576,12 @@ pub fn run_server(
                 ))
             })?;
 
+            // Publish the bound address so request scopes can populate
+            // `scope["server"] = (host, port)` / `.scheme` — FastAPI fills
+            // these from the ASGI scope dict, and user code reads them via
+            // `request.url.hostname` / `.port`.
+            let _ = crate::router::set_server_addr(host.clone(), port);
+
             println!("fastapi-rs running on http://{addr}");
 
             axum::serve(
@@ -468,8 +604,12 @@ pub fn run_server(
 /// Set of *declared* paths (verbatim) from the user's routes. Used by the
 /// redirect_slashes middleware to decide whether the alternate form of a
 /// requested URL is an actual registered route before redirecting.
-static DECLARED_PATHS: std::sync::OnceLock<std::collections::HashSet<String>> =
-    std::sync::OnceLock::new();
+/// Mutable so consecutive ``run_server()`` calls (test suites with
+/// many ephemeral apps) replace rather than ignore. Without this the
+/// redirect_slashes middleware uses the FIRST app's routes forever,
+/// silently 404ing later apps' trailing-slash redirects.
+static DECLARED_PATHS: std::sync::RwLock<Option<std::collections::HashSet<String>>> =
+    std::sync::RwLock::new(None);
 
 /// Pass-through middleware for non-preflight OPTIONS. Tower-http's
 /// ``CorsLayer`` intercepts *every* OPTIONS request with configured
@@ -526,34 +666,35 @@ async fn slashes_redirect_middleware(
             }
         }
     }
-    let declared = match DECLARED_PATHS.get() {
-        Some(s) => s,
+    // Look up under the lock without holding the guard across an await.
+    // ``check_declared`` returns ``(known, alt_known_if_needed)`` — two
+    // bools and an owned String — all owned/Send, so the guard's
+    // non-Send read-lock stays in a synchronous scope.
+    fn check_declared(path: &str) -> Option<(bool, bool, String)> {
+        let guard = DECLARED_PATHS.read().ok()?;
+        let declared = guard.as_ref()?;
+        let known = declared.contains(path);
+        let alternate: String = if path.ends_with('/') {
+            path[..path.len() - 1].to_string()
+        } else {
+            format!("{path}/")
+        };
+        let alt_known = declared.contains(&alternate);
+        Some((known, alt_known, alternate))
+    }
+    let (known, alt_known, alternate) = match check_declared(path) {
+        Some(t) => t,
         None => return next.run(req).await,
     };
-    // HashSet<String>::contains(&str) via Borrow<str> — zero-alloc lookup.
-    if declared.contains(path) {
+    if known || !alt_known {
         return next.run(req).await;
     }
 
-    // Only at this point do we potentially allocate (to build the alt form).
-    let alternate: String = if path.ends_with('/') {
-        path[..path.len() - 1].to_string()
-    } else {
-        format!("{path}/")
-    };
-
-    if !declared.contains(&alternate) {
-        return next.run(req).await;
-    }
-
-    // Only redirect safe methods — POST/PUT/DELETE with body should not be
-    // silently redirected (client must re-issue to canonical URL).
-    if !matches!(
-        req.method(),
-        &axum::http::Method::GET | &axum::http::Method::HEAD
-    ) {
-        return next.run(req).await;
-    }
+    // Starlette/FA redirects ALL methods — using 307 (Temporary
+    // Redirect) which preserves method + body on the re-request. Tests
+    // like ``@app.post("/images/multiple/")`` hit via
+    // ``client.post("/images/multiple")`` (no trailing) and expect 200
+    // via the redirect.
 
     // Preserve query string in the redirect target
     let mut redirect_to = alternate;

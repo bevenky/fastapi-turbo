@@ -65,6 +65,11 @@ pub struct WsScopeInfo {
     pub scheme: String,                     // "ws" or "wss"
     pub host: String,
     pub path_params: Vec<(String, String)>, // matched route path params
+    /// Client-offered subprotocols (from the ``Sec-WebSocket-Protocol``
+    /// request header, split on commas and trimmed). Starlette surfaces
+    /// this in ``scope["subprotocols"]`` so apps can call
+    /// ``ws.accept(subprotocol=...)`` with one of the offered values.
+    pub subprotocols: Vec<String>,
 }
 
 // ── WebSocket state (matches Starlette's WebSocketState) ───────────
@@ -224,6 +229,16 @@ pub struct AcceptParams {
     pub headers: Vec<(String, String)>,
 }
 
+/// What Python signals through the accept oneshot: either "upgrade the
+/// socket with these parameters" or "reject the handshake before upgrade
+/// with this HTTP status". Starlette rejects pre-accept WS connections
+/// with 403; we allow the caller to pick a code so dependency-injected
+/// auth middlewares can return 401/403/etc.
+pub enum AcceptAction {
+    Accept(AcceptParams),
+    Reject { status: u16 },
+}
+
 #[pyclass]
 pub struct PyWebSocket {
     tx: mpsc::UnboundedSender<WriterCmd>,
@@ -242,7 +257,7 @@ pub struct PyWebSocket {
     //   and custom headers to the route handler, which then performs the upgrade.
     //   ready_rx blocks until the route handler has finished the upgrade and
     //   connected the post-upgrade socket tasks — then send/receive can flow.
-    accept_tx: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<AcceptParams>>>>,
+    accept_tx: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<AcceptAction>>>>,
     ready_rx: cb::Receiver<()>,
 }
 
@@ -310,7 +325,7 @@ impl PyWebSocket {
             };
             // send() is infallible unless the receiver was dropped — treat as
             // already-accepted or route-handler-gone.
-            let _ = tx.send(params);
+            let _ = tx.send(AcceptAction::Accept(params));
 
             // Block until the route handler signals the upgrade is complete.
             let rx = self.ready_rx.clone();
@@ -323,6 +338,28 @@ impl PyWebSocket {
         }
         // Either we just accepted, or it was already accepted earlier.
         self.state.store(STATE_CONNECTED, Ordering::Release);
+        Ok(())
+    }
+
+    /// Reject the handshake before upgrade. Starlette normative path
+    /// for pre-accept ``WebSocketException``: the HTTP upgrade response
+    /// becomes a plain ``<status> Forbidden`` (status defaults to 403)
+    /// and no WebSocket frame ever travels. Safe to call at most once
+    /// and before ``accept()`` — later calls no-op because the oneshot
+    /// has already fired.
+    #[pyo3(signature = (status=403))]
+    fn reject(&self, status: u16) -> PyResult<()> {
+        let accept_tx = {
+            let mut guard = self.accept_tx.lock().unwrap();
+            guard.take()
+        };
+        if let Some(tx) = accept_tx {
+            let _ = tx.send(AcceptAction::Reject { status });
+        }
+        // Mark the WS as disconnected so any lingering user code that
+        // tries to send/receive gets an immediate error rather than
+        // hanging on the channel.
+        self.state.store(STATE_DISCONNECTED, Ordering::Release);
         Ok(())
     }
 
@@ -387,6 +424,19 @@ impl PyWebSocket {
             params_dict.set_item(k.as_str(), v.as_str())?;
         }
         dict.set_item(pyo3::intern!(py, "path_params"), params_dict)?;
+
+        // ASGI-standard client-offered subprotocols — required by apps
+        // that negotiate via ``scope["subprotocols"]`` before calling
+        // ``ws.accept(subprotocol=...)``.
+        let sp_list = pyo3::types::PyList::empty(py);
+        for s in &self.scope_info.subprotocols {
+            sp_list.append(s.as_str())?;
+        }
+        dict.set_item(pyo3::intern!(py, "subprotocols"), sp_list)?;
+
+        // ASGI type marker — some third-party auth/CSRF middlewares
+        // short-circuit on `scope["type"] == "websocket"`.
+        dict.set_item(pyo3::intern!(py, "type"), "websocket")?;
 
         Ok(dict)
     }
@@ -594,7 +644,7 @@ pub async fn handle_ws_upgrade(
     // once the reader/writer tasks spawn in the on_upgrade callback.
     let (tx_out, rx_out) = mpsc::unbounded_channel::<WriterCmd>();
     let (cb_tx, cb_rx) = cb::unbounded::<WsMessage>();
-    let (accept_tx, accept_rx) = tokio::sync::oneshot::channel::<AcceptParams>();
+    let (accept_tx, accept_rx) = tokio::sync::oneshot::channel::<AcceptAction>();
     let (ready_tx, ready_rx) = cb::bounded::<()>(1);
     let state = Arc::new(AtomicU8::new(STATE_CONNECTING));
 
@@ -663,15 +713,24 @@ pub async fn handle_ws_upgrade(
         });
     });
 
-    // Wait for the Python handler to call accept(). Bound with a timeout so
-    // a handler that never accepts doesn't hang a client connection.
+    // Wait for the Python handler to call accept() OR reject(). Bound
+    // with a timeout so a handler that never resolves doesn't hang a
+    // client connection.
     let params = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         accept_rx,
     )
     .await
     {
-        Ok(Ok(p)) => p,
+        Ok(Ok(AcceptAction::Accept(p))) => p,
+        Ok(Ok(AcceptAction::Reject { status })) => {
+            // Starlette semantics: pre-accept ``WebSocketException``
+            // aborts the handshake with an HTTP status body; no WS
+            // frame is sent, client sees a normal HTTP error response.
+            let sc = axum::http::StatusCode::from_u16(status)
+                .unwrap_or(axum::http::StatusCode::FORBIDDEN);
+            return (sc, sc.canonical_reason().unwrap_or("Forbidden")).into_response();
+        }
         Ok(Err(_)) | Err(_) => {
             // oneshot dropped (handler exited without accept) OR timeout.
             return (

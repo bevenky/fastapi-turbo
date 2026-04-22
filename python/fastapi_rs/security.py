@@ -13,6 +13,8 @@ These are callable classes that work as ``Depends()`` dependencies:
 # type annotations to strings, breaking the DI system's ability to detect
 # `request: Request` params for injection.
 
+from typing import Annotated, Optional
+
 from pydantic import BaseModel
 
 from fastapi_rs.exceptions import HTTPException
@@ -45,22 +47,28 @@ class HTTPAuthorizationCredentials(BaseModel):
 class OAuth2PasswordRequestForm:
     """Dependency class for OAuth2 password flow form data.
 
-    When used as ``form: OAuth2PasswordRequestForm = Depends()`` FastAPI
-    uses the class itself as the dep callable, inspects its ``__init__``
-    signature, and pulls each field from the request form body. We match
-    that by marking each field with a ``Form`` default so the framework
-    pulls them from ``application/x-www-form-urlencoded`` / multipart.
+    Matches FastAPI's ``OAuth2PasswordRequestForm`` signature exactly —
+    uses `Annotated[..., Form(...)]` so the generated OpenAPI `Body_*`
+    component carries the `pattern: ^password$` on `grant_type`,
+    `format: password` on `password`/`client_secret`, and the correct
+    `required` fields.
     """
 
     def __init__(
         self,
         *,
-        grant_type: str | None = _Form(default=None),
-        username: str = _Form(default=""),
-        password: str = _Form(default=""),
-        scope: str = _Form(default=""),
-        client_id: str | None = _Form(default=None),
-        client_secret: str | None = _Form(default=None),
+        grant_type: Annotated[
+            Optional[str],
+            _Form(pattern="^password$"),
+        ] = None,
+        username: Annotated[str, _Form()],
+        password: Annotated[str, _Form(json_schema_extra={"format": "password"})],
+        scope: Annotated[str, _Form()] = "",
+        client_id: Annotated[Optional[str], _Form()] = None,
+        client_secret: Annotated[
+            Optional[str],
+            _Form(json_schema_extra={"format": "password"}),
+        ] = None,
     ):
         self.grant_type = grant_type
         self.username = username
@@ -71,21 +79,21 @@ class OAuth2PasswordRequestForm:
 
 
 class OAuth2PasswordRequestFormStrict(OAuth2PasswordRequestForm):
-    """Like OAuth2PasswordRequestForm but requires grant_type="password".
-
-    Matches FastAPI's ``OAuth2PasswordRequestFormStrict`` which enforces
-    the ``grant_type`` field to be exactly ``"password"`` per the OAuth2 spec.
-    """
+    """Like ``OAuth2PasswordRequestForm`` but requires
+    ``grant_type="password"`` per the OAuth2 spec."""
 
     def __init__(
         self,
         *,
-        grant_type: str = _Form(default="password"),
-        username: str = _Form(default=""),
-        password: str = _Form(default=""),
-        scope: str = _Form(default=""),
-        client_id: str | None = _Form(default=None),
-        client_secret: str | None = _Form(default=None),
+        grant_type: Annotated[str, _Form(pattern="^password$")],
+        username: Annotated[str, _Form()],
+        password: Annotated[str, _Form(json_schema_extra={"format": "password"})],
+        scope: Annotated[str, _Form()] = "",
+        client_id: Annotated[Optional[str], _Form()] = None,
+        client_secret: Annotated[
+            Optional[str],
+            _Form(json_schema_extra={"format": "password"}),
+        ] = None,
     ):
         super().__init__(
             grant_type=grant_type,
@@ -186,6 +194,8 @@ class OAuth2PasswordBearer:
                 }
             },
         }
+        if description:
+            self.model["description"] = description
 
     async def __call__(self, request: Request = None, **kwargs) -> str | None:
         authorization = _get_authorization(request, **kwargs)
@@ -200,7 +210,33 @@ class OAuth2PasswordBearer:
         return None
 
 
-class HTTPBearer:
+class HTTPBase:
+    """Base class for HTTP-scheme security dependencies (``HTTPBearer``,
+    ``HTTPDigest``, ``HTTPBasic``). FastAPI exports this as
+    ``fastapi.security.http.HTTPBase`` and third-party auth libraries
+    subclass it to implement custom schemes.
+    """
+
+    def __init__(
+        self,
+        *,
+        scheme: str,
+        scheme_name: str | None = None,
+        description: str | None = None,
+        auto_error: bool = True,
+    ):
+        self.scheme_name = scheme_name or self.__class__.__name__
+        self.description = description
+        self.auto_error = auto_error
+        self.model: dict = {"type": "http", "scheme": scheme}
+        if description:
+            self.model["description"] = description
+
+    async def __call__(self, request: Request = None, **kwargs):  # pragma: no cover
+        raise NotImplementedError
+
+
+class HTTPBearer(HTTPBase):
     """HTTP Bearer scheme.
 
     Returns ``HTTPAuthorizationCredentials`` from the Authorization header.
@@ -214,14 +250,13 @@ class HTTPBearer:
         description: str | None = None,
         auto_error: bool = True,
     ):
+        super().__init__(
+            scheme="bearer",
+            scheme_name=scheme_name,
+            description=description,
+            auto_error=auto_error,
+        )
         self.bearerFormat = bearerFormat
-        self.scheme_name = scheme_name or self.__class__.__name__
-        self.description = description
-        self.auto_error = auto_error
-        self.model = {
-            "type": "http",
-            "scheme": "bearer",
-        }
         if bearerFormat:
             self.model["bearerFormat"] = bearerFormat
 
@@ -293,6 +328,8 @@ class HTTPBasic:
             "type": "http",
             "scheme": "basic",
         }
+        if description:
+            self.model["description"] = description
 
     async def __call__(self, request: Request = None, **kwargs) -> HTTPBasicCredentials | None:
         import base64
@@ -301,15 +338,25 @@ class HTTPBasic:
         if authorization and authorization.startswith("Basic "):
             try:
                 decoded = base64.b64decode(authorization[6:]).decode("utf-8")
-                username, _, password = decoded.partition(":")
-                return HTTPBasicCredentials(username=username, password=password)
+                # FA rejects Basic payloads that don't contain the
+                # mandatory ``username:password`` colon separator — the
+                # non-basic test sends a single token (no colon) and
+                # expects 401, not a user with empty password.
+                if ":" in decoded:
+                    username, _, password = decoded.partition(":")
+                    return HTTPBasicCredentials(username=username, password=password)
             except Exception:
                 pass
         if self.auto_error:
+            realm = f'realm="{self.realm}"' if self.realm else None
+            if realm:
+                www_auth = f"Basic {realm}"
+            else:
+                www_auth = "Basic"
             raise HTTPException(
                 status_code=401,
                 detail="Not authenticated",
-                headers={"WWW-Authenticate": f'Basic realm="{self.realm or ""}"'},
+                headers={"WWW-Authenticate": www_auth},
             )
         return None
 
@@ -319,14 +366,17 @@ def _make_api_key_call(location: str, name: str, auto_error: bool, self_ref):
 
     Each APIKey* instance has its own `name` -- we synthesize an async def
     whose default value is an instance-bound Header/Query/Cookie marker so
-    the dep resolver knows where to pull the value from.
+    the dep resolver knows where to pull the value from. The marker is
+    excluded from the OpenAPI schema (``include_in_schema=False``) because
+    FastAPI documents these values under ``components.securitySchemes``,
+    not under the operation's ``parameters`` list.
     """
     if location == "header":
-        marker = _Header(default=None, alias=name)
+        marker = _Header(default=None, alias=name, include_in_schema=False)
     elif location == "query":
-        marker = _Query(default=None, alias=name)
+        marker = _Query(default=None, alias=name, include_in_schema=False)
     elif location == "cookie":
-        marker = _Cookie(default=None, alias=name)
+        marker = _Cookie(default=None, alias=name, include_in_schema=False)
     else:
         marker = None
 
@@ -351,6 +401,8 @@ class _APIKeyBase:
         self.description = description
         self.auto_error = auto_error
         self.model = {"type": "apiKey", "in": self._location, "name": name}
+        if description:
+            self.model["description"] = description
         self._call = _make_api_key_call(self._location, name, auto_error, self)
         import inspect as _inspect
         self.__signature__ = _inspect.signature(self._call)

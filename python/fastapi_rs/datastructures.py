@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse
 
 
 class URL:
@@ -143,69 +143,101 @@ class Headers:
 
 
 class QueryParams:
-    """Dict-like for query parameters with multi-value support."""
+    """Dict-like for query parameters with multi-value support.
+
+    Preserves declaration order of the raw query string — Starlette's
+    `multi_items()` yields pairs in the exact order they appeared. A
+    `parse_qs`-based implementation would group by key and lose that
+    ordering; we use `parse_qsl` to keep insertion order.
+    """
 
     def __init__(self, raw=None):
+        self._items: list[tuple[str, str]] = []
         if raw is None:
-            self._dict: dict[str, list[str]] = {}
+            pass
         elif isinstance(raw, str):
-            if isinstance(raw, bytes):
-                raw = raw.decode("latin-1")
-            self._dict = parse_qs(raw, keep_blank_values=True)
+            self._items = list(parse_qsl(raw, keep_blank_values=True))
         elif isinstance(raw, bytes):
-            self._dict = parse_qs(raw.decode("latin-1"), keep_blank_values=True)
+            self._items = list(parse_qsl(raw.decode("latin-1"), keep_blank_values=True))
         elif isinstance(raw, dict):
-            self._dict = {}
             for k, v in raw.items():
                 if isinstance(v, list):
-                    self._dict[k] = v
+                    for item in v:
+                        self._items.append((k, str(item)))
                 else:
-                    self._dict[k] = [str(v)]
-        else:
-            self._dict = {}
+                    self._items.append((k, str(v)))
+        elif isinstance(raw, (list, tuple)):
+            for pair in raw:
+                if len(pair) == 2:
+                    self._items.append((str(pair[0]), str(pair[1])))
 
     def __getitem__(self, key: str) -> str:
-        return self._dict[key][0]
+        # Starlette/FastAPI: when a key appears multiple times the LAST
+        # occurrence wins for dict-style access; `getlist()` still returns
+        # the full ordered list.
+        val = None
+        found = False
+        for k, v in self._items:
+            if k == key:
+                val = v
+                found = True
+        if not found:
+            raise KeyError(key)
+        return val
 
     def __contains__(self, key: object) -> bool:
         if isinstance(key, str):
-            return key in self._dict
+            return any(k == key for k, _ in self._items)
         return False
 
     def get(self, key: str, default: str | None = None) -> str | None:
-        vals = self._dict.get(key)
-        if vals:
-            return vals[0]
-        return default
+        val = default
+        for k, v in self._items:
+            if k == key:
+                val = v
+        return val
 
     def getlist(self, key: str) -> list[str]:
-        return self._dict.get(key, [])
+        return [v for k, v in self._items if k == key]
 
     def keys(self):
-        return self._dict.keys()
+        seen: set[str] = set()
+        for k, _ in self._items:
+            if k not in seen:
+                seen.add(k)
+                yield k
 
     def values(self):
-        return (v[0] for v in self._dict.values())
+        # Starlette: yield only the last value per unique key.
+        last: dict[str, str] = {}
+        for k, v in self._items:
+            last[k] = v
+        return iter(last.values())
 
     def items(self):
-        return ((k, v[0]) for k, v in self._dict.items())
+        last: dict[str, str] = {}
+        for k, v in self._items:
+            last[k] = v
+        return iter(last.items())
 
     def multi_items(self):
-        for k, vs in self._dict.items():
-            for v in vs:
-                yield k, v
+        # Yield in original order (insertion order of the raw query string).
+        return iter(self._items)
 
     def __iter__(self):
-        return iter(self._dict)
+        return self.keys()
 
     def __len__(self) -> int:
-        return len(self._dict)
+        seen: set[str] = set()
+        for k, _ in self._items:
+            seen.add(k)
+        return len(seen)
 
     def __repr__(self) -> str:
-        return f"QueryParams({self._dict!r})"
+        return f"QueryParams({self._items!r})"
 
     def __bool__(self) -> bool:
-        return bool(self._dict)
+        return bool(self._items)
 
 
 class Address:

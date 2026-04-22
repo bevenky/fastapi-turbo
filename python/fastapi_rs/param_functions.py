@@ -41,6 +41,9 @@ class _ParamMarker(FieldInfo):
         default=...,
         *,
         alias: str | None = None,
+        validation_alias: str | None = None,
+        serialization_alias: str | None = None,
+        alias_priority: int | None = None,
         title: str | None = None,
         description: str | None = None,
         gt=None,
@@ -62,15 +65,43 @@ class _ParamMarker(FieldInfo):
         # Store custom attrs that FieldInfo doesn't natively keep
         self.include_in_schema = include_in_schema
         self.example = example
-        # pattern is the modern name; regex is the legacy alias
+        # pattern is the modern name; regex is the legacy alias.
+        # Emit the same deprecation warning FA does — test suites that
+        # assert ``pytest.warns(FastAPIDeprecationWarning)`` depend on
+        # it firing the moment a handler is decorated.
+        if regex is not None:
+            import warnings as _warnings
+            from fastapi_rs.exceptions import (
+                FastAPIDeprecationWarning as _FADeprecationWarning,
+            )
+            _warnings.warn(
+                "`regex` has been deprecated, please use `pattern` instead",
+                _FADeprecationWarning,
+                stacklevel=4,
+            )
         self.regex = pattern or regex
         self.pattern = self.regex
         self.openapi_examples = openapi_examples
 
-        # Build kwargs for FieldInfo.__init__
+        # Build kwargs for FieldInfo.__init__. Pydantic's ``Field(...)``
+        # implicitly propagates ``alias`` to ``validation_alias`` and
+        # ``serialization_alias`` when the latter two aren't passed —
+        # tests that do ``Form(alias="p_alias")`` and assert on
+        # ``schema.properties["p_alias"]`` depend on this (Pydantic's
+        # schema generator uses ``serialization_alias`` for output).
         fi_kwargs: dict = {}
         if alias is not None:
             fi_kwargs["alias"] = alias
+            if validation_alias is None:
+                fi_kwargs["validation_alias"] = alias
+            if serialization_alias is None:
+                fi_kwargs["serialization_alias"] = alias
+        if validation_alias is not None:
+            fi_kwargs["validation_alias"] = validation_alias
+        if serialization_alias is not None:
+            fi_kwargs["serialization_alias"] = serialization_alias
+        if alias_priority is not None:
+            fi_kwargs["alias_priority"] = alias_priority
         if title is not None:
             fi_kwargs["title"] = title
         if description is not None:
@@ -99,6 +130,22 @@ class _ParamMarker(FieldInfo):
             fi_kwargs["json_schema_extra"] = json_schema_extra
 
         super().__init__(default=default, **fi_kwargs, **extra)
+
+    def __repr__(self) -> str:
+        # FastAPI's param classes use a minimal repr that just shows
+        # the default value. Tests (and some user debug output) assert
+        # on this exact form: ``Query(teststr)``, ``Body(...)``, etc.
+        from pydantic_core import PydanticUndefined as _Und
+        default = self.default
+        if default is _Und or default is Ellipsis:
+            default_repr = "PydanticUndefined"
+        else:
+            default_repr = str(default)
+        return f"{type(self).__name__}({default_repr})"
+
+
+class Param(_ParamMarker):
+    pass
 
 
 class Query(_ParamMarker):

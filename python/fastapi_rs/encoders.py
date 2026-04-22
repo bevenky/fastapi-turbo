@@ -102,9 +102,13 @@ def jsonable_encoder(
     if isinstance(obj, dict):
         result = {}
         for k, v in obj.items():
-            if exclude and k in exclude:
+            # Note: ``include=set()`` / ``include={}`` means "include
+            # NOTHING" per FastAPI — distinct from ``include=None``
+            # which means "include everything". Check against None so
+            # an empty container correctly filters all keys out.
+            if exclude is not None and k in exclude:
                 continue
-            if include and k not in include:
+            if include is not None and k not in include:
                 continue
             if exclude_none and v is None:
                 continue
@@ -150,14 +154,56 @@ def jsonable_encoder(
     if isinstance(obj, uuid.UUID):
         return str(obj)
 
-    # Decimal
+    # Decimal — FastAPI parity: non-finite Decimals (Infinity / NaN)
+    # return as float so downstream callers can detect them with
+    # ``math.isinf`` / ``math.isnan`` before rendering. Finite
+    # Decimals prefer int when they have no fractional part, else
+    # float — matches stock ``fastapi.encoders.jsonable_encoder``.
     if isinstance(obj, decimal.Decimal):
-        # Return as float if it can be represented exactly, else string
+        if not obj.is_finite():
+            return float(obj)
         if obj == obj.to_integral_value():
             return int(obj)
         return float(obj)
 
-    # Generators / iterables
+    # Pydantic Undefined sentinel — FA serialises as JSON null.
+    try:
+        from pydantic_core import PydanticUndefined, PydanticUndefinedType
+        if obj is PydanticUndefined or isinstance(obj, PydanticUndefinedType):
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Final fallback — FA's pattern: try ``dict(obj)`` first (covers
+    # objects that implement ``__iter__`` yielding key/value pairs),
+    # then ``vars(obj)`` for plain-class DTOs. If both fail, fall
+    # through to an iterable-of-values list (generators, custom
+    # iterators). If *that* fails too, raise ``ValueError`` matching
+    # FA so callers learn about unsupported types instead of silently
+    # getting ``str(obj)``.
+    errors: list[Exception] = []
+    data: dict | None = None
+    try:
+        data = dict(obj)
+    except Exception as e:  # noqa: BLE001
+        errors.append(e)
+        try:
+            data = vars(obj)
+        except Exception as e2:  # noqa: BLE001
+            errors.append(e2)
+    if data is not None:
+        return jsonable_encoder(
+            data,
+            include=include,
+            exclude=exclude,
+            by_alias=by_alias,
+            exclude_unset=exclude_unset,
+            exclude_defaults=exclude_defaults,
+            exclude_none=exclude_none,
+            custom_encoder=custom_encoder,
+            sqlalchemy_safe=sqlalchemy_safe,
+        )
+    # Iterable but not key-value (generator, custom iterator).
     try:
         return [
             jsonable_encoder(
@@ -167,23 +213,6 @@ def jsonable_encoder(
             )
             for item in obj
         ]
-    except TypeError:
-        pass
-
-    # Objects with __dict__
-    if hasattr(obj, "__dict__"):
-        data = {}
-        for k, v in obj.__dict__.items():
-            if sqlalchemy_safe and k.startswith("_sa_"):
-                continue
-            if exclude_none and v is None:
-                continue
-            data[k] = jsonable_encoder(
-                v,
-                exclude_none=exclude_none,
-                custom_encoder=custom_encoder,
-            )
-        return data
-
-    # Fallback: convert to string
-    return str(obj)
+    except Exception as e:  # noqa: BLE001
+        errors.append(e)
+    raise ValueError(errors)
