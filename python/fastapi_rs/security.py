@@ -609,12 +609,16 @@ class OpenIdConnect:
             self.model["description"] = description
 
     async def __call__(self, request: Request = None, **kwargs) -> str | None:
+        # FA parity: pass the raw Authorization header through unchanged
+        # — including the ``Bearer `` prefix. Callers who want just the
+        # credentials must strip it themselves.
         authorization = _get_authorization(request, **kwargs)
         if authorization:
-            # User presents an OIDC id_token (typically in Authorization: Bearer ...)
-            if authorization.startswith("Bearer "):
-                return authorization[7:]
             return authorization
         if self.auto_error:
-            raise HTTPException(status_code=401, detail="Not authenticated")
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return None

@@ -711,8 +711,15 @@ fn convert_path(fastapi_path: &str) -> String {
             if let Some(name) = param.strip_suffix(":path") {
                 result.push_str(&format!("{{*{name}}}"));
             } else {
+                // Strip other Starlette converters (``:int``, ``:float``,
+                // ``:str``, ``:uuid``) — we pass the raw string to the
+                // handler and let Pydantic do the coercion.
+                let bare = match param.find(':') {
+                    Some(idx) => &param[..idx],
+                    None => &param,
+                };
                 result.push('{');
-                result.push_str(&param);
+                result.push_str(bare);
                 result.push('}');
             }
         } else {
