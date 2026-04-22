@@ -1646,6 +1646,35 @@ def _build_form_file_body(
     from pydantic import create_model, Field as _PField
     from typing import Optional, Any as _Any
 
+    # ``data: Annotated[ModelA | ModelB, Form()]`` — emit ``anyOf:
+    # [$ref ModelA, $ref ModelB]`` with the handler-param title. All
+    # expanded fields share ``_form_union_models``.
+    if form_params and not file_params:
+        from pydantic import BaseModel as _BM2
+        _union_tuples = {fp.get("_form_union_models") for fp in form_params}
+        _union = next(iter(_union_tuples), None) if len(_union_tuples) == 1 else None
+        _union_owner = next(
+            iter({fp.get("_form_union_owner") for fp in form_params}), None
+        )
+        if (
+            _union is not None
+            and _union_owner is not None
+            and all(isinstance(a, type) and issubclass(a, _BM2) for a in _union)
+        ):
+            title = _union_owner.replace("_", " ").title().replace(" ", "")
+            schema = {
+                "anyOf": [
+                    {"$ref": f"#/components/schemas/{m.__name__}"} for m in _union
+                ],
+                "title": title,
+            }
+            return {
+                "content": {
+                    "application/x-www-form-urlencoded": {"schema": schema}
+                },
+                "required": True,
+            }
+
     # Form taking a BaseModel directly (``data: FormData = Form()``) —
     # FA emits the MODEL's own schema under
     # ``components.schemas.<ModelName>`` rather than synthesising a
@@ -2143,7 +2172,21 @@ def _note_model_usage(model_class, ctx: str) -> None:
     root propagates the "output" usage through every nested model it
     references, so deep `List[Node]` style graphs split correctly.
     """
-    if model_class is None or not hasattr(model_class, "model_json_schema"):
+    import typing as _typing
+    try:
+        from pydantic import BaseModel as _BM
+    except ImportError:  # pragma: no cover
+        return
+    if model_class is None:
+        return
+    # TypeAdapterProxy wraps non-BaseModel body types (``list[Item]``,
+    # ``dict[str, X]``, discriminated unions, etc.). Walk its inner
+    # annotation so nested ``BaseModel`` arms still get their usage marked.
+    inner_ann = getattr(model_class, "_annotation", None)
+    if inner_ann is not None and not hasattr(model_class, "model_json_schema"):
+        _walk_annotation_for_usage(inner_ann, ctx, _typing, _BM)
+        return
+    if not hasattr(model_class, "model_json_schema"):
         return
     existing = _MODEL_USAGE.setdefault(id(model_class), set())
     if ctx in existing:
@@ -2151,11 +2194,6 @@ def _note_model_usage(model_class, ctx: str) -> None:
     existing.add(ctx)
     # Walk nested model references.
     fields = getattr(model_class, "model_fields", None) or {}
-    import typing as _typing
-    try:
-        from pydantic import BaseModel as _BM
-    except ImportError:  # pragma: no cover
-        return
     for finfo in fields.values():
         ann = getattr(finfo, "annotation", None)
         _walk_annotation_for_usage(ann, ctx, _typing, _BM)
@@ -2312,6 +2350,13 @@ def _collect_schemas(
         _pmc = param.get("_param_model_class")
         if _pmc is not None and param.get("kind") in ("form", "file"):
             _collect_model_schemas(_pmc, schemas)
+        # Form Union expansion (``data: Annotated[A | B, Form()]``) —
+        # emit both models under components.schemas so ``anyOf: [$ref
+        # A, $ref B]`` resolves.
+        _fum = param.get("_form_union_models")
+        if _fum:
+            for m in _fum:
+                _collect_model_schemas(m, schemas)
 
     # From route.responses (extra status codes with models).
     # ``responses={404: {"model": list[Message]}}`` — walk container
