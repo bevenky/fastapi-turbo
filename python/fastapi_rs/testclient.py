@@ -306,6 +306,8 @@ class TestClient:
         self,
         url: str,
         subprotocols: list[str] | None = None,
+        headers: dict | None = None,
+        cookies: dict | None = None,
         **kwargs: Any,
     ) -> "_WebSocketTestSession":
         """Open a WebSocket connection to the running server.
@@ -319,15 +321,50 @@ class TestClient:
         # TestClient, which FA's tests use.
         self._ensure_started()
         ws_url = f"ws://127.0.0.1:{self._port}{url}"
-        return _WebSocketTestSession(ws_url, subprotocols=subprotocols, **kwargs)
+        # Carry forward cookies set on the client (``client.cookies``
+        # or ``cookies=`` in the TestClient ctor) as a ``Cookie``
+        # header; ``websockets.sync.client.connect`` doesn't expose a
+        # cookies arg.
+        extra_hdrs: list[tuple[str, str]] = []
+        if headers:
+            for k, v in dict(headers).items():
+                extra_hdrs.append((k, v))
+        # Merge cookies from client + per-call + seed
+        cookie_jar: dict[str, str] = {}
+        if self._client is not None:
+            try:
+                for c in self._client.cookies.jar:
+                    cookie_jar[c.name] = c.value
+            except Exception:  # noqa: BLE001
+                pass
+        if self._seed_cookies:
+            cookie_jar.update(dict(self._seed_cookies))
+        if cookies:
+            cookie_jar.update(cookies)
+        if cookie_jar:
+            cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_jar.items())
+            extra_hdrs.append(("Cookie", cookie_header))
+        return _WebSocketTestSession(
+            ws_url,
+            subprotocols=subprotocols,
+            additional_headers=extra_hdrs or None,
+            **kwargs,
+        )
 
 
 class _WebSocketTestSession:
     """Synchronous Starlette-compatible test WebSocket session."""
 
-    def __init__(self, url: str, subprotocols: list[str] | None = None, **_: Any):
+    def __init__(
+        self,
+        url: str,
+        subprotocols: list[str] | None = None,
+        additional_headers: list[tuple[str, str]] | None = None,
+        **_: Any,
+    ):
         self._url = url
         self._subprotocols = subprotocols
+        self._additional_headers = additional_headers
         self._ws = None
         from websockets.sync.client import connect as _connect  # noqa: E402
         self._connect = _connect
@@ -336,7 +373,24 @@ class _WebSocketTestSession:
         kw: dict = {}
         if self._subprotocols:
             kw["subprotocols"] = self._subprotocols
-        self._ws = self._connect(self._url, **kw)
+        if self._additional_headers:
+            kw["additional_headers"] = self._additional_headers
+        try:
+            self._ws = self._connect(self._url, **kw)
+        except Exception as e:
+            # FA's TestClient converts handshake rejection to
+            # ``WebSocketDisconnect`` — tests wrap in
+            # ``pytest.raises(WebSocketDisconnect)`` for both pre- and
+            # post-accept closures.
+            from fastapi_rs.exceptions import WebSocketDisconnect
+            try:
+                from websockets.exceptions import InvalidStatus
+                if isinstance(e, InvalidStatus):
+                    code = getattr(e.response, "status_code", None) or 1008
+                    raise WebSocketDisconnect(code=code) from None
+            except ImportError:
+                pass
+            raise
         return self
 
     def __exit__(self, *args: Any) -> None:
@@ -364,16 +418,45 @@ class _WebSocketTestSession:
 
     # ── Receive ────────────────────────────────────────────────────
 
+    def _translate_ws_error(self, exc):
+        """Convert underlying ``websockets`` library errors into the
+        ``WebSocketDisconnect`` that FA test suites expect.
+        """
+        from fastapi_rs.exceptions import WebSocketDisconnect
+        try:
+            from websockets.exceptions import (
+                ConnectionClosed, ConnectionClosedOK, ConnectionClosedError,
+            )
+            if isinstance(exc, (ConnectionClosedOK, ConnectionClosedError, ConnectionClosed)):
+                code = getattr(exc, "code", 1000) or 1000
+                reason = getattr(exc, "reason", "") or ""
+                return WebSocketDisconnect(code=code, reason=reason)
+        except ImportError:
+            pass
+        return None
+
     def receive_text(self) -> str:
         assert self._ws is not None
-        msg = self._ws.recv()
+        try:
+            msg = self._ws.recv()
+        except Exception as exc:
+            translated = self._translate_ws_error(exc)
+            if translated is not None:
+                raise translated from None
+            raise
         if isinstance(msg, bytes):
             return msg.decode("utf-8")
         return msg
 
     def receive_bytes(self) -> bytes:
         assert self._ws is not None
-        msg = self._ws.recv()
+        try:
+            msg = self._ws.recv()
+        except Exception as exc:
+            translated = self._translate_ws_error(exc)
+            if translated is not None:
+                raise translated from None
+            raise
         if isinstance(msg, str):
             return msg.encode("utf-8")
         return msg
