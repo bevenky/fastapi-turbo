@@ -177,12 +177,21 @@ class TestClient:
             # Let user-supplied defaults win over our injected Host.
             for k, v in dict(self._seed_headers).items():
                 default_headers[k] = v
+        # FA's test suite runs with ``filterwarnings = ["error"]`` —
+        # any ``ResourceWarning`` (including unclosed sockets) becomes
+        # a test failure. Disable keep-alive so each httpx call closes
+        # its socket synchronously instead of leaving it in the pool
+        # for GC to finalize.
         self._client = httpx.Client(
             base_url=f"http://127.0.0.1:{self._port}",
             follow_redirects=self._follow_redirects,
             headers=default_headers,
             cookies=self._seed_cookies,
             event_hooks={"request": [_force_host]},
+            limits=httpx.Limits(
+                max_keepalive_connections=0,
+                max_connections=10,
+            ),
         )
         self._started = True
 
