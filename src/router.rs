@@ -73,6 +73,39 @@ fn response_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     Ok(RESPONSE_CLS.get().unwrap())
 }
 
+/// Cached handle to ``fastapi_turbo.applications._set_current_request_scope``.
+/// Populates the request-scoped ContextVar so ``@app.exception_handler``
+/// callbacks can see the real path/method/query via ``request.url.path``
+/// even when the handler itself doesn't declare ``request: Request``.
+static SET_REQUEST_SCOPE: std::sync::OnceLock<pyo3::Py<pyo3::PyAny>> = std::sync::OnceLock::new();
+
+fn set_request_scope_ctxvar(
+    py: pyo3::Python<'_>,
+    method: &Option<String>,
+    path: &Option<String>,
+    query: &Option<String>,
+) {
+    let func = SET_REQUEST_SCOPE.get_or_init(|| {
+        py.import("fastapi_turbo.applications")
+            .and_then(|m| m.getattr("_set_current_request_scope"))
+            .map(|f| f.unbind())
+            .unwrap_or_else(|_| py.None())
+    });
+    if func.is_none(py) {
+        return;
+    }
+    // (method, path, query) — all Option<String>. None-safe: send py.None().
+    let m = method.as_deref().map(|s| pyo3::types::PyString::new(py, s));
+    let p = path.as_deref().map(|s| pyo3::types::PyString::new(py, s));
+    let q = query.as_deref().map(|s| pyo3::types::PyString::new(py, s));
+    let args = (
+        m.map(|b| b.into_any()).unwrap_or_else(|| py.None().into_bound(py)),
+        p.map(|b| b.into_any()).unwrap_or_else(|| py.None().into_bound(py)),
+        q.map(|b| b.into_any()).unwrap_or_else(|| py.None().into_bound(py)),
+    );
+    let _ = func.bind(py).call1(args);
+}
+
 /// Inject request metadata (method, path, query, headers) into kwargs for
 /// the middleware wrapper. Called for every handler invocation so that
 /// `BaseHTTPMiddleware.dispatch()` can inspect `request.url.path`,
@@ -1452,6 +1485,7 @@ async fn handle_request(
             if state.has_http_middleware {
                 // Middleware wrapper needs metadata kwargs
                 return Python::attach(|py| {
+                    set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query);
                     let kwargs = PyDict::new(py);
                     if state.has_http_middleware {
                         inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
@@ -1472,6 +1506,7 @@ async fn handle_request(
             }
             // Ultra-fast path: zero-param, no middleware
             return Python::attach(|py| {
+                set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query);
                 match state.handler.call0(py) {
                     Ok(py_result) => py_to_response_with_request(py, py_result.bind(py), range_header.as_deref()),
                     Err(py_err) => pyerr_to_response(py, &py_err),
@@ -1482,6 +1517,7 @@ async fn handle_request(
         // Sync handler with params — use block_in_place for GIL-safe concurrency
         return tokio::task::block_in_place(|| {
             Python::attach(|py| {
+                set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query);
                 let body_json_opt = if state.has_body_params { body_json.as_ref() } else { None };
                 let kwargs = match extract_params_to_pydict_full(
                     py, &state.params, &path_map, &query_params, &query_multi,
@@ -1533,6 +1569,7 @@ async fn handle_request(
     if state.is_async {
         return tokio::task::block_in_place(|| {
             Python::attach(|py| {
+                set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query);
                 // Build kwargs from params
                 let body_json_opt = if state.has_body_params { body_json.as_ref() } else { None };
 
@@ -1641,6 +1678,7 @@ async fn handle_request(
     // === Unified path: sync handlers with dependencies ===
     let resp = tokio::task::block_in_place(|| {
         Python::attach(|py| -> Response {
+            set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query);
             let mut resolved: HashMap<String, Py<PyAny>> = HashMap::new();
             let mut dep_cache: HashMap<u64, String> = HashMap::new();
 

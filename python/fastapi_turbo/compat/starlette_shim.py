@@ -118,6 +118,43 @@ def _build() -> dict[str, types.ModuleType]:
         path_format += path[idx:]
         return _re.compile(path_regex), path_format, param_convertors
     starlette_routing.compile_path = compile_path  # type: ignore[attr-defined]
+
+    # Minimal ``starlette.routing.request_response`` stub.
+    #
+    # In stock Starlette this helper wraps a sync/async endpoint into
+    # an ASGI app that the Router dispatches to. fastapi_turbo's Rust
+    # router never calls it, so the wrapped ASGI app is inert here —
+    # but sentry-sdk's Starlette integration monkey-patches this exact
+    # symbol at setup_once() time and crashes on AttributeError if it
+    # isn't present. Shipping a no-op-equivalent wrapper lets Sentry
+    # install cleanly. Sentry's ASGI-level tracing (via
+    # ``SentryAsgiMiddleware``) is unaffected because that layer wraps
+    # the app object, not individual routes.
+    import asyncio as _asyncio_rr
+
+    def request_response(func):
+        """Wrap a sync/async endpoint into an ASGI app.
+
+        Mirrors the Starlette signature; the returned app is callable
+        as ``await app(scope, receive, send)`` but is only invoked when
+        a tool has monkey-patched something that calls it.
+        """
+        async def _app(scope, receive, send):
+            from fastapi_turbo.requests import Request as _Req
+            req = _Req(scope, receive=receive, send=send)
+            if _asyncio_rr.iscoroutinefunction(func):
+                response = await func(req)
+            else:
+                response = func(req)
+            if hasattr(response, "__call__"):
+                try:
+                    await response(scope, receive, send)
+                except TypeError:
+                    pass
+        return _app
+
+    starlette_routing.request_response = request_response  # type: ignore[attr-defined]
+
     modules["starlette.routing"] = starlette_routing
 
     # ── starlette.exceptions ───────────────────────────────────────

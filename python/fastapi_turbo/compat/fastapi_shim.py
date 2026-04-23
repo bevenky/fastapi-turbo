@@ -40,7 +40,12 @@ def _build() -> dict[str, types.ModuleType]:
 
     # ── fastapi (top-level) ────────────────────────────────────────
     fastapi = _mod("fastapi")
-    fastapi.__version__ = fastapi_turbo.__version__  # type: ignore[attr-defined]
+    # Report the FastAPI version we target compat against, not our own
+    # 0.1.0. Third-party libraries (sentry-sdk, slowapi, fastapi-users)
+    # gate features on FastAPI version — reporting the real target
+    # ensures they take the modern code path.
+    fastapi.__version__ = "0.136.0"  # type: ignore[attr-defined]
+    fastapi.fastapi_turbo_version = fastapi_turbo.__version__  # type: ignore[attr-defined]
 
     # Application
     fastapi.FastAPI = _applications.FastAPI  # type: ignore[attr-defined]
@@ -145,6 +150,56 @@ def _build() -> dict[str, types.ModuleType]:
             pass
         return app
     fastapi_routing.request_response = request_response  # type: ignore[attr-defined]
+
+    # ``get_request_handler`` — sentry_sdk.integrations.fastapi patches this
+    # at setup_once() to wrap every FastAPI route with its tracing layer.
+    # Our router compiles routes via its own pipeline and never calls it,
+    # so the monkey-patch is harmless here; we just need the attribute to
+    # exist for the patch to install. Sentry's actual tracing arrives via
+    # the ``SentryAsgiMiddleware`` path (``app.add_middleware(...)``),
+    # which the ASGI middleware chain invokes correctly.
+    def get_request_handler(
+        dependant=None,
+        body_field=None,
+        status_code=None,
+        response_class=None,
+        response_field=None,
+        response_model_include=None,
+        response_model_exclude=None,
+        response_model_by_alias=True,
+        response_model_exclude_unset=False,
+        response_model_exclude_defaults=False,
+        response_model_exclude_none=False,
+        dependency_overrides_provider=None,
+        embed_body_fields=False,
+    ):
+        """Stub — Sentry / slowapi monkey-patch this at setup time.
+        Returns a no-op async ASGI-style app; our router never calls it.
+        """
+        async def _noop_app(request):
+            return None
+        return _noop_app
+
+    fastapi_routing.get_request_handler = get_request_handler  # type: ignore[attr-defined]
+
+    # ``serialize_response`` — sentry_sdk + response-serialisation libs
+    # patch this. Provide a simple pass-through so the patch site exists.
+    def serialize_response(
+        *,
+        field=None,
+        response_content,
+        include=None,
+        exclude=None,
+        by_alias=True,
+        exclude_unset=False,
+        exclude_defaults=False,
+        exclude_none=False,
+        is_coroutine=False,
+    ):
+        return response_content
+
+    fastapi_routing.serialize_response = serialize_response  # type: ignore[attr-defined]
+
     # FA tests monkeypatch ``fastapi.routing._PING_INTERVAL`` to speed
     # up keepalive pings. Re-export the value from ``fastapi.sse`` so
     # ``monkeypatch.setattr("fastapi.routing._PING_INTERVAL", 0.05)``
@@ -821,14 +876,27 @@ def _build() -> dict[str, types.ModuleType]:
     # path must exist so `fastapi.cli` doesn't blow up. Import fails
     # loudly if someone tries to USE the CLI.
     fastapi_cli = _mod("fastapi.cli")
-    # ``fastapi_cli.cli_main`` is the optional-install entry point —
-    # tests patch it to ``None`` to exercise the "fastapi[standard] is
-    # missing" branch. Try to import the real one; fall back to None.
-    try:
-        from fastapi_cli.cli import app as _cli_main
-    except Exception:  # noqa: BLE001
-        _cli_main = None
-    fastapi_cli.cli_main = _cli_main  # type: ignore[attr-defined]
+
+    # ``fastapi_cli.cli_main`` is the optional-install entry point. Do
+    # NOT import ``fastapi_cli.cli`` eagerly — it transitively imports
+    # ``fastapi_cloud_cli`` which pulls in ``sentry_sdk`` at module
+    # load time, breaking third-party tests that assert ``sentry_sdk``
+    # is pristine at startup (e.g. sentry-python's own test suite).
+    # Defer to first-access via a module ``__getattr__``.
+    _fastapi_cli_cache: dict = {}
+
+    def _fastapi_cli_module_getattr(name: str):
+        if name == "cli_main":
+            if "cli_main" not in _fastapi_cli_cache:
+                try:
+                    from fastapi_cli.cli import app as _cli_main
+                except Exception:  # noqa: BLE001
+                    _cli_main = None
+                _fastapi_cli_cache["cli_main"] = _cli_main
+            return _fastapi_cli_cache["cli_main"]
+        raise AttributeError(name)
+
+    fastapi_cli.__getattr__ = _fastapi_cli_module_getattr  # type: ignore[attr-defined]
 
     def _cli_main_fn():
         """Real FA: invoke ``fastapi_cli`` if installed, else raise a

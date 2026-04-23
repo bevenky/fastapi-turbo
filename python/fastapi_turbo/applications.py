@@ -4,9 +4,45 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextvars
 import inspect
 import json
 from typing import Any, Callable, Sequence
+
+# Tracks the ASGI scope of the currently-executing request so that
+# ``@app.exception_handler`` callbacks can receive a properly populated
+# ``Request`` (real path, method, headers) instead of a bare stub.
+# Set at the top of each request's Python handler pipeline; read by
+# ``_invoke_exception_handler``. Request-scoped — resets on every
+# request via ``contextvars.copy_context()``-style isolation built in.
+_current_request_scope: contextvars.ContextVar = contextvars.ContextVar(
+    "fastapi_turbo_current_request_scope", default=None
+)
+
+
+def _set_current_request_scope(
+    method: str | None,
+    path: str | None,
+    query_string: str | None,
+) -> None:
+    """Populate the per-request ContextVar so exception handlers can see
+    the real request path/method via ``request.url.path``.
+
+    Called from the Rust bridge once per request (before the user
+    handler dispatches). Handler wrappers also refresh this if they
+    later construct a proper ASGI scope with more fields.
+    """
+    scope = {
+        "type": "http",
+    }
+    if method:
+        scope["method"] = method
+    if path is not None:
+        scope["path"] = path
+        scope["raw_path"] = path.encode("latin-1")
+    if query_string is not None:
+        scope["query_string"] = query_string.encode("latin-1")
+    _current_request_scope.set(scope)
 
 from fastapi_turbo._introspect import introspect_endpoint
 from fastapi_turbo._openapi import generate_openapi_schema
@@ -3304,7 +3340,8 @@ class FastAPI:
         if handler is None:
             return None
         from fastapi_turbo.requests import Request
-        request = Request({"type": "http", "app": self})
+        scope = _current_request_scope.get() or {}
+        request = Request({**scope, "type": "http", "app": self})
         if inspect.iscoroutinefunction(handler):
             coro = handler(request, exc)
             try:
@@ -3328,9 +3365,9 @@ class FastAPI:
         handler = self._lookup_exception_handler(exc)
         if handler is None:
             return None
-        # Build a minimal Request stub — handlers typically only use it for introspection
         from fastapi_turbo.requests import Request
-        request = Request({"type": "http", "app": self})
+        scope = _current_request_scope.get() or {}
+        request = Request({**scope, "type": "http", "app": self})
         try:
             if inspect.iscoroutinefunction(handler):
                 # Drive the coroutine via the send(None) trick (works for handlers
