@@ -288,15 +288,22 @@ class TestClient:
         # inherently; ours caches the background server to keep thread
         # counts bounded, so we fire shutdown handlers explicitly here.
         try:
-            shutdown = getattr(self.app, "_run_shutdown_handlers", None)
-            if shutdown is not None:
-                shutdown()
-            lifespan_stop = getattr(self.app, "_run_lifespan_shutdown", None)
-            if lifespan_stop is not None and (
-                getattr(self.app, "lifespan", None)
-                or getattr(self.app, "_lifespan_cms", None)
-            ):
-                lifespan_stop()
+            # If the app started a lifespan-MW chain (raw ASGI middleware
+            # registered), stopping the chain drives shutdown through the
+            # MW stack AND runs shutdown handlers + lifespan-CM exit.
+            stop_chain = getattr(self.app, "_stop_lifespan_mw_chain", None)
+            if stop_chain is not None and stop_chain():
+                pass
+            else:
+                shutdown = getattr(self.app, "_run_shutdown_handlers", None)
+                if shutdown is not None:
+                    shutdown()
+                lifespan_stop = getattr(self.app, "_run_lifespan_shutdown", None)
+                if lifespan_stop is not None and (
+                    getattr(self.app, "lifespan", None)
+                    or getattr(self.app, "_lifespan_cms", None)
+                ):
+                    lifespan_stop()
         except Exception:  # noqa: BLE001
             pass
         if self._client:

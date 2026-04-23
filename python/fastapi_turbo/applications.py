@@ -2677,6 +2677,11 @@ class FastAPI:
         # @app.middleware("http") registered middlewares — Python-side HTTP middlewares
         # that wrap each user route handler.
         self._http_middlewares: list[Callable] = []
+        # Raw ASGI-3 middleware classes registered via ``add_middleware``.
+        # The HTTP-shim list above adapts these per-request; this list
+        # preserves them so ``_start_lifespan_mw_chain`` can dispatch a
+        # ``lifespan`` scope through the same chain (Sentry/OTel need it).
+        self._raw_asgi_middlewares: list[tuple[type, dict[str, Any]]] = []
         # Server-side exceptions worth re-raising in the test thread
         # (``ResponseValidationError``, ``FastAPIError``, raw ``ValueError``s
         # raised during request dispatch). ``TestClient`` drains this after
@@ -3030,6 +3035,8 @@ class FastAPI:
                 self._http_middlewares.append(
                     _make_asgi_middleware_shim(middleware_cls, kwargs)
                 )
+                # Also preserve the raw class for lifespan-scope dispatch.
+                self._raw_asgi_middlewares.append((middleware_cls, kwargs))
                 return
 
         self._middleware_stack.append((middleware_cls, kwargs))
@@ -5264,6 +5271,222 @@ class FastAPI:
         _submit(_exit_all())
         self._lifespan_cms = None
 
+    # --- async variants callable from inside the worker loop ---------
+    # The sync `_run_*` helpers submit to the worker loop via `submit()`,
+    # which would deadlock if invoked from inside a coroutine already
+    # running on that loop (e.g. the lifespan-MW dispatcher below). These
+    # coroutine variants do the work inline — same result, awaitable.
+    async def _async_run_startup_handlers(self) -> None:
+        for handler in self._collect_startup_handlers():
+            if inspect.iscoroutinefunction(handler):
+                await handler()
+            else:
+                handler()
+
+    async def _async_run_shutdown_handlers(self) -> None:
+        for handler in self._collect_shutdown_handlers():
+            if inspect.iscoroutinefunction(handler):
+                await handler()
+            else:
+                handler()
+
+    async def _async_run_lifespan_startup(self) -> None:
+        if getattr(self, "_lifespan_cms", None):
+            return
+        lifespans = self._collect_lifespans()
+        if not lifespans:
+            return
+        from contextlib import asynccontextmanager as _acm
+        import inspect as _inspect
+
+        def _wrap(cb):
+            def _probe():
+                return cb(self)
+            cm = _probe()
+            if hasattr(cm, "__aenter__"):
+                return cm
+            if _inspect.isasyncgen(cm):
+                @_acm
+                async def _agen_wrap(app):
+                    it = cb(app)
+                    val = await it.__anext__()
+                    try:
+                        yield val
+                    finally:
+                        try:
+                            await it.__anext__()
+                        except StopAsyncIteration:
+                            pass
+                return _agen_wrap(self)
+            if _inspect.isgenerator(cm):
+                @_acm
+                async def _gen_wrap(app):
+                    it = cb(app)
+                    val = next(it)
+                    try:
+                        yield val
+                    finally:
+                        try:
+                            next(it)
+                        except StopIteration:
+                            pass
+                return _gen_wrap(self)
+            if hasattr(cm, "__enter__"):
+                @_acm
+                async def _sync_cm_wrap():
+                    val = cm.__enter__()
+                    try:
+                        yield val
+                    finally:
+                        cm.__exit__(None, None, None)
+                return _sync_cm_wrap()
+            return cm
+
+        cms = [_wrap(lf) for lf in lifespans]
+        self._lifespan_cms = cms
+        merged: dict = {}
+        for cm in cms:
+            state = await cm.__aenter__()
+            if state:
+                merged.update(state)
+        self._app_state = merged
+        for k, v in merged.items():
+            setattr(self.state, k, v)
+
+    async def _async_run_lifespan_shutdown(self) -> None:
+        cms = getattr(self, "_lifespan_cms", None)
+        if not cms:
+            return
+        for cm in reversed(cms):
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+        self._lifespan_cms = None
+
+    # --- lifespan dispatch through the raw ASGI middleware chain ----
+    def _start_lifespan_mw_chain(self) -> bool:
+        """If raw ASGI middleware is registered, dispatch a lifespan.startup
+        message through the composed chain and block until complete.
+        Returns True if dispatched (caller should use the chained path for
+        shutdown too), False if there's no chain to drive (caller does the
+        direct-call path).
+
+        The chain lets Sentry/OpenTelemetry-style middleware that hooks
+        ``scope['type'] == 'lifespan'`` see startup/shutdown events.
+        """
+        if not self._raw_asgi_middlewares:
+            return False
+
+        import asyncio
+        import traceback
+        from fastapi_turbo._async_worker import submit as _submit
+
+        app_self = self
+        state: dict = {
+            "recv_q": None,
+            "send_done": None,
+            "send_events": [],
+            "task": None,
+        }
+
+        async def _inner_app(scope, receive, send):
+            if scope.get("type") != "lifespan":
+                return
+            msg = await receive()
+            if msg.get("type") != "lifespan.startup":
+                await send({
+                    "type": "lifespan.startup.failed",
+                    "message": f"unexpected message {msg.get('type')!r}",
+                })
+                return
+            try:
+                await app_self._async_run_lifespan_startup()
+                await app_self._async_run_startup_handlers()
+            except BaseException:  # noqa: BLE001
+                tb = traceback.format_exc()
+                await send({"type": "lifespan.startup.failed", "message": tb})
+                raise  # Let outer MW (Sentry) see + re-raise
+            await send({"type": "lifespan.startup.complete"})
+
+            msg = await receive()
+            if msg.get("type") != "lifespan.shutdown":
+                return
+            try:
+                await app_self._async_run_shutdown_handlers()
+                await app_self._async_run_lifespan_shutdown()
+            except BaseException:  # noqa: BLE001
+                tb = traceback.format_exc()
+                await send({"type": "lifespan.shutdown.failed", "message": tb})
+                raise
+            await send({"type": "lifespan.shutdown.complete"})
+
+        # Compose the raw ASGI MW chain (outer-most first per add_middleware LIFO)
+        composed = _inner_app
+        for mw_cls, kwargs in reversed(app_self._raw_asgi_middlewares):
+            try:
+                composed = mw_cls(app=composed, **kwargs)
+            except TypeError:
+                composed = mw_cls(**kwargs)
+
+        async def _kickoff():
+            state["recv_q"] = asyncio.Queue()
+            state["send_done"] = asyncio.Event()
+
+            async def _recv():
+                return await state["recv_q"].get()
+
+            async def _send(msg):
+                state["send_events"].append(msg)
+                t = msg.get("type", "")
+                if t.endswith(".complete") or t.endswith(".failed"):
+                    state["send_done"].set()
+
+            scope = {
+                "type": "lifespan",
+                "asgi": {"version": "3.0", "spec_version": "2.0"},
+                "state": {},
+            }
+            state["task"] = asyncio.ensure_future(composed(scope, _recv, _send))
+            # Swallow the eventual exception from the re-raised startup/shutdown
+            # failure so asyncio doesn't log "Task exception was never retrieved".
+            # The error was already observed by the outer MW chain + surfaced
+            # via the ``.failed`` ASGI message.
+            state["task"].add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            await state["recv_q"].put({"type": "lifespan.startup"})
+            await state["send_done"].wait()
+            state["send_done"].clear()
+
+            last = state["send_events"][-1] if state["send_events"] else None
+            if last and last.get("type") == "lifespan.startup.failed":
+                raise RuntimeError(
+                    f"Lifespan startup failed: {last.get('message')}"
+                )
+
+        _submit(_kickoff())
+        app_self._lifespan_mw_state = state
+        return True
+
+    def _stop_lifespan_mw_chain(self) -> bool:
+        state = getattr(self, "_lifespan_mw_state", None)
+        if not state or not state.get("task"):
+            return False
+        import asyncio
+        from fastapi_turbo._async_worker import submit as _submit
+
+        async def _kickoff():
+            state["send_events"].clear()
+            await state["recv_q"].put({"type": "lifespan.shutdown"})
+            await state["send_done"].wait()
+            try:
+                await state["task"]
+            except BaseException:  # noqa: BLE001
+                pass
+
+        _submit(_kickoff())
+        self._lifespan_mw_state = None
+        return True
+
     # ------------------------------------------------------------------
     # Server launch
     # ------------------------------------------------------------------
@@ -5272,20 +5495,22 @@ class FastAPI:
         """Collect routes, hand them to the Rust core, and start serving."""
         from fastapi_turbo._fastapi_turbo_core import ParamInfo, RouteInfo, run_server
 
-        # Run lifespan startup phase if lifespan is set (P0 fix #3).
-        # Also trigger for router-level lifespans (test_router_events).
-        if self._collect_lifespans():
-            self._run_lifespan_startup()
-            atexit.register(self._run_lifespan_shutdown)
-
-        # Run startup event handlers (P0 fix #2)
-        self._run_startup_handlers()
-
-        # Register shutdown handlers via atexit (P0 fix #2). Check the
-        # FULL chain (app + routers) — a router-only shutdown (no
-        # app-level handler) must still run.
-        if self._collect_shutdown_handlers():
-            atexit.register(self._run_shutdown_handlers)
+        # Prefer the ASGI-middleware-chained path when raw ASGI middleware
+        # is registered — that way Sentry/OTel-style MW that hooks
+        # ``scope['type'] == 'lifespan'`` sees startup/shutdown events.
+        # The chained path runs both ``_async_run_lifespan_*`` and
+        # ``_async_run_*_handlers`` inside a single ``lifespan`` dispatch
+        # composed through ``self._raw_asgi_middlewares``.
+        if self._start_lifespan_mw_chain():
+            atexit.register(self._stop_lifespan_mw_chain)
+        else:
+            # Direct-call path (no raw ASGI MW to route through).
+            if self._collect_lifespans():
+                self._run_lifespan_startup()
+                atexit.register(self._run_lifespan_shutdown)
+            self._run_startup_handlers()
+            if self._collect_shutdown_handlers():
+                atexit.register(self._run_shutdown_handlers)
 
         # Register ``/openapi.json`` as a Python handler BEFORE route
         # collection so ``run_server`` hands it to Rust. The handler
