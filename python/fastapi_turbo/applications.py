@@ -2148,6 +2148,92 @@ from fastapi_turbo.requests import Request as _Request
 from fastapi_turbo.responses import JSONResponse as _JSONResponse
 
 
+async def _ws_entry_with_asgi_chain(app_self, ws, path_params, inner_ws_entry):
+    """Dispatch a synthesised ``scope['type'] == 'websocket'`` through the
+    app's raw ASGI middleware chain, then call ``inner_ws_entry(ws, **path_params)``.
+
+    Gives Sentry / OTel / rate-limit middleware connection-level visibility
+    and exception capture. Per-message (``websocket.send`` / ``websocket.receive``)
+    observation isn't plumbed — most tracing middleware keys off scope,
+    not individual frames.
+    """
+    import asyncio
+
+    # Build the ASGI scope from the WebSocket object.
+    url = getattr(ws, "url", None)
+    path = url.path if url is not None else "/"
+    query = (url.query or "") if url is not None else ""
+    raw_headers = []
+    try:
+        for k, v in (ws.headers.raw or []):
+            kk = k.encode("latin-1") if isinstance(k, str) else k
+            vv = v.encode("latin-1") if isinstance(v, str) else v
+            raw_headers.append((kk, vv))
+    except Exception:  # noqa: BLE001
+        pass
+    scope = {
+        "type": "websocket",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "scheme": "ws",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "query_string": query.encode("latin-1"),
+        "headers": raw_headers,
+        "client": getattr(ws, "client", None),
+        "server": getattr(ws, "server", None),
+        "subprotocols": getattr(ws, "_subprotocols", []) or [],
+        "state": {},
+        "app": app_self,
+    }
+
+    # Receive queue: start with websocket.connect so the MW sees the handshake.
+    recv_q: asyncio.Queue = asyncio.Queue()
+    await recv_q.put({"type": "websocket.connect"})
+
+    async def _recv():
+        return await recv_q.get()
+
+    async def _send(_msg):
+        # Phase 1: no-op observer. MW still sees the scope and can catch
+        # exceptions from ``await self.app(scope, receive, send)``.
+        return None
+
+    inner_exc: list = []
+
+    async def _inner(s, r, _s):
+        # Pull the connect event so MW-side ``receive()`` wrappers that
+        # only consume one message stay consistent.
+        msg = await r()
+        if msg.get("type") != "websocket.connect":
+            return
+        # Run the actual WS handler. If it raises, propagate so an outer
+        # MW's ``try/except`` can observe (Sentry / OTel).
+        try:
+            await inner_ws_entry(ws, **path_params)
+        except BaseException as e:  # noqa: BLE001
+            inner_exc.append(e)
+            raise
+
+    # Compose raw ASGI MW chain around the inner app (outer-most first).
+    composed = _inner
+    for mw_cls, kwargs in reversed(app_self._raw_asgi_middlewares):
+        try:
+            composed = mw_cls(app=composed, **kwargs)
+        except TypeError:
+            composed = mw_cls(**kwargs)
+
+    try:
+        await composed(scope, _recv, _send)
+    except BaseException:  # noqa: BLE001
+        # If the MW didn't swallow the handler's exception, surface it the
+        # same way the non-chained path would: raise in the worker loop so
+        # ``_ws_server_exceptions`` / TestClient capture logic fires.
+        if inner_exc:
+            raise inner_exc[0]
+        raise
+
+
 def _make_asgi_middleware_shim(mw_cls, kwargs):
     """Adapt a raw ASGI3 middleware class (``async __call__(scope, receive, send)``)
     into an ``@app.middleware("http")`` style callable ``async(request, call_next)``.
@@ -4038,10 +4124,30 @@ class FastAPI:
         _ws_entry._ws_synthetic_route = _synthetic_route  # type: ignore[attr-defined]
         _ws_entry._ws_endpoint_ctx = _ws_endpoint_ctx  # type: ignore[attr-defined]
 
+        # If raw ASGI middleware is registered, dispatch the WS invocation
+        # through the composed MW chain so middlewares that key off
+        # ``scope['type'] == 'websocket'`` (Sentry's connection-span, OTel
+        # tracing, rate-limit gates, logging) see the connection, can
+        # wrap receive/send, and can capture exceptions from the user
+        # handler via ``try/except await self.app(scope, receive, send)``.
+        app_self = self
+
+        async def _ws_asgi_chain_entry(ws, **path_params):
+            # Fast path: no ASGI MW registered — behaviour identical to
+            # the pre-chain path.
+            if not app_self._raw_asgi_middlewares:
+                return await _ws_entry(ws, **path_params)
+            return await _ws_entry_with_asgi_chain(app_self, ws, path_params, _ws_entry)
+
+        # Forward the WS-synthetic-route + endpoint_ctx attrs that
+        # route collection relies on for OpenAPI / mount-prefix logic.
+        _ws_asgi_chain_entry._ws_synthetic_route = _synthetic_route  # type: ignore[attr-defined]
+        _ws_asgi_chain_entry._ws_endpoint_ctx = _ws_endpoint_ctx  # type: ignore[attr-defined]
+
         # Always return an async entry: Rust treats both sync/async the
         # same way via the worker loop, and this lets us await deps and
         # teardown uniformly even for sync endpoints.
-        return _ws_entry
+        return _ws_asgi_chain_entry
 
     def _get_all_dependencies_for_route(
         self, router: APIRouter, route, include_deps: list | None = None,
