@@ -627,6 +627,19 @@ class _WebSocketTestSession:
         if srv_exc is not None:
             raise srv_exc
 
+    @property
+    def accepted_subprotocol(self) -> str | None:
+        """Subprotocol the server picked in its ``accept(subprotocol=…)``.
+
+        Mirrors Starlette's ``WebSocketTestSession.accepted_subprotocol`` —
+        tests read this after ``__enter__`` to assert that the server
+        negotiated the expected subprotocol.
+        """
+        if self._ws is None:
+            return None
+        sp = getattr(self._ws, "subprotocol", None)
+        return sp if sp else None
+
     # ── Send ───────────────────────────────────────────────────────
 
     def send_text(self, data: str) -> None:

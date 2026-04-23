@@ -1821,8 +1821,16 @@ def _try_compile_handler(
             # Teardown MUST run after the response is captured (FA sends
             # the body / middleware reads state.copy() before teardown
             # mutates state), so it runs in a separate submit below.
+            #
+            # When the handler raises, yield-dep ``finally`` blocks must
+            # still fire (in LIFO order) so DB connections close, state
+            # dicts record the "finished" transition, etc. That teardown
+            # has to run on the SAME loop as setup, so we perform it
+            # inside this coro before re-raising.
+            _async_gens_holder: list = []
+
             async def _setup_and_handler():
-                async_gens: list = []
+                async_gens = _async_gens_holder
                 for name, call_fn, _orig, input_map, func_id, kind, use_cache in _fp_chain:
                     ck = (func_id, "request") if func_id is not None else None
                     if use_cache and ck is not None and ck in _cache:
@@ -1878,7 +1886,28 @@ def _try_compile_handler(
                         ), async_gens)
                     raise
 
-                result = await _fp_endpoint(**_hkwargs)
+                try:
+                    result = await _fp_endpoint(**_hkwargs)
+                except BaseException as _h_exc:
+                    # Handler raised. Drive each yield-dep's finally /
+                    # except via ``athrow`` in reverse order so the dep
+                    # can observe the exception and clean up on the
+                    # same loop. A dep re-raising ``_h_exc`` is normal
+                    # (the ``finally`` re-raises on exit); swallow that
+                    # and keep unwinding. Any other exception from a
+                    # dep's teardown also shouldn't mask the original.
+                    _gens = list(_async_gens_holder)
+                    _async_gens_holder.clear()
+                    for _gen in reversed(_gens):
+                        try:
+                            await _gen.athrow(_h_exc)
+                        except StopAsyncIteration:
+                            pass
+                        except BaseException as _td_exc:
+                            if _td_exc is _h_exc:
+                                pass  # finally re-raised the same exception
+                            # else: swallow — original exception wins
+                    raise
                 # Snapshot via response_model BEFORE returning — this
                 # decouples the result from the dep's shared-state dict
                 # so post-submit teardown can't mutate the body.
@@ -1909,7 +1938,23 @@ def _try_compile_handler(
                 # fallback would re-run them, causing duplicated writes.
                 # Let HTTPException / RequestValidationError / user errors
                 # propagate — the outer handler turns them into responses.
-                result, _async_gens = _worker_submit(_setup_and_handler())
+                try:
+                    result, _async_gens = _worker_submit(_setup_and_handler())
+                except BaseException as _exc_fast:
+                    # Capture non-HTTP handler errors so
+                    # ``TestClient(raise_server_exceptions=True)`` can
+                    # re-raise them in the test thread, matching
+                    # Starlette's ASGI TestClient semantics.
+                    try:
+                        from fastapi_turbo.exceptions import HTTPException as _HEfp
+                    except ImportError:
+                        _HEfp = ()  # type: ignore[assignment]
+                    if (
+                        _app is not None
+                        and not isinstance(_exc_fast, _HEfp)
+                    ):
+                        _app._captured_server_exceptions.append(_exc_fast)
+                    raise
 
                 # Post-process (response_class wrap / status_code) on main
                 # thread so it doesn't block the worker loop.
@@ -3704,6 +3749,37 @@ class FastAPI:
                                 marker.__class__.__name__,
                             )
                         continue
+
+                    # Plain-typed param without marker → Query (FA default,
+                    # matching the handler-level fallback at _wrap_websocket_
+                    # endpoint's param_spec build). Lets
+                    # ``def dep(token: str = "")`` pull ``token`` from
+                    # ``?token=...`` on the connect URL.
+                    if p.kind in (
+                        _inspect.Parameter.VAR_POSITIONAL,
+                        _inspect.Parameter.VAR_KEYWORD,
+                    ):
+                        continue
+                    default_val = (
+                        _inspect.Parameter.empty
+                        if p.default is _inspect.Parameter.empty
+                        else p.default
+                    )
+                    raw_val = ws.query_params.get(p_name)
+                    if raw_val is None:
+                        if default_val is not _inspect.Parameter.empty:
+                            dep_kwargs[p_name] = default_val
+                            continue
+                        raise _WSExc(
+                            code=1008,
+                            reason=f"missing query parameter {p_name!r}",
+                        )
+                    if ann is _inspect.Parameter.empty or ann is None:
+                        dep_kwargs[p_name] = raw_val
+                    else:
+                        dep_kwargs[p_name] = _validate_scalar(
+                            raw_val, _inner_type(ann), p_name, "Query",
+                        )
 
             # Invoke the dependency (sync/async, function/generator).
             scope = _get_dep_scope(dep)
