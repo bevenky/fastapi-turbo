@@ -1,6 +1,6 @@
-"""fastapi-rs + redis.asyncio (ASYNC) — pure Redis GET/SET benchmark."""
+"""fastapi-turbo + redis.asyncio (ASYNC) — pure Redis GET/SET benchmark."""
 import os
-from fastapi_rs import FastAPI
+from fastapi_turbo import FastAPI
 import redis.asyncio as aredis
 
 app = FastAPI()

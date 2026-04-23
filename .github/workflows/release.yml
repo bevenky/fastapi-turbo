@@ -1,5 +1,5 @@
 # Build and publish pre-compiled wheels for all platforms.
-# Users run `pip install fastapi-rs` — no Rust toolchain needed.
+# Users run `pip install fastapi-turbo` — no Rust toolchain needed.
 #
 # This is the same pattern used by orjson, pydantic-core, and cryptography.
 # maturin builds platform-specific wheels containing the compiled .so/.dylib/.pyd.

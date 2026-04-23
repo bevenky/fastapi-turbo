@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # File handling benchmark — upload + FileResponse + StaticFiles
-# Compares: fastapi-rs, Go Gin, Node Fastify
+# Compares: fastapi-turbo, Go Gin, Node Fastify
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -50,8 +50,8 @@ go build -o files-gin files_go_gin.go
 
 echo -e "${CYAN}=== Starting servers ===${NC}"
 
-# fastapi-rs
-PORT=$PORT_RS python "$SCRIPT_DIR/files_fastapi_rs.py" >/tmp/files_rs.log 2>&1 &
+# fastapi-turbo
+PORT=$PORT_RS python "$SCRIPT_DIR/files_fastapi_turbo.py" >/tmp/files_rs.log 2>&1 &
 PIDS+=($!)
 
 # Go Gin
@@ -64,7 +64,7 @@ PORT=$PORT_JS node files_fastify.js >/tmp/files_js.log 2>&1 &
 PIDS+=($!)
 cd "$SCRIPT_DIR"
 
-wait_for_port $PORT_RS "fastapi-rs" || { cat /tmp/files_rs.log; exit 1; }
+wait_for_port $PORT_RS "fastapi-turbo" || { cat /tmp/files_rs.log; exit 1; }
 wait_for_port $PORT_GO "Go-Gin"     || { cat /tmp/files_go.log; exit 1; }
 wait_for_port $PORT_JS "Fastify"    || { cat /tmp/files_js.log; exit 1; }
 

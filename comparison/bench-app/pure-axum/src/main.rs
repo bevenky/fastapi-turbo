@@ -1,6 +1,6 @@
 //! Pure-axum file handling benchmark.
 //!
-//! Mirrors the endpoints of `files_fastapi_rs.py` / `files_go_gin.go` /
+//! Mirrors the endpoints of `files_fastapi_turbo.py` / `files_go_gin.go` /
 //! `files_fastify.js` exactly so we can measure the absolute Rust ceiling
 //! for our framework overhead comparison.
 

@@ -1,4 +1,4 @@
-"""ROUND 2 — Deep validation parity app for fastapi-rs.
+"""ROUND 2 — Deep validation parity app for fastapi-turbo.
 
 Expands R1 with endpoints covering the FULL Pydantic v2 error matrix
 at every input location (query/path/header/cookie/body scalar/body-model
@@ -8,10 +8,10 @@ and at every nesting depth 1..5.
 Each endpoint is designed to, when hit with a single specific invalid
 request body, produce a deterministic Pydantic ValidationError the runner
 can compare byte-for-byte (detail[].{type,loc,msg,input,ctx,url}) across
-stock FastAPI and fastapi-rs.
+stock FastAPI and fastapi-turbo.
 
-Uses ONLY stock FastAPI imports. When the app is loaded under fastapi-rs,
-the compat shim rewires these to fastapi_rs.
+Uses ONLY stock FastAPI imports. When the app is loaded under fastapi-turbo,
+the compat shim rewires these to fastapi_turbo.
 """
 from __future__ import annotations
 

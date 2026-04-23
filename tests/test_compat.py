@@ -1,37 +1,37 @@
 """Phase 9-10 tests: compatibility shims for fastapi.* and starlette.* imports."""
 
-import fastapi_rs  # noqa: F401 — ensure shims are installed
+import fastapi_turbo  # noqa: F401 — ensure shims are installed
 
 
 # ── fastapi top-level imports ──────────────────────────────────────
 
 
 def test_fastapi_import_fastapi():
-    """from fastapi import FastAPI resolves to fastapi_rs."""
+    """from fastapi import FastAPI resolves to fastapi_turbo."""
     from fastapi import FastAPI
-    from fastapi_rs import FastAPI as JamunFastAPI
+    from fastapi_turbo import FastAPI as JamunFastAPI
 
     assert FastAPI is JamunFastAPI
 
 
 def test_fastapi_depends_import():
     from fastapi import Depends
-    from fastapi_rs import Depends as JamunDepends
+    from fastapi_turbo import Depends as JamunDepends
 
     assert Depends is JamunDepends
 
 
 def test_fastapi_http_exception_import():
     from fastapi import HTTPException
-    from fastapi_rs import HTTPException as JamunHTTPException
+    from fastapi_turbo import HTTPException as JamunHTTPException
 
     assert HTTPException is JamunHTTPException
 
 
 def test_fastapi_query_path_import():
     from fastapi import Query, Path, Header, Cookie, Body, Form, File
-    from fastapi_rs import Query as JQ, Path as JP, Header as JH
-    from fastapi_rs import Cookie as JC, Body as JB, Form as JFo, File as JFi
+    from fastapi_turbo import Query as JQ, Path as JP, Header as JH
+    from fastapi_turbo import Cookie as JC, Body as JB, Form as JFo, File as JFi
 
     assert Query is JQ
     assert Path is JP
@@ -44,7 +44,7 @@ def test_fastapi_query_path_import():
 
 def test_fastapi_response_import():
     from fastapi import JSONResponse, HTMLResponse, Response
-    from fastapi_rs import JSONResponse as JJ, HTMLResponse as JH, Response as JR
+    from fastapi_turbo import JSONResponse as JJ, HTMLResponse as JH, Response as JR
 
     assert JSONResponse is JJ
     assert HTMLResponse is JH
@@ -53,35 +53,35 @@ def test_fastapi_response_import():
 
 def test_fastapi_request_import():
     from fastapi import Request
-    from fastapi_rs import Request as JamunRequest
+    from fastapi_turbo import Request as JamunRequest
 
     assert Request is JamunRequest
 
 
 def test_fastapi_uploadfile_import():
     from fastapi import UploadFile
-    from fastapi_rs import UploadFile as JamunUploadFile
+    from fastapi_turbo import UploadFile as JamunUploadFile
 
     assert UploadFile is JamunUploadFile
 
 
 def test_fastapi_apirouter_import():
     from fastapi import APIRouter
-    from fastapi_rs import APIRouter as JamunAPIRouter
+    from fastapi_turbo import APIRouter as JamunAPIRouter
 
     assert APIRouter is JamunAPIRouter
 
 
 def test_fastapi_background_tasks_import():
     from fastapi import BackgroundTasks
-    from fastapi_rs import BackgroundTasks as JamunBT
+    from fastapi_turbo import BackgroundTasks as JamunBT
 
     assert BackgroundTasks is JamunBT
 
 
 def test_fastapi_websocket_import():
     from fastapi import WebSocket
-    from fastapi_rs import WebSocket as JamunWS
+    from fastapi_turbo import WebSocket as JamunWS
 
     assert WebSocket is JamunWS
 
@@ -91,9 +91,9 @@ def test_fastapi_websocket_import():
 
 def test_fastapi_responses_module():
     from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
-    from fastapi_rs.responses import JSONResponse as JJ
-    from fastapi_rs.responses import HTMLResponse as JH
-    from fastapi_rs.responses import PlainTextResponse as JP
+    from fastapi_turbo.responses import JSONResponse as JJ
+    from fastapi_turbo.responses import HTMLResponse as JH
+    from fastapi_turbo.responses import PlainTextResponse as JP
 
     assert JSONResponse is JJ
     assert HTMLResponse is JH
@@ -102,7 +102,7 @@ def test_fastapi_responses_module():
 
 def test_fastapi_routing_module():
     from fastapi.routing import APIRouter, APIRoute
-    from fastapi_rs.routing import APIRouter as JR, APIRoute as JA
+    from fastapi_turbo.routing import APIRouter as JR, APIRoute as JA
 
     assert APIRouter is JR
     assert APIRoute is JA
@@ -110,7 +110,7 @@ def test_fastapi_routing_module():
 
 def test_fastapi_exceptions_module():
     from fastapi.exceptions import HTTPException, RequestValidationError
-    from fastapi_rs.exceptions import HTTPException as JH, RequestValidationError as JR
+    from fastapi_turbo.exceptions import HTTPException as JH, RequestValidationError as JR
 
     assert HTTPException is JH
     assert RequestValidationError is JR
@@ -118,7 +118,7 @@ def test_fastapi_exceptions_module():
 
 def test_fastapi_security_import():
     from fastapi.security import OAuth2PasswordBearer
-    from fastapi_rs.security import OAuth2PasswordBearer as JamunOAuth2
+    from fastapi_turbo.security import OAuth2PasswordBearer as JamunOAuth2
 
     assert OAuth2PasswordBearer is JamunOAuth2
 
@@ -150,7 +150,7 @@ def test_fastapi_security_all_classes():
 
 def test_fastapi_encoders_module():
     from fastapi.encoders import jsonable_encoder
-    from fastapi_rs.encoders import jsonable_encoder as J
+    from fastapi_turbo.encoders import jsonable_encoder as J
 
     assert jsonable_encoder is J
 
@@ -165,14 +165,14 @@ def test_fastapi_status_module():
 
 def test_fastapi_testclient_module():
     from fastapi.testclient import TestClient
-    from fastapi_rs.testclient import TestClient as JTC
+    from fastapi_turbo.testclient import TestClient as JTC
 
     assert TestClient is JTC
 
 
 def test_fastapi_middleware_cors():
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi_rs.middleware.cors import CORSMiddleware as JC
+    from fastapi_turbo.middleware.cors import CORSMiddleware as JC
 
     assert CORSMiddleware is JC
 
@@ -182,14 +182,14 @@ def test_fastapi_middleware_cors():
 
 def test_starlette_response_import():
     from starlette.responses import JSONResponse
-    from fastapi_rs.responses import JSONResponse as JamunJSONResponse
+    from fastapi_turbo.responses import JSONResponse as JamunJSONResponse
 
     assert JSONResponse is JamunJSONResponse
 
 
 def test_starlette_request_import():
     from starlette.requests import Request
-    from fastapi_rs.requests import Request as JamunRequest
+    from fastapi_turbo.requests import Request as JamunRequest
 
     assert Request is JamunRequest
 
@@ -204,14 +204,14 @@ def test_starlette_status_import():
 
 def test_starlette_websocket_import():
     from starlette.websockets import WebSocket
-    from fastapi_rs.websockets import WebSocket as JamunWS
+    from fastapi_turbo.websockets import WebSocket as JamunWS
 
     assert WebSocket is JamunWS
 
 
 def test_starlette_exceptions_import():
     from starlette.exceptions import HTTPException
-    from fastapi_rs.exceptions import HTTPException as JamunHTTPException
+    from fastapi_turbo.exceptions import HTTPException as JamunHTTPException
 
     assert HTTPException is JamunHTTPException
 
@@ -227,21 +227,21 @@ def test_starlette_datastructures_import():
 
 def test_starlette_middleware_cors():
     from starlette.middleware.cors import CORSMiddleware
-    from fastapi_rs.middleware.cors import CORSMiddleware as JC
+    from fastapi_turbo.middleware.cors import CORSMiddleware as JC
 
     assert CORSMiddleware is JC
 
 
 def test_starlette_concurrency_import():
     from starlette.concurrency import run_in_threadpool
-    from fastapi_rs.concurrency import run_in_threadpool as JR
+    from fastapi_turbo.concurrency import run_in_threadpool as JR
 
     assert run_in_threadpool is JR
 
 
 def test_starlette_background_import():
     from starlette.background import BackgroundTasks, BackgroundTask
-    from fastapi_rs.background import BackgroundTasks as JBT, BackgroundTask as JBT1
+    from fastapi_turbo.background import BackgroundTasks as JBT, BackgroundTask as JBT1
 
     assert BackgroundTasks is JBT
     assert BackgroundTask is JBT1
@@ -253,7 +253,7 @@ def test_starlette_background_import():
 def test_shim_uninstall_reinstall():
     """Uninstalling and reinstalling shims works."""
     import sys
-    from fastapi_rs.compat import uninstall, install
+    from fastapi_turbo.compat import uninstall, install
 
     # Shims should be installed
     assert "fastapi" in sys.modules
@@ -266,5 +266,5 @@ def test_shim_uninstall_reinstall():
 
     # Verify imports still work
     from fastapi import FastAPI
-    from fastapi_rs import FastAPI as JF
+    from fastapi_turbo import FastAPI as JF
     assert FastAPI is JF

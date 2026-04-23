@@ -1,7 +1,7 @@
-"""4-way scaling benchmark: fastapi-rs vs Go Gin vs Fastify vs pure Axum.
+"""4-way scaling benchmark: fastapi-turbo vs Go Gin vs Fastify vs pure Axum.
 
 The pure-axum column shows the absolute Rust ceiling — the framework-overhead
-floor that fastapi-rs pays for the Python interop."""
+floor that fastapi-turbo pays for the Python interop."""
 from __future__ import annotations
 import socket, time, sys
 
@@ -108,7 +108,7 @@ def json_req(port, accept_gzip=False):
 def main():
     # bench_vs_rust.py rs,go,js,ax
     p_rs, p_go, p_js, p_ax = [int(x) for x in sys.argv[1].split(",")]
-    fws = [("fastapi-rs", p_rs), ("Go-Gin", p_go), ("Fastify", p_js), ("pure-axum", p_ax)]
+    fws = [("fastapi-turbo", p_rs), ("Go-Gin", p_go), ("Fastify", p_js), ("pure-axum", p_ax)]
 
     def run_row(label, req_builder):
         row = [f"{label:<20}"]

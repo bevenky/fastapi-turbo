@@ -3,7 +3,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BENCH="$PROJECT_ROOT/target/release/fastapi-rs-bench"
+BENCH="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
 PY_RS="python3"
 PY_FA="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
@@ -37,9 +37,9 @@ wait_port() {
 [ -x "$SCRIPT_DIR/db_rust_axum/target/release/db-axum" ] || (cd "$SCRIPT_DIR/db_rust_axum" && PATH="$HOME/.cargo/bin:$PATH" cargo build --release 2>&1 | tail -1)
 [ -x "$SCRIPT_DIR/db-gin" ] || (cd "$SCRIPT_DIR" && go build -o db-gin db_go_gin.go)
 
-FASTAPI_RS_NO_SHIM=1 PORT=19030 $PY_RS "$SCRIPT_DIR/db_fastapi_rs_app.py"      >/tmp/dbm_19030.log 2>&1 & PIDS+=($!)
-FASTAPI_RS_NO_SHIM=1 PORT=19032 $PY_RS "$SCRIPT_DIR/db_async_psycopg3_app.py"  >/tmp/dbm_19032.log 2>&1 & PIDS+=($!)
-FASTAPI_RS_NO_SHIM=1 PORT=19033 $PY_RS "$SCRIPT_DIR/db_sync_fastapi_rs_app.py" >/tmp/dbm_19033.log 2>&1 & PIDS+=($!)
+FASTAPI_TURBO_NO_SHIM=1 PORT=19030 $PY_RS "$SCRIPT_DIR/db_fastapi_turbo_app.py"      >/tmp/dbm_19030.log 2>&1 & PIDS+=($!)
+FASTAPI_TURBO_NO_SHIM=1 PORT=19032 $PY_RS "$SCRIPT_DIR/db_async_psycopg3_app.py"  >/tmp/dbm_19032.log 2>&1 & PIDS+=($!)
+FASTAPI_TURBO_NO_SHIM=1 PORT=19033 $PY_RS "$SCRIPT_DIR/db_sync_fastapi_turbo_app.py" >/tmp/dbm_19033.log 2>&1 & PIDS+=($!)
 PORT=19034 $PY_FA "$SCRIPT_DIR/db_fastapi_uvicorn_app.py"                     >/tmp/dbm_19034.log 2>&1 & PIDS+=($!)
 PORT=19031 "$SCRIPT_DIR/db-gin"                                              >/tmp/dbm_19031.log 2>&1 & PIDS+=($!)
 PORT=19036 "$SCRIPT_DIR/db_rust_axum/target/release/db-axum"                 >/tmp/dbm_19036.log 2>&1 & PIDS+=($!)
@@ -67,9 +67,9 @@ echo -e "label\tendpoint\trps\tp50\tp99"
 
 for pair in "Go-Gin:19031" \
             "Rust-Axum:19036" \
-            "fastapi-rs_pg3_sync:19030" \
-            "fastapi-rs_pg2_sync:19033" \
-            "fastapi-rs_pg3_async:19032" \
+            "fastapi-turbo_pg3_sync:19030" \
+            "fastapi-turbo_pg2_sync:19033" \
+            "fastapi-turbo_pg3_async:19032" \
             "FastAPI_asyncpg:19034"; do
     label="${pair%:*}"; port="${pair##*:}"
     bench_one "$label" "$port" "/health"

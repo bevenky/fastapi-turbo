@@ -1,4 +1,4 @@
-"""FastAPI vs fastapi-rs WebSocket parity runner.
+"""FastAPI vs fastapi-turbo WebSocket parity runner.
 
 Boots both servers on their own ports from the SAME `parity_app_websocket`
 module and compares the observable client-side behaviour of each scenario
@@ -95,12 +95,12 @@ def _start_uvicorn(port: int) -> subprocess.Popen:
     )
 
 
-def _start_fastapi_rs(port: int) -> subprocess.Popen:
+def _start_fastapi_turbo(port: int) -> subprocess.Popen:
     env = os.environ.copy()
     env["PYTHONPATH"] = HERE + os.pathsep + env.get("PYTHONPATH", "")
     code = f"""
-import fastapi_rs.compat
-fastapi_rs.compat.install()
+import fastapi_turbo.compat
+fastapi_turbo.compat.install()
 import sys
 sys.path.insert(0, {HERE!r})
 from parity_app_websocket import app
@@ -267,14 +267,14 @@ def main() -> int:
     fr_port = _free_port()
 
     print(f"{BLD}={'=' * 70}")
-    print(f"  WebSocket Parity: FA :{fa_port}  |  fastapi-rs :{fr_port}")
+    print(f"  WebSocket Parity: FA :{fa_port}  |  fastapi-turbo :{fr_port}")
     print(f"={'=' * 70}{RST}\n")
 
     print("Starting uvicorn (FA)...", end=" ", flush=True)
     fa_proc = _start_uvicorn(fa_port)
     print("ok")
-    print("Starting fastapi-rs...", end=" ", flush=True)
-    fr_proc = _start_fastapi_rs(fr_port)
+    print("Starting fastapi-turbo...", end=" ", flush=True)
+    fr_proc = _start_fastapi_turbo(fr_port)
     print("ok")
 
     try:
@@ -282,7 +282,7 @@ def main() -> int:
             print(f"{RED}FA failed to start{RST}")
             return 2
         if not _wait_ws(fr_port):
-            print(f"{RED}fastapi-rs failed to start{RST}")
+            print(f"{RED}fastapi-turbo failed to start{RST}")
             return 2
 
         fa_url = f"ws://{HOST}:{fa_port}"

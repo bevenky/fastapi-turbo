@@ -1,4 +1,4 @@
-"""SSE streaming benchmark — fastapi-rs vs Go Gin vs Fastify.
+"""SSE streaming benchmark — fastapi-turbo vs Go Gin vs Fastify.
 
 Mirrors vLLM / SGLang's per-request SSE stream: N data chunks terminated
 with `data: [DONE]\n\n`. Measures:
@@ -7,7 +7,7 @@ with `data: [DONE]\n\n`. Measures:
   - time to first byte  (how quickly the server flushes chunk 0)
   - requests / sec over a keepalive connection
 
-Servers expected to be up on 19500 (fastapi-rs), 19501 (Go), 19502 (Fastify).
+Servers expected to be up on 19500 (fastapi-turbo), 19501 (Go), 19502 (Fastify).
 """
 from __future__ import annotations
 
@@ -112,7 +112,7 @@ def main():
     WARMUP = 200
 
     cases = [
-        ("fastapi-rs", 19500),
+        ("fastapi-turbo", 19500),
         ("Go Gin",     19501),
         ("Fastify",    19502),
     ]

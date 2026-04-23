@@ -16,7 +16,7 @@ class TestResponseModelIncludeExclude:
 
     def test_route_stores_include_exclude(self):
         """APIRoute stores response_model_include and response_model_exclude."""
-        from fastapi_rs.routing import APIRoute
+        from fastapi_turbo.routing import APIRoute
 
         def handler():
             return {}
@@ -32,7 +32,7 @@ class TestResponseModelIncludeExclude:
 
     def test_route_defaults_none(self):
         """response_model_include/exclude default to None."""
-        from fastapi_rs.routing import APIRoute
+        from fastapi_turbo.routing import APIRoute
 
         def handler():
             return {}
@@ -44,7 +44,7 @@ class TestResponseModelIncludeExclude:
     def test_apply_response_model_include(self):
         """_apply_response_model with include only returns included fields."""
         from pydantic import BaseModel
-        from fastapi_rs.applications import _apply_response_model
+        from fastapi_turbo.applications import _apply_response_model
 
         class UserOut(BaseModel):
             name: str
@@ -61,7 +61,7 @@ class TestResponseModelIncludeExclude:
     def test_apply_response_model_exclude(self):
         """_apply_response_model with exclude omits excluded fields."""
         from pydantic import BaseModel
-        from fastapi_rs.applications import _apply_response_model
+        from fastapi_turbo.applications import _apply_response_model
 
         class UserOut(BaseModel):
             name: str
@@ -80,7 +80,7 @@ class TestResponseModelIncludeExclude:
     def test_include_exclude_via_decorator(self):
         """response_model_include/exclude work through the FastAPI decorator."""
         from pydantic import BaseModel
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         class UserOut(BaseModel):
             name: str
@@ -107,7 +107,7 @@ class TestResponseModelExcludeOptions:
 
     def test_route_stores_exclude_flags(self):
         """APIRoute stores the exclude_unset/defaults/none flags."""
-        from fastapi_rs.routing import APIRoute
+        from fastapi_turbo.routing import APIRoute
 
         def handler():
             return {}
@@ -125,7 +125,7 @@ class TestResponseModelExcludeOptions:
 
     def test_route_defaults_false(self):
         """exclude_unset/defaults/none default to False."""
-        from fastapi_rs.routing import APIRoute
+        from fastapi_turbo.routing import APIRoute
 
         def handler():
             return {}
@@ -138,7 +138,7 @@ class TestResponseModelExcludeOptions:
     def test_apply_response_model_exclude_unset(self):
         """_apply_response_model with exclude_unset omits unset fields."""
         from pydantic import BaseModel
-        from fastapi_rs.applications import _apply_response_model
+        from fastapi_turbo.applications import _apply_response_model
 
         class ItemOut(BaseModel):
             name: str
@@ -155,7 +155,7 @@ class TestResponseModelExcludeOptions:
     def test_apply_response_model_exclude_defaults(self):
         """_apply_response_model with exclude_defaults omits default-valued fields."""
         from pydantic import BaseModel
-        from fastapi_rs.applications import _apply_response_model
+        from fastapi_turbo.applications import _apply_response_model
 
         class ItemOut(BaseModel):
             name: str
@@ -171,7 +171,7 @@ class TestResponseModelExcludeOptions:
     def test_apply_response_model_exclude_none(self):
         """_apply_response_model with exclude_none omits None-valued fields."""
         from pydantic import BaseModel
-        from fastapi_rs.applications import _apply_response_model
+        from fastapi_turbo.applications import _apply_response_model
 
         class ItemOut(BaseModel):
             name: str
@@ -195,18 +195,18 @@ class TestORJSONResponse:
 
     def test_import(self):
         """ORJSONResponse is importable from responses module."""
-        from fastapi_rs.responses import ORJSONResponse
+        from fastapi_turbo.responses import ORJSONResponse
         assert ORJSONResponse is not None
 
     def test_import_from_top_level(self):
-        """ORJSONResponse is importable from fastapi_rs."""
-        from fastapi_rs import ORJSONResponse
+        """ORJSONResponse is importable from fastapi_turbo."""
+        from fastapi_turbo import ORJSONResponse
         assert ORJSONResponse is not None
 
     def test_renders_json(self):
         """ORJSONResponse renders content as JSON bytes."""
-        from fastapi_rs.responses import ORJSONResponse
-        from fastapi_rs.exceptions import FastAPIDeprecationWarning
+        from fastapi_turbo.responses import ORJSONResponse
+        from fastapi_turbo.exceptions import FastAPIDeprecationWarning
         import warnings as _w
         with _w.catch_warnings():
             _w.simplefilter("ignore", FastAPIDeprecationWarning)
@@ -216,13 +216,13 @@ class TestORJSONResponse:
 
     def test_media_type(self):
         """ORJSONResponse has application/json media type."""
-        from fastapi_rs.responses import ORJSONResponse
+        from fastapi_turbo.responses import ORJSONResponse
         assert ORJSONResponse.media_type == "application/json"
 
     def test_status_code(self):
         """ORJSONResponse accepts custom status code."""
-        from fastapi_rs.responses import ORJSONResponse
-        from fastapi_rs.exceptions import FastAPIDeprecationWarning
+        from fastapi_turbo.responses import ORJSONResponse
+        from fastapi_turbo.exceptions import FastAPIDeprecationWarning
         import warnings as _w
         with _w.catch_warnings():
             _w.simplefilter("ignore", FastAPIDeprecationWarning)
@@ -235,19 +235,19 @@ class TestUJSONResponse:
 
     def test_import(self):
         """UJSONResponse is importable from responses module."""
-        from fastapi_rs.responses import UJSONResponse
+        from fastapi_turbo.responses import UJSONResponse
         assert UJSONResponse is not None
 
     def test_import_from_top_level(self):
-        """UJSONResponse is importable from fastapi_rs."""
-        from fastapi_rs import UJSONResponse
+        """UJSONResponse is importable from fastapi_turbo."""
+        from fastapi_turbo import UJSONResponse
         assert UJSONResponse is not None
 
     def test_renders_json(self):
         """UJSONResponse renders content as JSON bytes."""
         import warnings
-        from fastapi_rs.exceptions import FastAPIDeprecationWarning
-        from fastapi_rs.responses import UJSONResponse
+        from fastapi_turbo.exceptions import FastAPIDeprecationWarning
+        from fastapi_turbo.responses import UJSONResponse
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FastAPIDeprecationWarning)
             r = UJSONResponse(content={"hello": "world"})
@@ -256,7 +256,7 @@ class TestUJSONResponse:
 
     def test_media_type(self):
         """UJSONResponse has application/json media type."""
-        from fastapi_rs.responses import UJSONResponse
+        from fastapi_turbo.responses import UJSONResponse
         assert UJSONResponse.media_type == "application/json"
 
 
@@ -270,13 +270,13 @@ class TestAsyncTestClient:
 
     def test_import(self):
         """AsyncTestClient is importable from testclient module."""
-        from fastapi_rs.testclient import AsyncTestClient
+        from fastapi_turbo.testclient import AsyncTestClient
         assert AsyncTestClient is not None
 
     def test_has_async_context_manager(self):
         """AsyncTestClient implements __aenter__ and __aexit__."""
-        from fastapi_rs.testclient import AsyncTestClient
-        from fastapi_rs import FastAPI
+        from fastapi_turbo.testclient import AsyncTestClient
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
         client = AsyncTestClient(app)
@@ -285,8 +285,8 @@ class TestAsyncTestClient:
 
     def test_has_http_methods(self):
         """AsyncTestClient has get, post, put, delete, patch, options, head, request methods."""
-        from fastapi_rs.testclient import AsyncTestClient
-        from fastapi_rs import FastAPI
+        from fastapi_turbo.testclient import AsyncTestClient
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
         client = AsyncTestClient(app)
@@ -297,8 +297,8 @@ class TestAsyncTestClient:
     def test_methods_are_async(self):
         """AsyncTestClient methods are coroutine functions."""
         import inspect
-        from fastapi_rs.testclient import AsyncTestClient
-        from fastapi_rs import FastAPI
+        from fastapi_turbo.testclient import AsyncTestClient
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
         client = AsyncTestClient(app)
@@ -307,8 +307,8 @@ class TestAsyncTestClient:
 
     def test_init_stores_app(self):
         """AsyncTestClient stores the app reference."""
-        from fastapi_rs.testclient import AsyncTestClient
-        from fastapi_rs import FastAPI
+        from fastapi_turbo.testclient import AsyncTestClient
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
         client = AsyncTestClient(app)
@@ -325,34 +325,34 @@ class TestOpenAPIExtendedInfo:
 
     def test_app_stores_servers(self):
         """FastAPI stores servers parameter."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         servers = [{"url": "https://api.example.com", "description": "Production"}]
         app = FastAPI(servers=servers)
         assert app.servers == servers
 
     def test_app_stores_terms_of_service(self):
         """FastAPI stores terms_of_service parameter."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI(terms_of_service="https://example.com/tos")
         assert app.terms_of_service == "https://example.com/tos"
 
     def test_app_stores_contact(self):
         """FastAPI stores contact parameter."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         contact = {"name": "Support", "email": "support@example.com"}
         app = FastAPI(contact=contact)
         assert app.contact == contact
 
     def test_app_stores_license_info(self):
         """FastAPI stores license_info parameter."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         license_info = {"name": "MIT", "url": "https://opensource.org/licenses/MIT"}
         app = FastAPI(license_info=license_info)
         assert app.license_info == license_info
 
     def test_openapi_includes_servers(self):
         """OpenAPI schema includes servers when set."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         servers = [{"url": "https://api.example.com"}]
         app = FastAPI(servers=servers)
 
@@ -366,7 +366,7 @@ class TestOpenAPIExtendedInfo:
 
     def test_openapi_includes_terms_of_service(self):
         """OpenAPI schema includes termsOfService in info when set."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI(terms_of_service="https://example.com/tos")
 
         @app.get("/test")
@@ -378,7 +378,7 @@ class TestOpenAPIExtendedInfo:
 
     def test_openapi_includes_contact(self):
         """OpenAPI schema includes contact in info when set."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         contact = {"name": "Support", "email": "support@example.com"}
         app = FastAPI(contact=contact)
 
@@ -391,7 +391,7 @@ class TestOpenAPIExtendedInfo:
 
     def test_openapi_includes_license(self):
         """OpenAPI schema includes license in info when set."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         license_info = {"name": "MIT"}
         app = FastAPI(license_info=license_info)
 
@@ -404,7 +404,7 @@ class TestOpenAPIExtendedInfo:
 
     def test_openapi_defaults_no_extra_fields(self):
         """OpenAPI schema omits servers/contact/etc when not set."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/test")
@@ -428,8 +428,8 @@ class TestOpenAPISecuritySchemes:
 
     def test_oauth2_scheme_in_openapi(self):
         """OAuth2PasswordBearer appears in securitySchemes."""
-        from fastapi_rs import FastAPI, Depends
-        from fastapi_rs.security import OAuth2PasswordBearer
+        from fastapi_turbo import FastAPI, Depends
+        from fastapi_turbo.security import OAuth2PasswordBearer
 
         app = FastAPI()
         oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
@@ -447,8 +447,8 @@ class TestOpenAPISecuritySchemes:
 
     def test_http_bearer_in_openapi(self):
         """HTTPBearer appears in securitySchemes."""
-        from fastapi_rs import FastAPI, Depends
-        from fastapi_rs.security import HTTPBearer
+        from fastapi_turbo import FastAPI, Depends
+        from fastapi_turbo.security import HTTPBearer
 
         app = FastAPI()
         bearer = HTTPBearer()
@@ -465,8 +465,8 @@ class TestOpenAPISecuritySchemes:
 
     def test_api_key_header_in_openapi(self):
         """APIKeyHeader appears in securitySchemes."""
-        from fastapi_rs import FastAPI, Depends
-        from fastapi_rs.security import APIKeyHeader
+        from fastapi_turbo import FastAPI, Depends
+        from fastapi_turbo.security import APIKeyHeader
 
         app = FastAPI()
         api_key = APIKeyHeader(name="X-API-Key")
@@ -483,7 +483,7 @@ class TestOpenAPISecuritySchemes:
 
     def test_no_security_no_schemes(self):
         """OpenAPI without security deps has no securitySchemes."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -506,7 +506,7 @@ class TestOpenAPITagDescriptions:
 
     def test_app_stores_openapi_tags(self):
         """FastAPI stores openapi_tags parameter."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         tags = [
             {"name": "items", "description": "Operations with items"},
             {"name": "users", "description": "Operations with users"},
@@ -516,7 +516,7 @@ class TestOpenAPITagDescriptions:
 
     def test_openapi_tags_in_schema(self):
         """OpenAPI schema includes tags array when openapi_tags is set."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         tags = [
             {"name": "items", "description": "Operations with items"},
         ]
@@ -532,7 +532,7 @@ class TestOpenAPITagDescriptions:
 
     def test_openapi_no_tags_when_not_set(self):
         """OpenAPI schema omits tags when openapi_tags is not set."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/test")
@@ -553,40 +553,40 @@ class TestWebSocketDisconnect:
 
     def test_import_from_exceptions(self):
         """WebSocketDisconnect is importable from exceptions module."""
-        from fastapi_rs.exceptions import WebSocketDisconnect
+        from fastapi_turbo.exceptions import WebSocketDisconnect
         assert WebSocketDisconnect is not None
 
     def test_import_from_top_level(self):
-        """WebSocketDisconnect is importable from fastapi_rs."""
-        from fastapi_rs import WebSocketDisconnect
+        """WebSocketDisconnect is importable from fastapi_turbo."""
+        from fastapi_turbo import WebSocketDisconnect
         assert WebSocketDisconnect is not None
 
     def test_default_code(self):
         """WebSocketDisconnect defaults to code 1000."""
-        from fastapi_rs.exceptions import WebSocketDisconnect
+        from fastapi_turbo.exceptions import WebSocketDisconnect
         exc = WebSocketDisconnect()
         assert exc.code == 1000
 
     def test_custom_code(self):
         """WebSocketDisconnect accepts custom code."""
-        from fastapi_rs.exceptions import WebSocketDisconnect
+        from fastapi_turbo.exceptions import WebSocketDisconnect
         exc = WebSocketDisconnect(code=1001)
         assert exc.code == 1001
 
     def test_reason(self):
         """WebSocketDisconnect accepts a reason."""
-        from fastapi_rs.exceptions import WebSocketDisconnect
+        from fastapi_turbo.exceptions import WebSocketDisconnect
         exc = WebSocketDisconnect(code=1000, reason="Normal closure")
         assert exc.reason == "Normal closure"
 
     def test_is_exception(self):
         """WebSocketDisconnect is an Exception subclass."""
-        from fastapi_rs.exceptions import WebSocketDisconnect
+        from fastapi_turbo.exceptions import WebSocketDisconnect
         assert issubclass(WebSocketDisconnect, Exception)
 
     def test_default_reason_none(self):
         """WebSocketDisconnect defaults reason to None."""
-        from fastapi_rs.exceptions import WebSocketDisconnect
+        from fastapi_turbo.exceptions import WebSocketDisconnect
         exc = WebSocketDisconnect()
         assert exc.reason is None
 
@@ -601,26 +601,26 @@ class TestWebSocketIterators:
 
     def test_websocket_has_iter_text(self):
         """WebSocket has iter_text method."""
-        from fastapi_rs.websockets import WebSocket
+        from fastapi_turbo.websockets import WebSocket
         ws = WebSocket()
         assert hasattr(ws, "iter_text")
 
     def test_websocket_has_iter_bytes(self):
         """WebSocket has iter_bytes method."""
-        from fastapi_rs.websockets import WebSocket
+        from fastapi_turbo.websockets import WebSocket
         ws = WebSocket()
         assert hasattr(ws, "iter_bytes")
 
     def test_websocket_has_iter_json(self):
         """WebSocket has iter_json method."""
-        from fastapi_rs.websockets import WebSocket
+        from fastapi_turbo.websockets import WebSocket
         ws = WebSocket()
         assert hasattr(ws, "iter_json")
 
     def test_iter_text_is_async_generator(self):
         """iter_text returns an async generator."""
         import inspect
-        from fastapi_rs.websockets import WebSocket
+        from fastapi_turbo.websockets import WebSocket
         ws = WebSocket()
         gen = ws.iter_text()
         assert inspect.isasyncgen(gen)
@@ -628,7 +628,7 @@ class TestWebSocketIterators:
     def test_iter_bytes_is_async_generator(self):
         """iter_bytes returns an async generator."""
         import inspect
-        from fastapi_rs.websockets import WebSocket
+        from fastapi_turbo.websockets import WebSocket
         ws = WebSocket()
         gen = ws.iter_bytes()
         assert inspect.isasyncgen(gen)
@@ -636,7 +636,7 @@ class TestWebSocketIterators:
     def test_iter_json_is_async_generator(self):
         """iter_json returns an async generator."""
         import inspect
-        from fastapi_rs.websockets import WebSocket
+        from fastapi_turbo.websockets import WebSocket
         ws = WebSocket()
         gen = ws.iter_json()
         assert inspect.isasyncgen(gen)
@@ -644,7 +644,7 @@ class TestWebSocketIterators:
     def test_iter_json_accepts_mode(self):
         """iter_json accepts a mode parameter."""
         import inspect
-        from fastapi_rs.websockets import WebSocket
+        from fastapi_turbo.websockets import WebSocket
         ws = WebSocket()
         gen = ws.iter_json(mode="binary")
         assert inspect.isasyncgen(gen)
@@ -660,7 +660,7 @@ class TestGenerateUniqueIdFunction:
 
     def test_default_no_custom_id(self):
         """Without generate_unique_id_function, operation_id is None by default."""
-        from fastapi_rs.routing import APIRoute
+        from fastapi_turbo.routing import APIRoute
 
         def handler():
             return {}
@@ -670,7 +670,7 @@ class TestGenerateUniqueIdFunction:
 
     def test_explicit_operation_id_takes_precedence(self):
         """Explicit operation_id takes precedence over generate_unique_id_function."""
-        from fastapi_rs.routing import APIRoute
+        from fastapi_turbo.routing import APIRoute
 
         def handler():
             return {}
@@ -688,7 +688,7 @@ class TestGenerateUniqueIdFunction:
 
     def test_generate_unique_id_function_called(self):
         """generate_unique_id_function is called to set operation_id."""
-        from fastapi_rs.routing import APIRoute
+        from fastapi_turbo.routing import APIRoute
 
         def handler():
             return {}
@@ -705,7 +705,7 @@ class TestGenerateUniqueIdFunction:
 
     def test_default_generate_unique_id(self):
         """_default_generate_unique_id generates sensible IDs."""
-        from fastapi_rs.routing import _default_generate_unique_id, APIRoute
+        from fastapi_turbo.routing import _default_generate_unique_id, APIRoute
 
         def my_handler():
             return {}
@@ -716,7 +716,7 @@ class TestGenerateUniqueIdFunction:
 
     def test_generate_unique_id_function_stored(self):
         """generate_unique_id_function is stored on the route."""
-        from fastapi_rs.routing import APIRoute
+        from fastapi_turbo.routing import APIRoute
 
         def handler():
             return {}
@@ -741,21 +741,21 @@ class TestTraceMethod:
 
     def test_fastapi_has_trace(self):
         """FastAPI has a trace() method."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
         assert hasattr(app, "trace")
         assert callable(app.trace)
 
     def test_router_has_trace(self):
         """APIRouter has a trace() method."""
-        from fastapi_rs.routing import APIRouter
+        from fastapi_turbo.routing import APIRouter
         router = APIRouter()
         assert hasattr(router, "trace")
         assert callable(router.trace)
 
     def test_trace_registers_route(self):
         """app.trace() registers a TRACE route."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.trace("/debug")
@@ -768,7 +768,7 @@ class TestTraceMethod:
 
     def test_trace_on_router(self):
         """router.trace() registers a TRACE route."""
-        from fastapi_rs.routing import APIRouter
+        from fastapi_turbo.routing import APIRouter
         router = APIRouter()
 
         @router.trace("/debug")
@@ -781,7 +781,7 @@ class TestTraceMethod:
 
     def test_trace_route_endpoint(self):
         """TRACE route stores the correct endpoint."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.trace("/debug")
@@ -793,7 +793,7 @@ class TestTraceMethod:
 
     def test_trace_with_kwargs(self):
         """TRACE route accepts kwargs like tags."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.trace("/debug", tags=["debug"])
@@ -805,7 +805,7 @@ class TestTraceMethod:
 
     def test_trace_multiple_routes(self):
         """Multiple TRACE routes can be registered."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.trace("/debug1")

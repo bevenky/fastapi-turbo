@@ -46,7 +46,7 @@ pub fn set_server_addr(host: String, port: u16) -> Result<(), (String, u16)> {
 fn bg_tasks_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     if let Some(c) = BG_TASKS_CLS.get() { return Ok(c); }
     let cls: Py<PyAny> = py
-        .import("fastapi_rs.background")?
+        .import("fastapi_turbo.background")?
         .getattr("BackgroundTasks")?
         .unbind();
     let _ = BG_TASKS_CLS.set(cls);
@@ -56,7 +56,7 @@ fn bg_tasks_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
 fn request_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     if let Some(c) = REQUEST_CLS.get() { return Ok(c); }
     let cls: Py<PyAny> = py
-        .import("fastapi_rs.requests")?
+        .import("fastapi_turbo.requests")?
         .getattr("Request")?
         .unbind();
     let _ = REQUEST_CLS.set(cls);
@@ -66,7 +66,7 @@ fn request_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
 fn response_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     if let Some(c) = RESPONSE_CLS.get() { return Ok(c); }
     let cls: Py<PyAny> = py
-        .import("fastapi_rs.responses")?
+        .import("fastapi_turbo.responses")?
         .getattr("Response")?
         .unbind();
     let _ = RESPONSE_CLS.set(cls);
@@ -242,7 +242,7 @@ fn inject_framework_objects(
             "inject_security_scopes" => {
                 // Empty SecurityScopes — real scope collection from
                 // nested Security() dep chain happens in the resolver.
-                let ss_mod = py.import("fastapi_rs.security")?;
+                let ss_mod = py.import("fastapi_turbo.security")?;
                 let ss_cls = ss_mod.getattr("SecurityScopes")?;
                 let scopes_list = pyo3::types::PyList::empty(py);
                 let kw = PyDict::new(py);
@@ -779,7 +779,7 @@ struct RouteState {
     has_form_params: bool,
     has_http_middleware: bool,
     /// True when the Python handler advertises
-    /// ``_fastapi_rs_defers_extraction_errors = True`` — the compile
+    /// ``_fastapi_turbo_defers_extraction_errors = True`` — the compile
     /// pipeline sets this on routes with `Depends(...)` so that
     /// ``HTTPException`` raised from a dep body wins over accumulated
     /// parameter-validation 422s (FA-normative precedence).
@@ -923,7 +923,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
             // calls `validate_python(data, from_attributes=True)`. This
             // matches stock FastAPI's error shape (`model_attributes_type`
             // instead of `model_type`, FA-style messages, no ctx).
-            let fa_factory = py.import("fastapi_rs._introspect")
+            let fa_factory = py.import("fastapi_turbo._introspect")
                 .and_then(|m| m.getattr("_make_fa_body_validator"))
                 .ok();
             for param in &mut params {
@@ -964,15 +964,15 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     .and_then(|v| v.extract::<bool>(py))
                     .unwrap_or(false),
                 defers_extraction_errors: route.handler
-                    .getattr(py, "_fastapi_rs_defers_extraction_errors")
+                    .getattr(py, "_fastapi_turbo_defers_extraction_errors")
                     .and_then(|v| v.extract::<bool>(py))
                     .unwrap_or(false),
                 lax_content_type: route.handler
-                    .getattr(py, "_fastapi_rs_lax_content_type")
+                    .getattr(py, "_fastapi_turbo_lax_content_type")
                     .and_then(|v| v.extract::<bool>(py))
                     .unwrap_or(false),
                 route_obj: route.handler
-                    .getattr(py, "_fastapi_rs_route_obj")
+                    .getattr(py, "_fastapi_turbo_route_obj")
                     .ok(),
             })
         });
@@ -1013,7 +1013,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     axum::routing::MethodFilter::TRACE, handler_fn,
                 ),
                 other => {
-                    eprintln!("fastapi-rs: unsupported HTTP method '{other}', skipping");
+                    eprintln!("fastapi-turbo: unsupported HTTP method '{other}', skipping");
                     continue;
                 }
             };
@@ -1057,7 +1057,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     // the whole route since we can't split the
                     // MethodRouter. Rare; a warning helps surface it.
                     eprintln!(
-                        "fastapi-rs: duplicate method(s) {dup:?} on path {axum_path:?}, skipping second registration"
+                        "fastapi-turbo: duplicate method(s) {dup:?} on path {axum_path:?}, skipping second registration"
                     );
                 }
             } else {
@@ -1450,7 +1450,7 @@ async fn handle_request(
                         if let Some(ref raw) = raw_body_for_mw {
                             if !raw.is_empty() {
                                 let _ = kwargs.set_item(
-                                    "__fastapi_rs_raw_body_bytes__",
+                                    "__fastapi_turbo_raw_body_bytes__",
                                     pyo3::types::PyBytes::new(py, raw),
                                 );
                             }
@@ -1499,7 +1499,7 @@ async fn handle_request(
                     if let Some(ref raw) = raw_body_for_mw {
                         if !raw.is_empty() {
                             let _ = kwargs.set_item(
-                                "__fastapi_rs_raw_body_bytes__",
+                                "__fastapi_turbo_raw_body_bytes__",
                                 pyo3::types::PyBytes::new(py, raw),
                             );
                         }
@@ -1536,7 +1536,7 @@ async fn handle_request(
                         if let Some(ref raw) = raw_body_for_mw {
                             if !raw.is_empty() {
                                 let _ = kwargs.set_item(
-                                    "__fastapi_rs_raw_body_bytes__",
+                                    "__fastapi_turbo_raw_body_bytes__",
                                     pyo3::types::PyBytes::new(py, raw),
                                 );
                             }
@@ -1572,7 +1572,7 @@ async fn handle_request(
                         if let Some(ref raw) = raw_body_for_mw {
                             if !raw.is_empty() {
                                 let _ = kwargs.set_item(
-                                    "__fastapi_rs_raw_body_bytes__",
+                                    "__fastapi_turbo_raw_body_bytes__",
                                     pyo3::types::PyBytes::new(py, raw),
                                 );
                             }
@@ -1612,7 +1612,7 @@ async fn handle_request(
                         if let Some(ref raw) = raw_body_for_mw {
                             if !raw.is_empty() {
                                 let _ = kwargs.set_item(
-                                    "__fastapi_rs_raw_body_bytes__",
+                                    "__fastapi_turbo_raw_body_bytes__",
                                     pyo3::types::PyBytes::new(py, raw),
                                 );
                             }
@@ -1849,7 +1849,7 @@ fn extract_params_to_pydict_full<'py>(
     // sentinel kwarg.
     if defers_extraction_errors && !body_bytes.is_empty() {
         if let Ok(raw_str) = std::str::from_utf8(body_bytes) {
-            let _ = kwargs.set_item("__fastapi_rs_raw_body_str__", raw_str);
+            let _ = kwargs.set_item("__fastapi_turbo_raw_body_str__", raw_str);
         }
     }
 
@@ -2362,7 +2362,7 @@ fn extract_params_to_pydict_full<'py>(
             })));
         }
         let err_json = serde_json::Value::Array(extraction_errors).to_string();
-        let _ = kwargs.set_item("__fastapi_rs_extraction_errors__", err_json);
+        let _ = kwargs.set_item("__fastapi_turbo_extraction_errors__", err_json);
     }
 
     // Expose RAW request dicts so param-model builders can feed them
@@ -2405,7 +2405,7 @@ fn extract_params_to_pydict_full<'py>(
                     let _ = qd.set_item(k, list);
                 }
             }
-            let _ = kwargs.set_item("__fastapi_rs_raw_query__", qd);
+            let _ = kwargs.set_item("__fastapi_turbo_raw_query__", qd);
         }
         if has_header_pm {
             if let Some(h) = headers {
@@ -2435,7 +2435,7 @@ fn extract_params_to_pydict_full<'py>(
                         let _ = hd.set_item(k.as_str(), list);
                     }
                 }
-                let _ = kwargs.set_item("__fastapi_rs_raw_headers__", hd);
+                let _ = kwargs.set_item("__fastapi_turbo_raw_headers__", hd);
             }
         }
         if has_cookie_pm {
@@ -2449,7 +2449,7 @@ fn extract_params_to_pydict_full<'py>(
                         }
                     }
                 }
-                let _ = kwargs.set_item("__fastapi_rs_raw_cookies__", cd);
+                let _ = kwargs.set_item("__fastapi_turbo_raw_cookies__", cd);
             }
         }
         if has_form_pm {
@@ -2470,7 +2470,7 @@ fn extract_params_to_pydict_full<'py>(
                         let _ = fd.set_item(k.as_str(), list);
                     }
                 }
-                let _ = kwargs.set_item("__fastapi_rs_raw_form__", fd);
+                let _ = kwargs.set_item("__fastapi_turbo_raw_form__", fd);
             }
         }
     }
@@ -3049,7 +3049,7 @@ fn try_coerce_str_to_py(py: Python<'_>, raw: &str, type_hint: &str) -> Option<Py
         "bool" => {
             // Pydantic-v2's bool coercion accepts `t/f/y/n` and capitalized
             // forms in addition to the usual true/false spellings. Match
-            // that set so FastAPI and fastapi-rs agree on `?flag=t`.
+            // that set so FastAPI and fastapi-turbo agree on `?flag=t`.
             let lower = raw.to_ascii_lowercase();
             match lower.as_str() {
                 "true" | "t" | "1" | "yes" | "y" | "on" => Some(

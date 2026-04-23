@@ -2,7 +2,7 @@
 
 Uses ONLY stock FastAPI imports so the same code runs under both:
   - Real FastAPI + uvicorn (reference)
-  - fastapi-rs with compat shim (under test)
+  - fastapi-turbo with compat shim (under test)
 
 150 endpoints exercising middleware, error handling, lifecycle/state,
 and router composition patterns.
@@ -924,7 +924,7 @@ def sub_endpoint():
     return {"sub": True}
 
 
-# Note: mount behavior differs between FastAPI and fastapi-rs
+# Note: mount behavior differs between FastAPI and fastapi-turbo
 # We test via direct include_router for compatibility
 sub_router = APIRouter()
 
@@ -1424,7 +1424,7 @@ def p245_list_dicts():
 
 @app.get("/p246/int-response")
 def p246_int():
-    # Bare scalar returns are edge cases in fastapi-rs; wrap for parity
+    # Bare scalar returns are edge cases in fastapi-turbo; wrap for parity
     return {"value": 42}
 
 

@@ -1,10 +1,10 @@
 """Deep validation parity app: ~150 endpoints exercising Pydantic v2 validation edge cases.
 
-Uses ONLY stock FastAPI imports. The compat shim maps these to fastapi-rs when
-the app is started under fastapi-rs.
+Uses ONLY stock FastAPI imports. The compat shim maps these to fastapi-turbo when
+the app is started under fastapi-turbo.
 
 Every endpoint is designed to produce specific, reproducible Pydantic ValidationErrors
-so we can compare response bodies field-by-field between stock FastAPI and fastapi-rs.
+so we can compare response bodies field-by-field between stock FastAPI and fastapi-turbo.
 """
 from __future__ import annotations
 

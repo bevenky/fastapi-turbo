@@ -1,6 +1,6 @@
 """Run audit_vllm_sglang app and test every endpoint.
 
-Pass == fastapi-rs fully handles every vLLM / SGLang pattern.
+Pass == fastapi-turbo fully handles every vLLM / SGLang pattern.
 """
 from __future__ import annotations
 

@@ -3,7 +3,7 @@
 
 For each of parity_app_redis (sync) and parity_app_redis_async (async):
   - boots stock FastAPI via uvicorn
-  - boots fastapi-rs
+  - boots fastapi-turbo
   - runs ~250 tests that exercise Redis commands + high-level patterns
   - compares (status, body-json, selected headers) between FA and FR
   - clears Redis (FLUSHDB) before every test so state is isolated
@@ -112,7 +112,7 @@ def wait_for_port(port, timeout=STARTUP_TIMEOUT):
 def start_uvicorn(port: int, app_module: str):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
-    env.pop("FASTAPI_RS", None)
+    env.pop("FASTAPI_TURBO", None)
     env["REDIS_HOST"] = HOST
     env["REDIS_PORT"] = str(REDIS_PORT)
     return subprocess.Popen(
@@ -123,7 +123,7 @@ def start_uvicorn(port: int, app_module: str):
     )
 
 
-def start_fastapi_rs(port: int, app_import: str):
+def start_fastapi_turbo(port: int, app_import: str):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
     env["REDIS_HOST"] = HOST
@@ -131,7 +131,7 @@ def start_fastapi_rs(port: int, app_import: str):
     script = f"""
 import sys
 sys.path.insert(0, '{PROJECT_ROOT}')
-from fastapi_rs.compat import install
+from fastapi_turbo.compat import install
 install()
 from {app_import} import app
 app.run(host='{HOST}', port={port})
@@ -166,7 +166,7 @@ _CLIENTS: dict[str, httpx.Client] = {}
 def _client(base: str) -> httpx.Client:
     c = _CLIENTS.get(base)
     if c is None:
-        # Short timeout: when fastapi-rs hangs on a broken handler we don't
+        # Short timeout: when fastapi-turbo hangs on a broken handler we don't
         # want to wait 10s per request. 1.2s is plenty for Redis ops.
         c = httpx.Client(base_url=base, timeout=1.2, follow_redirects=False)
         _CLIENTS[base] = c
@@ -188,7 +188,7 @@ def _tick_fr_result(fr: Any, fr_base: str):
         _CIRCUIT["fr_fail_streak"] += 1
         if _CIRCUIT["fr_fail_streak"] >= 20 and not _fr_broken(fr_base):
             _CIRCUIT["fr_broken_suite"] = fr_base
-            print(f"{RED}⚠ fastapi-rs broken: tripping circuit breaker on {fr_base}{RESET}")
+            print(f"{RED}⚠ fastapi-turbo broken: tripping circuit breaker on {fr_base}{RESET}")
     else:
         _CIRCUIT["fr_fail_streak"] = 0
 
@@ -1521,8 +1521,8 @@ def run_suite(suite: Suite, fa_base: str, fr_base: str):
 def boot_pair(app_module: str, app_import: str, fa_port: int, fr_port: int):
     print(f"Starting uvicorn ({app_module}) on :{fa_port}…")
     fa = start_uvicorn(fa_port, app_module)
-    print(f"Starting fastapi-rs ({app_import}) on :{fr_port}…")
-    fr = start_fastapi_rs(fr_port, app_import)
+    print(f"Starting fastapi-turbo ({app_import}) on :{fr_port}…")
+    fr = start_fastapi_turbo(fr_port, app_import)
     if not wait_for_port(fa_port):
         try:
             out = fa.stderr.read(2000).decode(errors="ignore")
@@ -1535,7 +1535,7 @@ def boot_pair(app_module: str, app_import: str, fa_port: int, fr_port: int):
             out = fr.stderr.read(2000).decode(errors="ignore")
         except Exception:
             out = ""
-        print(f"{RED}fastapi-rs failed to start on :{fr_port}{RESET}\n{out}")
+        print(f"{RED}fastapi-turbo failed to start on :{fr_port}{RESET}\n{out}")
         return fa, fr, False
     # Verify /health on both
     for base in [f"http://{HOST}:{fa_port}", f"http://{HOST}:{fr_port}"]:

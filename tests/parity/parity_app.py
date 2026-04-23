@@ -1,7 +1,7 @@
 """Parity mega-app: 100 endpoints testing every FastAPI pattern.
 
-Uses ONLY stock FastAPI imports. The compat shim maps these to fastapi-rs
-when running under fastapi-rs.
+Uses ONLY stock FastAPI imports. The compat shim maps these to fastapi-turbo
+when running under fastapi-turbo.
 """
 import asyncio
 import enum

@@ -5,7 +5,7 @@
 //! GIL is only acquired to convert results to Python dicts.
 //!
 //! Usage from Python:
-//!   from fastapi_rs.db import Pool
+//!   from fastapi_turbo.db import Pool
 //!   pool = Pool("postgresql://user@localhost/mydb")
 //!   row = pool.query_one("SELECT * FROM users WHERE id=$1", [1])
 //!   rows = pool.query("SELECT * FROM users LIMIT $1", [10])

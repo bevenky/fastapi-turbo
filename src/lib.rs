@@ -25,7 +25,7 @@ fn core_version() -> &'static str {
 
 /// The PyO3 module definition.
 #[pymodule(gil_used = false)]
-fn _fastapi_rs_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _fastapi_turbo_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_hello, m)?)?;
     m.add_function(wrap_pyfunction!(core_version, m)?)?;
     m.add_function(wrap_pyfunction!(server::run_server, m)?)?;

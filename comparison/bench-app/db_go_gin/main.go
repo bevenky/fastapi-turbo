@@ -4,7 +4,7 @@
 // Exercises: JOINs, pagination, aggregation, INSERT RETURNING,
 // Redis caching, multi-table queries.
 //
-// Same endpoints as db_fastapi_rs_app.py for fair comparison.
+// Same endpoints as db_fastapi_turbo_app.py for fair comparison.
 //
 // Build: cd db_go_gin && go mod tidy && go build -o db-gin .
 package main
@@ -79,7 +79,7 @@ func main() {
 	ctx := context.Background()
 
 	// PostgreSQL connection pool (same size as Python app: min=5, max=20)
-	poolConfig, err := pgxpool.ParseConfig("postgresql://venky@localhost/fastapi_rs_bench")
+	poolConfig, err := pgxpool.ParseConfig("postgresql://venky@localhost/fastapi_turbo_bench")
 	if err != nil {
 		log.Fatalf("Failed to parse PG config: %v", err)
 	}

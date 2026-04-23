@@ -1,4 +1,4 @@
-# fastapi-rs Benchmarks
+# fastapi-turbo Benchmarks
 
 ## Test Environment
 
@@ -13,13 +13,13 @@
 
 ---
 
-## 2026-04-20 — fastapi-rs vs FastAPI+uvicorn vs Go Gin (head-to-head)
+## 2026-04-20 — fastapi-turbo vs FastAPI+uvicorn vs Go Gin (head-to-head)
 
 *All three servers run an endpoint-identical app. `20,000` requests per
 endpoint after `3,000` warmup, single TCP connection, HTTP/1.1 keep-alive,
 compiled Rust bench client.*
 
-| Endpoint | FA+uvicorn p50 | **fastapi-rs p50** | Go Gin p50 | FA req/s | **FR req/s** | Gin req/s | FR vs FA | FR vs Gin |
+| Endpoint | FA+uvicorn p50 | **fastapi-turbo p50** | Go Gin p50 | FA req/s | **FR req/s** | Gin req/s | FR vs FA | FR vs Gin |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
 | GET /hello (plain JSON) | 162 μs | **25 μs** | 24 μs | 6,133 | **38,698** | 39,319 | **6.5×** | 0.96× |
 | GET /path/42 (path param + int coerce) | 171 μs | **27 μs** | 24 μs | 5,819 | **36,118** | 38,871 | **6.3×** | 0.89× |
@@ -30,7 +30,7 @@ compiled Rust bench client.*
 
 ### Takeaways
 
-- **4–7× faster p50 than stock FastAPI + uvicorn** — fastapi-rs processes
+- **4–7× faster p50 than stock FastAPI + uvicorn** — fastapi-turbo processes
   each request in 25–37 µs vs 110–196 µs for FastAPI.
 - **Within 4–24% of Go Gin on p50**, matching Gin on `GET /hello`
   (25 vs 24 µs) and landing within a few microseconds on every other
@@ -43,7 +43,7 @@ compiled Rust bench client.*
   validation and typed errors, which Gin doesn't provide (its
   `ShouldBindJSON` returns a raw error string).
 - **`/with-deps` (2-level `Depends` chain + Header extraction, both deps
-  `async def`)** — fastapi-rs statically scans async functions for
+  `async def`)** — fastapi-turbo statically scans async functions for
   `await` expressions and drives await-free ones on the calling thread
   (~2 µs) instead of submitting to the shared worker loop (~30 µs).
   Real async deps that hit the DB still run on the shared loop to
@@ -57,7 +57,7 @@ Reproducing:
 
 ```bash
 source /Users/venky/tech/jamun_env/bin/activate
-cargo build --release --bin fastapi-rs-bench
+cargo build --release --bin fastapi-turbo-bench
 (cd benchmarks/go-gin && go build -o bench-gin .)
 python benchmarks/run_bench.py
 ```
@@ -72,12 +72,12 @@ python benchmarks/run_bench.py
 |---|-----------|-----|-----|-----|-------|
 | 1 | **Pure Rust Axum** | **18 μs** | 29 μs | 12 μs | 53,085 |
 | 2 | Node.js Fastify | 22 μs | 38 μs | 14 μs | 43,045 |
-| 3 | **fastapi-rs** | **24 μs** | **37 μs** | 15 μs | **41,392** |
+| 3 | **fastapi-turbo** | **24 μs** | **37 μs** | 15 μs | **41,392** |
 | 3 | Go Gin | 24 μs | 40 μs | 15 μs | 39,760 |
 | 3 | Go Echo | 24 μs | 43 μs | 16 μs | 40,252 |
 | 6 | FastAPI + uvicorn | 188 μs | 230 μs | 155 μs | 5,272 |
 
-**fastapi-rs ties Go Gin and Go Echo, and beats Go on throughput** (41,392 vs 39,760 req/s).
+**fastapi-turbo ties Go Gin and Go Echo, and beats Go on throughput** (41,392 vs 39,760 req/s).
 
 ### GET /with-deps (2-level dependency injection + header extraction)
 
@@ -87,10 +87,10 @@ python benchmarks/run_bench.py
 | 2 | Node.js Fastify | 22 μs | 35 μs | 14 μs | 44,163 | Manual |
 | 3 | Go Gin | 24 μs | 69 μs | 16 μs | 37,687 | Manual |
 | 3 | Go Echo | 24 μs | 36 μs | 16 μs | 41,079 | Manual |
-| 5 | **fastapi-rs** | **25 μs** | **40 μs** | 19 μs | **38,302** | FastAPI Depends() |
+| 5 | **fastapi-turbo** | **25 μs** | **40 μs** | 19 μs | **38,302** | FastAPI Depends() |
 | 6 | FastAPI + uvicorn | 126 μs | 155 μs | 109 μs | 7,853 | Depends() per-request |
 
-**fastapi-rs is just 1μs behind Go Gin** with full FastAPI Depends() DI and **has better p99** (40μs vs 69μs). fastapi-rs **beats Go Gin on throughput** (38,302 vs 37,687 req/s).
+**fastapi-turbo is just 1μs behind Go Gin** with full FastAPI Depends() DI and **has better p99** (40μs vs 69μs). fastapi-turbo **beats Go Gin on throughput** (38,302 vs 37,687 req/s).
 
 ### POST /items (JSON body + validation: `{"name": "widget", "price": 9.99}`)
 
@@ -99,13 +99,13 @@ python benchmarks/run_bench.py
 | 1 | **Pure Rust Axum** | **19 μs** | 33 μs | 14 μs | 49,342 | serde (compile-time) |
 | 2 | Go Gin | 25 μs | 48 μs | 17 μs | 37,620 | encoding/json |
 | 2 | Go Echo | 25 μs | 39 μs | 17 μs | 38,725 | encoding/json |
-| 4 | **fastapi-rs** | **28 μs** | **44 μs** | 20 μs | **35,061** | Pydantic v2 (Rust) |
+| 4 | **fastapi-turbo** | **28 μs** | **44 μs** | 20 μs | **35,061** | Pydantic v2 (Rust) |
 | 5 | Node.js Fastify | 30 μs | 44 μs | 20 μs | 32,176 | Ajv schema |
 | 6 | FastAPI + uvicorn | 206 μs | 244 μs | 173 μs | 4,828 | Pydantic v2 |
 
-**fastapi-rs BEATS Node.js Fastify on POST** (28μs vs 30μs) and is only 3μs behind Go.
+**fastapi-turbo BEATS Node.js Fastify on POST** (28μs vs 30μs) and is only 3μs behind Go.
 
-### Other HTTP Methods (fastapi-rs only)
+### Other HTTP Methods (fastapi-turbo only)
 
 | Method | Endpoint | p50 | p99 | min | req/s |
 |--------|----------|-----|-----|-----|-------|
@@ -124,14 +124,14 @@ PATCH and DELETE (no body) are as fast as GET — **22μs**, proving the body pa
 | 1 | **Pure Rust Axum** (zero Python) | **45 μs** | 32 μs | 21,766 | Axum WS baseline — beats Go! |
 | 2 | Node.js Fastify | 47 μs | 36 μs | 20,694 | |
 | 3 | Go Gin | 48 μs | 34 μs | 20,727 | |
-| 4 | **fastapi-rs SYNC handler** | **57 μs** | 43 μs | **17,339** | 12μs behind pure Rust (GIL cost) |
-| 4 | **fastapi-rs ASYNC handler** | **58 μs** | 45 μs | **16,996** | ChannelAwaitable — matches sync! |
+| 4 | **fastapi-turbo SYNC handler** | **57 μs** | 43 μs | **17,339** | 12μs behind pure Rust (GIL cost) |
+| 4 | **fastapi-turbo ASYNC handler** | **58 μs** | 45 μs | **16,996** | ChannelAwaitable — matches sync! |
 | 6 | FastAPI + uvicorn | 120 μs | 94 μs | 8,243 | |
 
 **Key findings:**
-- Pure Rust Axum WS **beats Go Gin by 3μs** — fastapi-rs's Rust layer is faster than Go for WS
-- fastapi-rs SYNC handler is **9μs behind Go, 2.1x faster than FastAPI**
-- The 12μs gap between fastapi-rs sync and pure Axum = 2 GIL crossings (receive + send)
+- Pure Rust Axum WS **beats Go Gin by 3μs** — fastapi-turbo's Rust layer is faster than Go for WS
+- fastapi-turbo SYNC handler is **9μs behind Go, 2.1x faster than FastAPI**
+- The 12μs gap between fastapi-turbo sync and pure Axum = 2 GIL crossings (receive + send)
 
 **WS optimization history:**
 | Version | Technique | p50 | vs Go |
@@ -169,7 +169,7 @@ Run with: `comparison/bench-app/run_files_benchmark.sh`
 
 ### Throughput (req/s, higher is better)
 
-| Endpoint            | fastapi-rs | Go Gin  | Fastify |
+| Endpoint            | fastapi-turbo | Go Gin  | Fastify |
 |---------------------|-----------:|--------:|--------:|
 | POST /upload 1 KB   | 12,167     | 31,918  | 16,679  |
 | POST /upload 64 KB  | **10,668** | 8,835   | 10,827  |
@@ -180,7 +180,7 @@ Run with: `comparison/bench-app/run_files_benchmark.sh`
 
 ### Latency p50 (μs, lower is better)
 
-| Endpoint            | fastapi-rs | Go Gin | Fastify |
+| Endpoint            | fastapi-turbo | Go Gin | Fastify |
 |---------------------|-----------:|-------:|--------:|
 | POST /upload 1 KB   | 81         | **29** | 57      |
 | POST /upload 64 KB  | 92         | 89     | 84      |
@@ -191,9 +191,9 @@ Run with: `comparison/bench-app/run_files_benchmark.sh`
 
 **Takeaways**
 
-- fastapi-rs **beats Go Gin** on 64 KB multipart uploads (10,668 vs 8,835 req/s)
+- fastapi-turbo **beats Go Gin** on 64 KB multipart uploads (10,668 vs 8,835 req/s)
   and ties Fastify.
-- fastapi-rs **beats Fastify by 2x** on FileResponse downloads (all sizes),
+- fastapi-turbo **beats Fastify by 2x** on FileResponse downloads (all sizes),
   and lands within 5–10% of Go Gin on downloads.
 - Static file serving is 30–40% slower than Go (tower-http ServeDir + mount
   dispatch overhead); still beats Fastify. Room to close the gap by caching
@@ -203,9 +203,9 @@ Run with: `comparison/bench-app/run_files_benchmark.sh`
 
 ---
 
-## fastapi-rs vs FastAPI Speedup
+## fastapi-turbo vs FastAPI Speedup
 
-| Endpoint | FastAPI + uvicorn | fastapi-rs | Speedup |
+| Endpoint | FastAPI + uvicorn | fastapi-turbo | Speedup |
 |----------|-------------------|-------|---------|
 | GET /hello | 188 μs | 24 μs | **7.8x** |
 | GET /with-deps | 126 μs | 25 μs | **5.0x** |
@@ -218,15 +218,15 @@ Run with: `comparison/bench-app/run_files_benchmark.sh`
 
 ### psycopg3 autocommit + pipeline: beats Go goroutines
 
-Using `fastapi_rs.db.create_pool()` with autocommit=True and pipeline mode:
+Using `fastapi_turbo.db.create_pool()` with autocommit=True and pipeline mode:
 
-| Queries | fastapi-rs | Go Gin (pgx) | Winner |
+| Queries | fastapi-turbo | Go Gin (pgx) | Winner |
 |---------|-----------|--------------|--------|
-| **1 query** | **53 μs** | 56 μs | **fastapi-rs beats Go** |
-| **4 seq** | **104 μs** | 144 μs | **fastapi-rs by 40 μs** |
+| **1 query** | **53 μs** | 56 μs | **fastapi-turbo beats Go** |
+| **4 seq** | **104 μs** | 144 μs | **fastapi-turbo by 40 μs** |
 | **4 pipeline vs goroutine** | **96 μs** | 79 μs | Go by 17 μs |
-| **10 seq** | **197 μs** | 321 μs | **fastapi-rs by 124 μs** |
-| **10 pipeline vs goroutine** | **138 μs** | 148 μs | **fastapi-rs beats Go** |
+| **10 seq** | **197 μs** | 321 μs | **fastapi-turbo by 124 μs** |
+| **10 pipeline vs goroutine** | **138 μs** | 148 μs | **fastapi-turbo beats Go** |
 
 Pipeline mode sends all queries in ONE network round-trip. Combined with autocommit (no BEGIN/COMMIT overhead), this matches or beats Go's goroutine parallelism.
 
@@ -282,7 +282,7 @@ Redis pipeline has zero overhead for single commands (29 μs vs 30 μs). Pipelin
 
 **PostgreSQL — Sequential vs Pipeline/Parallel:**
 
-| Queries | fastapi-rs | Go Gin | Go Echo | Fastify | FastAPI |
+| Queries | fastapi-turbo | Go Gin | Go Echo | Fastify | FastAPI |
 |---------|-----------|--------|---------|---------|---------|
 | 1 seq | **53 μs** | 55 μs | 56 μs | 77 μs | 281 μs |
 | 4 seq | **104 μs** | 144 μs | 146 μs | 226 μs | — |
@@ -290,11 +290,11 @@ Redis pipeline has zero overhead for single commands (29 μs vs 30 μs). Pipelin
 | 4 pipe/parallel | **96 μs** | 78 μs (goroutine) | 80 μs | 97 μs (Promise.all) | 447 μs (gather) |
 | 10 pipe/parallel | **139 μs** | 147 μs (goroutine) | 155 μs | 144 μs (Promise.all) | 596 μs (gather) |
 
-fastapi-rs beats Go on 1 query, 4 seq, 10 seq, and 10 pipeline. Beats Fastify on everything.
+fastapi-turbo beats Go on 1 query, 4 seq, 10 seq, and 10 pipeline. Beats Fastify on everything.
 
 **Redis — Sequential vs Pipeline:**
 
-| GETs | fastapi-rs | Go Gin | Go Echo | Fastify | FastAPI |
+| GETs | fastapi-turbo | Go Gin | Go Echo | Fastify | FastAPI |
 |------|-----------|--------|---------|---------|---------|
 | 1 seq | 63 μs | **48 μs** | **48 μs** | **47 μs** | 218 μs |
 | 4 seq | 152 μs | 110 μs | 109 μs | 113 μs | 494 μs |
@@ -340,11 +340,11 @@ Drivers: psycopg2+redis-py (rs-sync), asyncpg+redis.asyncio (rs-async), pgx+go-r
 
 **Key findings:**
 
-1. **fastapi-rs sync TIES Fastify** on GET /products/1 (81 vs 81), GET /products list (94 vs 93), PATCH (121 vs 121)
-2. **fastapi-rs sync BEATS Fastify** on GET /orders/1 (100 vs 127), POST (123 vs 124), Express on everything
+1. **fastapi-turbo sync TIES Fastify** on GET /products/1 (81 vs 81), GET /products list (94 vs 93), PATCH (121 vs 121)
+2. **fastapi-turbo sync BEATS Fastify** on GET /orders/1 (100 vs 127), POST (123 vs 124), Express on everything
 3. **Go Gin/Echo lead** with pgx (fastest Postgres driver at 57 μs per query)
 4. **Rust Axum is surprisingly slow** for DB queries — tokio-postgres is slower than pgx and psycopg2
-5. **fastapi-rs async is 1.5-2x faster than FastAPI+uvicorn** across all DB endpoints
+5. **fastapi-turbo async is 1.5-2x faster than FastAPI+uvicorn** across all DB endpoints
 6. **Sync is 2-3x faster than async** for sequential DB operations (psycopg2 38 μs vs asyncpg 148 μs)
 
 ### Why sync beats async for DB operations
@@ -354,7 +354,7 @@ Drivers: psycopg2+redis-py (rs-sync), asyncpg+redis.asyncio (rs-async), pgx+go-r
 | **Sync** (`def` + psycopg2/redis-py) | Handler blocks on DB call inside `block_in_place`. Tokio migrates other tasks to other workers. Zero event loop overhead. | Sequential DB operations (most API endpoints) |
 | **Async** (`async def` + asyncpg/redis.asyncio) | Handler runs on dedicated event loop thread via `run_until_complete` + uvloop. Event loop adds ~80-150 μs overhead per query. | Concurrent I/O within one handler (e.g., parallel API calls) |
 
-fastapi-rs supports both patterns. Sync handlers with `block_in_place` work like Go goroutines — the blocking is isolated to one tokio worker thread while others continue serving requests.
+fastapi-turbo supports both patterns. Sync handlers with `block_in_place` work like Go goroutines — the blocking is isolated to one tokio worker thread while others continue serving requests.
 
 ### All 5 Databases — Raw Driver Performance
 
@@ -370,7 +370,7 @@ fastapi-rs supports both patterns. Sync handlers with `block_in_place` work like
 
 ## Outbound HTTP Client Benchmark (reqwest-based)
 
-`fastapi_rs.http.Client` — httpx-compatible Python API backed by Rust `reqwest`. Target: uvicorn ASGI server on localhost.
+`fastapi_turbo.http.Client` — httpx-compatible Python API backed by Rust `reqwest`. Target: uvicorn ASGI server on localhost.
 
 ### Single request latency
 
@@ -379,17 +379,17 @@ fastapi-rs supports both patterns. Sync handlers with `block_in_place` work like
 | Go `net/http` | 108 μs | 87 μs | 131 μs |
 | Node.js `undici` | 101 μs | 78 μs | 137 μs |
 | Python `http.client` (stdlib) | 108 μs | 83 μs | 127 μs |
-| **fastapi_rs.http** | **136 μs** | **112 μs** | 156 μs |
+| **fastapi_turbo.http** | **136 μs** | **112 μs** | 156 μs |
 | httpx | 244 μs | 199 μs | 316 μs |
 | requests | 383 μs | 342 μs | 590 μs |
 
-fastapi_rs.http is **2.2x faster than httpx** and **3.4x faster than requests** with the same feature set (HTTP/2, TLS, cookies, redirects, auth, compression, proxy).
+fastapi_turbo.http is **2.2x faster than httpx** and **3.4x faster than requests** with the same feature set (HTTP/2, TLS, cookies, redirects, auth, compression, proxy).
 
 ### Parallel requests — `gather()` vs ThreadPool vs async gather
 
 Time to complete N parallel GETs:
 
-| Parallel | Go goroutines | Node undici | **fastapi_rs gather** | httpx ThreadPool | httpx async |
+| Parallel | Go goroutines | Node undici | **fastapi_turbo gather** | httpx ThreadPool | httpx async |
 |----------|--------------|-------------|----------------------|-----------------|-------------|
 | x2 | 166 μs | 156 μs | 216 μs | 399 μs | 1,065 μs |
 | x4 | 277 μs | 266 μs | **310 μs** | 742 μs | 2,577 μs |
@@ -398,7 +398,7 @@ Time to complete N parallel GETs:
 
 **Per-request latency** (amortized):
 
-| Parallel | Go | Node | **fastapi_rs** | httpx ThreadPool | httpx async |
+| Parallel | Go | Node | **fastapi_turbo** | httpx ThreadPool | httpx async |
 |----------|-----|------|---------------|------------------|-------------|
 | x10 | 55 μs | 53 μs | **62 μs** | 184 μs | 699 μs |
 | x20 | 49 μs | 47 μs | **53 μs** | 178 μs | 779 μs |
@@ -476,7 +476,7 @@ Tested with `python-freethreading` (Homebrew), `#[pymodule(gil_used = false)]` d
 | 2 | Node.js Fastify | 23 μs | 38 μs | 16 μs | 41,471 |
 | 3 | Go Gin | 24 μs | 47 μs | 16 μs | 39,379 |
 | 4 | Go Echo | 24 μs | 38 μs | 16 μs | 40,020 |
-| 5 | **fastapi-rs** | **26 μs** | 78 μs | 18 μs | 35,021 |
+| 5 | **fastapi-turbo** | **26 μs** | 78 μs | 18 μs | 35,021 |
 | 6 | FastAPI + uvicorn | 187 μs | 224 μs | 154 μs | 5,301 |
 | 7 | FastAPI + socketify | 205 μs | 282 μs | 166 μs | 4,789 |
 
@@ -488,7 +488,7 @@ Tested with `python-freethreading` (Homebrew), `#[pymodule(gil_used = false)]` d
 | 2 | Node.js Fastify | 23 μs | 37 μs | 15 μs | 42,154 | Manual (no DI framework) |
 | 3 | Go Gin | 24 μs | 46 μs | 16 μs | 39,147 | Manual function calls |
 | 4 | Go Echo | 24 μs | 39 μs | 16 μs | 39,513 | Manual function calls |
-| 5 | **fastapi-rs** | **27 μs** | 56 μs | 20 μs | 34,854 | FastAPI Depends() — compiled at startup, executed in Rust |
+| 5 | **fastapi-turbo** | **27 μs** | 56 μs | 20 μs | 34,854 | FastAPI Depends() — compiled at startup, executed in Rust |
 | 6 | FastAPI + socketify | 63 μs | 87 μs | 51 μs | 15,315 | Depends() — runtime Python introspection per-request |
 | 7 | FastAPI + uvicorn | 127 μs | 185 μs | 108 μs | 7,741 | Depends() — runtime Python introspection per-request |
 
@@ -499,7 +499,7 @@ Tested with `python-freethreading` (Homebrew), `#[pymodule(gil_used = false)]` d
 | 1 | **Pure Rust Axum** | **20 μs** | 35 μs | 15 μs | 46,717 | serde (compile-time types) |
 | 2 | Go Gin | 26 μs | 49 μs | 18 μs | 36,196 | encoding/json + struct tags |
 | 3 | Go Echo | 26 μs | 40 μs | 17 μs | 37,158 | encoding/json + struct tags |
-| 4 | **fastapi-rs** | **31 μs** | 47 μs | 20 μs | 31,649 | Pydantic v2 (Rust-backed) |
+| 4 | **fastapi-turbo** | **31 μs** | 47 μs | 20 μs | 31,649 | Pydantic v2 (Rust-backed) |
 | 5 | Node.js Fastify | 33 μs | 46 μs | 21 μs | 30,038 | JSON.parse + Ajv schema |
 | 6 | FastAPI + uvicorn | 202 μs | 360 μs | 176 μs | 4,788 | Pydantic v2 |
 | 7 | FastAPI + socketify | 258 μs | 308 μs | 208 μs | 3,826 | Pydantic v2 |
@@ -512,25 +512,25 @@ Tested with `python-freethreading` (Homebrew), `#[pymodule(gil_used = false)]` d
 | 2 | Go Echo | 26 μs | 42 μs | 18 μs | 36,545 |
 | 3 | Go Gin | 27 μs | 51 μs | 17 μs | 35,525 |
 
-*(fastapi-rs form parsing not yet implemented; FastAPI and Node.js not tested for form)*
+*(fastapi-turbo form parsing not yet implemented; FastAPI and Node.js not tested for form)*
 
 ---
 
 ## Key Takeaways
 
-### fastapi-rs vs FastAPI (the drop-in replacement story)
+### fastapi-turbo vs FastAPI (the drop-in replacement story)
 
-| Endpoint | FastAPI + uvicorn | fastapi-rs | Speedup |
+| Endpoint | FastAPI + uvicorn | fastapi-turbo | Speedup |
 |----------|-------------------|-------|---------|
 | GET /hello | 187 μs | 26 μs | **7.2x** |
 | GET /with-deps | 127 μs | 27 μs | **4.7x** |
 | POST /items | 202 μs | 31 μs | **6.5x** |
 
-fastapi-rs is **5-7x faster** than FastAPI while maintaining 100% API compatibility (same decorators, same Depends(), same Pydantic validation).
+fastapi-turbo is **5-7x faster** than FastAPI while maintaining 100% API compatibility (same decorators, same Depends(), same Pydantic validation).
 
-### fastapi-rs vs Go (the performance story)
+### fastapi-turbo vs Go (the performance story)
 
-| Endpoint | Go Gin | fastapi-rs | Overhead |
+| Endpoint | Go Gin | fastapi-turbo | Overhead |
 |----------|--------|-------|----------|
 | GET /hello | 24 μs | 26 μs | +2 μs (GIL acquisition) |
 | GET /with-deps | 24 μs | 27 μs | +3 μs (Python DI calls) |
@@ -538,15 +538,15 @@ fastapi-rs is **5-7x faster** than FastAPI while maintaining 100% API compatibil
 
 The 2-5 μs gap is the irreducible cost of crossing the Python boundary (GIL acquisition + PyO3 marshaling). Pure Axum (18-20 μs) proves the Rust infrastructure is faster than Go.
 
-### fastapi-rs vs Node.js Fastify
+### fastapi-turbo vs Node.js Fastify
 
-| Endpoint | Fastify | fastapi-rs | Winner |
+| Endpoint | Fastify | fastapi-turbo | Winner |
 |----------|---------|-------|--------|
 | GET /hello | 23 μs | 26 μs | Fastify by 3 μs |
 | GET /with-deps | 23 μs | 27 μs | Fastify by 4 μs |
-| POST /items | 33 μs | 31 μs | **fastapi-rs by 2 μs** |
+| POST /items | 33 μs | 31 μs | **fastapi-turbo by 2 μs** |
 
-fastapi-rs **beats Node.js Fastify on POST** (Pydantic's Rust-backed validation is faster than Ajv) and is within 3-4 μs on GET.
+fastapi-turbo **beats Node.js Fastify on POST** (Pydantic's Rust-backed validation is faster than Ajv) and is within 3-4 μs on GET.
 
 ### Throughput ranking (GET /hello)
 
@@ -556,7 +556,7 @@ fastapi-rs **beats Node.js Fastify on POST** (Pydantic's Rust-backed validation 
 | 2 | Node.js Fastify | 41,471 |
 | 3 | Go Echo | 40,020 |
 | 4 | Go Gin | 39,379 |
-| 5 | **fastapi-rs** | **35,021** |
+| 5 | **fastapi-turbo** | **35,021** |
 | 6 | FastAPI + uvicorn | 5,301 |
 | 7 | FastAPI + socketify | 4,789 |
 
@@ -564,7 +564,7 @@ fastapi-rs **beats Node.js Fastify on POST** (Pydantic's Rust-backed validation 
 
 ## Architecture Notes
 
-- **fastapi-rs's Rust core** uses Axum (hyper + matchit + tower) — the same stack as "Pure Rust Axum" in the benchmarks
+- **fastapi-turbo's Rust core** uses Axum (hyper + matchit + tower) — the same stack as "Pure Rust Axum" in the benchmarks
 - **Python overhead** per request: 5-7 μs (GIL acquisition + handler call + response serialization)
 - **Depends() resolution** is compiled at startup into a topological plan, executed in Rust at request time with a single GIL acquisition
 - **Trivial async deps** (`async def get_db(): return pool`) are resolved synchronously via `coro.send(None)` — no event loop round-trip

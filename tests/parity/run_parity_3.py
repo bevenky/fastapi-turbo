@@ -3,7 +3,7 @@
 
 Launches parity_app_3.py on:
   - FastAPI + uvicorn  (port 29300)
-  - fastapi-rs         (port 29301)
+  - fastapi-turbo         (port 29301)
 
 Then runs every pattern against both and compares results.
 """
@@ -22,7 +22,7 @@ import traceback
 import httpx
 
 FASTAPI_PORT = 29300
-FASTAPI_RS_PORT = 29301
+FASTAPI_TURBO_PORT = 29301
 HOST = "127.0.0.1"
 
 APP_FILE = os.path.join(os.path.dirname(__file__), "parity_app_3.py")
@@ -54,12 +54,12 @@ def _kill(proc):
 def start_fastapi(port):
     """Start the parity app under real FastAPI/uvicorn."""
     env = os.environ.copy()
-    env["FASTAPI_RS_NO_SHIM"] = "1"
+    env["FASTAPI_TURBO_NO_SHIM"] = "1"
     test_dir = os.path.dirname(os.path.abspath(APP_FILE))
     proc = subprocess.Popen(
         [sys.executable, "-c", f"""
 import sys, os
-os.environ["FASTAPI_RS_NO_SHIM"] = "1"
+os.environ["FASTAPI_TURBO_NO_SHIM"] = "1"
 sys.path.insert(0, {test_dir!r})
 import uvicorn
 from parity_app_3 import app
@@ -77,15 +77,15 @@ uvicorn.run(app, host="{HOST}", port={port}, log_level="warning")
     return proc
 
 
-def start_fastapi_rs(port):
-    """Start the parity app under fastapi-rs."""
+def start_fastapi_turbo(port):
+    """Start the parity app under fastapi-turbo."""
     test_dir = os.path.dirname(os.path.abspath(APP_FILE))
     proc = subprocess.Popen(
         [sys.executable, "-c", f"""
 import sys, os
-# Install compat shims so `from fastapi import ...` maps to fastapi_rs
-import fastapi_rs.compat
-fastapi_rs.compat.install()
+# Install compat shims so `from fastapi import ...` maps to fastapi_turbo
+import fastapi_turbo.compat
+fastapi_turbo.compat.install()
 sys.path.insert(0, {test_dir!r})
 from parity_app_3 import app
 app.run("{HOST}", {port})
@@ -97,7 +97,7 @@ app.run("{HOST}", {port})
         out = proc.stdout.read().decode()
         err = proc.stderr.read().decode()
         _kill(proc)
-        raise RuntimeError(f"fastapi-rs did not start on {port}\nstdout: {out}\nstderr: {err}")
+        raise RuntimeError(f"fastapi-turbo did not start on {port}\nstdout: {out}\nstderr: {err}")
     return proc
 
 
@@ -1192,7 +1192,7 @@ def run_all():
     print("Starting servers...")
 
     fastapi_proc = None
-    fastapi_rs_proc = None
+    fastapi_turbo_proc = None
 
     try:
         fastapi_proc = start_fastapi(FASTAPI_PORT)
@@ -1202,10 +1202,10 @@ def run_all():
         return
 
     try:
-        fastapi_rs_proc = start_fastapi_rs(FASTAPI_RS_PORT)
-        print(f"  fastapi-rs on :{FASTAPI_RS_PORT}")
+        fastapi_turbo_proc = start_fastapi_turbo(FASTAPI_TURBO_PORT)
+        print(f"  fastapi-turbo on :{FASTAPI_TURBO_PORT}")
     except Exception as e:
-        print(f"  FAILED to start fastapi-rs: {e}")
+        print(f"  FAILED to start fastapi-turbo: {e}")
         _kill(fastapi_proc)
         return
 
@@ -1231,11 +1231,11 @@ def run_all():
             fa_ok = False
             fa_err = str(e)
 
-        # Run against fastapi-rs
+        # Run against fastapi-turbo
         rs_ok = True
         rs_err = None
         try:
-            fn(FASTAPI_RS_PORT)
+            fn(FASTAPI_TURBO_PORT)
         except Exception as e:
             rs_ok = False
             rs_err = str(e)
@@ -1246,8 +1246,8 @@ def run_all():
             print(f"  {label}: PASS")
         elif fa_ok and not rs_ok:
             failed += 1
-            failures.append((label, f"fastapi-rs FAIL: {rs_err}"))
-            print(f"  {label}: FAIL (fastapi-rs: {rs_err})")
+            failures.append((label, f"fastapi-turbo FAIL: {rs_err}"))
+            print(f"  {label}: FAIL (fastapi-turbo: {rs_err})")
         elif not fa_ok and rs_ok:
             failed += 1
             failures.append((label, f"fastapi FAIL: {fa_err}"))
@@ -1272,7 +1272,7 @@ def run_all():
             print(f"  {label}: {reason}")
 
     _kill(fastapi_proc)
-    _kill(fastapi_rs_proc)
+    _kill(fastapi_turbo_proc)
 
 
 if __name__ == "__main__":

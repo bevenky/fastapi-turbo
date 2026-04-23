@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "fastapi-rs"
+name = "fastapi-turbo"
 version = "0.1.0"
 description = "FastAPI-compatible Python web framework powered by Rust Axum"
 requires-python = ">=3.10"
@@ -35,7 +35,7 @@ dev = [
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
-module-name = "fastapi_rs._fastapi_rs_core"
+module-name = "fastapi_turbo._fastapi_turbo_core"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

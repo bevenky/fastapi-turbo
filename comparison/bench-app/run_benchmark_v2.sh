@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # E-commerce API Benchmark v2
-# Compares: fastapi-rs, FastAPI+uvicorn, Go Gin, Go Echo, Node Fastify
+# Compares: fastapi-turbo, FastAPI+uvicorn, Go Gin, Go Echo, Node Fastify
 # Tests: GET (x3 pagination variants) + GET single + POST + PATCH + DELETE
 #        + auth + WebSocket.
 # ---------------------------------------------------------------------------
@@ -9,12 +9,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BENCH_CLIENT="$PROJECT_ROOT/target/release/fastapi-rs-bench"
+BENCH_CLIENT="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
 
 PYTHON_RS="python3"
 PYTHON_FASTAPI="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
-PORT_FASTAPI_RS=19001
+PORT_FASTAPI_TURBO=19001
 PORT_FASTAPI=19002
 PORT_GO_GIN=19003
 PORT_FASTIFY=19004
@@ -50,10 +50,10 @@ cd "$SCRIPT_DIR/go-gin" && go build -o ecommerce-gin . 2>&1
 cd "$SCRIPT_DIR/go-echo-ecommerce" && go build -o ecommerce-echo . 2>&1
 cd "$SCRIPT_DIR/fastify" && npm install --silent 2>&1
 cd "$PROJECT_ROOT"
-[ -x "$BENCH_CLIENT" ] || cargo build --release --bin fastapi-rs-bench 2>&1
+[ -x "$BENCH_CLIENT" ] || cargo build --release --bin fastapi-turbo-bench 2>&1
 
 # ── Start servers ────────────────────────────────────────────────────────
-FASTAPI_RS_NO_SHIM=1 PORT=$PORT_FASTAPI_RS $PYTHON_RS "$SCRIPT_DIR/fastapi_rs_app.py" >/tmp/bench_rs.log 2>&1 &
+FASTAPI_TURBO_NO_SHIM=1 PORT=$PORT_FASTAPI_TURBO $PYTHON_RS "$SCRIPT_DIR/fastapi_turbo_app.py" >/tmp/bench_rs.log 2>&1 &
 PIDS+=($!)
 PORT=$PORT_FASTAPI $PYTHON_FASTAPI "$SCRIPT_DIR/fastapi_app.py" >/tmp/bench_fa.log 2>&1 &
 PIDS+=($!)
@@ -64,7 +64,7 @@ PIDS+=($!)
 PORT=$PORT_GO_ECHO "$SCRIPT_DIR/go-echo-ecommerce/ecommerce-echo" >/tmp/bench_echo.log 2>&1 &
 PIDS+=($!)
 
-wait_for_port $PORT_FASTAPI_RS "fastapi-rs"
+wait_for_port $PORT_FASTAPI_TURBO "fastapi-turbo"
 wait_for_port $PORT_FASTAPI    "FastAPI"
 wait_for_port $PORT_GO_GIN     "Go-Gin"
 wait_for_port $PORT_FASTIFY    "Fastify"
@@ -110,7 +110,7 @@ asyncio.run(bench())
 ITEM_BODY='{"name":"Benchmark Item","price":42.99,"description":"test"}'
 UPDATE_BODY='{"name":"Updated Item","price":99.99,"description":"updated"}'
 
-FWS=("fastapi-rs:$PORT_FASTAPI_RS" "FastAPI:$PORT_FASTAPI" "Go-Gin:$PORT_GO_GIN" "Go-Echo:$PORT_GO_ECHO" "Fastify:$PORT_FASTIFY")
+FWS=("fastapi-turbo:$PORT_FASTAPI_TURBO" "FastAPI:$PORT_FASTAPI" "Go-Gin:$PORT_GO_GIN" "Go-Echo:$PORT_GO_ECHO" "Fastify:$PORT_FASTIFY")
 
 # ── Results TSV to stdout ────────────────────────────────────────────────
 echo -e "framework\ttest\trps\tp50\tp99\tmin"

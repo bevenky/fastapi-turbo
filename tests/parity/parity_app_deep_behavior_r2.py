@@ -2,10 +2,10 @@
 
 Heavily instrumented endpoints. Each request produces an X-Trace response header
 containing a JSON array of trace entries. Tests compare the FULL trace between
-FastAPI and fastapi-rs, not just end state.
+FastAPI and fastapi-turbo, not just end state.
 
-This app uses ONLY stock FastAPI imports — no fastapi_rs-specific code. The
-compat shim substitutes fastapi-rs at run time.
+This app uses ONLY stock FastAPI imports — no fastapi_turbo-specific code. The
+compat shim substitutes fastapi-turbo at run time.
 
 The trace records:
   - middleware enter / exit ordering

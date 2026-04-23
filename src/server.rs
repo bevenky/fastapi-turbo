@@ -244,7 +244,7 @@ const SWAGGER_UI_HTML: &str = r######"
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link type="text/css" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
     <link rel="shortcut icon" href="https://fastapi.tiangolo.com/img/favicon.png">
-    <title>fastapi-rs - Swagger UI</title>
+    <title>fastapi-turbo - Swagger UI</title>
     </head>
     <body>
     <div id="swagger-ui">
@@ -356,7 +356,7 @@ const REDOC_HTML: &str = r#"
     <!DOCTYPE html>
     <html>
     <head>
-    <title>fastapi-rs - ReDoc</title>
+    <title>fastapi-turbo - ReDoc</title>
     <!-- needed for adaptive design -->
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -637,7 +637,7 @@ pub fn run_server(
             // `request.url.hostname` / `.port`.
             let _ = crate::router::set_server_addr(host.clone(), port);
 
-            println!("fastapi-rs running on http://{addr}");
+            println!("fastapi-turbo running on http://{addr}");
 
             axum::serve(
                 listener,
@@ -912,7 +912,7 @@ async fn slashes_redirect_middleware_with_paths(
 
 /// Wait for either SIGINT (Ctrl-C) or SIGTERM. Many bench runners / process
 /// supervisors send SIGTERM for orderly shutdown; the old handler only caught
-/// SIGINT, so SIGTERM left fastapi-rs hanging and the listener held its port
+/// SIGINT, so SIGTERM left fastapi-turbo hanging and the listener held its port
 /// past the bench's cleanup phase (zombie processes blocking next-run startup).
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
@@ -921,7 +921,7 @@ async fn shutdown_signal() {
         Err(_) => {
             // Fallback: only SIGINT.
             tokio::signal::ctrl_c().await.ok();
-            println!("\nfastapi-rs shutting down...");
+            println!("\nfastapi-turbo shutting down...");
             return;
         }
     };
@@ -929,7 +929,7 @@ async fn shutdown_signal() {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
     }
-    println!("\nfastapi-rs shutting down...");
+    println!("\nfastapi-turbo shutting down...");
 }
 
 // ── Middleware configuration ─────────────────────────────────────────
@@ -1026,7 +1026,7 @@ fn parse_middleware_configs(
                 configs.push(MiddlewareConfig::HttpsRedirect);
             }
             other => {
-                eprintln!("fastapi-rs: unknown middleware type '{other}', skipping");
+                eprintln!("fastapi-turbo: unknown middleware type '{other}', skipping");
             }
         }
     }

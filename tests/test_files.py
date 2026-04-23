@@ -65,7 +65,7 @@ def test_upload_single_file(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, UploadFile
+        from fastapi_turbo import FastAPI, UploadFile
 
         app = FastAPI()
 
@@ -100,7 +100,7 @@ def test_upload_multiple_files(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, UploadFile
+        from fastapi_turbo import FastAPI, UploadFile
 
         app = FastAPI()
 
@@ -133,8 +133,8 @@ def test_upload_binary_preserved(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, UploadFile
-        from fastapi_rs.responses import Response
+        from fastapi_turbo import FastAPI, UploadFile
+        from fastapi_turbo.responses import Response
 
         app = FastAPI()
 
@@ -158,7 +158,7 @@ def test_upload_form_field_and_file(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, Form, UploadFile
+        from fastapi_turbo import FastAPI, Form, UploadFile
 
         app = FastAPI()
 
@@ -193,8 +193,8 @@ def test_file_response_serves_file(server_app, tmp_path):
     fpath.write_bytes(content)
 
     url = server_app(f"""
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import FileResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import FileResponse
 
         app = FastAPI()
 
@@ -219,8 +219,8 @@ def test_file_response_content_disposition(server_app, tmp_path):
     fpath.write_bytes(b"binary-data")
 
     url = server_app(f"""
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import FileResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import FileResponse
 
         app = FastAPI()
 
@@ -242,8 +242,8 @@ def test_file_response_not_found(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import FileResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import FileResponse
 
         app = FastAPI()
 
@@ -263,7 +263,7 @@ def test_file_response_not_found(server_app):
 
 def test_parse_range_header():
     """Unit test the range parser."""
-    from fastapi_rs._fastapi_rs_core import core_version
+    from fastapi_turbo._fastapi_turbo_core import core_version
     # Import indirectly — the parser is in Rust. We test via higher-level integration.
     assert core_version()
 
@@ -280,8 +280,8 @@ def test_static_files_serves_file(server_app, tmp_path):
     (static_dir / "style.css").write_text("body { color: red; }")
 
     url = server_app(f"""
-        from fastapi_rs import FastAPI
-        from fastapi_rs.staticfiles import StaticFiles
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.staticfiles import StaticFiles
 
         app = FastAPI()
         app.mount("/static", StaticFiles(directory="{static_dir}"), name="static")
@@ -308,7 +308,7 @@ def test_static_files_serves_file(server_app, tmp_path):
 class TestPyUploadFileUnit:
     def test_read_full(self):
         """PyUploadFile exposes the file-like API we expect."""
-        from fastapi_rs._fastapi_rs_core import PyUploadFile
+        from fastapi_turbo._fastapi_turbo_core import PyUploadFile
 
         # PyUploadFile is normally constructed by the Rust multipart parser,
         # but we verify the class exists + has the expected attributes.
@@ -318,8 +318,8 @@ class TestPyUploadFileUnit:
 
     def test_isinstance_check(self):
         """PyUploadFile should satisfy isinstance(x, UploadFile) via __subclasshook__."""
-        from fastapi_rs import UploadFile
-        from fastapi_rs._fastapi_rs_core import PyUploadFile
+        from fastapi_turbo import UploadFile
+        from fastapi_turbo._fastapi_turbo_core import PyUploadFile
 
         # Subclasshook checks attributes on the class, so direct class check
         assert issubclass(PyUploadFile, UploadFile)

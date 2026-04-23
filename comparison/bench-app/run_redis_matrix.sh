@@ -2,7 +2,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BENCH="$PROJECT_ROOT/target/release/fastapi-rs-bench"
+BENCH="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
 PY_RS="python3"
 PY_FA="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
@@ -21,9 +21,9 @@ wait_port() {
     return 1
 }
 
-FASTAPI_RS_NO_SHIM=1 PORT=19040 $PY_RS "$SCRIPT_DIR/redis_sync_app.py"       >/tmp/redis_19040.log 2>&1 &
+FASTAPI_TURBO_NO_SHIM=1 PORT=19040 $PY_RS "$SCRIPT_DIR/redis_sync_app.py"       >/tmp/redis_19040.log 2>&1 &
 PIDS+=($!)
-FASTAPI_RS_NO_SHIM=1 PORT=19041 $PY_RS "$SCRIPT_DIR/redis_async_app.py"      >/tmp/redis_19041.log 2>&1 &
+FASTAPI_TURBO_NO_SHIM=1 PORT=19041 $PY_RS "$SCRIPT_DIR/redis_async_app.py"      >/tmp/redis_19041.log 2>&1 &
 PIDS+=($!)
 PORT=19042 $PY_FA "$SCRIPT_DIR/redis_fastapi_uvicorn_app.py"                  >/tmp/redis_19042.log 2>&1 &
 PIDS+=($!)
@@ -47,12 +47,12 @@ bench_one() {
 }
 
 echo -e "label\tendpoint\trps\tp50\tp99"
-bench_one "fastapi-rs_sync(redis-py)" 19040 "/health"
-bench_one "fastapi-rs_sync(redis-py)" 19040 "/cache/get"
-bench_one "fastapi-rs_sync(redis-py)" 19040 "/cache/set" POST "{}"
-bench_one "fastapi-rs_async(redis.asyncio)" 19041 "/health"
-bench_one "fastapi-rs_async(redis.asyncio)" 19041 "/cache/get"
-bench_one "fastapi-rs_async(redis.asyncio)" 19041 "/cache/set" POST "{}"
+bench_one "fastapi-turbo_sync(redis-py)" 19040 "/health"
+bench_one "fastapi-turbo_sync(redis-py)" 19040 "/cache/get"
+bench_one "fastapi-turbo_sync(redis-py)" 19040 "/cache/set" POST "{}"
+bench_one "fastapi-turbo_async(redis.asyncio)" 19041 "/health"
+bench_one "fastapi-turbo_async(redis.asyncio)" 19041 "/cache/get"
+bench_one "fastapi-turbo_async(redis.asyncio)" 19041 "/cache/set" POST "{}"
 bench_one "FastAPI_uvicorn(redis.asyncio)" 19042 "/health"
 bench_one "FastAPI_uvicorn(redis.asyncio)" 19042 "/cache/get"
 bench_one "FastAPI_uvicorn(redis.asyncio)" 19042 "/cache/set" POST "{}"

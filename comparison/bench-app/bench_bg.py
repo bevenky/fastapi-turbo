@@ -85,7 +85,7 @@ def reset(port):
 
 def main():
     ports = [int(x) for x in sys.argv[1].split(",")]
-    names = ["fastapi-rs", "Go-Gin", "Fastify"][: len(ports)]
+    names = ["fastapi-turbo", "Go-Gin", "Fastify"][: len(ports)]
     fws = list(zip(names, ports))
 
     print(f"{'Endpoint':<18}" + "".join(f"{n:<26}" for n in names))

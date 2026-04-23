@@ -3,7 +3,7 @@
 
 Starts the parity_app_4 on:
   - port 29400 via uvicorn (stock FastAPI)
-  - port 29401 via fastapi-rs
+  - port 29401 via fastapi-turbo
 
 Then issues identical HTTP requests to both and compares responses.
 """
@@ -22,7 +22,7 @@ import urllib.parse
 # ── Config ────────────────────────────────────────────────────────
 
 FASTAPI_PORT = 29400
-FASTAPI_RS_PORT = 29401
+FASTAPI_TURBO_PORT = 29401
 HOST = "127.0.0.1"
 APP_MODULE = "tests.parity.parity_app_4:app"
 STARTUP_TIMEOUT = 15  # seconds
@@ -121,7 +121,7 @@ def start_uvicorn(port):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
     # Remove any compat shim influence
-    env.pop("FASTAPI_RS", None)
+    env.pop("FASTAPI_TURBO", None)
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", APP_MODULE,
          "--host", HOST, "--port", str(port), "--log-level", "warning"],
@@ -133,16 +133,16 @@ def start_uvicorn(port):
     return proc
 
 
-def start_fastapi_rs(port):
-    """Start fastapi-rs server."""
+def start_fastapi_turbo(port):
+    """Start fastapi-turbo server."""
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
     # Use a small script to import and run
     script = f"""
 import sys
 sys.path.insert(0, '{PROJECT_ROOT}')
-# Install compat shims so 'from fastapi import ...' maps to fastapi_rs
-from fastapi_rs.compat import install
+# Install compat shims so 'from fastapi import ...' maps to fastapi_turbo
+from fastapi_turbo.compat import install
 install()
 from tests.parity.parity_app_4 import app
 app.run(host='{HOST}', port={port})
@@ -173,7 +173,7 @@ def compare(pattern_id, description, fastapi_result, rs_result, check_fn=None):
         detail = f"FastAPI connection error: {fa_body}"
         passed = False
     elif rs_status == -1:
-        detail = f"fastapi-rs connection error: {rs_body}"
+        detail = f"fastapi-turbo connection error: {rs_body}"
         passed = False
     elif check_fn:
         try:
@@ -185,7 +185,7 @@ def compare(pattern_id, description, fastapi_result, rs_result, check_fn=None):
         # Default: status codes match and body matches
         if fa_status != rs_status:
             passed = False
-            detail = f"Status mismatch: FastAPI={fa_status}, fastapi-rs={rs_status}"
+            detail = f"Status mismatch: FastAPI={fa_status}, fastapi-turbo={rs_status}"
         elif fa_body != rs_body:
             # Try JSON comparison (ignore key ordering)
             try:
@@ -193,10 +193,10 @@ def compare(pattern_id, description, fastapi_result, rs_result, check_fn=None):
                 rs_json = json.loads(rs_body)
                 if fa_json != rs_json:
                     passed = False
-                    detail = f"JSON mismatch:\n  FastAPI:    {json.dumps(fa_json, sort_keys=True)}\n  fastapi-rs: {json.dumps(rs_json, sort_keys=True)}"
+                    detail = f"JSON mismatch:\n  FastAPI:    {json.dumps(fa_json, sort_keys=True)}\n  fastapi-turbo: {json.dumps(rs_json, sort_keys=True)}"
             except (json.JSONDecodeError, ValueError):
                 passed = False
-                detail = f"Body mismatch:\n  FastAPI:    {fa_body[:200]}\n  fastapi-rs: {rs_body[:200]}"
+                detail = f"Body mismatch:\n  FastAPI:    {fa_body[:200]}\n  fastapi-turbo: {rs_body[:200]}"
 
     label = f"{GREEN}PASS{RESET}" if passed else f"{RED}FAIL{RESET}"
     results.append((pattern_id, description, passed, detail))
@@ -241,7 +241,7 @@ def run_all_tests(fa_port, rs_port):
     # P401: /openapi.json exists and returns valid JSON
     def check_401(fs, fh, fb, rs, rh, rb):
         assert fs == 200, f"FastAPI openapi status={fs}"
-        assert rs == 200, f"fastapi-rs openapi status={rs}"
+        assert rs == 200, f"fastapi-turbo openapi status={rs}"
         json.loads(fb)
         json.loads(rb)
     compare(401, "/openapi.json exists and returns valid JSON",
@@ -266,7 +266,7 @@ def run_all_tests(fa_port, rs_port):
         fa_desc = fa_openapi.get("info", {}).get("description", "")
         rs_desc = rs_openapi.get("info", {}).get("description", "")
         assert fa_desc, "FastAPI missing description"
-        assert rs_desc, "fastapi-rs missing description"
+        assert rs_desc, "fastapi-turbo missing description"
         assert fa_desc == rs_desc, f"description mismatch: '{fa_desc}' vs '{rs_desc}'"
     compare(404, "/openapi.json has info.description",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_404)
@@ -276,7 +276,7 @@ def run_all_tests(fa_port, rs_port):
         fa_sum = fa_openapi.get("info", {}).get("summary", "")
         rs_sum = rs_openapi.get("info", {}).get("summary", "")
         assert fa_sum, "FastAPI missing summary"
-        assert rs_sum, "fastapi-rs missing summary"
+        assert rs_sum, "fastapi-turbo missing summary"
         assert fa_sum == rs_sum, f"summary mismatch: '{fa_sum}' vs '{rs_sum}'"
     compare(405, "/openapi.json has info.summary",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_405)
@@ -289,7 +289,7 @@ def run_all_tests(fa_port, rs_port):
         for route in ["/health", "/p406-get-route", "/p406-post-route",
                       "/p408-post-body", "/p409-response-model"]:
             assert route in fa_paths, f"FastAPI missing route {route}"
-            assert route in rs_paths, f"fastapi-rs missing route {route}"
+            assert route in rs_paths, f"fastapi-turbo missing route {route}"
     compare(406, "/openapi.json paths include all registered routes",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_406)
 
@@ -298,7 +298,7 @@ def run_all_tests(fa_port, rs_port):
         fa_health = fa_openapi.get("paths", {}).get("/health", {})
         rs_health = rs_openapi.get("paths", {}).get("/health", {})
         assert "get" in fa_health, "FastAPI /health missing GET"
-        assert "get" in rs_health, "fastapi-rs /health missing GET"
+        assert "get" in rs_health, "fastapi-turbo /health missing GET"
     compare(407, "/openapi.json GET endpoint has correct method",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_407)
 
@@ -307,7 +307,7 @@ def run_all_tests(fa_port, rs_port):
         fa_post = fa_openapi.get("paths", {}).get("/p408-post-body", {}).get("post", {})
         rs_post = rs_openapi.get("paths", {}).get("/p408-post-body", {}).get("post", {})
         assert "requestBody" in fa_post, "FastAPI POST missing requestBody"
-        assert "requestBody" in rs_post, "fastapi-rs POST missing requestBody"
+        assert "requestBody" in rs_post, "fastapi-turbo POST missing requestBody"
     compare(408, "/openapi.json POST endpoint has requestBody schema",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_408)
 
@@ -318,7 +318,7 @@ def run_all_tests(fa_port, rs_port):
         fa_resp = fa_get.get("responses", {}).get("200", {})
         rs_resp = rs_get.get("responses", {}).get("200", {})
         assert fa_resp, "FastAPI missing 200 response"
-        assert rs_resp, "fastapi-rs missing 200 response"
+        assert rs_resp, "fastapi-turbo missing 200 response"
     compare(409, "/openapi.json response_model creates response schema",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_409)
 
@@ -327,7 +327,7 @@ def run_all_tests(fa_port, rs_port):
         fa_op = fa_openapi.get("paths", {}).get("/p410-tags", {}).get("get", {})
         rs_op = rs_openapi.get("paths", {}).get("/p410-tags", {}).get("get", {})
         assert "items" in fa_op.get("tags", []), "FastAPI missing tags"
-        assert "items" in rs_op.get("tags", []), "fastapi-rs missing tags"
+        assert "items" in rs_op.get("tags", []), "fastapi-turbo missing tags"
     compare(410, "/openapi.json tags from route decorator",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_410)
 
@@ -336,7 +336,7 @@ def run_all_tests(fa_port, rs_port):
         fa_op = fa_openapi.get("paths", {}).get("/p411/items", {}).get("get", {})
         rs_op = rs_openapi.get("paths", {}).get("/p411/items", {}).get("get", {})
         assert "router-tagged" in fa_op.get("tags", []), f"FastAPI missing router tags, got {fa_op.get('tags', [])}"
-        assert "router-tagged" in rs_op.get("tags", []), f"fastapi-rs missing router tags, got {rs_op.get('tags', [])}"
+        assert "router-tagged" in rs_op.get("tags", []), f"fastapi-turbo missing router tags, got {rs_op.get('tags', [])}"
     compare(411, "/openapi.json tags from router",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_411)
 
@@ -345,7 +345,7 @@ def run_all_tests(fa_port, rs_port):
         fa_op = fa_openapi.get("paths", {}).get("/p412-deprecated", {}).get("get", {})
         rs_op = rs_openapi.get("paths", {}).get("/p412-deprecated", {}).get("get", {})
         assert fa_op.get("deprecated") is True, "FastAPI deprecated not True"
-        assert rs_op.get("deprecated") is True, "fastapi-rs deprecated not True"
+        assert rs_op.get("deprecated") is True, "fastapi-turbo deprecated not True"
     compare(412, "/openapi.json deprecated=True on endpoint",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_412)
 
@@ -354,7 +354,7 @@ def run_all_tests(fa_port, rs_port):
         fa_paths = fa_openapi.get("paths", {})
         rs_paths = rs_openapi.get("paths", {})
         assert "/p413-hidden" not in fa_paths, "FastAPI should hide /p413-hidden"
-        assert "/p413-hidden" not in rs_paths, "fastapi-rs should hide /p413-hidden"
+        assert "/p413-hidden" not in rs_paths, "fastapi-turbo should hide /p413-hidden"
     compare(413, "/openapi.json include_in_schema=False hides endpoint",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_413)
 
@@ -363,12 +363,12 @@ def run_all_tests(fa_port, rs_port):
         fa_op = fa_openapi.get("paths", {}).get("/p414-constrained-query", {}).get("get", {})
         rs_op = rs_openapi.get("paths", {}).get("/p414-constrained-query", {}).get("get", {})
         assert fa_op, "FastAPI missing /p414-constrained-query"
-        assert rs_op, "fastapi-rs missing /p414-constrained-query"
+        assert rs_op, "fastapi-turbo missing /p414-constrained-query"
         # Both should have parameters with constraints
         fa_params = fa_op.get("parameters", [])
         rs_params = rs_op.get("parameters", [])
         assert len(fa_params) > 0, "FastAPI missing params"
-        assert len(rs_params) > 0, "fastapi-rs missing params"
+        assert len(rs_params) > 0, "fastapi-turbo missing params"
     compare(414, "/openapi.json query param with ge/le",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_414)
 
@@ -377,7 +377,7 @@ def run_all_tests(fa_port, rs_port):
         fa_op = fa_openapi.get("paths", {}).get("/p415-path-int/{item_id}", {}).get("get", {})
         rs_op = rs_openapi.get("paths", {}).get("/p415-path-int/{item_id}", {}).get("get", {})
         assert fa_op, "FastAPI missing /p415-path-int/{item_id}"
-        assert rs_op, "fastapi-rs missing /p415-path-int/{item_id}"
+        assert rs_op, "fastapi-turbo missing /p415-path-int/{item_id}"
     compare(415, "/openapi.json path param typed as integer",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_415)
 
@@ -388,7 +388,7 @@ def run_all_tests(fa_port, rs_port):
         fa_has_oauth = any("oauth2" in v.get("type", "") for v in fa_components.values())
         rs_has_oauth = any("oauth2" in v.get("type", "") for v in rs_components.values())
         assert fa_has_oauth, f"FastAPI missing OAuth2 scheme, got {fa_components}"
-        assert rs_has_oauth, f"fastapi-rs missing OAuth2 scheme, got {rs_components}"
+        assert rs_has_oauth, f"fastapi-turbo missing OAuth2 scheme, got {rs_components}"
     compare(416, "/openapi.json security scheme (OAuth2)",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_416)
 
@@ -399,7 +399,7 @@ def run_all_tests(fa_port, rs_port):
         fa_has_bearer = any(v.get("scheme") == "bearer" for v in fa_components.values())
         rs_has_bearer = any(v.get("scheme") == "bearer" for v in rs_components.values())
         assert fa_has_bearer, f"FastAPI missing HTTPBearer scheme, got {fa_components}"
-        assert rs_has_bearer, f"fastapi-rs missing HTTPBearer scheme, got {rs_components}"
+        assert rs_has_bearer, f"fastapi-turbo missing HTTPBearer scheme, got {rs_components}"
     compare(417, "/openapi.json security scheme (HTTPBearer)",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_417)
 
@@ -408,16 +408,16 @@ def run_all_tests(fa_port, rs_port):
         fa_servers = fa_openapi.get("servers", [])
         rs_servers = rs_openapi.get("servers", [])
         assert len(fa_servers) > 0, "FastAPI missing servers"
-        assert len(rs_servers) > 0, "fastapi-rs missing servers"
+        assert len(rs_servers) > 0, "fastapi-turbo missing servers"
     compare(418, "/openapi.json servers list",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_418)
 
     # P419: /docs serves Swagger UI HTML
     def check_419(fs, fh, fb, rs, rh, rb):
         assert fs == 200, f"FastAPI /docs status={fs}"
-        assert rs == 200, f"fastapi-rs /docs status={rs}"
+        assert rs == 200, f"fastapi-turbo /docs status={rs}"
         assert "swagger" in fb.lower() or "openapi" in fb.lower(), "FastAPI /docs not Swagger"
-        assert "swagger" in rb.lower() or "openapi" in rb.lower(), "fastapi-rs /docs not Swagger"
+        assert "swagger" in rb.lower() or "openapi" in rb.lower(), "fastapi-turbo /docs not Swagger"
     fa_docs = http_request(fa_port, "/docs")
     rs_docs = http_request(rs_port, "/docs")
     compare(419, "/docs serves Swagger UI HTML", fa_docs, rs_docs, check_419)
@@ -425,9 +425,9 @@ def run_all_tests(fa_port, rs_port):
     # P420: /redoc serves ReDoc HTML
     def check_420(fs, fh, fb, rs, rh, rb):
         assert fs == 200, f"FastAPI /redoc status={fs}"
-        assert rs == 200, f"fastapi-rs /redoc status={rs}"
+        assert rs == 200, f"fastapi-turbo /redoc status={rs}"
         assert "redoc" in fb.lower(), "FastAPI /redoc not ReDoc"
-        assert "redoc" in rb.lower(), "fastapi-rs /redoc not ReDoc"
+        assert "redoc" in rb.lower(), "fastapi-turbo /redoc not ReDoc"
     fa_redoc = http_request(fa_port, "/redoc")
     rs_redoc = http_request(rs_port, "/redoc")
     compare(420, "/redoc serves ReDoc HTML", fa_redoc, rs_redoc, check_420)
@@ -438,9 +438,9 @@ def run_all_tests(fa_port, rs_port):
     # P421: Jinja2Templates render basic template
     def check_html(fs, fh, fb, rs, rh, rb):
         assert fs == 200, f"FastAPI status={fs}"
-        assert rs == 200, f"fastapi-rs status={rs}"
+        assert rs == 200, f"fastapi-turbo status={rs}"
         assert "Hello Basic" in fb, f"FastAPI missing content: {fb[:100]}"
-        assert "Hello Basic" in rb, f"fastapi-rs missing content: {rb[:100]}"
+        assert "Hello Basic" in rb, f"fastapi-turbo missing content: {rb[:100]}"
     compare_json(421, "Jinja2Templates render basic template",
                  fa_port, rs_port, "/p421-template-basic", check_fn=check_html)
 
@@ -448,7 +448,7 @@ def run_all_tests(fa_port, rs_port):
     def check_422(fs, fh, fb, rs, rh, rb):
         assert fs == 200 and rs == 200
         assert "Alice" in fb and "30" in fb, f"FastAPI missing context: {fb[:100]}"
-        assert "Alice" in rb and "30" in rb, f"fastapi-rs missing context: {rb[:100]}"
+        assert "Alice" in rb and "30" in rb, f"fastapi-turbo missing context: {rb[:100]}"
     compare_json(422, "Jinja2Templates with context variables",
                  fa_port, rs_port, "/p422-template-context", check_fn=check_422)
 
@@ -456,7 +456,7 @@ def run_all_tests(fa_port, rs_port):
     def check_423(fs, fh, fb, rs, rh, rb):
         assert fs == 200 and rs == 200
         assert "Legacy" in fb, f"FastAPI missing Legacy: {fb[:100]}"
-        assert "Legacy" in rb, f"fastapi-rs missing Legacy: {rb[:100]}"
+        assert "Legacy" in rb, f"fastapi-turbo missing Legacy: {rb[:100]}"
     compare_json(423, "Jinja2Templates template render (old-style compat)",
                  fa_port, rs_port, "/p423-template-old-style", check_fn=check_423)
 
@@ -464,14 +464,14 @@ def run_all_tests(fa_port, rs_port):
     def check_424(fs, fh, fb, rs, rh, rb):
         assert fs == 200 and rs == 200
         assert "World" in fb, f"FastAPI missing World: {fb[:100]}"
-        assert "World" in rb, f"fastapi-rs missing World: {rb[:100]}"
+        assert "World" in rb, f"fastapi-turbo missing World: {rb[:100]}"
     compare_json(424, "Jinja2Templates new-style signature",
                  fa_port, rs_port, "/p424-template-new-style", check_fn=check_424)
 
     # P425: StaticFiles serves files
     def check_static(fs, fh, fb, rs, rh, rb):
         assert fs == 200, f"FastAPI static status={fs}"
-        assert rs == 200, f"fastapi-rs static status={rs}"
+        assert rs == 200, f"fastapi-turbo static status={rs}"
         assert fb == rb, f"Content mismatch: '{fb[:80]}' vs '{rb[:80]}'"
     compare_json(425, "StaticFiles mount serves files",
                  fa_port, rs_port, "/static/data.txt", check_fn=check_static)
@@ -482,7 +482,7 @@ def run_all_tests(fa_port, rs_port):
         fa_ct = fh.get("content-type", fh.get("Content-Type", ""))
         rs_ct = rh.get("content-type", rh.get("Content-Type", ""))
         assert "css" in fa_ct.lower(), f"FastAPI CSS type: {fa_ct}"
-        assert "css" in rs_ct.lower(), f"fastapi-rs CSS type: {rs_ct}"
+        assert "css" in rs_ct.lower(), f"fastapi-turbo CSS type: {rs_ct}"
     compare_json(426, "StaticFiles serves CSS with correct content-type",
                  fa_port, rs_port, "/static/style.css", check_fn=check_426)
 
@@ -492,30 +492,30 @@ def run_all_tests(fa_port, rs_port):
         fa_ct = fh.get("content-type", fh.get("Content-Type", ""))
         rs_ct = rh.get("content-type", rh.get("Content-Type", ""))
         assert "javascript" in fa_ct.lower(), f"FastAPI JS type: {fa_ct}"
-        assert "javascript" in rs_ct.lower(), f"fastapi-rs JS type: {rs_ct}"
+        assert "javascript" in rs_ct.lower(), f"fastapi-turbo JS type: {rs_ct}"
     compare_json(427, "StaticFiles serves JS with correct content-type",
                  fa_port, rs_port, "/static/app.js", check_fn=check_427)
 
     # P428: StaticFiles 404 for missing files
     def check_428(fs, fh, fb, rs, rh, rb):
         assert fs == 404, f"FastAPI should 404, got {fs}"
-        assert rs == 404, f"fastapi-rs should 404, got {rs}"
+        assert rs == 404, f"fastapi-turbo should 404, got {rs}"
     compare_json(428, "StaticFiles 404 for missing files",
                  fa_port, rs_port, "/static/nonexistent.xyz", check_fn=check_428)
 
     # P429: StaticFiles html=True (SPA mode)
     def check_429(fs, fh, fb, rs, rh, rb):
         assert fs == 200, f"FastAPI SPA status={fs}"
-        assert rs == 200, f"fastapi-rs SPA status={rs}"
+        assert rs == 200, f"fastapi-turbo SPA status={rs}"
         assert "SPA Index" in fb, f"FastAPI SPA missing index: {fb[:100]}"
-        assert "SPA Index" in rb, f"fastapi-rs SPA missing index: {rb[:100]}"
+        assert "SPA Index" in rb, f"fastapi-turbo SPA missing index: {rb[:100]}"
     compare_json(429, "StaticFiles html=True serves index.html",
                  fa_port, rs_port, "/spa/", check_fn=check_429)
 
     # P430: mount sub-FastAPI app
     def check_430(fs, fh, fb, rs, rh, rb):
         assert fs == 200, f"FastAPI sub-app status={fs}"
-        assert rs == 200, f"fastapi-rs sub-app status={rs}"
+        assert rs == 200, f"fastapi-turbo sub-app status={rs}"
     compare_json(430, "mount sub-FastAPI app at prefix",
                  fa_port, rs_port, "/sub/sub-health", check_fn=check_430)
 
@@ -526,14 +526,14 @@ def run_all_tests(fa_port, rs_port):
     # P432: sub-app doesn't leak to parent
     def check_432(fs, fh, fb, rs, rh, rb):
         assert fs == 404 or fs == 405, f"FastAPI should 404, got {fs}"
-        assert rs == 404 or rs == 405, f"fastapi-rs should 404, got {rs}"
+        assert rs == 404 or rs == 405, f"fastapi-turbo should 404, got {rs}"
     compare_json(432, "mount sub-app doesn't leak to parent",
                  fa_port, rs_port, "/sub-health", check_fn=check_432)
 
     # P433: template with status_code
     def check_433(fs, fh, fb, rs, rh, rb):
         assert fs == 201, f"FastAPI template status={fs}"
-        assert rs == 201, f"fastapi-rs template status={rs}"
+        assert rs == 201, f"fastapi-turbo template status={rs}"
     compare_json(433, "template with custom status_code",
                  fa_port, rs_port, "/p433-template-status", check_fn=check_433)
 
@@ -543,7 +543,7 @@ def run_all_tests(fa_port, rs_port):
         fa_hdr = fh.get("x-template", fh.get("X-Template", ""))
         rs_hdr = rh.get("x-template", rh.get("X-Template", ""))
         assert fa_hdr == "yes", f"FastAPI missing X-Template header"
-        assert rs_hdr == "yes", f"fastapi-rs missing X-Template header"
+        assert rs_hdr == "yes", f"fastapi-turbo missing X-Template header"
     compare_json(434, "template with custom headers",
                  fa_port, rs_port, "/p434-template-headers", check_fn=check_434)
 
@@ -557,7 +557,7 @@ def run_all_tests(fa_port, rs_port):
     # P437: multiple static mounts
     def check_437(fs, fh, fb, rs, rh, rb):
         assert fs == 200, f"FastAPI assets status={fs}"
-        assert rs == 200, f"fastapi-rs assets status={rs}"
+        assert rs == 200, f"fastapi-turbo assets status={rs}"
         assert "logo" in fb and "logo" in rb
     compare_json(437, "multiple static mounts",
                  fa_port, rs_port, "/assets/logo.txt", check_fn=check_437)
@@ -566,7 +566,7 @@ def run_all_tests(fa_port, rs_port):
     def check_438(fs, fh, fb, rs, rh, rb):
         assert fs == 200 and rs == 200
         assert fb == "checksum_content_abc123", f"FastAPI content: {fb}"
-        assert rb == "checksum_content_abc123", f"fastapi-rs content: {rb}"
+        assert rb == "checksum_content_abc123", f"fastapi-turbo content: {rb}"
     compare_json(438, "static file content integrity",
                  fa_port, rs_port, "/static/checksum.txt", check_fn=check_438)
 
@@ -687,9 +687,9 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert "nickname" not in fa_data, f"FastAPI should exclude None: {fa_data}"
-        assert "nickname" not in rs_data, f"fastapi-rs should exclude None: {rs_data}"
+        assert "nickname" not in rs_data, f"fastapi-turbo should exclude None: {rs_data}"
         assert "bio" not in fa_data, f"FastAPI should exclude None bio: {fa_data}"
-        assert "bio" not in rs_data, f"fastapi-rs should exclude None bio: {rs_data}"
+        assert "bio" not in rs_data, f"fastapi-turbo should exclude None bio: {rs_data}"
         assert fa_data["name"] == "Alice"
         assert rs_data["name"] == "Alice"
     compare_json(460, "Response excludes None fields",
@@ -708,7 +708,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["path"] == "/p462-request-url-path", f"FastAPI path: {fa_data}"
-        assert rs_data["path"] == "/p462-request-url-path", f"fastapi-rs path: {rs_data}"
+        assert rs_data["path"] == "/p462-request-url-path", f"fastapi-turbo path: {rs_data}"
     compare_json(462, "request.url.path returns correct path",
                  fa_port, rs_port, "/p462-request-url-path", check_fn=check_462)
 
@@ -718,7 +718,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert "foo=bar" in fa_data["query"], f"FastAPI query: {fa_data}"
-        assert "foo=bar" in rs_data["query"], f"fastapi-rs query: {rs_data}"
+        assert "foo=bar" in rs_data["query"], f"fastapi-turbo query: {rs_data}"
     compare_json(463, "request.url.query returns query string",
                  fa_port, rs_port, "/p463-request-url-query?foo=bar&baz=1", check_fn=check_463)
 
@@ -728,7 +728,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["host"] != "unknown", f"FastAPI host unknown"
-        assert rs_data["host"] != "unknown", f"fastapi-rs host unknown"
+        assert rs_data["host"] != "unknown", f"fastapi-turbo host unknown"
     compare_json(464, "request.headers['host'] returns host",
                  fa_port, rs_port, "/p464-request-headers-host", check_fn=check_464)
 
@@ -738,7 +738,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert "json" in fa_data["content_type"].lower(), f"FastAPI ct: {fa_data}"
-        assert "json" in rs_data["content_type"].lower(), f"fastapi-rs ct: {rs_data}"
+        assert "json" in rs_data["content_type"].lower(), f"fastapi-turbo ct: {rs_data}"
     compare_json(465, "request.headers['content-type'] for POST",
                  fa_port, rs_port, "/p465-request-content-type",
                  method="POST", body={"test": True}, check_fn=check_465)
@@ -749,7 +749,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["key"] == "myvalue", f"FastAPI key: {fa_data}"
-        assert rs_data["key"] == "myvalue", f"fastapi-rs key: {rs_data}"
+        assert rs_data["key"] == "myvalue", f"fastapi-turbo key: {rs_data}"
     compare_json(466, "request.query_params['key']",
                  fa_port, rs_port, "/p466-request-query-params?key=myvalue", check_fn=check_466)
 
@@ -763,7 +763,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["session"] == "abc123", f"FastAPI cookie: {fa_data}"
-        assert rs_data["session"] == "abc123", f"fastapi-rs cookie: {rs_data}"
+        assert rs_data["session"] == "abc123", f"fastapi-turbo cookie: {rs_data}"
     compare_json(468, "request.cookies['session']",
                  fa_port, rs_port, "/p468-request-cookies",
                  headers={"Cookie": "session=abc123"}, check_fn=check_468)
@@ -774,7 +774,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["client_host"] != "unknown", f"FastAPI client: {fa_data}"
-        assert rs_data["client_host"] != "unknown", f"fastapi-rs client: {rs_data}"
+        assert rs_data["client_host"] != "unknown", f"fastapi-turbo client: {rs_data}"
     compare_json(469, "request.client.host returns client IP",
                  fa_port, rs_port, "/p469-request-client", check_fn=check_469)
 
@@ -784,7 +784,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["has_app"] is True, f"FastAPI app: {fa_data}"
-        assert rs_data["has_app"] is True, f"fastapi-rs app: {rs_data}"
+        assert rs_data["has_app"] is True, f"fastapi-turbo app: {rs_data}"
     compare_json(470, "request.app is the FastAPI instance",
                  fa_port, rs_port, "/p470-request-app", check_fn=check_470)
 
@@ -794,7 +794,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["db_pool"] == "fake_pool_connected", f"FastAPI state: {fa_data}"
-        assert rs_data["db_pool"] == "fake_pool_connected", f"fastapi-rs state: {rs_data}"
+        assert rs_data["db_pool"] == "fake_pool_connected", f"fastapi-turbo state: {rs_data}"
     compare_json(471, "request.app.state.X returns lifespan state",
                  fa_port, rs_port, "/p471-request-app-state", check_fn=check_471)
 
@@ -804,7 +804,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["custom_val"] == "hello", f"FastAPI state: {fa_data}"
-        assert rs_data["custom_val"] == "hello", f"fastapi-rs state: {rs_data}"
+        assert rs_data["custom_val"] == "hello", f"fastapi-turbo state: {rs_data}"
     compare_json(472, "request.state.X per-request",
                  fa_port, rs_port, "/p472-request-state", check_fn=check_472)
 
@@ -814,7 +814,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["body_length"] > 0, f"FastAPI body: {fa_data}"
-        assert rs_data["body_length"] > 0, f"fastapi-rs body: {rs_data}"
+        assert rs_data["body_length"] > 0, f"fastapi-turbo body: {rs_data}"
     compare_json(473, "await request.body() returns bytes",
                  fa_port, rs_port, "/p473-request-body",
                  method="POST", body={"payload": "test_data"}, check_fn=check_473)
@@ -825,7 +825,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["data"]["key"] == "value", f"FastAPI json: {fa_data}"
-        assert rs_data["data"]["key"] == "value", f"fastapi-rs json: {rs_data}"
+        assert rs_data["data"]["key"] == "value", f"fastapi-turbo json: {rs_data}"
     compare_json(474, "await request.json() returns parsed dict",
                  fa_port, rs_port, "/p474-request-json",
                  method="POST", body={"key": "value"}, check_fn=check_474)
@@ -836,7 +836,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["form"]["username"] == "testuser", f"FastAPI form: {fa_data}"
-        assert rs_data["form"]["username"] == "testuser", f"fastapi-rs form: {rs_data}"
+        assert rs_data["form"]["username"] == "testuser", f"fastapi-turbo form: {rs_data}"
     fa_475 = http_form(fa_port, "/p475-request-form", {"username": "testuser", "action": "login"})
     rs_475 = http_form(rs_port, "/p475-request-form", {"username": "testuser", "action": "login"})
     compare(475, "await request.form() returns form data", fa_475, rs_475, check_475)
@@ -850,7 +850,7 @@ def run_all_tests(fa_port, rs_port):
         fa_url = fa_data.get("url", fa_data.get("error", ""))
         rs_url = rs_data.get("url", rs_data.get("error", ""))
         assert "p476-url-for" in fa_url, f"FastAPI url_for: {fa_data}"
-        assert "p476-url-for" in rs_url, f"fastapi-rs url_for: {rs_data}"
+        assert "p476-url-for" in rs_url, f"fastapi-turbo url_for: {rs_data}"
     compare_json(476, "request.url_for('route_name')",
                  fa_port, rs_port, "/p476-url-for", check_fn=check_476)
 
@@ -860,7 +860,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert "http" in fa_data["base_url"], f"FastAPI base_url: {fa_data}"
-        assert "http" in rs_data["base_url"], f"fastapi-rs base_url: {rs_data}"
+        assert "http" in rs_data["base_url"], f"fastapi-turbo base_url: {rs_data}"
     compare_json(477, "request.base_url returns scheme://host",
                  fa_port, rs_port, "/p477-base-url", check_fn=check_477)
 
@@ -870,7 +870,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["type"] == "http", f"FastAPI scope type: {fa_data}"
-        assert rs_data["type"] == "http", f"fastapi-rs scope type: {rs_data}"
+        assert rs_data["type"] == "http", f"fastapi-turbo scope type: {rs_data}"
     compare_json(478, "request.scope['type'] == 'http'",
                  fa_port, rs_port, "/p478-request-scope-type", check_fn=check_478)
 
@@ -880,7 +880,7 @@ def run_all_tests(fa_port, rs_port):
         fa_path = fh.get("x-path-seen", fh.get("X-Path-Seen", ""))
         rs_path = rh.get("x-path-seen", rh.get("X-Path-Seen", ""))
         assert "/p479" in fa_path, f"FastAPI middleware header: {fa_path}"
-        assert "/p479" in rs_path, f"fastapi-rs middleware header: {rs_path}"
+        assert "/p479" in rs_path, f"fastapi-turbo middleware header: {rs_path}"
     compare_json(479, "request in middleware (path accessible)",
                  fa_port, rs_port, "/p479-middleware-request", check_fn=check_479)
 
@@ -890,7 +890,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["stamp"] == "middleware_was_here", f"FastAPI state: {fa_data}"
-        assert rs_data["stamp"] == "middleware_was_here", f"fastapi-rs state: {rs_data}"
+        assert rs_data["stamp"] == "middleware_was_here", f"fastapi-turbo state: {rs_data}"
     compare_json(480, "request.state persists across middleware",
                  fa_port, rs_port, "/p480-state-across-mw", check_fn=check_480)
 
@@ -901,9 +901,9 @@ def run_all_tests(fa_port, rs_port):
     def check_481(fs, fh, fb, rs, rh, rb):
         assert fs == 200 and rs == 200
         assert "word0" in fb, f"FastAPI SSE: {fb[:100]}"
-        assert "word0" in rb, f"fastapi-rs SSE: {rb[:100]}"
+        assert "word0" in rb, f"fastapi-turbo SSE: {rb[:100]}"
         assert "[DONE]" in fb, f"FastAPI SSE missing DONE"
-        assert "[DONE]" in rb, f"fastapi-rs SSE missing DONE"
+        assert "[DONE]" in rb, f"fastapi-turbo SSE missing DONE"
     compare_json(481, "StreamingResponse + text/event-stream",
                  fa_port, rs_port, "/p481-sse-stream", method="POST", body={}, check_fn=check_481)
 
@@ -913,7 +913,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["username"] == "admin", f"FastAPI: {fa_data}"
-        assert rs_data["username"] == "admin", f"fastapi-rs: {rs_data}"
+        assert rs_data["username"] == "admin", f"fastapi-turbo: {rs_data}"
     fa_482 = http_form(fa_port, "/p482-oauth-login", {"username": "admin", "password": "secret", "grant_type": "password"})
     rs_482 = http_form(rs_port, "/p482-oauth-login", {"username": "admin", "password": "secret", "grant_type": "password"})
     compare(482, "OAuth2PasswordRequestForm for login", fa_482, rs_482, check_482)
@@ -928,7 +928,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["has_paths"] is True, f"FastAPI: {fa_data}"
-        assert rs_data["has_paths"] is True, f"fastapi-rs: {rs_data}"
+        assert rs_data["has_paths"] is True, f"fastapi-turbo: {rs_data}"
         assert fa_data["title"] == "Parity Test App 4"
         assert rs_data["title"] == "Parity Test App 4"
     compare_json(484, "read OpenAPI schema programmatically",
@@ -937,11 +937,11 @@ def run_all_tests(fa_port, rs_port):
     # P485: run_in_threadpool
     def check_485(fs, fh, fb, rs, rh, rb):
         assert fs == 200, f"FastAPI status={fs}, body={fb[:200]}"
-        assert rs == 200, f"fastapi-rs status={rs}, body={rb[:200]}"
+        assert rs == 200, f"fastapi-turbo status={rs}, body={rb[:200]}"
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["result"] == 499500, f"FastAPI threadpool: {fa_data}"
-        assert rs_data["result"] == 499500, f"fastapi-rs threadpool: {rs_data}"
+        assert rs_data["result"] == 499500, f"fastapi-turbo threadpool: {rs_data}"
     compare_json(485, "run_in_threadpool for CPU work",
                  fa_port, rs_port, "/p485-threadpool", check_fn=check_485)
 
@@ -950,7 +950,7 @@ def run_all_tests(fa_port, rs_port):
         fa_op = fa_openapi.get("paths", {}).get("/p486-custom-op-id", {}).get("get", {})
         rs_op = rs_openapi.get("paths", {}).get("/p486-custom-op-id", {}).get("get", {})
         assert fa_op.get("operationId") == "my_custom_operation", f"FastAPI opId: {fa_op.get('operationId')}"
-        assert rs_op.get("operationId") == "my_custom_operation", f"fastapi-rs opId: {rs_op.get('operationId')}"
+        assert rs_op.get("operationId") == "my_custom_operation", f"fastapi-turbo opId: {rs_op.get('operationId')}"
     compare(486, "custom unique_id for operation IDs",
             (fa_s, {}, fa_openapi_raw), (rs_s, {}, rs_openapi_raw), check_486)
 
@@ -971,7 +971,7 @@ def run_all_tests(fa_port, rs_port):
     def check_489(fs, fh, fb, rs, rh, rb):
         assert fs == 200 and rs == 200
         assert "output" in fb, f"FastAPI SSE: {fb[:100]}"
-        assert "output" in rb, f"fastapi-rs SSE: {rb[:100]}"
+        assert "output" in rb, f"fastapi-turbo SSE: {rb[:100]}"
     compare_json(489, "LangServe SSE pattern",
                  fa_port, rs_port, "/p489-langserve-sse",
                  method="POST", body={"input": "hello world"}, check_fn=check_489)
@@ -979,7 +979,7 @@ def run_all_tests(fa_port, rs_port):
     # P490: FileResponse
     def check_490(fs, fh, fb, rs, rh, rb):
         assert fs == 200, f"FastAPI file status={fs}"
-        assert rs == 200, f"fastapi-rs file status={rs}"
+        assert rs == 200, f"fastapi-turbo file status={rs}"
         assert "download" in fb and "download" in rb
     compare_json(490, "FileResponse + filename",
                  fa_port, rs_port, "/p490-file-download", check_fn=check_490)
@@ -994,7 +994,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["app"] == "dispatch_1", f"FastAPI: {fa_data}"
-        assert rs_data["app"] == "dispatch_1", f"fastapi-rs: {rs_data}"
+        assert rs_data["app"] == "dispatch_1", f"fastapi-turbo: {rs_data}"
     compare_json(492, "multiple sub-apps (app1)",
                  fa_port, rs_port, "/p492-app1/info", check_fn=check_492a)
 
@@ -1004,7 +1004,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["username"] == "alice", f"FastAPI: {fa_data}"
-        assert rs_data["username"] == "alice", f"fastapi-rs: {rs_data}"
+        assert rs_data["username"] == "alice", f"fastapi-turbo: {rs_data}"
     fa_493 = http_form(fa_port, "/p493-auth/login", {"username": "alice", "password": "pw"})
     rs_493 = http_form(rs_port, "/p493-auth/login", {"username": "alice", "password": "pw"})
     compare(493, "router factory (get_auth_router)", fa_493, rs_493, check_493)
@@ -1023,7 +1023,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["limiter"]["limit"] == 100, f"FastAPI: {fa_data}"
-        assert rs_data["limiter"]["limit"] == 100, f"fastapi-rs: {rs_data}"
+        assert rs_data["limiter"]["limit"] == 100, f"fastapi-turbo: {rs_data}"
     compare_json(496, "app.state for rate limiter storage",
                  fa_port, rs_port, "/p496-app-state", check_fn=check_496)
 
@@ -1033,7 +1033,7 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["path_count"] > 0, f"FastAPI: {fa_data}"
-        assert rs_data["path_count"] > 0, f"fastapi-rs: {rs_data}"
+        assert rs_data["path_count"] > 0, f"fastapi-turbo: {rs_data}"
         assert fa_data["has_openapi_version"] is True
         assert rs_data["has_openapi_version"] is True
     compare_json(497, "read OpenAPI schema programmatically",
@@ -1041,11 +1041,11 @@ def run_all_tests(fa_port, rs_port):
 
     # P498: RequestValidationError handler
     def check_498(fs, fh, fb, rs, rh, rb):
-        assert fs == 422 and rs == 422, f"Status: FastAPI={fs}, fastapi-rs={rs}"
+        assert fs == 422 and rs == 422, f"Status: FastAPI={fs}, fastapi-turbo={rs}"
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert "custom_validation_error" in fa_data.get("detail", ""), f"FastAPI: {fa_data}"
-        assert "custom_validation_error" in rs_data.get("detail", ""), f"fastapi-rs: {rs_data}"
+        assert "custom_validation_error" in rs_data.get("detail", ""), f"fastapi-turbo: {rs_data}"
     # Trigger validation error by omitting required query param
     compare_json(498, "RequestValidationError handler",
                  fa_port, rs_port, "/p498-validation-error", check_fn=check_498)
@@ -1060,12 +1060,12 @@ def run_all_tests(fa_port, rs_port):
         fa_data = json.loads(fb)
         rs_data = json.loads(rb)
         assert fa_data["message"] == "full stack works", f"FastAPI: {fa_data}"
-        assert rs_data["message"] == "full stack works", f"fastapi-rs: {rs_data}"
+        assert rs_data["message"] == "full stack works", f"fastapi-turbo: {rs_data}"
         assert fa_data["user"] == "authenticated_user", f"FastAPI user: {fa_data}"
-        assert rs_data["user"] == "authenticated_user", f"fastapi-rs user: {rs_data}"
+        assert rs_data["user"] == "authenticated_user", f"fastapi-turbo user: {rs_data}"
         # response_model should strip "extra" field
         assert "extra" not in fa_data, f"FastAPI extra not stripped: {fa_data}"
-        assert "extra" not in rs_data, f"fastapi-rs extra not stripped: {rs_data}"
+        assert "extra" not in rs_data, f"fastapi-turbo extra not stripped: {rs_data}"
     fa_500 = http_request(fa_port, "/p500-full-stack",
                           headers={"Authorization": "Bearer test_token"})
     rs_500 = http_request(rs_port, "/p500-full-stack",
@@ -1078,7 +1078,7 @@ def run_all_tests(fa_port, rs_port):
 def main():
     print(f"\n{BOLD}{'='*60}")
     print(f"  Parity Test Suite 4: Patterns 401-500")
-    print(f"  FastAPI on :{FASTAPI_PORT}   |   fastapi-rs on :{FASTAPI_RS_PORT}")
+    print(f"  FastAPI on :{FASTAPI_PORT}   |   fastapi-turbo on :{FASTAPI_TURBO_PORT}")
     print(f"{'='*60}{RESET}\n")
 
     uvicorn_proc = None
@@ -1089,13 +1089,13 @@ def main():
         print(f"Starting uvicorn (stock FastAPI) on port {FASTAPI_PORT}...")
         uvicorn_proc = start_uvicorn(FASTAPI_PORT)
 
-        print(f"Starting fastapi-rs on port {FASTAPI_RS_PORT}...")
-        rs_proc = start_fastapi_rs(FASTAPI_RS_PORT)
+        print(f"Starting fastapi-turbo on port {FASTAPI_TURBO_PORT}...")
+        rs_proc = start_fastapi_turbo(FASTAPI_TURBO_PORT)
 
         # Wait for both
         print("Waiting for servers to start...")
         fa_ready = wait_for_port(FASTAPI_PORT)
-        rs_ready = wait_for_port(FASTAPI_RS_PORT)
+        rs_ready = wait_for_port(FASTAPI_TURBO_PORT)
 
         if not fa_ready:
             print(f"{RED}ERROR: uvicorn failed to start on port {FASTAPI_PORT}{RESET}")
@@ -1105,7 +1105,7 @@ def main():
             return 1
 
         if not rs_ready:
-            print(f"{RED}ERROR: fastapi-rs failed to start on port {FASTAPI_RS_PORT}{RESET}")
+            print(f"{RED}ERROR: fastapi-turbo failed to start on port {FASTAPI_TURBO_PORT}{RESET}")
             if rs_proc:
                 stderr = rs_proc.stderr.read().decode() if rs_proc.stderr else ""
                 print(f"  stderr: {stderr[:500]}")
@@ -1115,16 +1115,16 @@ def main():
 
         # Verify health on both
         fa_health = http_request(FASTAPI_PORT, "/health")
-        rs_health = http_request(FASTAPI_RS_PORT, "/health")
+        rs_health = http_request(FASTAPI_TURBO_PORT, "/health")
         if fa_health[0] != 200:
             print(f"{RED}FastAPI /health failed: {fa_health}{RESET}")
             return 1
         if rs_health[0] != 200:
-            print(f"{RED}fastapi-rs /health failed: {rs_health}{RESET}")
+            print(f"{RED}fastapi-turbo /health failed: {rs_health}{RESET}")
             return 1
 
         # Run all tests
-        run_all_tests(FASTAPI_PORT, FASTAPI_RS_PORT)
+        run_all_tests(FASTAPI_PORT, FASTAPI_TURBO_PORT)
 
         # Summary
         total = len(results)

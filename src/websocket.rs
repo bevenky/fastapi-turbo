@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
-/// Cached `fastapi_rs.exceptions.WebSocketDisconnect` class — used by the
+/// Cached `fastapi_turbo.exceptions.WebSocketDisconnect` class — used by the
 /// receive awaitables to raise the correct typed exception without the
 /// Python-side `try/except` translation layer.
 static WS_DISCONNECT_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
@@ -26,7 +26,7 @@ fn ws_disconnect_class(py: Python<'_>) -> Option<&'static Py<PyAny>> {
     if let Some(c) = WS_DISCONNECT_CLS.get() {
         return Some(c);
     }
-    let exc = py.import("fastapi_rs.exceptions").ok()?;
+    let exc = py.import("fastapi_turbo.exceptions").ok()?;
     let cls: Py<PyAny> = exc.getattr("WebSocketDisconnect").ok()?.unbind();
     let _ = WS_DISCONNECT_CLS.set(cls);
     WS_DISCONNECT_CLS.get()
@@ -73,7 +73,7 @@ pub struct WsScopeInfo {
 }
 
 // ── WebSocket state (matches Starlette's WebSocketState) ───────────
-// These values MUST match python/fastapi_rs/websockets.py::WebSocketState.
+// These values MUST match python/fastapi_turbo/websockets.py::WebSocketState.
 
 pub const STATE_CONNECTING: u8 = 0;
 pub const STATE_CONNECTED: u8 = 1;
@@ -667,7 +667,7 @@ pub async fn handle_ws_upgrade(
     // WebSocket wrapper, call accept(), and interact with the socket.
     let ws_obj = Python::attach(|py| {
         let ws_cell = Py::new(py, py_ws).expect("PyWebSocket");
-        let ws_mod = py.import("fastapi_rs.websockets").expect("websockets");
+        let ws_mod = py.import("fastapi_turbo.websockets").expect("websockets");
         let ws_cls = ws_mod.getattr("WebSocket").expect("WebSocket");
         ws_cls.call1((ws_cell,)).expect("wrap").unbind()
     });

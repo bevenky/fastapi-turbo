@@ -2,9 +2,9 @@
 Uses the fastest async drivers (psycopg3 82μs vs asyncpg 147μs).
 Standard FastAPI code — users would write this exact same way.
 """
-import fastapi_rs
-from fastapi_rs import FastAPI, Query, HTTPException
-from fastapi_rs.middleware.cors import CORSMiddleware
+import fastapi_turbo
+from fastapi_turbo import FastAPI, Query, HTTPException
+from fastapi_turbo.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg
 from psycopg_pool import AsyncConnectionPool
@@ -22,7 +22,7 @@ async def get_pool():
     global pg_pool
     if pg_pool is None:
         pg_pool = AsyncConnectionPool(
-            "dbname=fastapi_rs_bench user=venky", min_size=5, max_size=20, open=False
+            "dbname=fastapi_turbo_bench user=venky", min_size=5, max_size=20, open=False
         )
         await pg_pool.open()
         await pg_pool.wait()

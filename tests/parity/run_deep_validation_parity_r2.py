@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ROUND 2 — Deep validation parity runner.
 
-Boots stock FastAPI on :29910 (uvicorn, subprocess) and fastapi-rs on :29911
+Boots stock FastAPI on :29910 (uvicorn, subprocess) and fastapi-turbo on :29911
 (in-thread). For each of ~500 crafted cases it sends a single bad request and
 compares the ENTIRE 422 response body between both servers: every error in
 detail[], every field of each error (type/loc/msg/input/ctx/url).
@@ -56,7 +56,7 @@ def wait_for_server(url: str, timeout: float = 25.0) -> bool:
 def start_fastapi() -> subprocess.Popen:
     src = f"""
 import os, sys
-os.environ['FASTAPI_RS_NO_SHIM'] = '1'
+os.environ['FASTAPI_TURBO_NO_SHIM'] = '1'
 sys.path.insert(0, {TEST_DIR!r})
 import uvicorn
 uvicorn.run('parity_app_deep_validation_r2:app', host='127.0.0.1',
@@ -69,10 +69,10 @@ uvicorn.run('parity_app_deep_validation_r2:app', host='127.0.0.1',
     )
 
 
-def start_fastapi_rs_thread() -> threading.Thread:
+def start_fastapi_turbo_thread() -> threading.Thread:
     def run():
-        import fastapi_rs.compat  # noqa: F401
-        fastapi_rs.compat.install()
+        import fastapi_turbo.compat  # noqa: F401
+        fastapi_turbo.compat.install()
         sys.path.insert(0, TEST_DIR)
         import parity_app_deep_validation_r2 as papp  # noqa: WPS433
         papp.app.run("127.0.0.1", RS_PORT)
@@ -1739,7 +1739,7 @@ def deep_compare_case(case: Case, fa_r: httpx.Response, rs_r: httpx.Response,
     # on genuinely broken FA plumbing (e.g. Python's stdlib json cannot
     # serialize NaN/inf, so any 422 detail that carries such an input as
     # its Pydantic `input` field triggers a serialization error during
-    # error-handler rendering). fastapi-rs handles these cleanly (NaN →
+    # error-handler rendering). fastapi-turbo handles these cleanly (NaN →
     # null in the JSON encoder) and returns a correct 422. Treat FA's
     # 500/"Internal Server Error" as an acknowledged FA defect and
     # accept FR's well-formed 422 as a pass for every property.
@@ -1909,8 +1909,8 @@ def main():
 
     print(f"[+] Starting stock FastAPI (uvicorn) on :{FA_PORT}")
     fa_proc = start_fastapi()
-    print(f"[+] Starting fastapi-rs on :{RS_PORT}")
-    start_fastapi_rs_thread()
+    print(f"[+] Starting fastapi-turbo on :{RS_PORT}")
+    start_fastapi_turbo_thread()
 
     try:
         if not wait_for_server(FA_URL):
@@ -1919,7 +1919,7 @@ def main():
             print(err[:1500])
             return 2
         if not wait_for_server(RS_URL):
-            print(f"[!] fastapi-rs failed to boot on :{RS_PORT}")
+            print(f"[!] fastapi-turbo failed to boot on :{RS_PORT}")
             return 2
 
         print("[+] Both servers ready. Running cases...")

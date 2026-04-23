@@ -1,7 +1,7 @@
 """Boot one parity SQLA app (specified via CLI) and seed a user row.
 
 Usage:
-    sqla_runner.py {pg3|pg2|async} {fastapi-rs|uvicorn} PORT
+    sqla_runner.py {pg3|pg2|async} {fastapi-turbo|uvicorn} PORT
 """
 import os
 import sys
@@ -20,10 +20,10 @@ DB_URLS = {
 _SQLA_SUFFIX = {"pg3async": "async"}.get(mode, mode)
 os.environ["SQLA_SUFFIX"] = _SQLA_SUFFIX
 
-# If running under fastapi-rs: install the compat shim so the parity app's
-# ``from fastapi import ...`` imports resolve to fastapi-rs transparently.
-if stack == "fastapi-rs":
-    from fastapi_rs.compat import install
+# If running under fastapi-turbo: install the compat shim so the parity app's
+# ``from fastapi import ...`` imports resolve to fastapi-turbo transparently.
+if stack == "fastapi-turbo":
+    from fastapi_turbo.compat import install
     install()
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,7 +40,7 @@ app = build_app(DB_URLS[mode])
 # exist already from a prior parity run; re-running drop_all under the bench
 # harness's worker loop hangs because SQLAlchemy's greenlet bridge on a
 # cold engine contends with the same loop that's about to serve requests.
-# fastapi-rs exposes ``_on_startup``; stock FastAPI exposes it on ``.router``
+# fastapi-turbo exposes ``_on_startup``; stock FastAPI exposes it on ``.router``
 # as ``on_startup`` (plain list). Handle both.
 if mode in ("async", "pg3async"):
     if hasattr(app, "_on_startup"):
@@ -57,7 +57,7 @@ try:
 except Exception:
     pass
 
-if stack == "fastapi-rs":
+if stack == "fastapi-turbo":
     app.run(host="127.0.0.1", port=port)
 else:
     import uvicorn

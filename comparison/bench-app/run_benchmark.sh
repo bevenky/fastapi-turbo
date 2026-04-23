@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # Mini E-commerce API Benchmark
-# Compares: fastapi-rs, FastAPI+uvicorn, Go Gin, Node Fastify
+# Compares: fastapi-turbo, FastAPI+uvicorn, Go Gin, Node Fastify
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BENCH_CLIENT="$PROJECT_ROOT/target/release/fastapi-rs-bench"
+BENCH_CLIENT="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
 
 # Python interpreters
-# fastapi-rs is installed in the default env; real FastAPI lives in a venv
+# fastapi-turbo is installed in the default env; real FastAPI lives in a venv
 PYTHON_RS="python3"
 PYTHON_FASTAPI="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
@@ -24,7 +24,7 @@ if [ ! -x "$PYTHON_FASTAPI" ]; then
 fi
 
 # Ports
-PORT_FASTAPI_RS=19001
+PORT_FASTAPI_TURBO=19001
 PORT_FASTAPI=19002
 PORT_GO_GIN=19003
 PORT_FASTIFY=19004
@@ -98,9 +98,9 @@ echo -e "  ${GREEN}node_modules ready${NC}"
 echo -e "${YELLOW}[3/4] Checking bench client...${NC}"
 if [ ! -x "$BENCH_CLIENT" ]; then
     echo -e "  ${RED}Bench client not found at $BENCH_CLIENT${NC}"
-    echo "  Building with: cargo build --release --bin fastapi-rs-bench"
+    echo "  Building with: cargo build --release --bin fastapi-turbo-bench"
     cd "$PROJECT_ROOT"
-    cargo build --release --bin fastapi-rs-bench 2>&1
+    cargo build --release --bin fastapi-turbo-bench 2>&1
 fi
 echo -e "  ${GREEN}Bench client ready${NC}"
 
@@ -110,9 +110,9 @@ echo -e "  ${GREEN}Bench client ready${NC}"
 echo ""
 echo -e "${YELLOW}[4/4] Starting servers...${NC}"
 
-# fastapi-rs (uses default Python where fastapi-rs is installed)
+# fastapi-turbo (uses default Python where fastapi-turbo is installed)
 cd "$PROJECT_ROOT"
-FASTAPI_RS_NO_SHIM=1 PORT=$PORT_FASTAPI_RS $PYTHON_RS "$SCRIPT_DIR/fastapi_rs_app.py" &
+FASTAPI_TURBO_NO_SHIM=1 PORT=$PORT_FASTAPI_TURBO $PYTHON_RS "$SCRIPT_DIR/fastapi_turbo_app.py" &
 PIDS+=($!)
 
 # FastAPI + uvicorn (uses the fastapi venv)
@@ -128,7 +128,7 @@ PORT=$PORT_FASTIFY node "$SCRIPT_DIR/fastify/server.js" &
 PIDS+=($!)
 
 # Wait for all servers
-wait_for_port $PORT_FASTAPI_RS "fastapi-rs"
+wait_for_port $PORT_FASTAPI_TURBO "fastapi-turbo"
 wait_for_port $PORT_FASTAPI    "FastAPI"
 wait_for_port $PORT_GO_GIN     "Go Gin"
 wait_for_port $PORT_FASTIFY    "Fastify"
@@ -282,8 +282,8 @@ UPDATE_BODY='{"name":"Updated Item","price":99.99,"description":"updated"}'
 FORM_BODY='username=admin&password=secret'
 
 declare -A FRAMEWORKS
-FRAMEWORKS=( ["fastapi-rs"]=$PORT_FASTAPI_RS ["FastAPI"]=$PORT_FASTAPI ["Go-Gin"]=$PORT_GO_GIN ["Fastify"]=$PORT_FASTIFY )
-ORDERED_NAMES=("fastapi-rs" "FastAPI" "Go-Gin" "Fastify")
+FRAMEWORKS=( ["fastapi-turbo"]=$PORT_FASTAPI_TURBO ["FastAPI"]=$PORT_FASTAPI ["Go-Gin"]=$PORT_GO_GIN ["Fastify"]=$PORT_FASTIFY )
+ORDERED_NAMES=("fastapi-turbo" "FastAPI" "Go-Gin" "Fastify")
 
 # Result arrays (associative)
 declare -A RESULTS

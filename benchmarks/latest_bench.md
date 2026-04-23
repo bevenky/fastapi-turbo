@@ -1,4 +1,4 @@
-# fastapi-rs benchmark — fresh run
+# fastapi-turbo benchmark — fresh run
 
 Machine: Apple M-series, macOS 25.4. Python 3.14 (GIL-enabled). Rust bench client
 over keep-alive TCP, single connection per framework, loopback.
@@ -6,7 +6,7 @@ over keep-alive TCP, single connection per framework, loopback.
 **Loads run:** 15 000 (HTTP) · 5 000 (WS / DB) · 10 000 (Redis) · 3 000 (SQLA).
 Warm-up 200–500.
 
-Columns ordered as requested: **Go Gin · Go Echo · Rust Axum · Fastify · fastapi-rs · FastAPI (uvicorn)**.
+Columns ordered as requested: **Go Gin · Go Echo · Rust Axum · Fastify · fastapi-turbo · FastAPI (uvicorn)**.
 
 ---
 
@@ -17,7 +17,7 @@ CRUD, auth, WS chat echo. All servers implement the same contract.
 
 ### Throughput (req/s — higher is better)
 
-| Endpoint                 |  Go Gin | Go Echo | Rust Axum | Fastify | fastapi-rs | FastAPI |
+| Endpoint                 |  Go Gin | Go Echo | Rust Axum | Fastify | fastapi-turbo | FastAPI |
 |--------------------------|--------:|--------:|----------:|--------:|-----------:|--------:|
 | GET /health              | 31 068  | 31 776  |    54 317 | 37 335  | 36 234     |   5 167 |
 | GET /items?limit=1       | 32 017  | 30 957  |    52 655 | 38 702  | 30 227     |   3 119 |
@@ -34,7 +34,7 @@ keep-alive bug that caused the batched run to drop those rows.
 
 ### Latency — p50 / p99 (μs, lower is better)
 
-| Endpoint                 |    Go Gin |    Go Echo |  Rust Axum |  Fastify | fastapi-rs |       FastAPI |
+| Endpoint                 |    Go Gin |    Go Echo |  Rust Axum |  Fastify | fastapi-turbo |       FastAPI |
 |--------------------------|----------:|-----------:|-----------:|---------:|-----------:|--------------:|
 | GET /health              |    28/75  |     28/71  |     17/30  |   25/44  |     27/42  |    192/238    |
 | GET /items?limit=10      |    29/77  |     28/73  |     19/32  |   24/56  |     31/76  |    329/413    |
@@ -50,7 +50,7 @@ keep-alive bug that caused the batched run to drop those rows.
 
 Live Postgres 16 on localhost. `db_*_app.py`, same endpoints across stacks.
 
-| Endpoint                           |  Go Gin | Rust Axum | fastapi-rs pg3 sync | fastapi-rs pg2 sync | fastapi-rs pg3 async | FastAPI asyncpg |
+| Endpoint                           |  Go Gin | Rust Axum | fastapi-turbo pg3 sync | fastapi-turbo pg2 sync | fastapi-turbo pg3 async | FastAPI asyncpg |
 |------------------------------------|--------:|----------:|--------------------:|--------------------:|---------------------:|----------------:|
 | GET /health                        | 31 652  |   23 789† |       21 195†       |       11 023†       |       36 215         |      4 177      |
 | GET /products/1 (JOIN)             | 14 239  |    1 431† |        7 553        |        9 304        |        3 028         |      2 798      |
@@ -59,7 +59,7 @@ Live Postgres 16 on localhost. `db_*_app.py`, same endpoints across stacks.
 | GET /cached/products/1 (Redis→PG)  | 13 335  |    3 985  |        6 876        |        7 491        |        1 995†        |      4 082      |
 | POST /products (INSERT)            |  6 525  |    1 455† |        2 847†       |        7 533        |        2 352         |      1 956      |
 
-p50 μs on `/products/1`: Go Gin 67 · Rust Axum 674† · fastapi-rs pg3 sync 130 · fastapi-rs pg2 sync 85 · fastapi-rs pg3 async 328 · FastAPI asyncpg 350.
+p50 μs on `/products/1`: Go Gin 67 · Rust Axum 674† · fastapi-turbo pg3 sync 130 · fastapi-turbo pg2 sync 85 · fastapi-turbo pg3 async 328 · FastAPI asyncpg 350.
 
 † Numbers with dagger were depressed by **CPU contention** — all 6 servers ran
 simultaneously sharing a single Postgres pool and the macOS scheduler didn't
@@ -71,15 +71,15 @@ run, not as an absolute ceiling.
 
 ## 3. Redis — sync vs async driver matrix (pure GET/SET, no Postgres)
 
-| Endpoint              | Rust Axum | fastapi-rs sync (redis-py) | fastapi-rs async (redis.asyncio) | FastAPI uvicorn (redis.asyncio) |
+| Endpoint              | Rust Axum | fastapi-turbo sync (redis-py) | fastapi-turbo async (redis.asyncio) | FastAPI uvicorn (redis.asyncio) |
 |-----------------------|----------:|---------------------------:|---------------------------------:|--------------------------------:|
 | GET /health           |  51 440   |   38 663                   |   32 517                         |   8 279                         |
 | GET /cache/get        |  22 097   |   16 584                   |    6 945                         |   4 383                         |
 | POST /cache/set       |  21 232   |   14 927                   |    5 305                         |   3 828                         |
 
-p50 μs on `/cache/get`: Rust Axum 44 · fastapi-rs sync 59 · fastapi-rs async 133 · FastAPI uvicorn 225.
+p50 μs on `/cache/get`: Rust Axum 44 · fastapi-turbo sync 59 · fastapi-turbo async 133 · FastAPI uvicorn 225.
 
-**fastapi-rs sync + redis-py is ~4× FastAPI+uvicorn (async)** and ~75% of Rust Axum.
+**fastapi-turbo sync + redis-py is ~4× FastAPI+uvicorn (async)** and ~75% of Rust Axum.
 
 ---
 
@@ -91,16 +91,16 @@ exhaustion.
 
 | Stack                                      | /health rps | /users/1 rps |
 |--------------------------------------------|------------:|-------------:|
-| **fastapi-rs + SQLA + psycopg2 sync**          |   32 990    |    3 638     |
-| **fastapi-rs + SQLA + psycopg3 sync**          |   32 256    |    3 245     |
-| **fastapi-rs + SQLA + asyncpg (async)**        |   31 648    |    **2 641** |
+| **fastapi-turbo + SQLA + psycopg2 sync**          |   32 990    |    3 638     |
+| **fastapi-turbo + SQLA + psycopg3 sync**          |   32 256    |    3 245     |
+| **fastapi-turbo + SQLA + asyncpg (async)**        |   31 648    |    **2 641** |
 | FastAPI uvicorn + SQLA + psycopg2 sync         |    5 237    |    1 407     |
 | FastAPI uvicorn + SQLA + psycopg3 sync         |    5 232    |    1 287     |
 | FastAPI uvicorn + SQLA + asyncpg (async)       |    8 890    |    1 945     |
 
-p50 μs on /users/1: fastapi-rs pg2 273 · pg3 307 · asyncpg **376** · FastAPI pg2 704 · pg3 757 · asyncpg 508.
+p50 μs on /users/1: fastapi-turbo pg2 273 · pg3 307 · asyncpg **376** · FastAPI pg2 704 · pg3 757 · asyncpg 508.
 
-**fastapi-rs now beats FastAPI across the board, including SQLA async:**
+**fastapi-turbo now beats FastAPI across the board, including SQLA async:**
 - psycopg2 sync: **2.6× faster** than FastAPI
 - psycopg3 sync: **2.5× faster**
 - **asyncpg async: 1.36× faster** than FastAPI (was 25% behind before this session's fix)
@@ -140,14 +140,14 @@ leaving port-holding zombies.
 plugin no longer returns 400 + `Connection: close` mid-run.
 
 Customer-visible upshot: FastAPI code using `Depends(get_async_session)` +
-`AsyncSession` **just works and is faster than uvicorn** under fastapi-rs.
+`AsyncSession` **just works and is faster than uvicorn** under fastapi-turbo.
 No code changes required.
 
 ---
 
 ## 5. Fixes landed this session before running the matrices
 
-1. **SIGTERM now handled by fastapi-rs** (`src/server.rs`) — the old
+1. **SIGTERM now handled by fastapi-turbo** (`src/server.rs`) — the old
    `shutdown_signal()` only caught SIGINT, so bench scripts sending
    `kill $PID` (default SIGTERM) left processes lingering on ports. Now uses
    `tokio::select!` over both SIGINT and SIGTERM.
@@ -169,16 +169,16 @@ No code changes required.
 
 ## 6. Headlines
 
-- **CRUD:** fastapi-rs = 6–9× stock FastAPI, 65–85% of Go (Gin / Echo),
+- **CRUD:** fastapi-turbo = 6–9× stock FastAPI, 65–85% of Go (Gin / Echo),
   55–60% of Rust Axum, roughly on par with Node Fastify on pagination reads.
-- **Postgres sync drivers:** fastapi-rs + psycopg2 is the fastest Python stack —
+- **Postgres sync drivers:** fastapi-turbo + psycopg2 is the fastest Python stack —
   matches Go Gin's throughput on `/orders/1` multi-JOIN (9.5K vs 7.6K) in a
   contended run.
-- **Redis:** fastapi-rs sync + redis-py beats every other Python variant at
+- **Redis:** fastapi-turbo sync + redis-py beats every other Python variant at
   ~17K rps — 4× the uvicorn baseline, 75% of pure Rust.
-- **FastAPI's async-driver advantage is marginal once fastapi-rs runs sync
+- **FastAPI's async-driver advantage is marginal once fastapi-turbo runs sync
   drivers** — async Python pays a loop-dispatch tax that sync paths avoid
-  under fastapi-rs's tokio threadpool.
+  under fastapi-turbo's tokio threadpool.
 
 ---
 

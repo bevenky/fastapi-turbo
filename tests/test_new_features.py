@@ -29,7 +29,7 @@ import pytest
 
 class TestCookies:
     def test_set_cookie_basic(self):
-        from fastapi_rs.responses import Response
+        from fastapi_turbo.responses import Response
 
         r = Response(content="hi")
         r.set_cookie("session", "abc123")
@@ -41,7 +41,7 @@ class TestCookies:
         assert "SameSite=lax" in value
 
     def test_set_cookie_all_options(self):
-        from fastapi_rs.responses import Response
+        from fastapi_turbo.responses import Response
 
         r = Response()
         r.set_cookie(
@@ -58,7 +58,7 @@ class TestCookies:
         assert "SameSite=strict" in value
 
     def test_delete_cookie(self):
-        from fastapi_rs.responses import Response
+        from fastapi_turbo.responses import Response
 
         r = Response()
         r.delete_cookie("session")
@@ -67,7 +67,7 @@ class TestCookies:
         assert "Max-Age=0" in value
 
     def test_multiple_cookies_preserved(self):
-        from fastapi_rs.responses import Response
+        from fastapi_turbo.responses import Response
 
         r = Response()
         r.set_cookie("a", "1")
@@ -84,8 +84,8 @@ class TestCookies:
 
 class TestResponseClass:
     def test_response_class_wraps_dict(self):
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import HTMLResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import HTMLResponse
 
         app = FastAPI()
 
@@ -103,8 +103,8 @@ class TestResponseClass:
         assert result.media_type == "text/html"
 
     def test_response_class_ignores_existing_response(self):
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import HTMLResponse, JSONResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import HTMLResponse, JSONResponse
 
         app = FastAPI()
 
@@ -123,7 +123,7 @@ class TestResponseClass:
 
 class TestResponsesDict:
     def test_response_description(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -136,7 +136,7 @@ class TestResponsesDict:
         assert op["responses"]["200"]["description"] == "Custom description"
 
     def test_responses_dict_merges(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -152,7 +152,7 @@ class TestResponsesDict:
 
     def test_responses_dict_with_model(self):
         from pydantic import BaseModel
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         class Err(BaseModel):
             code: str
@@ -175,7 +175,7 @@ class TestResponsesDict:
 
 class TestMediaType:
     def test_body_media_type(self):
-        from fastapi_rs import FastAPI, Body
+        from fastapi_turbo import FastAPI, Body
         from typing import Annotated
 
         app = FastAPI()
@@ -198,7 +198,7 @@ class TestMediaType:
 
 class TestIncludeInSchema:
     def test_hidden_route(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -220,7 +220,7 @@ class TestIncludeInSchema:
 
 class TestOpenAPIExtra:
     def test_extra_fields_merged(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -239,7 +239,7 @@ class TestOpenAPIExtra:
 
 class TestPerRouteSecurity:
     def test_explicit_security(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -252,7 +252,7 @@ class TestPerRouteSecurity:
         assert op["security"] == [{"BearerAuth": []}]
 
     def test_empty_security_disables(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -270,8 +270,8 @@ class TestPerRouteSecurity:
 
 class TestExamples:
     def test_param_example(self):
-        from fastapi_rs import FastAPI, Query
-        from fastapi_rs.exceptions import FastAPIDeprecationWarning
+        from fastapi_turbo import FastAPI, Query
+        from fastapi_turbo.exceptions import FastAPIDeprecationWarning
         import warnings as _w
 
         app = FastAPI()
@@ -289,7 +289,7 @@ class TestExamples:
         assert any(p.get("example") == "Alice" for p in params)
 
     def test_param_examples_named(self):
-        from fastapi_rs import FastAPI, Query
+        from fastapi_turbo import FastAPI, Query
 
         app = FastAPI()
 
@@ -309,7 +309,7 @@ class TestExamples:
 
 class TestCallbacks:
     def test_callbacks_in_openapi(self):
-        from fastapi_rs import APIRouter, FastAPI
+        from fastapi_turbo import APIRouter, FastAPI
 
         cb_router = APIRouter()
 
@@ -333,7 +333,7 @@ class TestCallbacks:
 
 class TestUrlPathFor:
     def test_url_path_for_simple(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -345,7 +345,7 @@ class TestUrlPathFor:
         assert url == "/users/42"
 
     def test_url_path_for_missing_name(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -353,7 +353,7 @@ class TestUrlPathFor:
             app.url_path_for("nonexistent")
 
     def test_url_path_for_with_root_path(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI(root_path="/api/v1")
 
@@ -370,14 +370,14 @@ class TestUrlPathFor:
 
 class TestRootPath:
     def test_root_path_stored(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI(root_path="/api/v1")
         assert app.root_path == "/api/v1"
         assert app.root_path_in_servers is True
 
     def test_root_path_adds_server_to_openapi(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI(root_path="/api")
 
@@ -397,13 +397,13 @@ class TestRootPath:
 
 class TestHTTPDigest:
     def test_digest_import(self):
-        from fastapi_rs import HTTPDigest
-        from fastapi_rs.security import HTTPDigest as HTTPDigest2
+        from fastapi_turbo import HTTPDigest
+        from fastapi_turbo.security import HTTPDigest as HTTPDigest2
 
         assert HTTPDigest is HTTPDigest2
 
     def test_digest_model(self):
-        from fastapi_rs import HTTPDigest
+        from fastapi_turbo import HTTPDigest
 
         scheme = HTTPDigest()
         assert scheme.model["type"] == "http"
@@ -415,7 +415,7 @@ class TestHTTPDigest:
 
 class TestExceptionHandler:
     def test_decorator_registers(self):
-        from fastapi_rs import FastAPI, HTTPException
+        from fastapi_turbo import FastAPI, HTTPException
 
         app = FastAPI()
 
@@ -426,7 +426,7 @@ class TestExceptionHandler:
         assert HTTPException in app.exception_handlers
 
     def test_status_code_key(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -437,8 +437,8 @@ class TestExceptionHandler:
         assert 404 in app.exception_handlers
 
     def test_handler_invoked_in_compiled_route(self):
-        from fastapi_rs import FastAPI, HTTPException
-        from fastapi_rs.responses import JSONResponse
+        from fastapi_turbo import FastAPI, HTTPException
+        from fastapi_turbo.responses import JSONResponse
 
         app = FastAPI()
 
@@ -456,7 +456,7 @@ class TestExceptionHandler:
         assert result.status_code == 418
 
     def test_mro_lookup(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         class CustomException(Exception):
             pass
@@ -479,7 +479,7 @@ class TestExceptionHandler:
 
 class TestHTTPMiddleware:
     def test_decorator_registers(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -490,7 +490,7 @@ class TestHTTPMiddleware:
         assert len(app._http_middlewares) == 1
 
     def test_unsupported_type_raises(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
         with pytest.raises(ValueError):
@@ -499,7 +499,7 @@ class TestHTTPMiddleware:
                 pass
 
     def test_middleware_wraps_endpoint(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
 
@@ -524,7 +524,7 @@ class TestHTTPMiddleware:
         assert call_log == ["before", "handler", "after"]
 
     def test_middleware_chain_order(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
         call_log = []

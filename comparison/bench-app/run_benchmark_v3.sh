@@ -3,7 +3,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BENCH="$PROJECT_ROOT/target/release/fastapi-rs-bench"
+BENCH="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
 PY_RS="python3"
 PY_FA="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
@@ -39,14 +39,14 @@ cd "$SCRIPT_DIR/rust-axum-ecommerce" && PATH="$HOME/.cargo/bin:$PATH" cargo buil
 cd "$PROJECT_ROOT"
 
 # ── start ──
-FASTAPI_RS_NO_SHIM=1 PORT=$P_RS $PY_RS "$SCRIPT_DIR/fastapi_rs_app.py" >/tmp/rs.log 2>&1 & PIDS+=($!)
+FASTAPI_TURBO_NO_SHIM=1 PORT=$P_RS $PY_RS "$SCRIPT_DIR/fastapi_turbo_app.py" >/tmp/rs.log 2>&1 & PIDS+=($!)
 PORT=$P_FA $PY_FA "$SCRIPT_DIR/fastapi_app.py" >/tmp/fa.log 2>&1 & PIDS+=($!)
 PORT=$P_GIN "$SCRIPT_DIR/go-gin/ecommerce-gin" >/tmp/gin.log 2>&1 & PIDS+=($!)
 PORT=$P_FY node "$SCRIPT_DIR/fastify/server.js" >/tmp/fy.log 2>&1 & PIDS+=($!)
 PORT=$P_ECHO "$SCRIPT_DIR/go-echo-ecommerce/ecommerce-echo" >/tmp/echo.log 2>&1 & PIDS+=($!)
 PORT=$P_AXUM "$SCRIPT_DIR/rust-axum-ecommerce/target/release/ecommerce-axum" >/tmp/axum.log 2>&1 & PIDS+=($!)
 
-wait_port $P_RS   fastapi-rs
+wait_port $P_RS   fastapi-turbo
 wait_port $P_FA   FastAPI
 wait_port $P_GIN  Go-Gin
 wait_port $P_FY   Fastify
@@ -94,7 +94,7 @@ UBODY='{"name":"U","price":99.99,"description":"u"}'
 
 echo -e "framework\ttest\trps\tp50\tp99"
 
-for fw_port in "Go-Gin:$P_GIN" "Go-Echo:$P_ECHO" "Rust-Axum:$P_AXUM" "Fastify:$P_FY" "fastapi-rs:$P_RS" "FastAPI:$P_FA"; do
+for fw_port in "Go-Gin:$P_GIN" "Go-Echo:$P_ECHO" "Rust-Axum:$P_AXUM" "Fastify:$P_FY" "fastapi-turbo:$P_RS" "FastAPI:$P_FA"; do
     fw="${fw_port%:*}"; port="${fw_port##*:}"
     echo "→ $fw" >&2
     row "$fw" "GET /health"              "$(bench $port '/health')"

@@ -1,4 +1,4 @@
-"""Benchmark fastapi-rs vs baseline overhead measurement."""
+"""Benchmark fastapi-turbo vs baseline overhead measurement."""
 import time
 import statistics
 import sys
@@ -35,10 +35,10 @@ if __name__ == "__main__":
     port = 19876
     
     # Write test apps
-    with open("/tmp/bench_fastapi_rs.py", "w") as f:
+    with open("/tmp/bench_fastapi_turbo.py", "w") as f:
         f.write("""
-import fastapi_rs
-from fastapi_rs import FastAPI, Depends, Header
+import fastapi_turbo
+from fastapi_turbo import FastAPI, Depends, Header
 app = FastAPI()
 
 async def get_db():
@@ -58,11 +58,11 @@ async def with_deps(user=Depends(get_user), db=Depends(get_db)):
 app.run(host="127.0.0.1", port=""" + str(port) + """)
 """)
     
-    proc = subprocess.Popen([sys.executable, "/tmp/bench_fastapi_rs.py"],
+    proc = subprocess.Popen([sys.executable, "/tmp/bench_fastapi_turbo.py"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     time.sleep(2)
     
-    print("=== fastapi-rs Benchmark ===\n")
+    print("=== fastapi-turbo Benchmark ===\n")
     
     print("GET /hello (no deps, sync handler):")
     stats = bench_requests(f"http://127.0.0.1:{port}/hello", n=1000)

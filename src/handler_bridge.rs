@@ -51,7 +51,7 @@ pub fn init_async_worker() {
     let _ = ASYNC_WORKER_TX.set(tx);
 
     Python::attach(|py| {
-        let worker = py.import("fastapi_rs._async_worker").expect("_async_worker");
+        let worker = py.import("fastapi_turbo._async_worker").expect("_async_worker");
         worker.call_method0("init").expect("worker init");
         let submit = worker.getattr("submit").expect("submit").unbind();
         let _ = ASYNC_SUBMIT.set(submit);
@@ -250,7 +250,7 @@ fn get_event_loop(py: Python<'_>) -> PyResult<Py<PyAny>> {
 
             let loop_for_thread = loop_py.clone_ref(py);
             std::thread::Builder::new()
-                .name("fastapi-rs-asyncio".to_string())
+                .name("fastapi-turbo-asyncio".to_string())
                 .spawn(move || {
                     Python::attach(|py| {
                         let loop_bound = loop_for_thread.bind(py);
@@ -343,7 +343,7 @@ pub async fn call_async_handler(
 }
 
 /// Schedule an async Python callable on the persistent event loop.
-/// Uses `fastapi_rs._async_bridge.schedule_on_loop()` which wraps the handler call
+/// Uses `fastapi_turbo._async_bridge.schedule_on_loop()` which wraps the handler call
 /// in an async wrapper running ON the event loop thread — this ensures
 /// `asyncio.get_event_loop()` works inside the handler.
 /// Public wrapper for WebSocket handlers that must always use the event loop.
@@ -370,7 +370,7 @@ async fn call_async_via_event_loop(
         }
 
         // Use the Python bridge helper to schedule on the event loop
-        let bridge = py.import("fastapi_rs._async_bridge")?;
+        let bridge = py.import("fastapi_turbo._async_bridge")?;
 
         // Create a Rust callback that sends the result through the channel
         let tx = Mutex::new(Some(tx));

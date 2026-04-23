@@ -63,7 +63,7 @@ def test_websocket_echo(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -92,7 +92,7 @@ def test_websocket_multiple_messages(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -124,7 +124,7 @@ def test_websocket_json(server_app):
     import json
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -155,7 +155,7 @@ def test_websocket_with_http_routes(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.get("/hello")
@@ -197,7 +197,7 @@ def test_websocket_binary_preserved(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -228,7 +228,7 @@ def test_websocket_receive_dict(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -269,7 +269,7 @@ def test_websocket_state_tracking(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket, WebSocketState
+        from fastapi_turbo import FastAPI, WebSocket, WebSocketState
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -300,7 +300,7 @@ def test_websocket_state_tracking(server_app):
 
 def test_websocket_state_enum_values():
     """WebSocketState enum values match Starlette's."""
-    from fastapi_rs import WebSocketState
+    from fastapi_turbo import WebSocketState
 
     assert int(WebSocketState.CONNECTING) == 0
     assert int(WebSocketState.CONNECTED) == 1
@@ -310,7 +310,7 @@ def test_websocket_state_enum_values():
 
 def test_starlette_websockets_import_shim():
     """`from starlette.websockets import WebSocketState` must work via the shim."""
-    import fastapi_rs  # noqa: F401
+    import fastapi_turbo  # noqa: F401
 
     from starlette.websockets import WebSocket, WebSocketState, WebSocketDisconnect
 
@@ -328,7 +328,7 @@ def test_websocket_send_json_compact(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -357,7 +357,7 @@ def test_websocket_json_invalid_mode_raises(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -389,7 +389,7 @@ def test_websocket_close_preserves_reason(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -425,8 +425,8 @@ def test_websocket_disconnect_propagates_peer_close_code(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
-        from fastapi_rs.exceptions import WebSocketDisconnect
+        from fastapi_turbo import FastAPI, WebSocket
+        from fastapi_turbo.exceptions import WebSocketDisconnect
 
         app = FastAPI()
 
@@ -466,7 +466,7 @@ def test_websocket_state_validation_send_before_accept(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -500,7 +500,7 @@ def test_websocket_close_flushes_frame(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -537,7 +537,7 @@ def test_websocket_scope_has_headers_and_client(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -566,7 +566,7 @@ def test_websocket_scope_has_headers_and_client(server_app):
 
 def test_websocket_query_params():
     """ws.query_params parses the query string correctly."""
-    from fastapi_rs.websockets import WebSocket
+    from fastapi_turbo.websockets import WebSocket
 
     ws = WebSocket(scope={
         "type": "websocket",
@@ -580,7 +580,7 @@ def test_websocket_query_params():
 
 def test_websocket_url_and_base_url():
     """ws.url and ws.base_url reflect the upgrade request."""
-    from fastapi_rs.websockets import WebSocket
+    from fastapi_turbo.websockets import WebSocket
 
     ws = WebSocket(scope={
         "type": "websocket",
@@ -596,7 +596,7 @@ def test_websocket_url_and_base_url():
 
 def test_websocket_cookies_from_scope():
     """ws.cookies parses the Cookie header."""
-    from fastapi_rs.websockets import WebSocket
+    from fastapi_turbo.websockets import WebSocket
 
     ws = WebSocket(scope={
         "type": "websocket",
@@ -615,7 +615,7 @@ def test_websocket_accept_subprotocol_negotiation(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -649,7 +649,7 @@ def test_websocket_accept_no_subprotocol(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")
@@ -677,7 +677,7 @@ def test_websocket_handler_no_accept_times_out(server_app):
     import websockets
 
     url = server_app("""
-        from fastapi_rs import FastAPI, WebSocket
+        from fastapi_turbo import FastAPI, WebSocket
         app = FastAPI()
 
         @app.websocket("/ws")

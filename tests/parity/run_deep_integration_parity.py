@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deep integration parity runner.
 
-Runs stock FastAPI (uvicorn) on port 29800 and fastapi-rs on port 29801.
+Runs stock FastAPI (uvicorn) on port 29800 and fastapi-turbo on port 29801.
 Each test is a multi-step flow (login then /me, create then read, etc.)
 asserting both servers produce identical end-state.
 
@@ -23,14 +23,14 @@ import httpx
 # ── Config ────────────────────────────────────────────────────────
 
 FASTAPI_PORT = 29800
-FASTAPI_RS_PORT = 29801
+FASTAPI_TURBO_PORT = 29801
 HOST = "127.0.0.1"
 APP_MODULE = "tests.parity.parity_app_deep_integration:app"
 STARTUP_TIMEOUT = 20
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FA = f"http://{HOST}:{FASTAPI_PORT}"
-FR = f"http://{HOST}:{FASTAPI_RS_PORT}"
+FR = f"http://{HOST}:{FASTAPI_TURBO_PORT}"
 
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -56,7 +56,7 @@ def wait_for_port(port, timeout=STARTUP_TIMEOUT):
 def start_uvicorn(port):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
-    env.pop("FASTAPI_RS", None)
+    env.pop("FASTAPI_TURBO", None)
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", APP_MODULE,
          "--host", HOST, "--port", str(port), "--log-level", "warning"],
@@ -68,13 +68,13 @@ def start_uvicorn(port):
     return proc
 
 
-def start_fastapi_rs(port):
+def start_fastapi_turbo(port):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
     script = f"""
 import sys
 sys.path.insert(0, '{PROJECT_ROOT}')
-from fastapi_rs.compat import install
+from fastapi_turbo.compat import install
 install()
 from tests.parity.parity_app_deep_integration import app
 app.run(host='{HOST}', port={port})
@@ -2528,7 +2528,7 @@ def run_all(fa_port, rs_port):
 def main():
     print(f"\n{BOLD}{'='*72}")
     print(f"  Deep Integration Parity Suite")
-    print(f"  FastAPI on :{FASTAPI_PORT}   |   fastapi-rs on :{FASTAPI_RS_PORT}")
+    print(f"  FastAPI on :{FASTAPI_PORT}   |   fastapi-turbo on :{FASTAPI_TURBO_PORT}")
     print(f"{'='*72}{RESET}\n")
 
     uvicorn_proc = None
@@ -2537,12 +2537,12 @@ def main():
     try:
         print(f"Starting uvicorn on :{FASTAPI_PORT} …")
         uvicorn_proc = start_uvicorn(FASTAPI_PORT)
-        print(f"Starting fastapi-rs on :{FASTAPI_RS_PORT} …")
-        rs_proc = start_fastapi_rs(FASTAPI_RS_PORT)
+        print(f"Starting fastapi-turbo on :{FASTAPI_TURBO_PORT} …")
+        rs_proc = start_fastapi_turbo(FASTAPI_TURBO_PORT)
 
         print("Waiting for servers to listen…")
         fa_ready = wait_for_port(FASTAPI_PORT)
-        rs_ready = wait_for_port(FASTAPI_RS_PORT)
+        rs_ready = wait_for_port(FASTAPI_TURBO_PORT)
 
         if not fa_ready:
             print(f"{RED}uvicorn failed to start{RESET}")
@@ -2554,7 +2554,7 @@ def main():
                     pass
             return 1
         if not rs_ready:
-            print(f"{RED}fastapi-rs failed to start{RESET}")
+            print(f"{RED}fastapi-turbo failed to start{RESET}")
             if rs_proc:
                 try:
                     err = rs_proc.stderr.read(2000).decode(errors="ignore")
@@ -2577,7 +2577,7 @@ def main():
             return 1
 
         t0 = time.time()
-        run_all(FASTAPI_PORT, FASTAPI_RS_PORT)
+        run_all(FASTAPI_PORT, FASTAPI_TURBO_PORT)
         elapsed = time.time() - t0
 
         total = len(results)

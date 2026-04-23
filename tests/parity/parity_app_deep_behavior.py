@@ -4,8 +4,8 @@ This app exercises HOW requests are processed — middleware ordering, dep cachi
 streaming boundaries, cookie attributes, exception propagation, request/response
 introspection, concurrency, lifespan — not just "does it return 200".
 
-Uses ONLY stock FastAPI imports. The compat shim maps these to fastapi-rs when
-running under fastapi-rs.
+Uses ONLY stock FastAPI imports. The compat shim maps these to fastapi-turbo when
+running under fastapi-turbo.
 """
 import asyncio
 import json

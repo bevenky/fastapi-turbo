@@ -1,8 +1,8 @@
 """Parity mega-app 4: patterns 401-500 testing OpenAPI, templates, static
 files, advanced Pydantic, Request object, and real-world patterns.
 
-Uses ONLY stock FastAPI imports.  The compat shim maps these to fastapi-rs
-when running under fastapi-rs.
+Uses ONLY stock FastAPI imports.  The compat shim maps these to fastapi-turbo
+when running under fastapi-turbo.
 """
 import asyncio
 import enum
@@ -460,7 +460,7 @@ def p422(request: Request):
 
 
 # P423: old-style signature — Starlette 1.0 only supports new-style, so
-# we test new-style here (both FastAPI and fastapi-rs should handle it).
+# we test new-style here (both FastAPI and fastapi-turbo should handle it).
 @app.get("/p423-template-old-style")
 def p423(request: Request):
     return templates.TemplateResponse(request, "old_style.html", {"title": "Legacy"})

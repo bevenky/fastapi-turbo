@@ -1,6 +1,6 @@
-"""fastapi-rs + redis-py (SYNC) — pure Redis GET/SET benchmark."""
+"""fastapi-turbo + redis-py (SYNC) — pure Redis GET/SET benchmark."""
 import os
-from fastapi_rs import FastAPI
+from fastapi_turbo import FastAPI
 import redis
 
 app = FastAPI()

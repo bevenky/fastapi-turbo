@@ -76,7 +76,7 @@ func main() {
 	ctx := context.Background()
 
 	// PostgreSQL connection pool (same size: min=5, max=20)
-	poolConfig, err := pgxpool.ParseConfig("postgresql://venky@localhost/fastapi_rs_bench")
+	poolConfig, err := pgxpool.ParseConfig("postgresql://venky@localhost/fastapi_turbo_bench")
 	if err != nil {
 		log.Fatalf("Failed to parse PG config: %v", err)
 	}

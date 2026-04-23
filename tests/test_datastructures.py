@@ -7,7 +7,7 @@ import asyncio
 
 
 def test_url_from_string():
-    from fastapi_rs.datastructures import URL
+    from fastapi_turbo.datastructures import URL
 
     u = URL("https://example.com:8443/path?q=1#frag")
     assert u.scheme == "https"
@@ -20,7 +20,7 @@ def test_url_from_string():
 
 
 def test_url_from_scope():
-    from fastapi_rs.datastructures import URL
+    from fastapi_turbo.datastructures import URL
 
     scope = {
         "scheme": "http",
@@ -36,7 +36,7 @@ def test_url_from_scope():
 
 
 def test_headers_case_insensitive():
-    from fastapi_rs.datastructures import Headers
+    from fastapi_turbo.datastructures import Headers
 
     h = Headers({"Content-Type": "application/json", "X-Token": "abc"})
     assert h["content-type"] == "application/json"
@@ -48,7 +48,7 @@ def test_headers_case_insensitive():
 
 
 def test_headers_from_tuples():
-    from fastapi_rs.datastructures import Headers
+    from fastapi_turbo.datastructures import Headers
 
     h = Headers([(b"content-type", b"text/html"), (b"x-custom", b"val")])
     assert h["content-type"] == "text/html"
@@ -56,7 +56,7 @@ def test_headers_from_tuples():
 
 
 def test_query_params():
-    from fastapi_rs.datastructures import QueryParams
+    from fastapi_turbo.datastructures import QueryParams
 
     qp = QueryParams("q=python&limit=10&q=rust")
     assert qp["q"] == "rust"  # Starlette semantics: last wins
@@ -67,7 +67,7 @@ def test_query_params():
 
 
 def test_address():
-    from fastapi_rs.datastructures import Address
+    from fastapi_turbo.datastructures import Address
 
     a = Address(("127.0.0.1", 8080))
     assert a.host == "127.0.0.1"
@@ -75,7 +75,7 @@ def test_address():
 
 
 def test_state():
-    from fastapi_rs.datastructures import State
+    from fastapi_turbo.datastructures import State
 
     s = State()
     s.counter = 0
@@ -91,7 +91,7 @@ def test_state():
 
 
 def test_request_basic():
-    from fastapi_rs.requests import Request
+    from fastapi_turbo.requests import Request
 
     scope = {
         "method": "POST",
@@ -108,7 +108,7 @@ def test_request_basic():
 
 
 def test_request_cookies():
-    from fastapi_rs.requests import Request
+    from fastapi_turbo.requests import Request
 
     scope = {
         "headers": {"cookie": "session=abc123; theme=dark"},
@@ -119,7 +119,7 @@ def test_request_cookies():
 
 
 def test_request_body():
-    from fastapi_rs.requests import Request
+    from fastapi_turbo.requests import Request
 
     scope = {"_body": b'{"key": "value"}'}
     req = Request(scope)
@@ -128,7 +128,7 @@ def test_request_body():
 
 
 def test_request_json():
-    from fastapi_rs.requests import Request
+    from fastapi_turbo.requests import Request
 
     scope = {"_body": b'{"key": "value"}'}
     req = Request(scope)
@@ -137,7 +137,7 @@ def test_request_json():
 
 
 def test_request_state():
-    from fastapi_rs.requests import Request
+    from fastapi_turbo.requests import Request
 
     req = Request()
     req.state.user = "alice"
@@ -145,7 +145,7 @@ def test_request_state():
 
 
 def test_request_client():
-    from fastapi_rs.requests import Request
+    from fastapi_turbo.requests import Request
 
     scope = {"client": ("192.168.1.1", 54321)}
     req = Request(scope)
@@ -157,7 +157,7 @@ def test_request_client():
 
 
 def test_jsonable_encoder_primitives():
-    from fastapi_rs.encoders import jsonable_encoder
+    from fastapi_turbo.encoders import jsonable_encoder
 
     assert jsonable_encoder("hello") == "hello"
     assert jsonable_encoder(42) == 42
@@ -167,14 +167,14 @@ def test_jsonable_encoder_primitives():
 
 
 def test_jsonable_encoder_dict():
-    from fastapi_rs.encoders import jsonable_encoder
+    from fastapi_turbo.encoders import jsonable_encoder
 
     result = jsonable_encoder({"a": 1, "b": [2, 3]})
     assert result == {"a": 1, "b": [2, 3]}
 
 
 def test_jsonable_encoder_list():
-    from fastapi_rs.encoders import jsonable_encoder
+    from fastapi_turbo.encoders import jsonable_encoder
 
     result = jsonable_encoder([1, "two", 3.0])
     assert result == [1, "two", 3.0]
@@ -182,7 +182,7 @@ def test_jsonable_encoder_list():
 
 def test_jsonable_encoder_pydantic():
     from pydantic import BaseModel
-    from fastapi_rs.encoders import jsonable_encoder
+    from fastapi_turbo.encoders import jsonable_encoder
 
     class Item(BaseModel):
         name: str
@@ -195,7 +195,7 @@ def test_jsonable_encoder_pydantic():
 
 def test_jsonable_encoder_datetime():
     import datetime
-    from fastapi_rs.encoders import jsonable_encoder
+    from fastapi_turbo.encoders import jsonable_encoder
 
     dt = datetime.datetime(2024, 1, 15, 12, 30, 0)
     result = jsonable_encoder(dt)
@@ -205,7 +205,7 @@ def test_jsonable_encoder_datetime():
 
 def test_jsonable_encoder_uuid():
     import uuid
-    from fastapi_rs.encoders import jsonable_encoder
+    from fastapi_turbo.encoders import jsonable_encoder
 
     u = uuid.UUID("12345678-1234-5678-1234-567812345678")
     result = jsonable_encoder(u)
@@ -214,7 +214,7 @@ def test_jsonable_encoder_uuid():
 
 def test_jsonable_encoder_enum():
     import enum
-    from fastapi_rs.encoders import jsonable_encoder
+    from fastapi_turbo.encoders import jsonable_encoder
 
     class Color(enum.Enum):
         RED = "red"
@@ -224,7 +224,7 @@ def test_jsonable_encoder_enum():
 
 
 def test_jsonable_encoder_exclude_none():
-    from fastapi_rs.encoders import jsonable_encoder
+    from fastapi_turbo.encoders import jsonable_encoder
 
     data = {"a": 1, "b": None, "c": 3}
     result = jsonable_encoder(data, exclude_none=True)
@@ -235,7 +235,7 @@ def test_jsonable_encoder_exclude_none():
 
 
 def test_status_codes():
-    from fastapi_rs import status
+    from fastapi_turbo import status
 
     assert status.HTTP_200_OK == 200
     assert status.HTTP_201_CREATED == 201
@@ -258,7 +258,7 @@ def test_status_codes():
 
 
 def test_ws_status_codes():
-    from fastapi_rs import status
+    from fastapi_turbo import status
 
     assert status.WS_1000_NORMAL_CLOSURE == 1000
     assert status.WS_1001_GOING_AWAY == 1001
@@ -269,7 +269,7 @@ def test_ws_status_codes():
 
 
 def test_background_tasks():
-    from fastapi_rs.background import BackgroundTasks
+    from fastapi_turbo.background import BackgroundTasks
 
     results = []
 
@@ -291,7 +291,7 @@ def test_background_tasks():
 
 
 def test_oauth2_password_bearer():
-    from fastapi_rs.security import OAuth2PasswordBearer
+    from fastapi_turbo.security import OAuth2PasswordBearer
 
     scheme = OAuth2PasswordBearer(tokenUrl="/token")
     assert scheme.tokenUrl == "/token"
@@ -299,7 +299,7 @@ def test_oauth2_password_bearer():
     assert scheme.model["type"] == "oauth2"
 
     # Test __call__ with Request (new FastAPI-compatible signature)
-    from fastapi_rs.requests import Request
+    from fastapi_turbo.requests import Request
     req = Request({"type": "http", "headers": [(b"authorization", b"Bearer mytoken123")]})
     token = asyncio.run(scheme(req))
     assert token == "mytoken123"
@@ -307,9 +307,9 @@ def test_oauth2_password_bearer():
 
 def test_oauth2_password_bearer_no_token():
     import pytest
-    from fastapi_rs.security import OAuth2PasswordBearer
-    from fastapi_rs.exceptions import HTTPException
-    from fastapi_rs.requests import Request
+    from fastapi_turbo.security import OAuth2PasswordBearer
+    from fastapi_turbo.exceptions import HTTPException
+    from fastapi_turbo.requests import Request
 
     scheme = OAuth2PasswordBearer(tokenUrl="/token")
     req = Request({"type": "http", "headers": []})
@@ -319,8 +319,8 @@ def test_oauth2_password_bearer_no_token():
 
 
 def test_oauth2_password_bearer_no_auto_error():
-    from fastapi_rs.security import OAuth2PasswordBearer
-    from fastapi_rs.requests import Request
+    from fastapi_turbo.security import OAuth2PasswordBearer
+    from fastapi_turbo.requests import Request
 
     scheme = OAuth2PasswordBearer(tokenUrl="/token", auto_error=False)
     req = Request({"type": "http", "headers": []})
@@ -329,8 +329,8 @@ def test_oauth2_password_bearer_no_auto_error():
 
 
 def test_http_bearer():
-    from fastapi_rs.security import HTTPBearer
-    from fastapi_rs.requests import Request
+    from fastapi_turbo.security import HTTPBearer
+    from fastapi_turbo.requests import Request
 
     scheme = HTTPBearer()
     req = Request({"type": "http", "headers": [(b"authorization", b"Bearer xyz")]})
@@ -341,8 +341,8 @@ def test_http_bearer():
 
 def test_http_basic():
     import base64
-    from fastapi_rs.security import HTTPBasic
-    from fastapi_rs.requests import Request
+    from fastapi_turbo.security import HTTPBasic
+    from fastapi_turbo.requests import Request
 
     scheme = HTTPBasic()
     encoded = base64.b64encode(b"user:pass").decode()
@@ -356,7 +356,7 @@ def test_http_basic():
 
 
 def test_run_in_threadpool():
-    from fastapi_rs.concurrency import run_in_threadpool
+    from fastapi_turbo.concurrency import run_in_threadpool
 
     def sync_fn(x, y):
         return x + y
@@ -366,7 +366,7 @@ def test_run_in_threadpool():
 
 
 def test_run_in_threadpool_with_kwargs():
-    from fastapi_rs.concurrency import run_in_threadpool
+    from fastapi_turbo.concurrency import run_in_threadpool
 
     def sync_fn(x, y=10):
         return x + y

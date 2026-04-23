@@ -1,7 +1,7 @@
 package main
 
 // Go Gin comparison server with middleware + custom error handler
-// to match fastapi-rs feature set.
+// to match fastapi-turbo feature set.
 
 import (
 	"net/http"

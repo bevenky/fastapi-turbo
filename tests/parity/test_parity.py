@@ -1,6 +1,6 @@
 """Behavioral parity tests: patterns 1-100.
 
-Tests run the same app on both FastAPI (uvicorn) and fastapi-rs, comparing
+Tests run the same app on both FastAPI (uvicorn) and fastapi-turbo, comparing
 status codes and response bodies. Uses session-scoped servers (one startup).
 
 Run:

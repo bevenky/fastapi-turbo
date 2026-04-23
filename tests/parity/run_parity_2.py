@@ -2,7 +2,7 @@
 """Parity test runner for patterns 101-250.
 
 Starts the parity_app_2 on both FastAPI (uvicorn, port 29200) and
-fastapi-rs (app.run(), port 29201), then compares responses.
+fastapi-turbo (app.run(), port 29201), then compares responses.
 """
 
 from __future__ import annotations
@@ -23,9 +23,9 @@ import httpx
 PYTHON = sys.executable
 TEST_DIR = Path(__file__).parent
 FASTAPI_PORT = 29200
-FASTAPI_RS_PORT = 29201
+FASTAPI_TURBO_PORT = 29201
 FASTAPI_BASE = f"http://127.0.0.1:{FASTAPI_PORT}"
-RS_BASE = f"http://127.0.0.1:{FASTAPI_RS_PORT}"
+RS_BASE = f"http://127.0.0.1:{FASTAPI_TURBO_PORT}"
 TIMEOUT = 10.0  # seconds per request
 STARTUP_TIMEOUT = 15  # seconds to wait for server boot
 
@@ -60,14 +60,14 @@ def start_fastapi_server() -> subprocess.Popen:
     return proc
 
 
-def start_fastapi_rs_server() -> subprocess.Popen:
-    """Start parity_app_2 under fastapi-rs with compat shim."""
+def start_fastapi_turbo_server() -> subprocess.Popen:
+    """Start parity_app_2 under fastapi-turbo with compat shim."""
     proc = subprocess.Popen(
         [
             PYTHON, "-c",
-            "import fastapi_rs.compat; "
+            "import fastapi_turbo.compat; "
             "import importlib; mod = importlib.import_module('parity_app_2'); "
-            f"mod.app.run('127.0.0.1', {FASTAPI_RS_PORT})"
+            f"mod.app.run('127.0.0.1', {FASTAPI_TURBO_PORT})"
         ],
         cwd=str(TEST_DIR),
         stdout=subprocess.PIPE,
@@ -291,7 +291,7 @@ def run_all_tests(fa_client: httpx.Client, rs_client: httpx.Client) -> list[Test
     results.append(r)
 
     # 107: middleware modifies request
-    # Known limitation: fastapi-rs middleware creates a new Request object
+    # Known limitation: fastapi-turbo middleware creates a new Request object
     # so state set in middleware is not visible in the handler.
     r = TestResult(107, "Middleware modifies request (known diff: request.state)")
     try:
@@ -1325,8 +1325,8 @@ def main():
     print(f"Starting FastAPI (uvicorn) on port {FASTAPI_PORT}...")
     fa_proc = start_fastapi_server()
 
-    print(f"Starting fastapi-rs on port {FASTAPI_RS_PORT}...")
-    rs_proc = start_fastapi_rs_server()
+    print(f"Starting fastapi-turbo on port {FASTAPI_TURBO_PORT}...")
+    rs_proc = start_fastapi_turbo_server()
 
     try:
         # Wait for both servers
@@ -1339,11 +1339,11 @@ def main():
             print(f"  stderr: {err[:500]}")
             return 1
 
-        print("Waiting for fastapi-rs server...")
-        if not wait_for_port(FASTAPI_RS_PORT):
+        print("Waiting for fastapi-turbo server...")
+        if not wait_for_port(FASTAPI_TURBO_PORT):
             out = rs_proc.stdout.read().decode() if rs_proc.stdout else ""
             err = rs_proc.stderr.read().decode() if rs_proc.stderr else ""
-            print(f"FATAL: fastapi-rs server did not start.")
+            print(f"FATAL: fastapi-turbo server did not start.")
             print(f"  stdout: {out[:500]}")
             print(f"  stderr: {err[:500]}")
             return 1

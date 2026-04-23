@@ -1,7 +1,7 @@
-"""vLLM / SGLang feature-compatibility audit for fastapi-rs.
+"""vLLM / SGLang feature-compatibility audit for fastapi-turbo.
 
 Every pattern below was found in the vLLM or SGLang source tree
-(see research notes). The audit runs this app on fastapi-rs and
+(see research notes). The audit runs this app on fastapi-turbo and
 exercises each endpoint. Tests pass only if behaviour matches
 FastAPI/Starlette semantics.
 
@@ -29,7 +29,7 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncGenerator
 
-import fastapi_rs.compat  # install sys.modules shims first
+import fastapi_turbo.compat  # install sys.modules shims first
 from fastapi import (
     APIRouter,
     Depends,

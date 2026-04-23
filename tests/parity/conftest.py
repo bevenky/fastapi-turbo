@@ -1,4 +1,4 @@
-"""Shared fixtures for parity tests: start FastAPI + fastapi-rs once per session."""
+"""Shared fixtures for parity tests: start FastAPI + fastapi-turbo once per session."""
 import os
 import socket
 import subprocess
@@ -34,7 +34,7 @@ def _wait_for_server(port, timeout=15):
 
 
 class DualServers:
-    """Manages FastAPI + fastapi-rs server processes for a parity app."""
+    """Manages FastAPI + fastapi-turbo server processes for a parity app."""
 
     def __init__(self):
         self.fa_port = _free_port()
@@ -46,7 +46,7 @@ class DualServers:
         self.fa_proc = subprocess.Popen(
             [PYTHON, "-c", f"""
 import sys, os
-os.environ["FASTAPI_RS_NO_SHIM"] = "1"
+os.environ["FASTAPI_TURBO_NO_SHIM"] = "1"
 sys.path.insert(0, "{TEST_DIR}")
 import uvicorn
 from parity_app import app
@@ -58,8 +58,8 @@ uvicorn.run(app, host="127.0.0.1", port={self.fa_port}, log_level="error")
         self.rs_proc = subprocess.Popen(
             [PYTHON, "-c", f"""
 import sys, os
-import fastapi_rs.compat
-fastapi_rs.compat.install()
+import fastapi_turbo.compat
+fastapi_turbo.compat.install()
 sys.path.insert(0, "{TEST_DIR}")
 from parity_app import app
 app.run("127.0.0.1", {self.rs_port})
@@ -68,7 +68,7 @@ app.run("127.0.0.1", {self.rs_port})
         )
 
         assert _wait_for_server(self.fa_port), f"FastAPI failed to start on :{self.fa_port}"
-        assert _wait_for_server(self.rs_port), f"fastapi-rs failed to start on :{self.rs_port}"
+        assert _wait_for_server(self.rs_port), f"fastapi-turbo failed to start on :{self.rs_port}"
 
     def stop(self):
         for proc in [self.fa_proc, self.rs_proc]:

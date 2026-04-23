@@ -32,11 +32,11 @@ fastapi_routing.Mount = _sc.Mount
 
 **What**: fastapi-jsonrpc imports `ModelField` and `Undefined` from `fastapi._compat`, which is FastAPI's Pydantic v1/v2 bridge module.
 
-**Root cause**: The file `python/fastapi_rs/_compat_shim.py` exists with `ModelNameMap`, `Undefined`, and model helpers, but it is never registered in `sys.modules` as `fastapi._compat` by the compat shim.
+**Root cause**: The file `python/fastapi_turbo/_compat_shim.py` exists with `ModelNameMap`, `Undefined`, and model helpers, but it is never registered in `sys.modules` as `fastapi._compat` by the compat shim.
 
 **Fix**: Register in `fastapi_shim.py`:
 ```python
-import fastapi_rs._compat_shim as _compat_impl
+import fastapi_turbo._compat_shim as _compat_impl
 fastapi_compat = _mod("fastapi._compat")
 # Copy all public attributes
 for attr in dir(_compat_impl):
@@ -89,7 +89,7 @@ These are patterns where the import succeeds but runtime behavior may differ.
 
 | Pattern | Difference | Used by |
 |---------|------------|---------|
-| `BaseHTTPMiddleware` subclass | Shim passes through but fastapi-rs uses Tower middleware natively; custom middleware classes using `dispatch(request, call_next)` may not intercept all requests | 8+ repos |
+| `BaseHTTPMiddleware` subclass | Shim passes through but fastapi-turbo uses Tower middleware natively; custom middleware classes using `dispatch(request, call_next)` may not intercept all requests | 8+ repos |
 | `app.exception_handler(RequestValidationError)` | Custom exception handlers registered but may not override Rust-side 422 generation | 10+ repos |
 | `StaticFiles` mount | Delegates to starlette; requires starlette installed as runtime dep | 8+ repos |
 | `SessionMiddleware` | Delegates to starlette; cookie-based sessions work but may have timing differences | 7+ repos |

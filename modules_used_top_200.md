@@ -8,7 +8,7 @@
 
 ## Import Frequency by Tier
 
-| Tier | Description | Count | fastapi-rs Status |
+| Tier | Description | Count | fastapi-turbo Status |
 |------|-------------|-------|-------------------|
 | 1 | Used by 20+ repos (must work) | 18 imports | 18/18 PASS |
 | 2 | Used by 5-19 repos | 17 imports | 17/17 PASS |

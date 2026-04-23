@@ -2,7 +2,7 @@
 
 This app uses ONLY stock FastAPI imports so it runs identically on:
   - FastAPI + uvicorn  (port 29300)
-  - fastapi-rs         (port 29301)
+  - fastapi-turbo         (port 29301)
 """
 
 import asyncio

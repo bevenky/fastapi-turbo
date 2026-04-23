@@ -1,4 +1,4 @@
-"""File handling benchmarks — fastapi-rs vs Go Gin vs Fastify.
+"""File handling benchmarks — fastapi-turbo vs Go Gin vs Fastify.
 
 Measures:
   - POST /upload (multipart small ~1 KB file)
@@ -246,7 +246,7 @@ def main():
         sys.exit(1)
 
     ports = [int(p) for p in sys.argv[1].split(",")]
-    frameworks = ["fastapi-rs", "Go-Gin", "Fastify"][: len(ports)]
+    frameworks = ["fastapi-turbo", "Go-Gin", "Fastify"][: len(ports)]
 
     results: dict = {}
     for name, port in zip(frameworks, ports):

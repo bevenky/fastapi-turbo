@@ -18,7 +18,7 @@ def _free_port():
 
 @pytest.fixture()
 def server_app(tmp_path):
-    """Start a fastapi_rs server with the given app code, return (proc, base_url).
+    """Start a fastapi_turbo server with the given app code, return (proc, base_url).
 
     Usage: write app code to a file, start it, yield base_url, kill on cleanup.
     """
@@ -67,7 +67,7 @@ def test_async_handler(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/async-hello")
@@ -87,7 +87,7 @@ def test_async_with_await(server_app):
 
     url = server_app("""
         import asyncio
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/delayed")
@@ -107,7 +107,7 @@ def test_async_with_path_params(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/users/{user_id}")
@@ -125,7 +125,7 @@ def test_async_exception(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, HTTPException
+        from fastapi_turbo import FastAPI, HTTPException
         app = FastAPI()
 
         @app.get("/fail")
@@ -144,7 +144,7 @@ def test_mixed_sync_async(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/sync")

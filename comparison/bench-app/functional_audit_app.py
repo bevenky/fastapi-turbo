@@ -1,5 +1,5 @@
 """
-Comprehensive Functional Audit App for fastapi-rs.
+Comprehensive Functional Audit App for fastapi-turbo.
 Tests 70 FastAPI behavior patterns end-to-end.
 """
 import os, sys, enum, tempfile, pathlib
@@ -7,19 +7,19 @@ from contextlib import asynccontextmanager
 from typing import Optional
 from pydantic import BaseModel, Field
 
-# Ensure fastapi_rs is importable
+# Ensure fastapi_turbo is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from fastapi_rs import (
+from fastapi_turbo import (
     FastAPI, Depends, APIRouter, Request, Response,
     JSONResponse, HTMLResponse, PlainTextResponse, RedirectResponse,
     StreamingResponse, FileResponse, HTTPException, RequestValidationError,
     Query, Path, Header, Cookie, Body, Form, File, UploadFile,
     BackgroundTasks, status,
 )
-from fastapi_rs.security import OAuth2PasswordBearer, HTTPBearer, APIKeyHeader
-from fastapi_rs.middleware.cors import CORSMiddleware
-from fastapi_rs.middleware.base import BaseHTTPMiddleware
+from fastapi_turbo.security import OAuth2PasswordBearer, HTTPBearer, APIKeyHeader
+from fastapi_turbo.middleware.cors import CORSMiddleware
+from fastapi_turbo.middleware.base import BaseHTTPMiddleware
 
 # ---- Pydantic Models ----
 
@@ -425,7 +425,7 @@ def nested_model(item: ItemCreate):
 
 # 47. Enum in query params
 # NOTE: FastAPI auto-converts str->Enum, so handler can use color.value.
-# fastapi-rs passes the raw str, so we test with str(color) which works either way.
+# fastapi-turbo passes the raw str, so we test with str(color) which works either way.
 @app.get("/test/enum-query")
 def enum_query(color: ItemColor = Query(default=ItemColor.red)):
     # Handle both Enum objects and raw strings

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavioral parity runner: start same app on FastAPI + fastapi-rs, compare responses.
+"""Behavioral parity runner: start same app on FastAPI + fastapi-turbo, compare responses.
 
 Usage:
     python tests/parity/run_parity.py [--pattern P001] [--fastapi-only] [--rs-only] [--verbose]
@@ -48,7 +48,7 @@ def start_fastapi(port):
     proc = subprocess.Popen(
         [PYTHON, "-c", f"""
 import sys, os
-os.environ["FASTAPI_RS_NO_SHIM"] = "1"
+os.environ["FASTAPI_TURBO_NO_SHIM"] = "1"
 sys.path.insert(0, "{TEST_DIR}")
 import uvicorn
 from parity_app import app
@@ -60,15 +60,15 @@ uvicorn.run(app, host="127.0.0.1", port={port}, log_level="error")
     return proc
 
 
-def start_fastapi_rs(port):
-    """Start the parity app under fastapi-rs."""
+def start_fastapi_turbo(port):
+    """Start the parity app under fastapi-turbo."""
     proc = subprocess.Popen(
         [PYTHON, "-c", f"""
 import sys, os
-# Must import fastapi_rs.compat BEFORE importing the app so the shims
-# redirect `from fastapi import ...` to fastapi_rs.
-import fastapi_rs.compat
-fastapi_rs.compat.install()
+# Must import fastapi_turbo.compat BEFORE importing the app so the shims
+# redirect `from fastapi import ...` to fastapi_turbo.
+import fastapi_turbo.compat
+fastapi_turbo.compat.install()
 sys.path.insert(0, "{TEST_DIR}")
 from parity_app import app
 app.run("127.0.0.1", {port})
@@ -288,7 +288,7 @@ def main():
     parser.add_argument("--pattern", "-p", help="Run only this pattern (e.g., P001)")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--fastapi-only", action="store_true", help="Only start FastAPI")
-    parser.add_argument("--rs-only", action="store_true", help="Only start fastapi-rs")
+    parser.add_argument("--rs-only", action="store_true", help="Only start fastapi-turbo")
     args = parser.parse_args()
 
     fa_port = free_port()
@@ -297,8 +297,8 @@ def main():
     print(f"Starting FastAPI on :{fa_port} ...")
     fa_proc = start_fastapi(fa_port)
 
-    print(f"Starting fastapi-rs on :{rs_port} ...")
-    rs_proc = start_fastapi_rs(rs_port)
+    print(f"Starting fastapi-turbo on :{rs_port} ...")
+    rs_proc = start_fastapi_turbo(rs_port)
 
     try:
         if not wait_for_server(fa_port):
@@ -310,7 +310,7 @@ def main():
 
         if not wait_for_server(rs_port):
             stderr = rs_proc.stderr.read().decode() if rs_proc.stderr else ""
-            print(f"FATAL: fastapi-rs did not start on :{rs_port}")
+            print(f"FATAL: fastapi-turbo did not start on :{rs_port}")
             if stderr:
                 print(f"  stderr: {stderr[:500]}")
             return 1

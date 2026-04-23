@@ -1,7 +1,7 @@
 """Redis integration parity app (SYNC redis-py).
 
 Exposes ~150 endpoints that each exercise a Redis command/pattern. Both stock
-FastAPI and fastapi-rs mount this same app, and the runner compares each
+FastAPI and fastapi-turbo mount this same app, and the runner compares each
 endpoint's full HTTP response and the resulting Redis state.
 
 Connects to Redis at 127.0.0.1:<port-from-env> or 6392 by default.
@@ -9,7 +9,7 @@ Connects to Redis at 127.0.0.1:<port-from-env> or 6392 by default.
 Each endpoint uses a short, deterministic namespace. The runner FLUSHes the
 Redis DB between every test for strict isolation.
 
-Uses ONLY public FastAPI imports. fastapi-rs's compat shim maps them.
+Uses ONLY public FastAPI imports. fastapi-turbo's compat shim maps them.
 """
 from __future__ import annotations
 

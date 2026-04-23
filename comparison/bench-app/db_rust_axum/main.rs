@@ -503,7 +503,7 @@ async fn get_order(
 #[tokio::main]
 async fn main() {
     // PostgreSQL connection pool (min=5, max=20)
-    let pg_config = "host=localhost user=venky dbname=fastapi_rs_bench"
+    let pg_config = "host=localhost user=venky dbname=fastapi_turbo_bench"
         .parse::<tokio_postgres::Config>()
         .unwrap();
     let manager = PostgresConnectionManager::new(pg_config, NoTls);

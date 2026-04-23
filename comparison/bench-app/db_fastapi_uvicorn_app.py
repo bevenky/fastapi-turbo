@@ -1,4 +1,4 @@
-"""Database benchmark -- standard FastAPI + uvicorn (no fastapi-rs).
+"""Database benchmark -- standard FastAPI + uvicorn (no fastapi-turbo).
 
 This is the baseline: standard FastAPI with asyncpg + redis.asyncio,
 served by uvicorn. Same endpoints as all other benchmark apps.
@@ -26,7 +26,7 @@ async def get_pool():
     global pool
     if pool is None:
         pool = await asyncpg.create_pool(
-            "postgresql://venky@localhost/fastapi_rs_bench", min_size=5, max_size=20
+            "postgresql://venky@localhost/fastapi_turbo_bench", min_size=5, max_size=20
         )
     return pool
 

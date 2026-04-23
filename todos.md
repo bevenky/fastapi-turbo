@@ -1,4 +1,4 @@
-# fastapi-rs — TODOs
+# fastapi-turbo — TODOs
 
 Open work only. Shipped items are deleted after completion.
 
@@ -40,7 +40,7 @@ Standard FastAPI code hits these and breaks or silently misbehaves.
 
 ---
 
-## `fastapi_rs.audio` helper modules
+## `fastapi_turbo.audio` helper modules
 
 Opt-in modules that let users build real-time voice-agent apps in pure Python FastAPI code with Rust-native performance on per-frame hot operations. None change the WebSocket API.
 
@@ -49,7 +49,7 @@ Opt-in modules that let users build real-time voice-agent apps in pure Python Fa
 1. **`.codec`** — G.711 μ-law / A-law encode/decode. **CRITICAL for Python 3.13+.** Python removed `audioop` from stdlib in 3.13; any voice-agent Python stack doing G.711 encode/decode via `audioop` is broken with `ModuleNotFoundError`. Rust lookup-table codec (~100 LOC) unblocks all telephony users.
 
    ```python
-   from fastapi_rs.audio.codec import Mulaw, Alaw
+   from fastapi_turbo.audio.codec import Mulaw, Alaw
    pcm = Mulaw.decode(ulaw_bytes)    # ~1 μs (table lookup)
    ulaw = Mulaw.encode(pcm_bytes)
    ```

@@ -2,7 +2,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BENCH="$PROJECT_ROOT/target/release/fastapi-rs-bench"
+BENCH="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
 PY_RS="python3"
 PY_FA="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
@@ -34,8 +34,8 @@ wait_port() {
 # Build Rust Axum Redis if missing
 [ -x "$SCRIPT_DIR/rust-axum-redis/target/release/redis-axum" ] || (cd "$SCRIPT_DIR/rust-axum-redis" && PATH="$HOME/.cargo/bin:$PATH" cargo build --release 2>&1 | tail -1)
 
-FASTAPI_RS_NO_SHIM=1 PORT=19040 $PY_RS "$SCRIPT_DIR/redis_sync_app.py"       >/tmp/r_19040.log 2>&1 & PIDS+=($!)
-FASTAPI_RS_NO_SHIM=1 PORT=19041 $PY_RS "$SCRIPT_DIR/redis_async_app.py"      >/tmp/r_19041.log 2>&1 & PIDS+=($!)
+FASTAPI_TURBO_NO_SHIM=1 PORT=19040 $PY_RS "$SCRIPT_DIR/redis_sync_app.py"       >/tmp/r_19040.log 2>&1 & PIDS+=($!)
+FASTAPI_TURBO_NO_SHIM=1 PORT=19041 $PY_RS "$SCRIPT_DIR/redis_async_app.py"      >/tmp/r_19041.log 2>&1 & PIDS+=($!)
 PORT=19042 $PY_FA "$SCRIPT_DIR/redis_fastapi_uvicorn_app.py"                  >/tmp/r_19042.log 2>&1 & PIDS+=($!)
 PORT=19043 "$SCRIPT_DIR/rust-axum-redis/target/release/redis-axum"           >/tmp/r_19043.log 2>&1 & PIDS+=($!)
 
@@ -59,8 +59,8 @@ bench_one() {
 
 echo -e "label\tendpoint\trps\tp50\tp99"
 for pair in "Rust-Axum:19043" \
-            "fastapi-rs_sync(redis-py):19040" \
-            "fastapi-rs_async(redis.asyncio):19041" \
+            "fastapi-turbo_sync(redis-py):19040" \
+            "fastapi-turbo_async(redis.asyncio):19041" \
             "FastAPI_uvicorn(redis.asyncio):19042"; do
     label="${pair%:*}"; port="${pair##*:}"
     bench_one "$label" "$port" "/health"

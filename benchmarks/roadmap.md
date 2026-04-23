@@ -1,4 +1,4 @@
-# fastapi-rs performance roadmap
+# fastapi-turbo performance roadmap
 
 Where we are and what's left to do, ranked by honest effort-vs-impact.
 
@@ -32,7 +32,7 @@ Why: SQLA's `isolation_level="AUTOCOMMIT"` switch itself emits a
 BEGIN/ROLLBACK probe when applied to an already-acquired connection.
 Net wire cost is unchanged — shifted from "per-query wrap" to
 "per-connection isolation switch." To actually get the savings, we'd
-need a **separate autocommit engine pool** maintained by fastapi-rs,
+need a **separate autocommit engine pool** maintained by fastapi-turbo,
 which either forks the customer's pool (breaks pool state) or requires
 them to wire two engines (customer code change — invariant violation).
 
@@ -76,7 +76,7 @@ throughput is the binding constraint** (none in our current benches).
 
 ### Phase B — transparent Redis fast-path dispatch (2 weeks)
 
-At fastapi-rs import time, monkey-patch `redis.asyncio.client.Redis.
+At fastapi-turbo import time, monkey-patch `redis.asyncio.client.Redis.
 execute_command` for the ~25 hottest commands (GET/SET/DEL/HSET/HGET/
 MGET/INCR/EXPIRE/…). Route those through a Rust-backed connection
 manager using the `redis` crate + tokio. Exotic commands (pipelines,
@@ -122,8 +122,8 @@ Stacks with Phase C.2.
 ### Phase C.4 — Rust-backed asyncpg / psycopg2 / psycopg3 drop-in via `sys.modules` (4 weeks)
 
 Implement asyncpg's public Python API surface (~20 classes, ~40 Postgres
-type codecs) backed by `tokio-postgres`. At `fastapi_rs` import time
-(before SQLA does), `sys.modules['asyncpg'] = fastapi_rs._asyncpg_rust`.
+type codecs) backed by `tokio-postgres`. At `fastapi_turbo` import time
+(before SQLA does), `sys.modules['asyncpg'] = fastapi_turbo._asyncpg_rust`.
 SQLA's existing asyncpg dialect imports `asyncpg` and transparently
 gets our Rust version.
 

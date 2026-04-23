@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Deep validation parity runner for fastapi-rs.
+"""Deep validation parity runner for fastapi-turbo.
 
 Starts stock FastAPI on :29600 via subprocess.Popen(uvicorn).
-Starts fastapi-rs on :29601 in a background thread.
+Starts fastapi-turbo on :29601 in a background thread.
 For each of ~150 endpoints it sends a crafted INVALID payload and compares
 the 422 JSON response from both servers FIELD BY FIELD.
 
@@ -61,7 +61,7 @@ def wait_for_server(url: str, timeout: float = 20.0) -> bool:
 def start_fastapi() -> subprocess.Popen:
     src = f"""
 import os, sys
-os.environ['FASTAPI_RS_NO_SHIM'] = '1'
+os.environ['FASTAPI_TURBO_NO_SHIM'] = '1'
 sys.path.insert(0, {TEST_DIR!r})
 import uvicorn
 uvicorn.run('parity_app_deep_validation:app', host='127.0.0.1', port={FA_PORT}, log_level='error')
@@ -73,12 +73,12 @@ uvicorn.run('parity_app_deep_validation:app', host='127.0.0.1', port={FA_PORT}, 
     )
 
 
-def start_fastapi_rs_thread() -> threading.Thread:
+def start_fastapi_turbo_thread() -> threading.Thread:
     def run():
         # Must install shim before importing the app so stock `from fastapi import …`
-        # resolves to fastapi_rs.
-        import fastapi_rs.compat  # noqa: F401
-        fastapi_rs.compat.install()
+        # resolves to fastapi_turbo.
+        import fastapi_turbo.compat  # noqa: F401
+        fastapi_turbo.compat.install()
         sys.path.insert(0, TEST_DIR)
         import parity_app_deep_validation as papp  # noqa: WPS433
         papp.app.run("127.0.0.1", RS_PORT)
@@ -441,8 +441,8 @@ def main():
 
     print(f"[+] Starting stock FastAPI (uvicorn) on :{FA_PORT}")
     fa_proc = start_fastapi()
-    print(f"[+] Starting fastapi-rs on :{RS_PORT}")
-    start_fastapi_rs_thread()
+    print(f"[+] Starting fastapi-turbo on :{RS_PORT}")
+    start_fastapi_turbo_thread()
 
     try:
         if not wait_for_server(FA_URL):
@@ -450,7 +450,7 @@ def main():
             print(f"[!] FastAPI failed to boot on :{FA_PORT}\n{err[:500]}")
             return 2
         if not wait_for_server(RS_URL):
-            print(f"[!] fastapi-rs failed to boot on :{RS_PORT}")
+            print(f"[!] fastapi-turbo failed to boot on :{RS_PORT}")
             return 2
 
         print("[+] Both servers ready. Running cases...")

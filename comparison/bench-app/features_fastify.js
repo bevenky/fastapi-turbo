@@ -1,5 +1,5 @@
 // Fastify comparison server with onRequest hook + error handler
-// to match fastapi-rs feature set.
+// to match fastapi-turbo feature set.
 
 const Fastify = require('fastify');
 const fastify = Fastify({ logger: false });

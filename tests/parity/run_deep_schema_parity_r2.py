@@ -3,7 +3,7 @@
 
 Boots the R2 parity app under BOTH:
   - stock FastAPI on uvicorn (port 29900)
-  - fastapi-rs/jamun            (port 29901)
+  - fastapi-turbo/jamun            (port 29901)
 
 Then fetches `/openapi.json` from each and runs ~500 DEEP-subtree equality
 tests. Each test walks the full subtree and reports EVERY leaf-level
@@ -52,7 +52,7 @@ def start_fastapi(port: int) -> subprocess.Popen:
             "-c",
             (
                 "import sys, os\n"
-                "os.environ['FASTAPI_RS_NO_SHIM'] = '1'\n"
+                "os.environ['FASTAPI_TURBO_NO_SHIM'] = '1'\n"
                 f"sys.path.insert(0, {TEST_DIR!r})\n"
                 "import uvicorn\n"
                 "from parity_app_deep_schema_r2 import app\n"
@@ -64,15 +64,15 @@ def start_fastapi(port: int) -> subprocess.Popen:
     )
 
 
-def start_fastapi_rs(port: int) -> subprocess.Popen:
+def start_fastapi_turbo(port: int) -> subprocess.Popen:
     return subprocess.Popen(
         [
             PYTHON,
             "-c",
             (
                 "import sys\n"
-                "import fastapi_rs.compat\n"
-                "fastapi_rs.compat.install()\n"
+                "import fastapi_turbo.compat\n"
+                "fastapi_turbo.compat.install()\n"
                 f"sys.path.insert(0, {TEST_DIR!r})\n"
                 "from parity_app_deep_schema_r2 import app\n"
                 f"app.run('127.0.0.1', {port})\n"
@@ -591,8 +591,8 @@ def build_tests(fa: dict, rs: dict) -> List[Tuple[str, str, Callable[[], List[Di
 def main() -> int:
     print("Starting uvicorn (stock FastAPI) on", FA_PORT)
     fa_proc = start_fastapi(FA_PORT)
-    print("Starting fastapi-rs on", RS_PORT)
-    rs_proc = start_fastapi_rs(RS_PORT)
+    print("Starting fastapi-turbo on", RS_PORT)
+    rs_proc = start_fastapi_turbo(RS_PORT)
 
     try:
         if not wait_for_openapi(FA_PORT):
@@ -611,7 +611,7 @@ def main() -> int:
                     stderr = rs_proc.stderr.read(4096).decode(errors="replace")
             except Exception:
                 pass
-            print("fastapi-rs server did not come up:", stderr, file=sys.stderr)
+            print("fastapi-turbo server did not come up:", stderr, file=sys.stderr)
             return 2
 
         fa = fetch_openapi(FA_PORT)

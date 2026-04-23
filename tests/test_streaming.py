@@ -60,8 +60,8 @@ def server_app(tmp_path):
 def test_streaming_response_sync_generator(server_app):
     """StreamingResponse with a sync generator."""
     url = server_app("""
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import StreamingResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import StreamingResponse
         app = FastAPI()
 
         def generate():
@@ -84,8 +84,8 @@ def test_streaming_response_async_generator(server_app):
     """StreamingResponse with an async generator."""
     url = server_app("""
         import asyncio
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import StreamingResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import StreamingResponse
         app = FastAPI()
 
         async def generate():
@@ -107,8 +107,8 @@ def test_streaming_response_async_generator(server_app):
 def test_streaming_response_bytes(server_app):
     """StreamingResponse yielding bytes."""
     url = server_app("""
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import StreamingResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import StreamingResponse
         app = FastAPI()
 
         def generate():
@@ -130,8 +130,8 @@ def test_streaming_response_bytes(server_app):
 def test_streaming_response_custom_status(server_app):
     """StreamingResponse with custom status code."""
     url = server_app("""
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import StreamingResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import StreamingResponse
         app = FastAPI()
 
         def generate():
@@ -151,8 +151,8 @@ def test_streaming_response_custom_status(server_app):
 def test_streaming_response_custom_headers(server_app):
     """StreamingResponse with custom headers."""
     url = server_app("""
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import StreamingResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import StreamingResponse
         app = FastAPI()
 
         def generate():
@@ -176,8 +176,8 @@ def test_streaming_response_custom_headers(server_app):
 def test_streaming_with_regular_routes(server_app):
     """StreamingResponse alongside regular routes."""
     url = server_app("""
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import StreamingResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import StreamingResponse
         app = FastAPI()
 
         @app.get("/hello")

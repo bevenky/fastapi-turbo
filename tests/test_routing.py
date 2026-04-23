@@ -18,7 +18,7 @@ def _free_port():
 
 @pytest.fixture()
 def server_app(tmp_path):
-    """Start a fastapi_rs server with the given app code, return (proc, base_url).
+    """Start a fastapi_turbo server with the given app code, return (proc, base_url).
 
     Usage: write app code to a file, start it, yield base_url, kill on cleanup.
     """
@@ -66,7 +66,7 @@ def test_get_hello(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/hello")
@@ -84,7 +84,7 @@ def test_post_json_body(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         from pydantic import BaseModel
 
         app = FastAPI()
@@ -108,7 +108,7 @@ def test_path_params(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/users/{user_id}")
@@ -126,7 +126,7 @@ def test_query_params(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/search")
@@ -144,7 +144,7 @@ def test_query_param_default(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/search")
@@ -165,7 +165,7 @@ def test_404_not_found(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/hello")
@@ -182,7 +182,7 @@ def test_http_exception(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, HTTPException
+        from fastapi_turbo import FastAPI, HTTPException
         app = FastAPI()
 
         @app.get("/fail")
@@ -200,7 +200,7 @@ def test_missing_required_query_param(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/search")
@@ -217,7 +217,7 @@ def test_pydantic_validation_error(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         from pydantic import BaseModel
 
         app = FastAPI()
@@ -243,7 +243,7 @@ def test_multiple_methods(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/items")
@@ -266,8 +266,8 @@ def test_include_router(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
-        from fastapi_rs.routing import APIRouter
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.routing import APIRouter
 
         app = FastAPI()
         router = APIRouter()
@@ -291,7 +291,7 @@ def test_return_string(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.get("/hello")
@@ -309,7 +309,7 @@ def test_return_none(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
         app = FastAPI()
 
         @app.delete("/items/1")
@@ -331,7 +331,7 @@ def test_header_param(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, Header
+        from fastapi_turbo import FastAPI, Header
         app = FastAPI()
 
         @app.get("/check")
@@ -349,7 +349,7 @@ def test_header_with_default(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, Header
+        from fastapi_turbo import FastAPI, Header
         app = FastAPI()
 
         @app.get("/check")
@@ -371,7 +371,7 @@ def test_header_missing_required(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, Header
+        from fastapi_turbo import FastAPI, Header
         app = FastAPI()
 
         @app.get("/check")
@@ -388,7 +388,7 @@ def test_cookie_param(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, Cookie
+        from fastapi_turbo import FastAPI, Cookie
         app = FastAPI()
 
         @app.get("/session")
@@ -405,7 +405,7 @@ def test_cookie_with_default(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, Cookie
+        from fastapi_turbo import FastAPI, Cookie
         app = FastAPI()
 
         @app.get("/session")
@@ -423,7 +423,7 @@ def test_explicit_query_marker(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, Query
+        from fastapi_turbo import FastAPI, Query
         app = FastAPI()
 
         @app.get("/search")
@@ -441,7 +441,7 @@ def test_explicit_query_marker_missing_required(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_rs import FastAPI, Query
+        from fastapi_turbo import FastAPI, Query
         app = FastAPI()
 
         @app.get("/search")

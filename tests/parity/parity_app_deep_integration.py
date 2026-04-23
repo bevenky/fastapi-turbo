@@ -4,8 +4,8 @@ Contains ~20-30 mini-apps mounted as APIRouters, each covering a cohesive
 real-world workflow: auth, CRUD, pagination, file upload, SSE, error
 chains, middleware, streaming, content negotiation, etc.
 
-Uses ONLY stock FastAPI imports. The compat shim maps these to fastapi-rs
-when running under the fastapi-rs process.
+Uses ONLY stock FastAPI imports. The compat shim maps these to fastapi-turbo
+when running under the fastapi-turbo process.
 """
 from __future__ import annotations
 

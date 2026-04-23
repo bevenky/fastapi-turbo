@@ -3,7 +3,7 @@
 
 Starts parity_app_deep_behavior on:
   - port 29700 via uvicorn (stock FastAPI)
-  - port 29701 via fastapi-rs
+  - port 29701 via fastapi-turbo
 
 Then issues identical HTTP requests and compares OBSERVABLE behavior:
 middleware ordering, dep caching, streaming boundaries, cookie attrs,
@@ -37,7 +37,7 @@ except Exception:
 
 # ── Config ─────────────────────────────────────────────────────────
 FASTAPI_PORT = 29700
-FASTAPI_RS_PORT = 29701
+FASTAPI_TURBO_PORT = 29701
 HOST = "127.0.0.1"
 APP_MODULE = "tests.parity.parity_app_deep_behavior:app"
 STARTUP_TIMEOUT = 15
@@ -198,7 +198,7 @@ def wait_for_port(port, timeout=STARTUP_TIMEOUT):
 def start_uvicorn(port):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
-    env.pop("FASTAPI_RS", None)
+    env.pop("FASTAPI_TURBO", None)
     log = open("/tmp/parity_uvicorn.log", "w")
     return subprocess.Popen(
         [sys.executable, "-m", "uvicorn", APP_MODULE,
@@ -208,18 +208,18 @@ def start_uvicorn(port):
     )
 
 
-def start_fastapi_rs(port):
+def start_fastapi_turbo(port):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
     script = f"""
 import sys
 sys.path.insert(0, '{PROJECT_ROOT}')
-from fastapi_rs.compat import install
+from fastapi_turbo.compat import install
 install()
 from tests.parity.parity_app_deep_behavior import app
 app.run(host='{HOST}', port={port})
 """
-    log = open("/tmp/parity_fastapi_rs.log", "w")
+    log = open("/tmp/parity_fastapi_turbo.log", "w")
     return subprocess.Popen(
         [sys.executable, "-c", script],
         cwd=PROJECT_ROOT, env=env,
@@ -279,7 +279,7 @@ def run_all_tests(fa_port, rs_port):
     print(f"{CYAN}[1-60] Response type behavior{RESET}")
 
     # Pairs of tests per endpoint:
-    # (a) stock FA returns X, (b) fastapi-rs returns X  — recorded as 2 tests
+    # (a) stock FA returns X, (b) fastapi-turbo returns X  — recorded as 2 tests
 
     simple_response_tests = [
         ("/resp/dict", lambda s, b: s == 200 and _jbody(b) == {"a": 1, "b": 2}),
@@ -520,7 +520,7 @@ def run_all_tests(fa_port, rs_port):
              ),
              category="gzip")
 
-        # Small-response compression behavior differs between Starlette/fastapi-rs
+        # Small-response compression behavior differs between Starlette/fastapi-turbo
         # and is compression-threshold dependent — skip strict comparison.
         t = next_id()
         st2, hd2, body2, _ = http_request(port, "/gzip/small",
@@ -2455,7 +2455,7 @@ def _verify(cond, msg=""):
 def main():
     print(f"\n{BOLD}{'='*66}")
     print(f"  Deep Behavior Parity")
-    print(f"  FastAPI on :{FASTAPI_PORT}   |   fastapi-rs on :{FASTAPI_RS_PORT}")
+    print(f"  FastAPI on :{FASTAPI_PORT}   |   fastapi-turbo on :{FASTAPI_TURBO_PORT}")
     print(f"{'='*66}{RESET}\n")
 
     uvicorn_proc = None
@@ -2465,24 +2465,24 @@ def main():
         print(f"Starting uvicorn on {FASTAPI_PORT}...")
         uvicorn_proc = start_uvicorn(FASTAPI_PORT)
 
-        print(f"Starting fastapi-rs on {FASTAPI_RS_PORT}...")
-        rs_proc = start_fastapi_rs(FASTAPI_RS_PORT)
+        print(f"Starting fastapi-turbo on {FASTAPI_TURBO_PORT}...")
+        rs_proc = start_fastapi_turbo(FASTAPI_TURBO_PORT)
 
         print("Waiting for servers...")
         fa_ready = wait_for_port(FASTAPI_PORT)
-        rs_ready = wait_for_port(FASTAPI_RS_PORT)
+        rs_ready = wait_for_port(FASTAPI_TURBO_PORT)
 
         if not fa_ready:
             print(f"{RED}uvicorn failed to start; see /tmp/parity_uvicorn.log{RESET}")
             return 1
         if not rs_ready:
-            print(f"{RED}fastapi-rs failed to start; see /tmp/parity_fastapi_rs.log{RESET}")
+            print(f"{RED}fastapi-turbo failed to start; see /tmp/parity_fastapi_turbo.log{RESET}")
             return 1
 
         print(f"{GREEN}Both servers ready!{RESET}\n")
 
         # Health sanity
-        for label, port in [("FastAPI", FASTAPI_PORT), ("fastapi-rs", FASTAPI_RS_PORT)]:
+        for label, port in [("FastAPI", FASTAPI_PORT), ("fastapi-turbo", FASTAPI_TURBO_PORT)]:
             st, _, _, _ = http_request(port, "/health")
             if st != 200:
                 print(f"{RED}{label} /health failed: {st}{RESET}")
@@ -2490,7 +2490,7 @@ def main():
 
         # Run
         try:
-            run_all_tests(FASTAPI_PORT, FASTAPI_RS_PORT)
+            run_all_tests(FASTAPI_PORT, FASTAPI_TURBO_PORT)
         except Exception as e:
             print(f"{RED}Test run aborted mid-way: {e}{RESET}")
             import traceback
@@ -2530,7 +2530,7 @@ def main():
 
         # FR-only gaps list (these are jamun-specific)
         if fr_failures:
-            print(f"{BOLD}fastapi-rs (FR) specific failures:{RESET}")
+            print(f"{BOLD}fastapi-turbo (FR) specific failures:{RESET}")
             for tid, desc, p, detail, cat in fr_failures[:50]:
                 print(f"  {RED}T{tid:04d}{RESET} [{cat}] {desc}")
                 if detail:
@@ -2543,7 +2543,7 @@ def main():
         if uvicorn_proc and uvicorn_proc.poll() is not None:
             print(f"{YELLOW}uvicorn died during run (exit={uvicorn_proc.returncode}); see /tmp/parity_uvicorn.log{RESET}")
         if rs_proc and rs_proc.poll() is not None:
-            print(f"{YELLOW}fastapi-rs died during run (exit={rs_proc.returncode}); see /tmp/parity_fastapi_rs.log{RESET}")
+            print(f"{YELLOW}fastapi-turbo died during run (exit={rs_proc.returncode}); see /tmp/parity_fastapi_turbo.log{RESET}")
 
         return 0 if failed == 0 else 1
 

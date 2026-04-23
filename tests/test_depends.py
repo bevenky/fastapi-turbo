@@ -19,7 +19,7 @@ def _free_port():
 
 @pytest.fixture()
 def server_app(tmp_path):
-    """Start a fastapi_rs server with the given app code, return base_url."""
+    """Start a fastapi_turbo server with the given app code, return base_url."""
     procs = []
 
     def _start(code: str):
@@ -63,7 +63,7 @@ def server_app(tmp_path):
 def test_simple_depends(server_app):
     """Basic dependency injection."""
     url = server_app("""
-        from fastapi_rs import FastAPI, Depends
+        from fastapi_turbo import FastAPI, Depends
         app = FastAPI()
 
         def get_db():
@@ -83,7 +83,7 @@ def test_simple_depends(server_app):
 def test_depends_with_path_params(server_app):
     """Dependency alongside path params."""
     url = server_app("""
-        from fastapi_rs import FastAPI, Depends
+        from fastapi_turbo import FastAPI, Depends
         app = FastAPI()
 
         def get_db():
@@ -103,7 +103,7 @@ def test_depends_with_path_params(server_app):
 def test_nested_depends(server_app):
     """Two-level dependency chain."""
     url = server_app("""
-        from fastapi_rs import FastAPI, Depends, Header
+        from fastapi_turbo import FastAPI, Depends, Header
         app = FastAPI()
 
         def get_db():
@@ -126,7 +126,7 @@ def test_nested_depends(server_app):
 def test_shared_dependency(server_app):
     """Same dependency used by multiple consumers, resolved once (cached)."""
     url = server_app("""
-        from fastapi_rs import FastAPI, Depends
+        from fastapi_turbo import FastAPI, Depends
         app = FastAPI()
 
         call_count = 0
@@ -152,7 +152,7 @@ def test_shared_dependency(server_app):
 def test_async_depends(server_app):
     """Async dependency function."""
     url = server_app("""
-        from fastapi_rs import FastAPI, Depends
+        from fastapi_turbo import FastAPI, Depends
         app = FastAPI()
 
         async def get_db():
@@ -172,7 +172,7 @@ def test_async_depends(server_app):
 def test_depends_with_query_params(server_app):
     """Dependency that consumes query parameters."""
     url = server_app("""
-        from fastapi_rs import FastAPI, Depends
+        from fastapi_turbo import FastAPI, Depends
         app = FastAPI()
 
         def pagination(skip: int = 0, limit: int = 10):

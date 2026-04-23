@@ -1,8 +1,8 @@
 """Deep schema parity mega-app: extensive permutations for OpenAPI structural comparison.
 
-Uses ONLY stock FastAPI imports. The compat shim maps these to fastapi-rs.
+Uses ONLY stock FastAPI imports. The compat shim maps these to fastapi-turbo.
 All endpoints here are intended to produce structurally identical OpenAPI
-schemas under FastAPI (uvicorn) and fastapi-rs.
+schemas under FastAPI (uvicorn) and fastapi-turbo.
 """
 import enum
 from typing import Annotated, Dict, List, Literal, Optional, Union

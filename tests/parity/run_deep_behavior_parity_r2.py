@@ -3,7 +3,7 @@
 
 Starts parity_app_deep_behavior_r2 on:
   - port 29920 via uvicorn  (stock FastAPI)
-  - port 29921 via fastapi-rs
+  - port 29921 via fastapi-turbo
 
 Each test is much deeper than R1:
   - full middleware trace comparison (X-Trace header JSON array)
@@ -82,7 +82,7 @@ def wait_for_port(port, timeout=STARTUP_TIMEOUT):
 def start_uvicorn(port):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
-    env.pop("FASTAPI_RS", None)
+    env.pop("FASTAPI_TURBO", None)
     log = open("/tmp/parity_r2_uvicorn.log", "w")
     return subprocess.Popen(
         [sys.executable, "-m", "uvicorn", APP_MODULE,
@@ -92,18 +92,18 @@ def start_uvicorn(port):
     )
 
 
-def start_fastapi_rs(port):
+def start_fastapi_turbo(port):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
     script = f"""
 import sys
 sys.path.insert(0, {PROJECT_ROOT!r})
-from fastapi_rs.compat import install
+from fastapi_turbo.compat import install
 install()
 from tests.parity.parity_app_deep_behavior_r2 import app
 app.run(host={HOST!r}, port={port})
 """
-    log = open("/tmp/parity_r2_fastapi_rs.log", "w")
+    log = open("/tmp/parity_r2_fastapi_turbo.log", "w")
     return subprocess.Popen(
         [sys.executable, "-c", script],
         cwd=PROJECT_ROOT, env=env,
@@ -377,7 +377,7 @@ def run_all_tests(fa_port: int, fr_port: int):
         # teardown between MW3_out and MW4_out (and only yC lands in
         # the X-Trace header because yB/yA complete on the worker
         # thread AFTER the portal thread serialized the header).
-        # fastapi-rs runs deps synchronously so every teardown lands
+        # fastapi-turbo runs deps synchronously so every teardown lands
         # in the trace, before the MW unwind. Teardowns DO fire on
         # both servers; only their placement in the trace sequence
         # differs. Strip all teardown-related entries so the trace
@@ -3606,7 +3606,7 @@ def run_all_tests(fa_port: int, fr_port: int):
 def main():
     print(f"\n{BOLD}{'='*72}")
     print(f"  ROUND 2 Deep Behavior Parity")
-    print(f"  FastAPI on :{FA_PORT}  |  fastapi-rs on :{FR_PORT}")
+    print(f"  FastAPI on :{FA_PORT}  |  fastapi-turbo on :{FR_PORT}")
     print(f"{'='*72}{RESET}\n")
 
     uvicorn_proc = None
@@ -3615,8 +3615,8 @@ def main():
     try:
         print(f"Starting uvicorn on {FA_PORT}...")
         uvicorn_proc = start_uvicorn(FA_PORT)
-        print(f"Starting fastapi-rs on {FR_PORT}...")
-        rs_proc = start_fastapi_rs(FR_PORT)
+        print(f"Starting fastapi-turbo on {FR_PORT}...")
+        rs_proc = start_fastapi_turbo(FR_PORT)
 
         print("Waiting for servers...")
         fa_ready = wait_for_port(FA_PORT)
@@ -3626,7 +3626,7 @@ def main():
             print(f"{RED}uvicorn failed to start; see /tmp/parity_r2_uvicorn.log{RESET}")
             return 1
         if not fr_ready:
-            print(f"{RED}fastapi-rs failed to start; see /tmp/parity_r2_fastapi_rs.log{RESET}")
+            print(f"{RED}fastapi-turbo failed to start; see /tmp/parity_r2_fastapi_turbo.log{RESET}")
             return 1
 
         print(f"{GREEN}Both servers ready!{RESET}\n")
@@ -3701,7 +3701,7 @@ def main():
         if uvicorn_proc and uvicorn_proc.poll() is not None:
             print(f"{YELLOW}uvicorn died during run (exit={uvicorn_proc.returncode}); see /tmp/parity_r2_uvicorn.log{RESET}")
         if rs_proc and rs_proc.poll() is not None:
-            print(f"{YELLOW}fastapi-rs died during run (exit={rs_proc.returncode}); see /tmp/parity_r2_fastapi_rs.log{RESET}")
+            print(f"{YELLOW}fastapi-turbo died during run (exit={rs_proc.returncode}); see /tmp/parity_r2_fastapi_turbo.log{RESET}")
 
         return 0 if failed == 0 else 1
 

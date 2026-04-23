@@ -1,5 +1,5 @@
 """WebSocket parity app — same source used by both stock FastAPI and
-fastapi-rs. Exercises the WS surface most real apps touch: send/receive
+fastapi-turbo. Exercises the WS surface most real apps touch: send/receive
 text/bytes/json, subprotocols, close codes, path/query/header/cookie
 access from ``WebSocket``, and exception propagation.
 """

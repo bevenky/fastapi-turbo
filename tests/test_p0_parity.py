@@ -24,7 +24,7 @@ class TestResponseModelByAlias:
         """by_alias=True is the default. Field(alias=...) must appear in output."""
         from pydantic import BaseModel, Field
 
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         class User(BaseModel):
             user_id: int = Field(alias="userId")
@@ -48,7 +48,7 @@ class TestResponseModelByAlias:
     def test_by_alias_false_uses_python_names(self):
         from pydantic import BaseModel, Field
 
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         class User(BaseModel):
             user_id: int = Field(alias="userId")
@@ -69,7 +69,7 @@ class TestResponseModelByAlias:
         """Field(serialization_alias=) should also be honored in output."""
         from pydantic import BaseModel, Field
 
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         class M(BaseModel):
             name: str = Field(serialization_alias="displayName")
@@ -90,8 +90,8 @@ class TestResponseModelByAlias:
 
 class TestDefaultResponseClass:
     def test_app_level_default(self):
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import HTMLResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import HTMLResponse
 
         app = FastAPI(default_response_class=HTMLResponse)
 
@@ -106,8 +106,8 @@ class TestDefaultResponseClass:
         assert result.media_type == "text/html"
 
     def test_route_overrides_app(self):
-        from fastapi_rs import FastAPI
-        from fastapi_rs.responses import HTMLResponse, PlainTextResponse
+        from fastapi_turbo import FastAPI
+        from fastapi_turbo.responses import HTMLResponse, PlainTextResponse
 
         app = FastAPI(default_response_class=HTMLResponse)
 
@@ -120,8 +120,8 @@ class TestDefaultResponseClass:
         assert result.media_type == "text/plain"
 
     def test_router_level_default(self):
-        from fastapi_rs import APIRouter, FastAPI
-        from fastapi_rs.responses import HTMLResponse
+        from fastapi_turbo import APIRouter, FastAPI
+        from fastapi_turbo.responses import HTMLResponse
 
         app = FastAPI()
         router = APIRouter(default_response_class=HTMLResponse)
@@ -141,7 +141,7 @@ class TestDefaultResponseClass:
 
 class TestAppLevelResponses:
     def test_app_responses_appear_in_openapi(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI(
             responses={404: {"description": "Not found globally"}}
@@ -157,7 +157,7 @@ class TestAppLevelResponses:
         assert op["responses"]["404"]["description"] == "Not found globally"
 
     def test_route_responses_override_app(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI(
             responses={404: {"description": "App default 404"}}
@@ -177,20 +177,20 @@ class TestAppLevelResponses:
 
 class TestDebugMode:
     def test_debug_default_false(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI()
         assert app.debug is False
 
     def test_debug_true_stored(self):
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI(debug=True)
         assert app.debug is True
 
     def test_debug_prints_traceback(self, capsys):
         """In debug mode, handler exceptions print a traceback to stderr."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI(debug=True)
 
@@ -210,7 +210,7 @@ class TestDebugMode:
 
     def test_no_debug_no_traceback(self, capsys):
         """Without debug, tracebacks are NOT printed to stderr."""
-        from fastapi_rs import FastAPI
+        from fastapi_turbo import FastAPI
 
         app = FastAPI(debug=False)
 
@@ -228,7 +228,7 @@ class TestDebugMode:
 
     def test_http_exception_not_traced_in_debug(self, capsys):
         """HTTPException in debug mode should NOT print a traceback — it's control flow."""
-        from fastapi_rs import FastAPI, HTTPException
+        from fastapi_turbo import FastAPI, HTTPException
 
         app = FastAPI(debug=True)
 
@@ -251,8 +251,8 @@ class TestDebugMode:
 
 class TestORJSONResponse:
     def test_orjson_response_renders(self):
-        from fastapi_rs.responses import ORJSONResponse
-        from fastapi_rs.exceptions import FastAPIDeprecationWarning
+        from fastapi_turbo.responses import ORJSONResponse
+        from fastapi_turbo.exceptions import FastAPIDeprecationWarning
         import warnings
 
         with warnings.catch_warnings():
@@ -267,7 +267,7 @@ class TestORJSONResponse:
 
     def test_json_response_fallback(self):
         """JSONResponse should work even if orjson is not installed (falls back to stdlib)."""
-        from fastapi_rs.responses import JSONResponse
+        from fastapi_turbo.responses import JSONResponse
 
         # This should not raise ImportError even if orjson is absent
         resp = JSONResponse(content={"k": "v"})
@@ -277,7 +277,7 @@ class TestORJSONResponse:
 
     def test_json_response_compact_bytes_match_starlette(self):
         """JSONResponse output bytes should match Starlette's compact form."""
-        from fastapi_rs.responses import JSONResponse
+        from fastapi_turbo.responses import JSONResponse
 
         resp = JSONResponse(content={"a": 1, "b": "x"})
         # No spaces between key/value (compact form)

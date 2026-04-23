@@ -1,4 +1,4 @@
-# fastapi-rs Development Guide
+# fastapi-turbo Development Guide
 
 ## Commit Rules
 
@@ -6,7 +6,7 @@
 
 ## Project Overview
 
-fastapi-rs is a drop-in replacement for FastAPI, powered by Rust Axum via PyO3. It maintains 100% FastAPI API compatibility while delivering near-Go/Rust performance.
+fastapi-turbo is a drop-in replacement for FastAPI, powered by Rust Axum via PyO3. It maintains 100% FastAPI API compatibility while delivering near-Go/Rust performance.
 
 ## Architecture
 
@@ -27,7 +27,7 @@ fastapi-rs is a drop-in replacement for FastAPI, powered by Rust Axum via PyO3. 
 │  WS: ChannelAwaitable (custom Python awaitable    │
 │      backed by crossbeam, zero asyncio overhead)  │
 ├─────────────────────────────────────────────────┤
-│  Python Layer (python/fastapi_rs/)               │
+│  Python Layer (python/fastapi_turbo/)               │
 │  FastAPI-identical API surface                    │
 │  Compat shims: from fastapi import ... works      │
 │  Introspection: inspect.signature at startup      │
@@ -50,7 +50,7 @@ pytest tests/ -x -q --ignore=tests/test_websocket.py   # ~6s, 124 tests
 pytest tests/ -x -q                                      # ~50s, 128 tests
 
 # Benchmark
-./target/release/fastapi-rs-bench 127.0.0.1 PORT /path N WARMUP [METHOD] [BODY] [CONTENT_TYPE]
+./target/release/fastapi-turbo-bench 127.0.0.1 PORT /path N WARMUP [METHOD] [BODY] [CONTENT_TYPE]
 ```
 
 ## Key Design Decisions
@@ -75,7 +75,7 @@ src/
 ├── streaming.rs        # StreamingResponse bridge
 └── config.rs           # ServerConfig
 
-python/fastapi_rs/
+python/fastapi_turbo/
 ├── __init__.py         # Public API + compat shim auto-install
 ├── applications.py     # FastAPI class, compiled handler optimization
 ├── routing.py          # APIRouter, APIRoute

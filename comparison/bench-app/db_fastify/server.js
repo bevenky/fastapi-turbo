@@ -18,7 +18,7 @@ const PORT = parseInt(process.env.PORT || '19034', 10);
 const pgPool = new Pool({
   host: 'localhost',
   port: 5432,
-  database: 'fastapi_rs_bench',
+  database: 'fastapi_turbo_bench',
   user: 'venky',
   min: 5,
   max: 20,

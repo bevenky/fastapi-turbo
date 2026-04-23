@@ -1,5 +1,5 @@
 """
-Functional Audit Test Runner for fastapi-rs.
+Functional Audit Test Runner for fastapi-turbo.
 Starts the audit app, hits every endpoint, reports PASS/FAIL.
 """
 import subprocess
@@ -38,7 +38,7 @@ def wait_for_server(timeout=15):
 
 def run_tests():
     print("\n" + "=" * 70)
-    print("  FASTAPI-RS FUNCTIONAL AUDIT")
+    print("  FASTAPI-TURBO FUNCTIONAL AUDIT")
     print("=" * 70)
 
     client = httpx.Client(base_url=BASE, timeout=10, follow_redirects=False)
@@ -485,7 +485,7 @@ def run_tests():
         report(46, "response_model filters extras", False, str(e))
 
     # 47. Enum in query params
-    # NOTE: FastAPI auto-converts query string to Enum type; fastapi-rs passes raw str.
+    # NOTE: FastAPI auto-converts query string to Enum type; fastapi-turbo passes raw str.
     # Handler must be written to handle both (this is a known gap).
     try:
         r = client.get("/test/enum-query?color=green")

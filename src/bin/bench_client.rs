@@ -1,6 +1,6 @@
 //! Rust HTTP benchmark client for framework comparison.
 //!
-//! Usage: fastapi-rs-bench HOST PORT PATH [N] [WARMUP] [METHOD] [BODY] [CONTENT_TYPE]
+//! Usage: fastapi-turbo-bench HOST PORT PATH [N] [WARMUP] [METHOD] [BODY] [CONTENT_TYPE]
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

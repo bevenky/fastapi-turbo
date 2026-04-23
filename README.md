@@ -1,10 +1,10 @@
-# fastapi-rs
+# fastapi-turbo
 
 Drop-in replacement for FastAPI, with near-Rust performance that beats or matches Fastify (Node.js), Go Gin, and Go Echo.
 
 ```python
 # Change one import — everything else stays the same
-from fastapi_rs import FastAPI, Depends, Query, Header
+from fastapi_turbo import FastAPI, Depends, Query, Header
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -33,7 +33,7 @@ Measured with a compiled Rust HTTP client, 20K requests, keep-alive, Apple Silic
 
 ### HTTP (p50 latency, lower is better)
 
-| Endpoint | FastAPI | **fastapi-rs** | Go Gin | Go Echo | Fastify | Speedup vs FastAPI |
+| Endpoint | FastAPI | **fastapi-turbo** | Go Gin | Go Echo | Fastify | Speedup vs FastAPI |
 |----------|---------|---------------|--------|---------|---------|-------------------|
 | GET /hello | 188 us | **24 us** | 24 us | 24 us | 24 us | **7.8x** |
 | GET /with-deps (2-level DI) | 126 us | **26 us** | 24 us | 24 us | 23 us | **4.8x** |
@@ -41,7 +41,7 @@ Measured with a compiled Rust HTTP client, 20K requests, keep-alive, Apple Silic
 | DELETE | — | **23 us** | — | — | — | — |
 | PATCH | — | **23 us** | — | — | — | — |
 
-fastapi-rs **ties Go and Fastify on GET** and **beats Fastify on POST** (29 us vs 30 us) thanks to Pydantic's Rust-backed validation being faster than Ajv.
+fastapi-turbo **ties Go and Fastify on GET** and **beats Fastify on POST** (29 us vs 30 us) thanks to Pydantic's Rust-backed validation being faster than Ajv.
 
 ### WebSocket (p50 latency per echo round-trip, 10K messages)
 
@@ -50,10 +50,10 @@ fastapi-rs **ties Go and Fastify on GET** and **beats Fastify on POST** (29 us v
 | Pure Rust Axum (zero Python) | 45 us | — | 22,000 |
 | Go Gin | 48 us | — | 20,700 |
 | Fastify | 47 us | — | 20,700 |
-| **fastapi-rs** | **57 us** | **58 us** | **17,000** |
+| **fastapi-turbo** | **57 us** | **58 us** | **17,000** |
 | FastAPI + uvicorn | 120 us | 120 us | 8,200 |
 
-fastapi-rs async WebSocket matches sync (58 us vs 57 us) thanks to `ChannelAwaitable` — a custom Python awaitable backed by a Rust lock-free channel that bypasses asyncio scheduling entirely. **2.1x faster than FastAPI**.
+fastapi-turbo async WebSocket matches sync (58 us vs 57 us) thanks to `ChannelAwaitable` — a custom Python awaitable backed by a Rust lock-free channel that bypasses asyncio scheduling entirely. **2.1x faster than FastAPI**.
 
 ## How It Works
 
@@ -61,7 +61,7 @@ fastapi-rs async WebSocket matches sync (58 us vs 57 us) thanks to `ChannelAwait
 Your Python code (unchanged FastAPI handlers)
         |
         v
-fastapi-rs Python layer (decorators, Depends, Pydantic)
+fastapi-turbo Python layer (decorators, Depends, Pydantic)
         | inspect.signature() at startup -> compile dependency graphs
         v
 PyO3 boundary (1 GIL acquisition per request)
@@ -79,17 +79,17 @@ The key innovation: FastAPI's `Depends()` resolution is compiled into a topologi
 ## Install
 
 ```bash
-pip install fastapi-rs
+pip install fastapi-turbo
 ```
 
 Requires Python 3.10+. Pre-built wheels for Linux (x86_64, aarch64), macOS (x86_64, ARM), Windows.
 
 ## Zero-effort migration from FastAPI
 
-fastapi-rs intercepts `import fastapi` and `import starlette` at the Python module level, so your existing FastAPI code works without any changes:
+fastapi-turbo intercepts `import fastapi` and `import starlette` at the Python module level, so your existing FastAPI code works without any changes:
 
 ```python
-import fastapi_rs  # Activate once — all subsequent FastAPI imports redirect here
+import fastapi_turbo  # Activate once — all subsequent FastAPI imports redirect here
 
 # Your existing code, unchanged:
 from fastapi import FastAPI, Depends, HTTPException
@@ -98,9 +98,9 @@ from starlette.requests import Request
 from starlette.middleware.cors import CORSMiddleware
 ```
 
-Every `from fastapi ...` and `from starlette ...` import automatically resolves to the fastapi-rs equivalent. No find-and-replace needed.
+Every `from fastapi ...` and `from starlette ...` import automatically resolves to the fastapi-turbo equivalent. No find-and-replace needed.
 
-To disable this and use both FastAPI and fastapi-rs side by side, set `FASTAPI_RS_NO_SHIM=1`.
+To disable this and use both FastAPI and fastapi-turbo side by side, set `FASTAPI_TURBO_NO_SHIM=1`.
 
 ### What's supported
 
@@ -131,7 +131,7 @@ To disable this and use both FastAPI and fastapi-rs side by side, set `FASTAPI_R
 
 ## Database: Use psycopg3 (not psycopg2 or asyncpg)
 
-fastapi-rs is fastest with **psycopg3** — it supports autocommit mode (eliminates transaction overhead) and pipeline mode (sends multiple queries in one network round-trip). psycopg2 and asyncpg lack both features.
+fastapi-turbo is fastest with **psycopg3** — it supports autocommit mode (eliminates transaction overhead) and pipeline mode (sends multiple queries in one network round-trip). psycopg2 and asyncpg lack both features.
 
 ### Quick start
 
@@ -140,8 +140,8 @@ pip install "psycopg[binary,pool]"
 ```
 
 ```python
-from fastapi_rs import FastAPI
-from fastapi_rs.db import create_pool
+from fastapi_turbo import FastAPI
+from fastapi_turbo.db import create_pool
 
 app = FastAPI()
 pool = create_pool("dbname=mydb user=myuser")  # autocommit=True by default
@@ -179,15 +179,15 @@ def dashboard(user_id: int):
 | **1 query latency** | **22us** | 48us | 112us |
 | **10 queries (pipeline)** | **102us** | ~300us (seq) | 344us (gather) |
 
-### Performance: fastapi-rs vs Go Gin (through full framework)
+### Performance: fastapi-turbo vs Go Gin (through full framework)
 
-| Queries | fastapi-rs | Go Gin | Winner |
+| Queries | fastapi-turbo | Go Gin | Winner |
 |---------|-----------|--------|--------|
-| 1 query (autocommit) | **53us** | 56us | **fastapi-rs** |
+| 1 query (autocommit) | **53us** | 56us | **fastapi-turbo** |
 | 4 queries (pipeline vs goroutine) | **96us** | 79us | Go (by 17us) |
-| 10 queries (pipeline vs goroutine) | **138us** | 148us | **fastapi-rs** |
-| 4 queries (sequential) | **104us** | 144us | **fastapi-rs by 40us** |
-| 10 queries (sequential) | **197us** | 321us | **fastapi-rs by 124us** |
+| 10 queries (pipeline vs goroutine) | **138us** | 148us | **fastapi-turbo** |
+| 4 queries (sequential) | **104us** | 144us | **fastapi-turbo by 40us** |
+| 10 queries (sequential) | **197us** | 321us | **fastapi-turbo by 124us** |
 
 ### Autocommit and transactions
 
@@ -214,7 +214,7 @@ pip install "redis[hiredis]"
 ```
 
 ```python
-from fastapi_rs.db import create_redis
+from fastapi_turbo.db import create_redis
 
 cache = create_redis()  # redis-py + hiredis, auto decode_responses=True
 
@@ -275,17 +275,17 @@ with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
 - **Use psycopg3** (not psycopg2 or asyncpg) — pipeline + autocommit + fastest sync driver
 - **Pipeline Postgres** when running 4+ queries: `with conn.pipeline(): results = [conn.execute(q) for q in queries]`
 - **Pipeline Redis** when running 2+ commands: `with cache.pipeline() as p: [p.get(k) for k in keys]; p.execute()`
-- **Use `create_pool()`** from `fastapi_rs.db` — enables autocommit by default (saves 5μs per request)
-- **Use `create_redis()`** from `fastapi_rs.db` — enables hiredis + decode_responses by default
+- **Use `create_pool()`** from `fastapi_turbo.db` — enables autocommit by default (saves 5μs per request)
+- **Use `create_redis()`** from `fastapi_turbo.db` — enables hiredis + decode_responses by default
 - **Install hiredis** for Redis: `pip install "redis[hiredis]"` — C response parser, 18% faster pipelines (auto-detected by redis-py)
 - **Disable autocommit** only when you need transactions: `create_pool(dsn, autocommit=False)`
 
 ## HTTP Client
 
-`fastapi_rs.http.Client` is a drop-in replacement for `httpx.Client`, backed by Rust `reqwest`. Matches httpx's API exactly (same `Client`, `Response`, `Auth`, `Timeout`, `Limits`, event hooks, generator-based auth flow), but 2.2x faster on single requests and up to 3x faster on parallel fan-out.
+`fastapi_turbo.http.Client` is a drop-in replacement for `httpx.Client`, backed by Rust `reqwest`. Matches httpx's API exactly (same `Client`, `Response`, `Auth`, `Timeout`, `Limits`, event hooks, generator-based auth flow), but 2.2x faster on single requests and up to 3x faster on parallel fan-out.
 
 ```python
-from fastapi_rs.http import Client, BasicAuth, Timeout
+from fastapi_turbo.http import Client, BasicAuth, Timeout
 
 client = Client(
     base_url="https://api.example.com",
@@ -325,7 +325,7 @@ responses = client.gather(["/users/1", "/users/2", "/users/3"])
 |--------|-----|-------|
 | Go `net/http` | 108 μs | baseline |
 | Node.js `undici` | 101 μs | Fastify's HTTP client |
-| **fastapi_rs.http** | **136 μs** | full httpx-compatible API |
+| **fastapi_turbo.http** | **136 μs** | full httpx-compatible API |
 | Python `http.client` stdlib | 108 μs | no features |
 | httpx | 244 μs | |
 | requests | 383 μs | |
@@ -334,7 +334,7 @@ Only 28 μs slower than Go despite crossing the Python boundary. **2.2x faster t
 
 ### `gather()` — parallel requests, the killer feature
 
-| Parallel calls | Go goroutines | Node Promise.all | **fastapi_rs gather** | httpx ThreadPool | httpx async gather |
+| Parallel calls | Go goroutines | Node Promise.all | **fastapi_turbo gather** | httpx ThreadPool | httpx async gather |
 |---------------|---------------|------------------|----------------------|------------------|-------------------|
 | x4 | 277 μs | 266 μs | **310 μs** | 742 μs | 2,577 μs |
 | x10 | 547 μs | 530 μs | **622 μs** | 1,838 μs | 6,994 μs |

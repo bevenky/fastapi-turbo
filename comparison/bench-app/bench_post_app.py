@@ -4,8 +4,8 @@ import sys
 
 from pydantic import BaseModel
 
-from fastapi_rs import FastAPI, HTTPException
-from fastapi_rs.responses import JSONResponse
+from fastapi_turbo import FastAPI, HTTPException
+from fastapi_turbo.responses import JSONResponse
 
 
 class Item(BaseModel):

@@ -21,7 +21,7 @@ import (
 func main() {
 	gin.SetMode(gin.ReleaseMode)
 
-	// Set up temp dir with the same test files as the fastapi-rs version
+	// Set up temp dir with the same test files as the fastapi-turbo version
 	tmpDir, err := os.MkdirTemp("", "bench_files_go_")
 	if err != nil {
 		panic(err)
@@ -82,7 +82,7 @@ func main() {
 			c.JSON(http.StatusBadRequest, gin.H{"err": err.Error()})
 			return
 		}
-		// Read the full content to match fastapi-rs's behavior
+		// Read the full content to match fastapi-turbo's behavior
 		src, err := file.Open()
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"err": err.Error()})

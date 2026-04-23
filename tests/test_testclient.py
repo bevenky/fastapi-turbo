@@ -3,8 +3,8 @@
 
 def test_testclient_basic():
     """TestClient GET request works."""
-    from fastapi_rs import FastAPI
-    from fastapi_rs.testclient import TestClient
+    from fastapi_turbo import FastAPI
+    from fastapi_turbo.testclient import TestClient
 
     app = FastAPI()
 
@@ -20,8 +20,8 @@ def test_testclient_basic():
 
 def test_testclient_post_json():
     """TestClient POST with JSON body."""
-    from fastapi_rs import FastAPI
-    from fastapi_rs.testclient import TestClient
+    from fastapi_turbo import FastAPI
+    from fastapi_turbo.testclient import TestClient
     from pydantic import BaseModel
 
     app = FastAPI()
@@ -41,8 +41,8 @@ def test_testclient_post_json():
 
 def test_testclient_path_params():
     """TestClient with path parameters."""
-    from fastapi_rs import FastAPI
-    from fastapi_rs.testclient import TestClient
+    from fastapi_turbo import FastAPI
+    from fastapi_turbo.testclient import TestClient
 
     app = FastAPI()
 
@@ -58,8 +58,8 @@ def test_testclient_path_params():
 
 def test_testclient_query_params():
     """TestClient with query parameters."""
-    from fastapi_rs import FastAPI
-    from fastapi_rs.testclient import TestClient
+    from fastapi_turbo import FastAPI
+    from fastapi_turbo.testclient import TestClient
 
     app = FastAPI()
 
@@ -75,8 +75,8 @@ def test_testclient_query_params():
 
 def test_testclient_404():
     """TestClient returns 404 for unknown routes."""
-    from fastapi_rs import FastAPI
-    from fastapi_rs.testclient import TestClient
+    from fastapi_turbo import FastAPI
+    from fastapi_turbo.testclient import TestClient
 
     app = FastAPI()
 
@@ -91,8 +91,8 @@ def test_testclient_404():
 
 def test_testclient_http_exception():
     """TestClient handles HTTPException."""
-    from fastapi_rs import FastAPI, HTTPException
-    from fastapi_rs.testclient import TestClient
+    from fastapi_turbo import FastAPI, HTTPException
+    from fastapi_turbo.testclient import TestClient
 
     app = FastAPI()
 
@@ -108,8 +108,8 @@ def test_testclient_http_exception():
 
 def test_testclient_multiple_requests():
     """TestClient supports multiple requests in one session."""
-    from fastapi_rs import FastAPI
-    from fastapi_rs.testclient import TestClient
+    from fastapi_turbo import FastAPI
+    from fastapi_turbo.testclient import TestClient
 
     app = FastAPI()
 
@@ -131,6 +131,6 @@ def test_testclient_multiple_requests():
 def test_testclient_from_fastapi_import():
     """TestClient importable from fastapi.testclient."""
     from fastapi.testclient import TestClient
-    from fastapi_rs.testclient import TestClient as JTC
+    from fastapi_turbo.testclient import TestClient as JTC
 
     assert TestClient is JTC

@@ -17,7 +17,7 @@ static ORJSON_DUMPS: OnceLock<Py<PyAny>> = OnceLock::new();
 static DC_IS_DATACLASS: OnceLock<Py<PyAny>> = OnceLock::new();
 static DC_ASDICT: OnceLock<Py<PyAny>> = OnceLock::new();
 
-/// Cached fastapi_rs.responses class pointers. A Python type pointer is
+/// Cached fastapi_turbo.responses class pointers. A Python type pointer is
 /// stable for the life of the interpreter, so `obj.get_type() == cached_ptr`
 /// is a 1-ns comparison — ~5× faster than `obj.getattr("path")` for
 /// detecting a known response subclass.
@@ -31,7 +31,7 @@ fn init_response_classes(py: Python<'_>) {
     if JSON_RESPONSE_CLS.get().is_some() {
         return;
     }
-    if let Ok(m) = py.import("fastapi_rs.responses") {
+    if let Ok(m) = py.import("fastapi_turbo.responses") {
         if let Ok(c) = m.getattr("JSONResponse") {
             let _ = JSON_RESPONSE_CLS.set(c.unbind());
         }
@@ -80,9 +80,9 @@ static JSON_DEFAULT: OnceLock<Py<PyAny>> = OnceLock::new();
 
 fn json_default(py: Python<'_>) -> &'static Py<PyAny> {
     JSON_DEFAULT.get_or_init(|| {
-        py.import("fastapi_rs.responses")
+        py.import("fastapi_turbo.responses")
             .and_then(|m| m.getattr("_json_default"))
-            .expect("fastapi_rs.responses._json_default")
+            .expect("fastapi_turbo.responses._json_default")
             .unbind()
     })
 }

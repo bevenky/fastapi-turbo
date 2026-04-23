@@ -1,11 +1,11 @@
 [package]
-name = "fastapi-rs"
+name = "fastapi-turbo"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [lib]
-name = "_fastapi_rs_core"
+name = "_fastapi_turbo_core"
 crate-type = ["cdylib"]
 
 [dependencies]
@@ -44,5 +44,5 @@ strip = true
 opt-level = 0
 
 [[bin]]
-name = "fastapi-rs-bench"
+name = "fastapi-turbo-bench"
 path = "src/bin/bench_client.rs"

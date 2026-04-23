@@ -2,7 +2,7 @@
 """Deep OpenAPI schema parity runner.
 
 Starts the deep-schema parity app under BOTH stock FastAPI (uvicorn) and
-fastapi-rs, fetches both `/openapi.json` documents, and runs a large
+fastapi-turbo, fetches both `/openapi.json` documents, and runs a large
 collection of per-field structural assertions.
 
 Each test targets ONE structural property (e.g. a single operationId, a
@@ -44,7 +44,7 @@ def start_fastapi(port: int) -> subprocess.Popen:
     return subprocess.Popen(
         [PYTHON, "-c", f"""
 import sys, os
-os.environ['FASTAPI_RS_NO_SHIM'] = '1'
+os.environ['FASTAPI_TURBO_NO_SHIM'] = '1'
 sys.path.insert(0, {TEST_DIR!r})
 import uvicorn
 from parity_app_deep_schema import app
@@ -55,12 +55,12 @@ uvicorn.run(app, host='127.0.0.1', port={port}, log_level='error')
     )
 
 
-def start_fastapi_rs(port: int) -> subprocess.Popen:
+def start_fastapi_turbo(port: int) -> subprocess.Popen:
     return subprocess.Popen(
         [PYTHON, "-c", f"""
 import sys, os
-import fastapi_rs.compat
-fastapi_rs.compat.install()
+import fastapi_turbo.compat
+fastapi_turbo.compat.install()
 sys.path.insert(0, {TEST_DIR!r})
 from parity_app_deep_schema import app
 app.run('127.0.0.1', {port})
@@ -681,8 +681,8 @@ def budget_exceeded(results: list, budget: Dict[str, int]) -> bool:
 def main() -> int:
     print(f"Starting stock FastAPI/uvicorn on :{FA_PORT} ...")
     fa_proc = start_fastapi(FA_PORT)
-    print(f"Starting fastapi-rs on :{RS_PORT} ...")
-    rs_proc = start_fastapi_rs(RS_PORT)
+    print(f"Starting fastapi-turbo on :{RS_PORT} ...")
+    rs_proc = start_fastapi_turbo(RS_PORT)
 
     try:
         if not wait_for_openapi(FA_PORT):
@@ -693,7 +693,7 @@ def main() -> int:
             return 1
         if not wait_for_openapi(RS_PORT):
             stderr = rs_proc.stderr.read().decode(errors="replace") if rs_proc.stderr else ""
-            print(f"FATAL: fastapi-rs did not start on :{RS_PORT}")
+            print(f"FATAL: fastapi-turbo did not start on :{RS_PORT}")
             if stderr:
                 print("stderr:\n" + stderr[:2000])
             return 1

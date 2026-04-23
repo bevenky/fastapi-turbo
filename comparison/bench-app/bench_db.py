@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Database benchmark runner -- compares fastapi-rs vs Go Gin with real DB.
+"""Database benchmark runner -- compares fastapi-turbo vs Go Gin with real DB.
 
 Starts both servers, runs the Rust bench client against each endpoint,
 measures cold/warm cache performance, and prints comparison tables.
@@ -24,13 +24,13 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
-BENCH_CLIENT = PROJECT_ROOT / "target" / "release" / "fastapi-rs-bench"
+BENCH_CLIENT = PROJECT_ROOT / "target" / "release" / "fastapi-turbo-bench"
 
-PORT_FASTAPI_RS = 19030
+PORT_FASTAPI_TURBO = 19030
 PORT_GO_GIN = 19031
 
 FRAMEWORKS = {
-    "fastapi-rs": PORT_FASTAPI_RS,
+    "fastapi-turbo": PORT_FASTAPI_TURBO,
     "Go-Gin": PORT_GO_GIN,
 }
 
@@ -104,7 +104,7 @@ def clean_test_products():
     """Remove products created during benchmark."""
     try:
         subprocess.run(
-            ["psql", "-h", "localhost", "-U", "venky", "-d", "fastapi_rs_bench",
+            ["psql", "-h", "localhost", "-U", "venky", "-d", "fastapi_turbo_bench",
              "-c", "DELETE FROM products WHERE name LIKE 'BenchProduct%';"],
             capture_output=True, timeout=5,
         )
@@ -229,7 +229,7 @@ def print_table(title, tests, results, extractor, unit=""):
 # ── Main ────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Database benchmark: fastapi-rs vs Go Gin")
+    parser = argparse.ArgumentParser(description="Database benchmark: fastapi-turbo vs Go Gin")
     parser.add_argument("--requests", "-n", type=int, default=5000, help="Requests per test (default: 5000)")
     parser.add_argument("--warmup", "-w", type=int, default=200, help="Warmup requests (default: 200)")
     parser.add_argument("--concurrent", "-c", type=int, default=10, help="Concurrent connections for parallel tests (default: 10)")
@@ -242,7 +242,7 @@ def main():
     signal.signal(signal.SIGINT, lambda s, f: (cleanup(), sys.exit(1)))
 
     print(f"{CYAN}{'='*60}{NC}")
-    print(f"{CYAN}  Database Benchmark: fastapi-rs vs Go Gin{NC}")
+    print(f"{CYAN}  Database Benchmark: fastapi-turbo vs Go Gin{NC}")
     print(f"{CYAN}  PostgreSQL + Redis | {N} requests, {WARMUP} warmup{NC}")
     print(f"{CYAN}{'='*60}{NC}")
     print()
@@ -251,8 +251,8 @@ def main():
     print(f"{YELLOW}[1/4] Checking bench client...{NC}")
     if not BENCH_CLIENT.exists():
         print(f"  {RED}Bench client not found at {BENCH_CLIENT}{NC}")
-        print(f"  Building with: cargo build --release --bin fastapi-rs-bench")
-        subprocess.run(["cargo", "build", "--release", "--bin", "fastapi-rs-bench"],
+        print(f"  Building with: cargo build --release --bin fastapi-turbo-bench")
+        subprocess.run(["cargo", "build", "--release", "--bin", "fastapi-turbo-bench"],
                        cwd=str(PROJECT_ROOT), check=True)
     print(f"  {GREEN}Bench client ready{NC}")
 
@@ -272,11 +272,11 @@ def main():
     # ── Step 3: Start servers ──
     print(f"{YELLOW}[3/4] Starting servers...{NC}")
 
-    # fastapi-rs
+    # fastapi-turbo
     env_rs = os.environ.copy()
-    env_rs["FASTAPI_RS_NO_SHIM"] = "1"
+    env_rs["FASTAPI_TURBO_NO_SHIM"] = "1"
     proc_rs = subprocess.Popen(
-        [sys.executable, str(SCRIPT_DIR / "db_fastapi_rs_app.py")],
+        [sys.executable, str(SCRIPT_DIR / "db_fastapi_turbo_app.py")],
         cwd=str(PROJECT_ROOT),
         env=env_rs,
         stdout=open(os.devnull, "w"),
@@ -296,8 +296,8 @@ def main():
     )
     _processes.append(proc_go)
 
-    if not wait_for_port(PORT_FASTAPI_RS, "fastapi-rs"):
-        print(f"{RED}Failed to start fastapi-rs server{NC}")
+    if not wait_for_port(PORT_FASTAPI_TURBO, "fastapi-turbo"):
+        print(f"{RED}Failed to start fastapi-turbo server{NC}")
         cleanup()
         sys.exit(1)
     if not wait_for_port(PORT_GO_GIN, "Go Gin"):
@@ -394,14 +394,14 @@ def main():
     print_table("Latency p99 (us) -- lower is better", test_labels, results, parse_p99, "us")
 
     # ── Speedup summary ──
-    print(f"\n### Speedup: Go-Gin / fastapi-rs")
+    print(f"\n### Speedup: Go-Gin / fastapi-turbo")
     print()
     for test_key, label in test_labels:
-        rs_rps = parse_rps(results.get(f"fastapi-rs,{test_key}", ""))
+        rs_rps = parse_rps(results.get(f"fastapi-turbo,{test_key}", ""))
         go_rps = parse_rps(results.get(f"Go-Gin,{test_key}", ""))
         if rs_rps and go_rps:
             ratio = go_rps / rs_rps
-            winner = "Go" if ratio > 1 else "fastapi-rs"
+            winner = "Go" if ratio > 1 else "fastapi-turbo"
             ratio_display = f"{ratio:.2f}x" if ratio >= 1 else f"{1/ratio:.2f}x"
             print(f"  {label:<35} {ratio_display} ({winner} faster)")
         else:

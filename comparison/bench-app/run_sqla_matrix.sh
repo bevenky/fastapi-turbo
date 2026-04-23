@@ -4,7 +4,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BENCH="$PROJECT_ROOT/target/release/fastapi-rs-bench"
+BENCH="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
 PY_RS="python3"
 PY_FA="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
@@ -69,10 +69,10 @@ run_one() {
 }
 
 echo -e "label\tendpoint\trps\tp50\tp99"
-run_one "fastapi-rs_SQLA_pg3-sync"  pg3       fastapi-rs 19050 || true
-run_one "fastapi-rs_SQLA_pg2-sync"  pg2       fastapi-rs 19051 || true
-run_one "fastapi-rs_SQLA_asyncpg"   async     fastapi-rs 19052 || true
-run_one "fastapi-rs_SQLA_pg3-async" pg3async  fastapi-rs 19056 || true
+run_one "fastapi-turbo_SQLA_pg3-sync"  pg3       fastapi-turbo 19050 || true
+run_one "fastapi-turbo_SQLA_pg2-sync"  pg2       fastapi-turbo 19051 || true
+run_one "fastapi-turbo_SQLA_asyncpg"   async     fastapi-turbo 19052 || true
+run_one "fastapi-turbo_SQLA_pg3-async" pg3async  fastapi-turbo 19056 || true
 run_one "FastAPI_SQLA_pg3-sync"     pg3       uvicorn    19053 || true
 run_one "FastAPI_SQLA_pg2-sync"     pg2       uvicorn    19054 || true
 run_one "FastAPI_SQLA_asyncpg"      async     uvicorn    19055 || true

@@ -188,7 +188,7 @@ fn iterate_sync_generator(
     let py_iter = match iter_obj.call_method0("__iter__") {
         Ok(it) => it,
         Err(e) => {
-            eprintln!("fastapi-rs: failed to iterate streaming body: {e}");
+            eprintln!("fastapi-turbo: failed to iterate streaming body: {e}");
             return;
         }
     };
@@ -261,7 +261,7 @@ fn iterate_async_generator(
     }) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("fastapi-rs: streaming loop init failed: {e}");
+            eprintln!("fastapi-turbo: streaming loop init failed: {e}");
             return;
         }
     };
@@ -270,7 +270,7 @@ fn iterate_async_generator(
     let aiter = match iterator.bind(py).call_method0("__aiter__") {
         Ok(it) => it.unbind(),
         Err(e) => {
-            eprintln!("fastapi-rs: __aiter__ failed: {e}");
+            eprintln!("fastapi-turbo: __aiter__ failed: {e}");
             return;
         }
     };
@@ -287,7 +287,7 @@ fn iterate_async_generator(
             Ok(c) => c,
             Err(e) => {
                 if !e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
-                    eprintln!("fastapi-rs: __anext__ spawn error: {e}");
+                    eprintln!("fastapi-turbo: __anext__ spawn error: {e}");
                 }
                 break;
             }
@@ -304,7 +304,7 @@ fn iterate_async_generator(
                 if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
                     break;
                 }
-                eprintln!("fastapi-rs: run_until_complete streaming error: {e}");
+                eprintln!("fastapi-turbo: run_until_complete streaming error: {e}");
                 break;
             }
         }

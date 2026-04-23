@@ -1,6 +1,6 @@
 package main
 
-// Go Gin equivalent of the fastapi-rs drop-in example.
+// Go Gin equivalent of the fastapi-turbo drop-in example.
 // Matches every endpoint behavior for a fair benchmark.
 
 import (

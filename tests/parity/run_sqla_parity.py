@@ -3,7 +3,7 @@
 
 Per driver:
   - Boots stock FastAPI (uvicorn) on port 29930/29940/29950
-  - Boots fastapi-rs on 29931/29941/29951
+  - Boots fastapi-turbo on 29931/29941/29951
   - Resets DB, then runs ~150 behavior tests comparing both responses
   - After every test, DB-state is verified via an independent connection
 
@@ -39,7 +39,7 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 FASTAPI_PORTS = {"pg3": 29930, "async": 29940, "pg2": 29950}
-FASTAPI_RS_PORTS = {"pg3": 29931, "async": 29941, "pg2": 29951}
+FASTAPI_TURBO_PORTS = {"pg3": 29931, "async": 29941, "pg2": 29951}
 
 APP_MODULE = {
     "pg3":   "tests.parity.parity_app_sqla_psycopg3:app",
@@ -47,7 +47,7 @@ APP_MODULE = {
     "pg2":   "tests.parity.parity_app_sqla_psycopg2:app",
 }
 
-# Each driver uses two DBs: one for FastAPI/uvicorn, one for fastapi-rs.
+# Each driver uses two DBs: one for FastAPI/uvicorn, one for fastapi-turbo.
 FA_DB_URL = {
     "pg3":   "postgresql+psycopg://venky@localhost:5432/jamun_sqla_pg3_fa",
     "async": "postgresql+asyncpg://venky@localhost:5432/jamun_sqla_async_fa",
@@ -102,7 +102,7 @@ def wait_for_health(port, timeout=30):
 def start_uvicorn(driver, port):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
-    env["FASTAPI_RS_NO_SHIM"] = "1"
+    env["FASTAPI_TURBO_NO_SHIM"] = "1"
     env[URL_ENV[driver]] = FA_DB_URL[driver]
     # Discard stdout to avoid pipe-buffer deadlock when server logs > 64KiB.
     # Keep stderr in a tempfile for post-mortem inspection.
@@ -120,7 +120,7 @@ def start_uvicorn(driver, port):
     return proc
 
 
-def start_fastapi_rs(driver, port):
+def start_fastapi_turbo(driver, port):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
     env[URL_ENV[driver]] = FR_DB_URL[driver]
@@ -128,8 +128,8 @@ def start_fastapi_rs(driver, port):
     script = f"""
 import sys
 sys.path.insert(0, {PROJECT_ROOT!r})
-import fastapi_rs.compat
-fastapi_rs.compat.install()
+import fastapi_turbo.compat
+fastapi_turbo.compat.install()
 from {module} import app
 app.run(host={HOST!r}, port={port})
 """
@@ -653,11 +653,11 @@ def run_battery_sync(h: Harness, v: DBVerifier, r: Results, async_mode=False):
 
 def run_driver(driver: str, verbose=False):
     fa_port = FASTAPI_PORTS[driver]
-    fr_port = FASTAPI_RS_PORTS[driver]
+    fr_port = FASTAPI_TURBO_PORTS[driver]
     print(f"\n{BOLD}{CYAN}=== Driver: {driver} (FA={fa_port}, FR={fr_port}) ==={RESET}")
 
     fa_proc = start_uvicorn(driver, fa_port)
-    fr_proc = start_fastapi_rs(driver, fr_port)
+    fr_proc = start_fastapi_turbo(driver, fr_port)
 
     try:
         fa_ok = wait_for_health(fa_port)
@@ -671,7 +671,7 @@ def run_driver(driver: str, verbose=False):
                 pass
             return None
         if not fr_ok:
-            print(f"{RED}fastapi-rs failed to start on {fr_port}{RESET}")
+            print(f"{RED}fastapi-turbo failed to start on {fr_port}{RESET}")
             try:
                 with open(fr_proc._err_path, "rb") as f:
                     print(f"stderr: {f.read().decode()[-800:]}")

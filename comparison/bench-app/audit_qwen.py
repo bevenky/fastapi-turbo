@@ -8,7 +8,7 @@ import sys
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-import fastapi_rs.compat  # noqa: install shims
+import fastapi_turbo.compat  # noqa: install shims
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
