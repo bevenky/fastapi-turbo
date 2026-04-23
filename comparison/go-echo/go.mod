@@ -1,4 +1,4 @@
-module jamun-echo-bench
+module fastapi-turbo-echo-bench
 
 go 1.21
 

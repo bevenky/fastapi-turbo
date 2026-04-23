@@ -3074,7 +3074,7 @@ class FastAPI:
             elif isinstance(cls, type) and issubclass(cls, HTTPSRedirectMiddleware):
                 config.append({"type": "httpsredirect"})
             elif hasattr(cls, "_fastapi_turbo_middleware_type"):
-                # Jamun middleware class with a known Tower mapping
+                # fastapi-turbo middleware class with a known Tower mapping
                 config.append({"type": cls._fastapi_turbo_middleware_type, **kwargs})
             # else: unknown ASGI middleware — skip for now
         return config

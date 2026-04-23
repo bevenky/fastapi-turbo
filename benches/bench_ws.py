@@ -96,7 +96,7 @@ async def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
 
     servers = {
-        "Jamun":    "ws://127.0.0.1:18005/ws",
+        "fastapi-turbo": "ws://127.0.0.1:18005/ws",
         "Go Gin":   "ws://127.0.0.1:18002/ws",
         "Go Echo":  "ws://127.0.0.1:18003/ws",
         "Fastify":  "ws://127.0.0.1:18004/ws",

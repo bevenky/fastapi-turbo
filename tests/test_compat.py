@@ -9,23 +9,23 @@ import fastapi_turbo  # noqa: F401 — ensure shims are installed
 def test_fastapi_import_fastapi():
     """from fastapi import FastAPI resolves to fastapi_turbo."""
     from fastapi import FastAPI
-    from fastapi_turbo import FastAPI as JamunFastAPI
+    from fastapi_turbo import FastAPI as TurboFastAPI
 
-    assert FastAPI is JamunFastAPI
+    assert FastAPI is TurboFastAPI
 
 
 def test_fastapi_depends_import():
     from fastapi import Depends
-    from fastapi_turbo import Depends as JamunDepends
+    from fastapi_turbo import Depends as TurboDepends
 
-    assert Depends is JamunDepends
+    assert Depends is TurboDepends
 
 
 def test_fastapi_http_exception_import():
     from fastapi import HTTPException
-    from fastapi_turbo import HTTPException as JamunHTTPException
+    from fastapi_turbo import HTTPException as TurboHTTPException
 
-    assert HTTPException is JamunHTTPException
+    assert HTTPException is TurboHTTPException
 
 
 def test_fastapi_query_path_import():
@@ -53,37 +53,37 @@ def test_fastapi_response_import():
 
 def test_fastapi_request_import():
     from fastapi import Request
-    from fastapi_turbo import Request as JamunRequest
+    from fastapi_turbo import Request as TurboRequest
 
-    assert Request is JamunRequest
+    assert Request is TurboRequest
 
 
 def test_fastapi_uploadfile_import():
     from fastapi import UploadFile
-    from fastapi_turbo import UploadFile as JamunUploadFile
+    from fastapi_turbo import UploadFile as TurboUploadFile
 
-    assert UploadFile is JamunUploadFile
+    assert UploadFile is TurboUploadFile
 
 
 def test_fastapi_apirouter_import():
     from fastapi import APIRouter
-    from fastapi_turbo import APIRouter as JamunAPIRouter
+    from fastapi_turbo import APIRouter as TurboAPIRouter
 
-    assert APIRouter is JamunAPIRouter
+    assert APIRouter is TurboAPIRouter
 
 
 def test_fastapi_background_tasks_import():
     from fastapi import BackgroundTasks
-    from fastapi_turbo import BackgroundTasks as JamunBT
+    from fastapi_turbo import BackgroundTasks as TurboBT
 
-    assert BackgroundTasks is JamunBT
+    assert BackgroundTasks is TurboBT
 
 
 def test_fastapi_websocket_import():
     from fastapi import WebSocket
-    from fastapi_turbo import WebSocket as JamunWS
+    from fastapi_turbo import WebSocket as TurboWS
 
-    assert WebSocket is JamunWS
+    assert WebSocket is TurboWS
 
 
 # ── fastapi submodule imports ──────────────────────────────────────
@@ -118,9 +118,9 @@ def test_fastapi_exceptions_module():
 
 def test_fastapi_security_import():
     from fastapi.security import OAuth2PasswordBearer
-    from fastapi_turbo.security import OAuth2PasswordBearer as JamunOAuth2
+    from fastapi_turbo.security import OAuth2PasswordBearer as TurboOAuth2
 
-    assert OAuth2PasswordBearer is JamunOAuth2
+    assert OAuth2PasswordBearer is TurboOAuth2
 
 
 def test_fastapi_security_all_classes():
@@ -182,16 +182,16 @@ def test_fastapi_middleware_cors():
 
 def test_starlette_response_import():
     from starlette.responses import JSONResponse
-    from fastapi_turbo.responses import JSONResponse as JamunJSONResponse
+    from fastapi_turbo.responses import JSONResponse as TurboJSONResponse
 
-    assert JSONResponse is JamunJSONResponse
+    assert JSONResponse is TurboJSONResponse
 
 
 def test_starlette_request_import():
     from starlette.requests import Request
-    from fastapi_turbo.requests import Request as JamunRequest
+    from fastapi_turbo.requests import Request as TurboRequest
 
-    assert Request is JamunRequest
+    assert Request is TurboRequest
 
 
 def test_starlette_status_import():
@@ -204,16 +204,16 @@ def test_starlette_status_import():
 
 def test_starlette_websocket_import():
     from starlette.websockets import WebSocket
-    from fastapi_turbo.websockets import WebSocket as JamunWS
+    from fastapi_turbo.websockets import WebSocket as TurboWS
 
-    assert WebSocket is JamunWS
+    assert WebSocket is TurboWS
 
 
 def test_starlette_exceptions_import():
     from starlette.exceptions import HTTPException
-    from fastapi_turbo.exceptions import HTTPException as JamunHTTPException
+    from fastapi_turbo.exceptions import HTTPException as TurboHTTPException
 
-    assert HTTPException is JamunHTTPException
+    assert HTTPException is TurboHTTPException
 
 
 def test_starlette_datastructures_import():

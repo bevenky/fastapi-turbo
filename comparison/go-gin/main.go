@@ -10,7 +10,7 @@ import (
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
-// Simulated dependency injection (equivalent to Jamun's Depends)
+// Simulated dependency injection (equivalent to fastapi-turbo's Depends)
 func getDB() map[string]interface{} {
 	return map[string]interface{}{"connected": true}
 }
@@ -28,17 +28,17 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New() // No middleware for fair comparison
 
-	// Baseline — equivalent to Jamun's /_ping
+	// Baseline — equivalent to fastapi-turbo's /_ping
 	r.GET("/_ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ping": "pong"})
 	})
 
-	// Simple GET — equivalent to Jamun's /hello
+	// Simple GET — equivalent to fastapi-turbo's /hello
 	r.GET("/hello", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"message": "hello"})
 	})
 
-	// GET with simulated DI — equivalent to Jamun's /with-deps
+	// GET with simulated DI — equivalent to fastapi-turbo's /with-deps
 	r.GET("/with-deps", func(c *gin.Context) {
 		authorization := c.GetHeader("authorization")
 		db := getDB()

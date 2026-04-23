@@ -1,4 +1,4 @@
-module jamun-go-bench
+module fastapi-turbo-go-bench
 
 go 1.21
 

@@ -1,4 +1,4 @@
-module jamun-bench-echo-ecommerce
+module fastapi-turbo-bench-echo-ecommerce
 
 go 1.21
 

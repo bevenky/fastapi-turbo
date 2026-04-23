@@ -1,4 +1,4 @@
-"""Phase 9-10 tests: TestClient for Jamun applications."""
+"""Phase 9-10 tests: TestClient for fastapi-turbo applications."""
 
 
 def test_testclient_basic():
