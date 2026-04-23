@@ -1,0 +1,19 @@
+[package]
+name = "rust-axum-ecommerce"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ecommerce-axum"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
