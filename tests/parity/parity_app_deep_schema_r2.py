@@ -5,7 +5,7 @@ The Round 2 runner performs full deep-subtree equality on every node, so the
 richer we make the schema, the more gaps it surfaces.
 
 Only stock FastAPI + Pydantic imports. The compat shim redirects imports to
-fastapi-turbo when executed under jamun.
+fastapi-turbo at run time.
 """
 from __future__ import annotations
 

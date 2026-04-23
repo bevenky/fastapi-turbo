@@ -69,9 +69,9 @@ def ensure_redis():
     # Try to start docker container
     print(f"{YELLOW}Redis not responding on :{REDIS_PORT}; trying docker…{RESET}")
     # Remove any stale container
-    subprocess.run(["docker", "rm", "-f", "jamun_redis"], capture_output=True)
+    subprocess.run(["docker", "rm", "-f", "fastapi_turbo_redis"], capture_output=True)
     p = subprocess.run(
-        ["docker", "run", "-d", "--name", "jamun_redis",
+        ["docker", "run", "-d", "--name", "fastapi_turbo_redis",
          "-p", f"{REDIS_PORT}:6379", "redis:7"],
         capture_output=True,
     )

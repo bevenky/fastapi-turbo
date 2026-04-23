@@ -3,7 +3,7 @@
 
 Boots the R2 parity app under BOTH:
   - stock FastAPI on uvicorn (port 29900)
-  - fastapi-turbo/jamun            (port 29901)
+  - fastapi-turbo                  (port 29901)
 
 Then fetches `/openapi.json` from each and runs ~500 DEEP-subtree equality
 tests. Each test walks the full subtree and reports EVERY leaf-level
@@ -14,8 +14,8 @@ On completion, writes `/tmp/r2_gap_report.md` with the top distinct
 leaf-path patterns that differ.
 
 Usage:
-    cd /Users/venky/tech/jamun
-    source /Users/venky/tech/jamun_env/bin/activate
+    cd /Users/venky/tech/fastapi-turbo
+    source /Users/venky/tech/fastapi_turbo_env/bin/activate
     python tests/parity/run_deep_schema_parity_r2.py
 """
 from __future__ import annotations

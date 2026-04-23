@@ -49,25 +49,25 @@ APP_MODULE = {
 
 # Each driver uses two DBs: one for FastAPI/uvicorn, one for fastapi-turbo.
 FA_DB_URL = {
-    "pg3":   "postgresql+psycopg://venky@localhost:5432/jamun_sqla_pg3_fa",
-    "async": "postgresql+asyncpg://venky@localhost:5432/jamun_sqla_async_fa",
-    "pg2":   "postgresql+psycopg2://venky@localhost:5432/jamun_sqla_pg2_fa",
+    "pg3":   "postgresql+psycopg://venky@localhost:5432/fastapi_turbo_sqla_pg3_fa",
+    "async": "postgresql+asyncpg://venky@localhost:5432/fastapi_turbo_sqla_async_fa",
+    "pg2":   "postgresql+psycopg2://venky@localhost:5432/fastapi_turbo_sqla_pg2_fa",
 }
 FR_DB_URL = {
-    "pg3":   "postgresql+psycopg://venky@localhost:5432/jamun_sqla_pg3_fr",
-    "async": "postgresql+asyncpg://venky@localhost:5432/jamun_sqla_async_fr",
-    "pg2":   "postgresql+psycopg2://venky@localhost:5432/jamun_sqla_pg2_fr",
+    "pg3":   "postgresql+psycopg://venky@localhost:5432/fastapi_turbo_sqla_pg3_fr",
+    "async": "postgresql+asyncpg://venky@localhost:5432/fastapi_turbo_sqla_async_fr",
+    "pg2":   "postgresql+psycopg2://venky@localhost:5432/fastapi_turbo_sqla_pg2_fr",
 }
 # Used by the post-hoc DB verifier (plain psycopg, always).
 FA_VERIFY_URL = {
-    "pg3":   "postgresql://venky@localhost:5432/jamun_sqla_pg3_fa",
-    "async": "postgresql://venky@localhost:5432/jamun_sqla_async_fa",
-    "pg2":   "postgresql://venky@localhost:5432/jamun_sqla_pg2_fa",
+    "pg3":   "postgresql://venky@localhost:5432/fastapi_turbo_sqla_pg3_fa",
+    "async": "postgresql://venky@localhost:5432/fastapi_turbo_sqla_async_fa",
+    "pg2":   "postgresql://venky@localhost:5432/fastapi_turbo_sqla_pg2_fa",
 }
 FR_VERIFY_URL = {
-    "pg3":   "postgresql://venky@localhost:5432/jamun_sqla_pg3_fr",
-    "async": "postgresql://venky@localhost:5432/jamun_sqla_async_fr",
-    "pg2":   "postgresql://venky@localhost:5432/jamun_sqla_pg2_fr",
+    "pg3":   "postgresql://venky@localhost:5432/fastapi_turbo_sqla_pg3_fr",
+    "async": "postgresql://venky@localhost:5432/fastapi_turbo_sqla_async_fr",
+    "pg2":   "postgresql://venky@localhost:5432/fastapi_turbo_sqla_pg2_fr",
 }
 # Map driver → URL env var name that the app module reads
 URL_ENV = {"pg3": "SQLA_URL_PG3", "async": "SQLA_URL_ASYNC", "pg2": "SQLA_URL_PG2"}
@@ -106,7 +106,7 @@ def start_uvicorn(driver, port):
     env[URL_ENV[driver]] = FA_DB_URL[driver]
     # Discard stdout to avoid pipe-buffer deadlock when server logs > 64KiB.
     # Keep stderr in a tempfile for post-mortem inspection.
-    err_path = f"/tmp/jamun_sqla_fa_{driver}.err"
+    err_path = f"/tmp/fastapi_turbo_sqla_fa_{driver}.err"
     err_fh = open(err_path, "wb")
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", APP_MODULE[driver],
@@ -133,7 +133,7 @@ fastapi_turbo.compat.install()
 from {module} import app
 app.run(host={HOST!r}, port={port})
 """
-    err_path = f"/tmp/jamun_sqla_fr_{driver}.err"
+    err_path = f"/tmp/fastapi_turbo_sqla_fr_{driver}.err"
     err_fh = open(err_path, "wb")
     proc = subprocess.Popen(
         [sys.executable, "-c", script],

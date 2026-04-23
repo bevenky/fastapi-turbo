@@ -39,7 +39,7 @@ fastapi-turbo is a drop-in replacement for FastAPI, powered by Rust Axum via PyO
 
 ```bash
 # Activate venv (GIL-enabled Python 3.14 recommended)
-source /Users/venky/tech/jamun_env/bin/activate
+source /Users/venky/tech/fastapi_turbo_env/bin/activate
 
 # Build (release for benchmarks, dev for iteration)
 PATH="$HOME/.cargo/bin:$PATH" maturin develop          # debug, ~5s incremental

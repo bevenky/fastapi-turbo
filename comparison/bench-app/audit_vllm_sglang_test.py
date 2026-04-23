@@ -31,7 +31,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def start_server() -> subprocess.Popen:
-    py = "/Users/venky/tech/jamun_env/bin/python"
+    py = "/Users/venky/tech/fastapi_turbo_env/bin/python"
     here = Path(__file__).parent
     log = open("/tmp/audit_server.log", "wb")
     proc = subprocess.Popen(

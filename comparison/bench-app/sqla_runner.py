@@ -10,10 +10,10 @@ mode, stack, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
 
 # Route to the RS-owned DB (_fr suffix) so table names match parity apps.
 DB_URLS = {
-    "pg3":       "postgresql+psycopg://venky@localhost:5432/jamun_sqla_pg3_fr",
-    "pg2":       "postgresql+psycopg2://venky@localhost:5432/jamun_sqla_pg2_fr",
-    "async":     "postgresql+asyncpg://venky@localhost:5432/jamun_sqla_async_fr",
-    "pg3async":  "postgresql+psycopg://venky@localhost:5432/jamun_sqla_pg3async_fr",
+    "pg3":       "postgresql+psycopg://venky@localhost:5432/fastapi_turbo_sqla_pg3_fr",
+    "pg2":       "postgresql+psycopg2://venky@localhost:5432/fastapi_turbo_sqla_pg2_fr",
+    "async":     "postgresql+asyncpg://venky@localhost:5432/fastapi_turbo_sqla_async_fr",
+    "pg3async":  "postgresql+psycopg://venky@localhost:5432/fastapi_turbo_sqla_pg3async_fr",
 }
 # Parity apps' table-suffix follows SQLA_SUFFIX; pg3async reuses "async"
 # since the async ORM code path is identical (different driver only).

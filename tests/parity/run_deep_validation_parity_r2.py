@@ -10,7 +10,7 @@ The whole point of R2: one bad request -> ONE case revealing ALL buried
 field-level gaps (not just the first one).
 
 Run:
-    cd /Users/venky/tech/jamun && source /Users/venky/tech/jamun_env/bin/activate
+    cd /Users/venky/tech/fastapi-turbo && source /Users/venky/tech/fastapi_turbo_env/bin/activate
     python tests/parity/run_deep_validation_parity_r2.py
     python tests/parity/run_deep_validation_parity_r2.py --fail-dump gap.json
 """

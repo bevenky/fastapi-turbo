@@ -2501,7 +2501,7 @@ def main():
         passed = sum(1 for _, _, p, _, _ in results if p)
         failed = sum(1 for _, _, p, _, _ in results if not p)
 
-        # FA-only failures vs FR-only (to isolate jamun gaps from our test bugs)
+        # FA-only failures vs FR-only (to isolate fastapi-turbo gaps from test bugs)
         fa_failures = [r for r in results if not r[2] and "FA" in r[1]]
         fr_failures = [r for r in results if not r[2] and "FR" in r[1]]
 
@@ -2528,7 +2528,7 @@ def main():
                         print(f"         {detail[:250]}")
             print()
 
-        # FR-only gaps list (these are jamun-specific)
+        # FR-only gaps list (these are fastapi-turbo-specific)
         if fr_failures:
             print(f"{BOLD}fastapi-turbo (FR) specific failures:{RESET}")
             for tid, desc, p, detail, cat in fr_failures[:50]:

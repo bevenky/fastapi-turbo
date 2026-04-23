@@ -22,7 +22,7 @@ def check(name, cond, detail=""):
 
 
 def start_server():
-    py = "/Users/venky/tech/jamun_env/bin/python"
+    py = "/Users/venky/tech/fastapi_turbo_env/bin/python"
     log = open("/tmp/audit_qwen.log", "wb")
     proc = subprocess.Popen(
         [py, "audit_qwen.py", str(PORT)],

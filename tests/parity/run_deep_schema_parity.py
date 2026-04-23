@@ -11,8 +11,8 @@ scheme's `bearerFormat`). Tests are generated programmatically from the
 reference schema so coverage scales with the app surface.
 
 Usage:
-    cd /Users/venky/tech/jamun
-    source /Users/venky/tech/jamun_env/bin/activate
+    cd /Users/venky/tech/fastapi-turbo
+    source /Users/venky/tech/fastapi_turbo_env/bin/activate
     python tests/parity/run_deep_schema_parity.py
 """
 from __future__ import annotations

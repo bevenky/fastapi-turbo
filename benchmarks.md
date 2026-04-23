@@ -56,7 +56,7 @@ compiled Rust bench client.*
 Reproducing:
 
 ```bash
-source /Users/venky/tech/jamun_env/bin/activate
+source /Users/venky/tech/fastapi_turbo_env/bin/activate
 cargo build --release --bin fastapi-turbo-bench
 (cd benchmarks/go-gin && go build -o bench-gin .)
 python benchmarks/run_bench.py
