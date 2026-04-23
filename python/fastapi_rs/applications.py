@@ -1083,6 +1083,7 @@ def _try_compile_handler(
             dep.get("_dep_scope") or "request",
         ))
 
+    _orig_endpoint = endpoint  # async fn retained for the batched-submit path
     handler_func = endpoint
     if inspect.iscoroutinefunction(handler_func):
         handler_func = _make_sync_wrapper(handler_func, for_handler=True)
@@ -1728,6 +1729,245 @@ def _try_compile_handler(
     _compiled._fastapi_rs_defers_extraction_errors = True  # type: ignore[attr-defined]
     # Mount-prefix patching hook — see ``_compiled_no_deps``.
     _compiled._fastapi_rs_endpoint_ctx = _endpoint_ctx  # type: ignore[attr-defined]
+
+    # ── Batched-submit fast path ──────────────────────────────────────────
+    # When the handler is async AND any dep in the chain is an async-gen
+    # (SQLAlchemy AsyncSession, asyncpg/redis.asyncio pools) the generic
+    # ``_compiled`` above hops the worker loop THREE times per request —
+    # dep setup, handler await, dep teardown. Each hop is a
+    # ``run_coroutine_threadsafe`` round-trip (~100 μs). uvicorn runs all
+    # three on one loop; that was our 25% deficit on the SQLA async row.
+    #
+    # Collapse the three hops into one by executing the async-dep setup +
+    # handler await + async-dep teardown INSIDE a single coroutine and
+    # submitting that once. Only activate when the chain is "easy": no
+    # security-scopes plumbing, no sync generators mixed in. If anything
+    # at call time smells complex (dep_overrides, SecurityScopes, etc.) we
+    # fall back to the generic ``_compiled`` closure.
+    _handler_is_coro = inspect.iscoroutinefunction(_orig_endpoint)
+    _chain_all_simple = all(
+        # async gen yield dep OK
+        (is_gen and inspect.isasyncgenfunction(func))
+        # plain async fn OK
+        or (not is_gen and inspect.iscoroutinefunction(
+            getattr(func, "_fastapi_rs_original_async", func)
+        ))
+        # plain sync callable OK (after generator check)
+        or (not is_gen and not inspect.isasyncgenfunction(func))
+        for _name, func, _orig, _imap, _fid, is_gen, _uc, _ssi, _sc in dep_chain
+    )
+    _has_async_yield_dep = any(
+        is_gen and inspect.isasyncgenfunction(func)
+        for _name, func, _orig, _imap, _fid, is_gen, _uc, _ssi, _sc in dep_chain
+    )
+    _any_sec_scope = any(ssi is not None for *_x, ssi, _sc in dep_chain)
+    _any_sync_gen = any(
+        is_gen and not inspect.isasyncgenfunction(func)
+        for _name, func, _orig, _imap, _fid, is_gen, _uc, _ssi, _sc in dep_chain
+    )
+
+    if (
+        _handler_is_coro
+        and _has_async_yield_dep
+        and not _any_sec_scope
+        and not _any_sync_gen
+    ):
+        from fastapi_rs._async_worker import submit as _worker_submit
+
+        # Precompute which deps are async (yield vs fn) vs plain sync.
+        # Tuple: (name, func, orig_func, input_map, func_id, kind, use_cache)
+        # kind ∈ {"async_gen", "async_fn", "sync_fn"}
+        _fp_chain: list[tuple] = []
+        for name, func, orig_func, input_map, func_id, is_gen, use_cache, _ssi, _sc in dep_chain:
+            orig_async = getattr(func, "_fastapi_rs_original_async", None)
+            if is_gen:
+                kind = "async_gen"
+                call_fn = func  # async-gen fn
+            elif orig_async is not None:
+                kind = "async_fn"
+                call_fn = orig_async  # unwrapped async fn
+            elif inspect.iscoroutinefunction(func):
+                kind = "async_fn"
+                call_fn = func
+            else:
+                kind = "sync_fn"
+                call_fn = func
+            _fp_chain.append(
+                (name, call_fn, orig_func, input_map, func_id, kind, use_cache)
+            )
+
+        _fp_endpoint = _orig_endpoint  # the true async handler
+
+        def _compiled_fast(**kwargs):
+            # Runtime escape hatches — fall back to the generic path.
+            if _app is not None and _app.dependency_overrides:
+                return _compiled(**kwargs)
+
+            kwargs.pop("__fastapi_rs_raw_body_str__", None)
+            kwargs.pop("__fastapi_rs_raw_body_bytes__", None)
+            _extract_err_json = kwargs.pop(
+                "__fastapi_rs_extraction_errors__", None
+            )
+            _mw_req = kwargs.get("_middleware_request")
+            _defer_td = _mw_req is not None
+            if _defer_td and not hasattr(_mw_req, "_pending_teardowns"):
+                _mw_req._pending_teardowns = []
+
+            resolved = kwargs
+            _cache: dict = {}
+
+            # PHASE 1 (submitted): resolve deps + run handler. Produces a
+            # result snapshot AND the list of gens that need teardown.
+            # Teardown MUST run after the response is captured (FA sends
+            # the body / middleware reads state.copy() before teardown
+            # mutates state), so it runs in a separate submit below.
+            async def _setup_and_handler():
+                async_gens: list = []
+                for name, call_fn, _orig, input_map, func_id, kind, use_cache in _fp_chain:
+                    ck = (func_id, "request") if func_id is not None else None
+                    if use_cache and ck is not None and ck in _cache:
+                        resolved[name] = _cache[ck]
+                        continue
+                    dk = {
+                        target: resolved[src]
+                        for target, src in input_map
+                        if src in resolved
+                    }
+                    if kind == "async_gen":
+                        gen = call_fn(**dk)
+                        val = await gen.__anext__()
+                        async_gens.append(gen)
+                    elif kind == "async_fn":
+                        val = await call_fn(**dk)
+                    else:
+                        val = call_fn(**dk)
+                    resolved[name] = val
+                    if use_cache and ck is not None:
+                        _cache[ck] = val
+
+                if _extract_err_json:
+                    from fastapi_rs.responses import JSONResponse as _JR
+                    import json as _json
+                    return (_JR(
+                        content={"detail": _json.loads(_extract_err_json)},
+                        status_code=422,
+                    ), async_gens)
+
+                _hkwargs = {
+                    k: resolved[k]
+                    for k in handler_param_names
+                    if k in resolved
+                }
+                for _ek, _ecls in _enum_coerce_deps.items():
+                    if _ek in _hkwargs and isinstance(_hkwargs[_ek], str):
+                        try:
+                            _hkwargs[_ek] = _ecls(_hkwargs[_ek])
+                        except (ValueError, KeyError):
+                            pass
+                try:
+                    _apply_container_coerce(_hkwargs)
+                except Exception as _ccexc:
+                    from fastapi_rs.exceptions import (
+                        RequestValidationError as _RVEfp,
+                    )
+                    if isinstance(_ccexc, _RVEfp):
+                        from fastapi_rs.responses import JSONResponse as _JRfp
+                        return (_JRfp(
+                            content={"detail": list(_ccexc.errors())},
+                            status_code=422,
+                        ), async_gens)
+                    raise
+
+                result = await _fp_endpoint(**_hkwargs)
+                # Snapshot via response_model BEFORE returning — this
+                # decouples the result from the dep's shared-state dict
+                # so post-submit teardown can't mutate the body.
+                if response_model is not None and not hasattr(result, "status_code"):
+                    result = _apply_response_model(
+                        result,
+                        response_model,
+                        include=response_model_include,
+                        exclude=response_model_exclude,
+                        exclude_unset=response_model_exclude_unset,
+                        exclude_defaults=response_model_exclude_defaults,
+                        exclude_none=response_model_exclude_none,
+                        by_alias=response_model_by_alias,
+                        endpoint_ctx=_endpoint_ctx,
+                    )
+                return (result, async_gens)
+
+            async def _run_teardown(gens):
+                for gen in reversed(gens):
+                    try:
+                        await gen.__anext__()
+                    except StopAsyncIteration:
+                        pass
+
+            try:
+                try:
+                    result, _async_gens = _worker_submit(_setup_and_handler())
+                except Exception:
+                    # Any unexpected edge case — fall back to generic path.
+                    return _compiled(**kwargs)
+
+                # Post-process (response_class wrap / status_code) on main
+                # thread so it doesn't block the worker loop.
+                if (
+                    response_class is not None
+                    and not hasattr(result, "status_code")
+                ):
+                    try:
+                        _rc = response_class
+                        from fastapi_rs.datastructures import DefaultPlaceholder as _DP
+                        if isinstance(_rc, _DP):
+                            _rc = getattr(_rc, "value", None)
+                        if _rc is not None:
+                            kwargs_rc = {}
+                            if status_code is not None:
+                                kwargs_rc["status_code"] = status_code
+                            result = _rc(result, **kwargs_rc)
+                    except Exception:
+                        pass
+                elif status_code is not None and not hasattr(result, "status_code"):
+                    from fastapi_rs.responses import JSONResponse as _JRsc
+                    result = _JRsc(content=result, status_code=status_code)
+
+                # Teardown. If middleware is in the chain, defer — the
+                # outer MW wrapper drains ``_pending_teardowns`` AFTER the
+                # middleware unwinds (so MW can still see pre-teardown
+                # state via state.copy()). Otherwise fire-and-forget on
+                # the worker loop so the main thread returns immediately
+                # to Rust for response serialization. Teardown races in
+                # parallel with serialization + next request's setup,
+                # saving the ~120 μs synchronous teardown tail from our
+                # per-request p50.
+                #
+                # Safety: if teardown hasn't released the DB connection
+                # by the time the pool is empty, asyncpg/sqlalchemy will
+                # queue the next acquire — no corruption, only back-
+                # pressure. SQLAlchemy sessions with expire_on_commit=
+                # False (parity default) are safe to close in the
+                # background because their result objects are detached.
+                if _defer_td and _async_gens:
+                    for gen in reversed(_async_gens):
+                        _mw_req._pending_teardowns.append((gen, "worker", "request"))
+                elif _async_gens:
+                    import asyncio as _asyncio
+                    from fastapi_rs._async_worker import get_loop as _get_loop_fast
+                    try:
+                        _asyncio.run_coroutine_threadsafe(
+                            _run_teardown(_async_gens), _get_loop_fast()
+                        )  # intentionally no .result() — fire-and-forget
+                    except Exception:
+                        pass
+
+                return result
+            finally:
+                pass
+
+        _compiled_fast._fastapi_rs_defers_extraction_errors = True  # type: ignore[attr-defined]
+        _compiled_fast._fastapi_rs_endpoint_ctx = _endpoint_ctx  # type: ignore[attr-defined]
+        return _compiled_fast
 
     return _compiled
 
