@@ -114,6 +114,14 @@ def update_item(item_id: int, item: ItemUpdate, db=Depends(get_db)):
     return db[item_id]
 
 
+@app.patch("/items/{item_id}")
+def patch_item(item_id: int, item: ItemUpdate, db=Depends(get_db)):
+    if item_id not in db:
+        raise HTTPException(status_code=404, detail="Item not found")
+    db[item_id] = {"id": item_id, "name": item.name, "price": item.price, "description": item.description}
+    return db[item_id]
+
+
 @app.delete("/items/{item_id}", status_code=204)
 def delete_item(item_id: int, db=Depends(get_db)):
     if item_id in db:

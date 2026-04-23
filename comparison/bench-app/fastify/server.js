@@ -5,7 +5,13 @@
 
 'use strict';
 
-const fastify = require('fastify')({ logger: false });
+const fastify = require('fastify')({
+    logger: false,
+    keepAliveTimeout: 60000,
+    connectionTimeout: 0,
+});
+fastify.server.maxRequestsPerSocket = 0;  // unlimited keep-alive requests
+fastify.server.keepAliveTimeout = 60000;
 
 // ---------------------------------------------------------------------------
 // CORS
@@ -103,7 +109,7 @@ fastify.post('/items', async (request, reply) => {
 });
 
 // Update item
-fastify.put('/items/:id', async (request, reply) => {
+const updateHandler = async (request, reply) => {
     const id = parseInt(request.params.id, 10);
     if (!db.has(id)) {
         reply.code(404);
@@ -113,14 +119,17 @@ fastify.put('/items/:id', async (request, reply) => {
     const item = { id, name, price, description: description || null };
     db.set(id, item);
     return item;
-});
+};
+fastify.put('/items/:id', updateHandler);
+fastify.patch('/items/:id', updateHandler);
 
-// Delete item
+// Delete item — return 200 with empty body so keep-alive bench clients don't
+// trip on Fastify's 204-no-content closing the connection.
 fastify.delete('/items/:id', async (request, reply) => {
     const id = parseInt(request.params.id, 10);
     db.delete(id);
-    reply.code(204);
-    return;
+    reply.code(200);
+    return {};
 });
 
 // Get current user (auth required)

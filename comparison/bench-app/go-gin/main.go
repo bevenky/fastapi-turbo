@@ -177,8 +177,8 @@ func main() {
 		c.JSON(http.StatusCreated, item)
 	})
 
-	// Update item
-	r.PUT("/items/:id", func(c *gin.Context) {
+	// Update item (PUT + PATCH share the same handler)
+	updateHandler := func(c *gin.Context) {
 		id, err := strconv.Atoi(c.Param("id"))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"detail": "Invalid ID"})
@@ -199,7 +199,9 @@ func main() {
 		db[id] = item
 		mu.Unlock()
 		c.JSON(http.StatusOK, item)
-	})
+	}
+	r.PUT("/items/:id", updateHandler)
+	r.PATCH("/items/:id", updateHandler)
 
 	// Delete item
 	r.DELETE("/items/:id", func(c *gin.Context) {
