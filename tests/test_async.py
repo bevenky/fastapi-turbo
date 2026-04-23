@@ -1,5 +1,7 @@
 """Phase 4 integration tests: async handler support."""
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import json
 import socket
 import subprocess
@@ -67,7 +69,9 @@ def test_async_handler(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
         app = FastAPI()
 
         @app.get("/async-hello")
@@ -87,7 +91,8 @@ def test_async_with_await(server_app):
 
     url = server_app("""
         import asyncio
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+        from fastapi import FastAPI
         app = FastAPI()
 
         @app.get("/delayed")
@@ -107,7 +112,9 @@ def test_async_with_path_params(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
         app = FastAPI()
 
         @app.get("/users/{user_id}")
@@ -125,7 +132,9 @@ def test_async_exception(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_turbo import FastAPI, HTTPException
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI, HTTPException
         app = FastAPI()
 
         @app.get("/fail")
@@ -144,7 +153,9 @@ def test_mixed_sync_async(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
         app = FastAPI()
 
         @app.get("/sync")

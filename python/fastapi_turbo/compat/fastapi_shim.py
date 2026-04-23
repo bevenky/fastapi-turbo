@@ -94,6 +94,21 @@ def _build() -> dict[str, types.ModuleType]:
     # Security (commonly imported from top-level too)
     fastapi.Security = _dependencies.Security  # type: ignore[attr-defined]
 
+    # Mirror every top-level export from ``fastapi_turbo`` onto the
+    # ``fastapi`` shim module. Covers extensions we add (HTTPDigest,
+    # ORJSONResponse, UJSONResponse, EventSourceResponse, WebSocketState,
+    # ServerSentEvent, OAuth2ClientCredentials, etc.) so
+    # ``from fastapi import X`` resolves for every symbol that worked
+    # via ``from fastapi_turbo import X``.
+    for _name in getattr(fastapi_turbo, "__all__", ()):
+        if not hasattr(fastapi, _name):
+            _val = getattr(fastapi_turbo, _name, None)
+            if _val is not None:
+                try:
+                    setattr(fastapi, _name, _val)
+                except Exception:  # noqa: BLE001
+                    pass
+
     # Encoders
     fastapi.encoders = None  # will be set below  # type: ignore[attr-defined]
 
@@ -134,6 +149,11 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_routing = _mod("fastapi.routing")
     fastapi_routing.APIRouter = _routing.APIRouter  # type: ignore[attr-defined]
     fastapi_routing.APIRoute = _routing.APIRoute  # type: ignore[attr-defined]
+    # Private helpers tests sometimes import directly.
+    try:
+        fastapi_routing._default_generate_unique_id = _routing._default_generate_unique_id  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
     # APIWebSocketRoute stub — fastapi-turbo registers WS routes directly
     # via @app.websocket() rather than a dedicated class, but third-party
     # code uses this class name for isinstance checks.
@@ -218,6 +238,7 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_exceptions.HTTPException = _exceptions.HTTPException  # type: ignore[attr-defined]
     fastapi_exceptions.RequestValidationError = _exceptions.RequestValidationError  # type: ignore[attr-defined]
     fastapi_exceptions.WebSocketException = _exceptions.WebSocketException  # type: ignore[attr-defined]
+    fastapi_exceptions.WebSocketDisconnect = _exceptions.WebSocketDisconnect  # type: ignore[attr-defined]
     fastapi_exceptions.WebSocketRequestValidationError = _exceptions.WebSocketRequestValidationError  # type: ignore[attr-defined]
     fastapi_exceptions.FastAPIError = _exceptions.FastAPIError  # type: ignore[attr-defined]
     fastapi_exceptions.ResponseValidationError = _exceptions.ResponseValidationError  # type: ignore[attr-defined]
@@ -398,6 +419,11 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_testclient = _mod("fastapi.testclient")
     from fastapi_turbo.testclient import TestClient
     fastapi_testclient.TestClient = TestClient  # type: ignore[attr-defined]
+    try:
+        from fastapi_turbo.testclient import AsyncTestClient as _ATC
+        fastapi_testclient.AsyncTestClient = _ATC  # type: ignore[attr-defined]
+    except ImportError:
+        pass
     modules["fastapi.testclient"] = fastapi_testclient
 
     # ── fastapi.requests ──────────────────────────────────────────

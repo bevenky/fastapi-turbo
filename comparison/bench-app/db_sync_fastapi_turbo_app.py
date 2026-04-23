@@ -6,8 +6,8 @@ block with GIL released. Zero event loop overhead.
 Matches how Go works — pgx blocks the goroutine on socket read.
 """
 import fastapi_turbo
-from fastapi_turbo import FastAPI, Query, Body, HTTPException
-from fastapi_turbo.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Query, Body, HTTPException
+from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool

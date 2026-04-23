@@ -1,6 +1,8 @@
 """fastapi-turbo + redis.asyncio (ASYNC) — pure Redis GET/SET benchmark."""
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import os
-from fastapi_turbo import FastAPI
+from fastapi import FastAPI
 import redis.asyncio as aredis
 
 app = FastAPI()

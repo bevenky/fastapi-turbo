@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import asyncio
 import os
 import socket
@@ -65,7 +67,9 @@ def test_upload_single_file(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_turbo import FastAPI, UploadFile
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI, UploadFile
 
         app = FastAPI()
 
@@ -100,7 +104,9 @@ def test_upload_multiple_files(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_turbo import FastAPI, UploadFile
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI, UploadFile
 
         app = FastAPI()
 
@@ -133,8 +139,10 @@ def test_upload_binary_preserved(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_turbo import FastAPI, UploadFile
-        from fastapi_turbo.responses import Response
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI, UploadFile
+        from fastapi.responses import Response
 
         app = FastAPI()
 
@@ -158,7 +166,9 @@ def test_upload_form_field_and_file(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_turbo import FastAPI, Form, UploadFile
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI, Form, UploadFile
 
         app = FastAPI()
 
@@ -193,8 +203,10 @@ def test_file_response_serves_file(server_app, tmp_path):
     fpath.write_bytes(content)
 
     url = server_app(f"""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.responses import FileResponse
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from fastapi.responses import FileResponse
 
         app = FastAPI()
 
@@ -219,8 +231,10 @@ def test_file_response_content_disposition(server_app, tmp_path):
     fpath.write_bytes(b"binary-data")
 
     url = server_app(f"""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.responses import FileResponse
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from fastapi.responses import FileResponse
 
         app = FastAPI()
 
@@ -242,8 +256,10 @@ def test_file_response_not_found(server_app):
     import httpx
 
     url = server_app("""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.responses import FileResponse
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from fastapi.responses import FileResponse
 
         app = FastAPI()
 
@@ -280,8 +296,10 @@ def test_static_files_serves_file(server_app, tmp_path):
     (static_dir / "style.css").write_text("body { color: red; }")
 
     url = server_app(f"""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.staticfiles import StaticFiles
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from fastapi.staticfiles import StaticFiles
 
         app = FastAPI()
         app.mount("/static", StaticFiles(directory="{static_dir}"), name="static")
@@ -318,7 +336,7 @@ class TestPyUploadFileUnit:
 
     def test_isinstance_check(self):
         """PyUploadFile should satisfy isinstance(x, UploadFile) via __subclasshook__."""
-        from fastapi_turbo import UploadFile
+        from fastapi import UploadFile
         from fastapi_turbo._fastapi_turbo_core import PyUploadFile
 
         # Subclasshook checks attributes on the class, so direct class check

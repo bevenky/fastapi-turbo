@@ -1,5 +1,7 @@
 """Phase 8 integration tests: OpenAPI schema, Swagger UI, and ReDoc."""
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import json
 import socket
 import subprocess
@@ -63,7 +65,9 @@ def server_app(tmp_path):
 def test_openapi_json(server_app):
     """OpenAPI JSON schema is served at /openapi.json."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
         from pydantic import BaseModel
         app = FastAPI(title="Test API", version="1.0.0")
 
@@ -106,7 +110,9 @@ def test_openapi_json(server_app):
 def test_openapi_query_params(server_app):
     """OpenAPI schema captures query parameters."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
         app = FastAPI(title="Query Test", version="0.1.0")
 
         @app.get("/search")
@@ -138,7 +144,9 @@ def test_openapi_query_params(server_app):
 def test_swagger_ui(server_app):
     """Swagger UI HTML is served at /docs."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
         app = FastAPI()
 
         @app.get("/hello")
@@ -158,7 +166,9 @@ def test_swagger_ui(server_app):
 def test_redoc(server_app):
     """ReDoc HTML is served at /redoc."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
         app = FastAPI()
 
         @app.get("/hello")
@@ -178,7 +188,9 @@ def test_redoc(server_app):
 def test_openapi_disabled(server_app):
     """OpenAPI and docs can be disabled by setting URLs to None."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
         app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
         @app.get("/hello")

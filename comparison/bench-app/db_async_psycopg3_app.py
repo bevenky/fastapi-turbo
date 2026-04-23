@@ -3,8 +3,8 @@ Uses the fastest async drivers (psycopg3 82μs vs asyncpg 147μs).
 Standard FastAPI code — users would write this exact same way.
 """
 import fastapi_turbo
-from fastapi_turbo import FastAPI, Query, HTTPException
-from fastapi_turbo.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Query, HTTPException
+from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg
 from psycopg_pool import AsyncConnectionPool

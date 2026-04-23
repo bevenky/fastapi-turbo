@@ -1,11 +1,13 @@
 """Benchmark POST with Pydantic validation — all features enabled."""
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import sys
 
 from pydantic import BaseModel
 
-from fastapi_turbo import FastAPI, HTTPException
-from fastapi_turbo.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 
 class Item(BaseModel):

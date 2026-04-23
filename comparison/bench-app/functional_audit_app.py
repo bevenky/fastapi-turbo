@@ -2,6 +2,8 @@
 Comprehensive Functional Audit App for fastapi-turbo.
 Tests 70 FastAPI behavior patterns end-to-end.
 """
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import os, sys, enum, tempfile, pathlib
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -10,16 +12,16 @@ from pydantic import BaseModel, Field
 # Ensure fastapi_turbo is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from fastapi_turbo import (
+from fastapi import (
     FastAPI, Depends, APIRouter, Request, Response,
     JSONResponse, HTMLResponse, PlainTextResponse, RedirectResponse,
     StreamingResponse, FileResponse, HTTPException, RequestValidationError,
     Query, Path, Header, Cookie, Body, Form, File, UploadFile,
     BackgroundTasks, status,
 )
-from fastapi_turbo.security import OAuth2PasswordBearer, HTTPBearer, APIKeyHeader
-from fastapi_turbo.middleware.cors import CORSMiddleware
-from fastapi_turbo.middleware.base import BaseHTTPMiddleware
+from fastapi.security import OAuth2PasswordBearer, HTTPBearer, APIKeyHeader
+from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # ---- Pydantic Models ----
 

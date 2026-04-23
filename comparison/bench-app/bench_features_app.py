@@ -9,10 +9,12 @@ Endpoints:
   /hello-all                          — all features combined
 """
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import sys
 
-from fastapi_turbo import FastAPI, HTTPException
-from fastapi_turbo.responses import HTMLResponse, JSONResponse, Response
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 ROOT_PATH = ""  # can be overridden via env for root_path testing
 

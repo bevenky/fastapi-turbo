@@ -3,8 +3,10 @@
 Uses psycopg3 sync API. fastapi-turbo runs sync handlers on tokio blocking
 threads, so sync DB calls are natural and avoid all event-loop issues.
 """
-from fastapi_turbo import FastAPI, Query, Body, HTTPException
-from fastapi_turbo.middleware.cors import CORSMiddleware
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
+from fastapi import FastAPI, Query, Body, HTTPException
+from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from psycopg_pool import ConnectionPool
 import redis

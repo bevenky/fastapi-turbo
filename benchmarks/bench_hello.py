@@ -38,7 +38,7 @@ if __name__ == "__main__":
     with open("/tmp/bench_fastapi_turbo.py", "w") as f:
         f.write("""
 import fastapi_turbo
-from fastapi_turbo import FastAPI, Depends, Header
+from fastapi import FastAPI, Depends, Header
 app = FastAPI()
 
 async def get_db():

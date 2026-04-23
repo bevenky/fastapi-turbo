@@ -256,6 +256,33 @@ def _build() -> dict[str, types.ModuleType]:
     # ── starlette.middleware ───────────────────────────────────────
     starlette_middleware = _mod("starlette.middleware")
     starlette_middleware.Middleware = _sc.Middleware  # type: ignore[attr-defined]
+    # Convenience re-exports for ``from starlette.middleware import X``
+    # forms used in tutorials + tests.
+    try:
+        from fastapi_turbo.middleware.base import BaseHTTPMiddleware as _BHM
+        starlette_middleware.BaseHTTPMiddleware = _BHM  # type: ignore[attr-defined]
+    except ImportError:
+        pass
+    try:
+        from fastapi_turbo.middleware.cors import CORSMiddleware as _CORS
+        starlette_middleware.CORSMiddleware = _CORS  # type: ignore[attr-defined]
+    except ImportError:
+        pass
+    try:
+        from fastapi_turbo.middleware.gzip import GZipMiddleware as _GZip
+        starlette_middleware.GZipMiddleware = _GZip  # type: ignore[attr-defined]
+    except ImportError:
+        pass
+    try:
+        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware as _THM
+        starlette_middleware.TrustedHostMiddleware = _THM  # type: ignore[attr-defined]
+    except ImportError:
+        pass
+    try:
+        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware as _HRM
+        starlette_middleware.HTTPSRedirectMiddleware = _HRM  # type: ignore[attr-defined]
+    except ImportError:
+        pass
     modules["starlette.middleware"] = starlette_middleware
 
     # ── starlette.middleware.errors ────────────────────────────────
@@ -378,6 +405,10 @@ def _build() -> dict[str, types.ModuleType]:
     starlette_auth.UnauthenticatedUser = _auth.UnauthenticatedUser  # type: ignore[attr-defined]
     starlette_auth.requires = _auth.requires  # type: ignore[attr-defined]
     starlette_auth.has_required_scope = _sc.has_required_scope  # type: ignore[attr-defined]
+    # ``from starlette.authentication import AuthenticationMiddleware`` —
+    # users import this shorthand form in addition to
+    # ``starlette.middleware.authentication``. Mirror.
+    starlette_auth.AuthenticationMiddleware = _auth.AuthenticationMiddleware  # type: ignore[attr-defined]
     modules["starlette.authentication"] = starlette_auth
 
     # ── starlette.middleware.authentication ────────────────────────

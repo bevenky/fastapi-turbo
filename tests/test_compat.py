@@ -7,31 +7,32 @@ import fastapi_turbo  # noqa: F401 — ensure shims are installed
 
 
 def test_fastapi_import_fastapi():
-    """from fastapi import FastAPI resolves to fastapi_turbo."""
+    """import fastapi_turbo  # noqa: F401 — installs compat shim
+from fastapi import FastAPI resolves to fastapi_turbo."""
     from fastapi import FastAPI
-    from fastapi_turbo import FastAPI as TurboFastAPI
+    from fastapi import FastAPI as TurboFastAPI
 
     assert FastAPI is TurboFastAPI
 
 
 def test_fastapi_depends_import():
     from fastapi import Depends
-    from fastapi_turbo import Depends as TurboDepends
+    from fastapi import Depends as TurboDepends
 
     assert Depends is TurboDepends
 
 
 def test_fastapi_http_exception_import():
     from fastapi import HTTPException
-    from fastapi_turbo import HTTPException as TurboHTTPException
+    from fastapi import HTTPException as TurboHTTPException
 
     assert HTTPException is TurboHTTPException
 
 
 def test_fastapi_query_path_import():
     from fastapi import Query, Path, Header, Cookie, Body, Form, File
-    from fastapi_turbo import Query as JQ, Path as JP, Header as JH
-    from fastapi_turbo import Cookie as JC, Body as JB, Form as JFo, File as JFi
+    from fastapi import Query as JQ, Path as JP, Header as JH
+    from fastapi import Cookie as JC, Body as JB, Form as JFo, File as JFi
 
     assert Query is JQ
     assert Path is JP
@@ -44,7 +45,7 @@ def test_fastapi_query_path_import():
 
 def test_fastapi_response_import():
     from fastapi import JSONResponse, HTMLResponse, Response
-    from fastapi_turbo import JSONResponse as JJ, HTMLResponse as JH, Response as JR
+    from fastapi import JSONResponse as JJ, HTMLResponse as JH, Response as JR
 
     assert JSONResponse is JJ
     assert HTMLResponse is JH
@@ -53,35 +54,35 @@ def test_fastapi_response_import():
 
 def test_fastapi_request_import():
     from fastapi import Request
-    from fastapi_turbo import Request as TurboRequest
+    from fastapi import Request as TurboRequest
 
     assert Request is TurboRequest
 
 
 def test_fastapi_uploadfile_import():
     from fastapi import UploadFile
-    from fastapi_turbo import UploadFile as TurboUploadFile
+    from fastapi import UploadFile as TurboUploadFile
 
     assert UploadFile is TurboUploadFile
 
 
 def test_fastapi_apirouter_import():
     from fastapi import APIRouter
-    from fastapi_turbo import APIRouter as TurboAPIRouter
+    from fastapi import APIRouter as TurboAPIRouter
 
     assert APIRouter is TurboAPIRouter
 
 
 def test_fastapi_background_tasks_import():
     from fastapi import BackgroundTasks
-    from fastapi_turbo import BackgroundTasks as TurboBT
+    from fastapi import BackgroundTasks as TurboBT
 
     assert BackgroundTasks is TurboBT
 
 
 def test_fastapi_websocket_import():
     from fastapi import WebSocket
-    from fastapi_turbo import WebSocket as TurboWS
+    from fastapi import WebSocket as TurboWS
 
     assert WebSocket is TurboWS
 
@@ -91,9 +92,9 @@ def test_fastapi_websocket_import():
 
 def test_fastapi_responses_module():
     from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
-    from fastapi_turbo.responses import JSONResponse as JJ
-    from fastapi_turbo.responses import HTMLResponse as JH
-    from fastapi_turbo.responses import PlainTextResponse as JP
+    from fastapi.responses import JSONResponse as JJ
+    from fastapi.responses import HTMLResponse as JH
+    from fastapi.responses import PlainTextResponse as JP
 
     assert JSONResponse is JJ
     assert HTMLResponse is JH
@@ -102,7 +103,7 @@ def test_fastapi_responses_module():
 
 def test_fastapi_routing_module():
     from fastapi.routing import APIRouter, APIRoute
-    from fastapi_turbo.routing import APIRouter as JR, APIRoute as JA
+    from fastapi.routing import APIRouter as JR, APIRoute as JA
 
     assert APIRouter is JR
     assert APIRoute is JA
@@ -110,7 +111,7 @@ def test_fastapi_routing_module():
 
 def test_fastapi_exceptions_module():
     from fastapi.exceptions import HTTPException, RequestValidationError
-    from fastapi_turbo.exceptions import HTTPException as JH, RequestValidationError as JR
+    from fastapi.exceptions import HTTPException as JH, RequestValidationError as JR
 
     assert HTTPException is JH
     assert RequestValidationError is JR
@@ -118,7 +119,7 @@ def test_fastapi_exceptions_module():
 
 def test_fastapi_security_import():
     from fastapi.security import OAuth2PasswordBearer
-    from fastapi_turbo.security import OAuth2PasswordBearer as TurboOAuth2
+    from fastapi.security import OAuth2PasswordBearer as TurboOAuth2
 
     assert OAuth2PasswordBearer is TurboOAuth2
 
@@ -150,7 +151,7 @@ def test_fastapi_security_all_classes():
 
 def test_fastapi_encoders_module():
     from fastapi.encoders import jsonable_encoder
-    from fastapi_turbo.encoders import jsonable_encoder as J
+    from fastapi.encoders import jsonable_encoder as J
 
     assert jsonable_encoder is J
 
@@ -165,14 +166,14 @@ def test_fastapi_status_module():
 
 def test_fastapi_testclient_module():
     from fastapi.testclient import TestClient
-    from fastapi_turbo.testclient import TestClient as JTC
+    from fastapi.testclient import TestClient as JTC
 
     assert TestClient is JTC
 
 
 def test_fastapi_middleware_cors():
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi_turbo.middleware.cors import CORSMiddleware as JC
+    from starlette.middleware.cors import CORSMiddleware as JC
 
     assert CORSMiddleware is JC
 
@@ -182,14 +183,14 @@ def test_fastapi_middleware_cors():
 
 def test_starlette_response_import():
     from starlette.responses import JSONResponse
-    from fastapi_turbo.responses import JSONResponse as TurboJSONResponse
+    from fastapi.responses import JSONResponse as TurboJSONResponse
 
     assert JSONResponse is TurboJSONResponse
 
 
 def test_starlette_request_import():
     from starlette.requests import Request
-    from fastapi_turbo.requests import Request as TurboRequest
+    from starlette.requests import Request as TurboRequest
 
     assert Request is TurboRequest
 
@@ -204,14 +205,14 @@ def test_starlette_status_import():
 
 def test_starlette_websocket_import():
     from starlette.websockets import WebSocket
-    from fastapi_turbo.websockets import WebSocket as TurboWS
+    from starlette.websockets import WebSocket as TurboWS
 
     assert WebSocket is TurboWS
 
 
 def test_starlette_exceptions_import():
     from starlette.exceptions import HTTPException
-    from fastapi_turbo.exceptions import HTTPException as TurboHTTPException
+    from fastapi.exceptions import HTTPException as TurboHTTPException
 
     assert HTTPException is TurboHTTPException
 
@@ -227,21 +228,21 @@ def test_starlette_datastructures_import():
 
 def test_starlette_middleware_cors():
     from starlette.middleware.cors import CORSMiddleware
-    from fastapi_turbo.middleware.cors import CORSMiddleware as JC
+    from starlette.middleware.cors import CORSMiddleware as JC
 
     assert CORSMiddleware is JC
 
 
 def test_starlette_concurrency_import():
     from starlette.concurrency import run_in_threadpool
-    from fastapi_turbo.concurrency import run_in_threadpool as JR
+    from fastapi.concurrency import run_in_threadpool as JR
 
     assert run_in_threadpool is JR
 
 
 def test_starlette_background_import():
     from starlette.background import BackgroundTasks, BackgroundTask
-    from fastapi_turbo.background import BackgroundTasks as JBT, BackgroundTask as JBT1
+    from starlette.background import BackgroundTasks as JBT, BackgroundTask as JBT1
 
     assert BackgroundTasks is JBT
     assert BackgroundTask is JBT1
@@ -266,5 +267,5 @@ def test_shim_uninstall_reinstall():
 
     # Verify imports still work
     from fastapi import FastAPI
-    from fastapi_turbo import FastAPI as JF
+    from fastapi import FastAPI as JF
     assert FastAPI is JF

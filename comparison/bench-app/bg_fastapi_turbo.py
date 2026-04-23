@@ -6,11 +6,13 @@ Endpoints:
   POST /bg/cpu     — sync task that does 1000 hash iterations
   GET  /bg/count   — how many tasks have run
 """
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import os
 import sys
 import hashlib
-from fastapi_turbo import FastAPI, BackgroundTasks
-from fastapi_turbo.responses import JSONResponse
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 COUNT = [0]

@@ -8,6 +8,8 @@ Starts the parity_app_4 on:
 Then issues identical HTTP requests to both and compares responses.
 """
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import json
 import os
 import signal

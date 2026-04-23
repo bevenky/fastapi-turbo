@@ -10,8 +10,8 @@ This app exercises the hardest paths:
 - CORS + auth on every protected route
 """
 import fastapi_turbo
-from fastapi_turbo import FastAPI, Depends, Header, Query, HTTPException, Body
-from fastapi_turbo.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Depends, Header, Query, HTTPException, Body
+from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 import time

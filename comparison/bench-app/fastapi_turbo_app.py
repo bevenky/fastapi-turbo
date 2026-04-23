@@ -4,13 +4,15 @@ Exercises: CRUD, query params, path params, JSON body, Depends chain,
 Bearer auth, CORS middleware, form data login, WebSocket echo with timestamps.
 """
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import json
 import os
 import time
 
-from fastapi_turbo import FastAPI, Depends, Header, Query, HTTPException, WebSocket
-from fastapi_turbo.responses import JSONResponse
-from fastapi_turbo.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Depends, Header, Query, HTTPException, WebSocket
+from fastapi.responses import JSONResponse
+from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 

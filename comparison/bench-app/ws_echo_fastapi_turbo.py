@@ -1,7 +1,9 @@
 """fastapi-turbo WebSocket echo benchmark app — text and binary."""
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import sys
-from fastapi_turbo import FastAPI, WebSocket
-from fastapi_turbo.exceptions import WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
+from fastapi.exceptions import WebSocketDisconnect
 
 app = FastAPI()
 

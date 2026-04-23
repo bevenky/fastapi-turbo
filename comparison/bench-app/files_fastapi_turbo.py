@@ -7,14 +7,16 @@ Endpoints:
   GET  /health
 """
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import os
 import sys
 import tempfile
 
-from fastapi_turbo import FastAPI, UploadFile
-from fastapi_turbo.middleware.gzip import GZipMiddleware
-from fastapi_turbo.responses import FileResponse, JSONResponse
-from fastapi_turbo.staticfiles import StaticFiles
+from fastapi import FastAPI, UploadFile
+from starlette.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 
 # Create a temp directory with test files for download/static

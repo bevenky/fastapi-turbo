@@ -11,6 +11,8 @@ Covers:
 
 from __future__ import annotations
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import asyncio
 
 import pytest
@@ -21,7 +23,7 @@ import pytest
 
 class TestSecuritySchemes:
     def test_oauth2_client_credentials(self):
-        from fastapi_turbo.security import OAuth2ClientCredentials
+        from fastapi.security import OAuth2ClientCredentials
 
         scheme = OAuth2ClientCredentials(tokenUrl="/token", scopes={"read": "r"})
         assert scheme.model["type"] == "oauth2"
@@ -29,7 +31,7 @@ class TestSecuritySchemes:
         assert scheme.model["flows"]["clientCredentials"]["tokenUrl"] == "/token"
 
     def test_oauth2_authorization_code(self):
-        from fastapi_turbo.security import OAuth2AuthorizationCodeBearer
+        from fastapi.security import OAuth2AuthorizationCodeBearer
 
         scheme = OAuth2AuthorizationCodeBearer(
             authorizationUrl="/auth",
@@ -43,14 +45,14 @@ class TestSecuritySchemes:
         assert flow["refreshUrl"] == "/refresh"
 
     def test_openid_connect(self):
-        from fastapi_turbo.security import OpenIdConnect
+        from fastapi.security import OpenIdConnect
 
         scheme = OpenIdConnect(openIdConnectUrl="https://example.com/.well-known/openid-configuration")
         assert scheme.model["type"] == "openIdConnect"
         assert "openid-configuration" in scheme.model["openIdConnectUrl"]
 
     def test_imports_from_fastapi_turbo(self):
-        from fastapi_turbo import (
+        from fastapi import (
             OAuth2AuthorizationCodeBearer,
             OAuth2ClientCredentials,
             OpenIdConnect,
@@ -77,7 +79,7 @@ class TestSecuritySchemes:
 
 class TestRequestStream:
     def test_stream_yields_buffered_body(self):
-        from fastapi_turbo.requests import Request
+        from starlette.requests import Request
 
         req = Request(scope={"type": "http", "_body": b"hello world"})
 
@@ -91,7 +93,7 @@ class TestRequestStream:
         assert chunks == [b"hello world", b""]
 
     def test_stream_empty_body(self):
-        from fastapi_turbo.requests import Request
+        from starlette.requests import Request
 
         req = Request(scope={"type": "http"})
 
@@ -104,7 +106,7 @@ class TestRequestStream:
         assert asyncio.run(_consume()) == [b""]
 
     def test_stream_yields_receive_chunks(self):
-        from fastapi_turbo.requests import Request
+        from starlette.requests import Request
 
         # Mock ASGI receive callable that yields 3 chunks
         chunks_to_yield = [
@@ -137,8 +139,8 @@ class TestRequestStream:
 
 class TestRequestAuthUser:
     def test_unauthenticated_by_default(self):
-        from fastapi_turbo.authentication import UnauthenticatedUser
-        from fastapi_turbo.requests import Request
+        from starlette.authentication import UnauthenticatedUser
+        from starlette.requests import Request
 
         req = Request(scope={"type": "http"})
         assert isinstance(req.user, UnauthenticatedUser)
@@ -146,16 +148,16 @@ class TestRequestAuthUser:
         assert bool(req.user) is False
 
     def test_auth_scopes_empty_by_default(self):
-        from fastapi_turbo.authentication import AuthCredentials
-        from fastapi_turbo.requests import Request
+        from starlette.authentication import AuthCredentials
+        from starlette.requests import Request
 
         req = Request(scope={"type": "http"})
         assert isinstance(req.auth, AuthCredentials)
         assert req.auth.scopes == []
 
     def test_authenticated_user_reachable(self):
-        from fastapi_turbo.authentication import AuthCredentials, SimpleUser
-        from fastapi_turbo.requests import Request
+        from starlette.authentication import AuthCredentials, SimpleUser
+        from starlette.requests import Request
 
         user = SimpleUser("alice")
         creds = AuthCredentials(["authenticated", "admin"])
@@ -171,7 +173,7 @@ class TestRequestAuthUser:
 
 class TestSessionMiddleware:
     def test_sign_and_decode_roundtrip(self):
-        from fastapi_turbo.middleware.sessions import SessionMiddleware
+        from starlette.middleware.sessions import SessionMiddleware
 
         mw = SessionMiddleware(secret_key="test-secret")
         encoded = mw._encode({"user_id": 42, "name": "Alice"})
@@ -179,7 +181,7 @@ class TestSessionMiddleware:
         assert decoded == {"user_id": 42, "name": "Alice"}
 
     def test_bad_signature_rejected(self):
-        from fastapi_turbo.middleware.sessions import SessionMiddleware
+        from starlette.middleware.sessions import SessionMiddleware
 
         mw = SessionMiddleware(secret_key="test-secret")
         other_mw = SessionMiddleware(secret_key="different-secret")
@@ -187,7 +189,7 @@ class TestSessionMiddleware:
         assert other_mw._decode(encoded) is None
 
     def test_tampered_cookie_rejected(self):
-        from fastapi_turbo.middleware.sessions import SessionMiddleware
+        from starlette.middleware.sessions import SessionMiddleware
 
         mw = SessionMiddleware(secret_key="test-secret")
         encoded = mw._encode({"x": 1})
@@ -196,8 +198,8 @@ class TestSessionMiddleware:
         assert mw._decode(tampered) is None
 
     def test_app_middleware_registration(self):
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.middleware.sessions import SessionMiddleware
+        from fastapi import FastAPI
+        from starlette.middleware.sessions import SessionMiddleware
 
         app = FastAPI()
         app.add_middleware(SessionMiddleware, secret_key="s3cr3t")
@@ -216,13 +218,13 @@ class TestSessionMiddleware:
 class TestAuthenticationMiddleware:
     def test_backend_populates_auth_and_user(self):
         """AuthenticationBackend.authenticate() result ends up on request.scope."""
-        from fastapi_turbo.authentication import (
+        from starlette.authentication import (
             AuthCredentials,
             AuthenticationBackend,
             AuthenticationMiddleware,
             SimpleUser,
         )
-        from fastapi_turbo.requests import Request
+        from starlette.requests import Request
 
         class TokenBackend(AuthenticationBackend):
             async def authenticate(self, request):
@@ -242,11 +244,11 @@ class TestAuthenticationMiddleware:
         assert "user" in result["scopes"]
 
     def test_no_token_stays_unauthenticated(self):
-        from fastapi_turbo.authentication import (
+        from starlette.authentication import (
             AuthenticationBackend,
             AuthenticationMiddleware,
         )
-        from fastapi_turbo.requests import Request
+        from starlette.requests import Request
 
         class Backend(AuthenticationBackend):
             async def authenticate(self, request):
@@ -263,12 +265,12 @@ class TestAuthenticationMiddleware:
 
 class TestRequiresDecorator:
     def test_missing_scope_returns_403(self):
-        from fastapi_turbo.authentication import (
+        from starlette.authentication import (
             AuthCredentials,
             SimpleUser,
             requires,
         )
-        from fastapi_turbo.requests import Request
+        from starlette.requests import Request
 
         @requires("admin")
         async def secret(request: Request):
@@ -283,12 +285,12 @@ class TestRequiresDecorator:
         assert resp.status_code == 403
 
     def test_has_scope_runs_handler(self):
-        from fastapi_turbo.authentication import (
+        from starlette.authentication import (
             AuthCredentials,
             SimpleUser,
             requires,
         )
-        from fastapi_turbo.requests import Request
+        from starlette.requests import Request
 
         @requires(["authenticated", "admin"])
         async def admin_page(request: Request):
@@ -309,7 +311,7 @@ class TestPydanticV2Decorators:
     def test_computed_field_in_response(self):
         from pydantic import BaseModel, computed_field
 
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
 
         class User(BaseModel):
             first_name: str
@@ -333,7 +335,7 @@ class TestPydanticV2Decorators:
     def test_field_serializer(self):
         from pydantic import BaseModel, field_serializer
 
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
 
         class M(BaseModel):
             tags: list[str]
@@ -355,7 +357,7 @@ class TestPydanticV2Decorators:
     def test_model_validator(self):
         from pydantic import BaseModel, model_validator
 
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
 
         class Config(BaseModel):
             enabled: bool

@@ -3,6 +3,8 @@ Jinja2Templates, multiple body params, Body(embed=True),
 TrustedHostMiddleware, HTTPSRedirectMiddleware.
 """
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import json
 import os
 import socket
@@ -77,7 +79,9 @@ class TestMount:
     def test_mount_fastapi_sub_app(self, server_app):
         """Routes from a mounted FastAPI sub-app are reachable with prefix."""
         url = server_app("""
-            from fastapi_turbo import FastAPI
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI
             app = FastAPI()
             sub = FastAPI()
 
@@ -103,8 +107,10 @@ class TestMount:
     def test_mount_api_router(self, server_app):
         """Mount an APIRouter instance directly."""
         url = server_app("""
-            from fastapi_turbo import FastAPI
-            from fastapi_turbo.routing import APIRouter
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI
+            from fastapi.routing import APIRouter
             app = FastAPI()
             router = APIRouter()
 
@@ -121,14 +127,14 @@ class TestMount:
 
     def test_mount_method_exists(self):
         """FastAPI has a mount method."""
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
         app = FastAPI()
         assert hasattr(app, "mount")
         assert callable(app.mount)
 
     def test_mount_stores_apps(self):
         """mount() stores sub-apps in the _mounts list."""
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
         app = FastAPI()
         sub = FastAPI()
         app.mount("/sub", sub, name="sub")
@@ -139,7 +145,7 @@ class TestMount:
 
     def test_mount_collects_routes(self):
         """_collect_all_routes includes mounted app routes with prefix."""
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
         app = FastAPI()
         sub = FastAPI()
 
@@ -163,12 +169,12 @@ class TestBaseHTTPMiddleware:
 
     def test_import_from_middleware(self):
         """BaseHTTPMiddleware is importable from the middleware package."""
-        from fastapi_turbo.middleware import BaseHTTPMiddleware
+        from starlette.middleware import BaseHTTPMiddleware
         assert BaseHTTPMiddleware is not None
 
     def test_import_from_base_module(self):
         """BaseHTTPMiddleware is importable from middleware.base."""
-        from fastapi_turbo.middleware.base import BaseHTTPMiddleware
+        from starlette.middleware.base import BaseHTTPMiddleware
         assert BaseHTTPMiddleware is not None
 
     def test_import_from_starlette_shim(self):
@@ -178,7 +184,7 @@ class TestBaseHTTPMiddleware:
 
     def test_subclass_dispatch(self):
         """Subclassing and overriding dispatch works."""
-        from fastapi_turbo.middleware.base import BaseHTTPMiddleware
+        from starlette.middleware.base import BaseHTTPMiddleware
 
         class TimingMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request, call_next):
@@ -190,7 +196,7 @@ class TestBaseHTTPMiddleware:
 
     def test_dispatch_with_callable(self):
         """Passing a dispatch callable to constructor works."""
-        from fastapi_turbo.middleware.base import BaseHTTPMiddleware
+        from starlette.middleware.base import BaseHTTPMiddleware
 
         async def my_dispatch(request, call_next):
             return await call_next(request)
@@ -200,13 +206,13 @@ class TestBaseHTTPMiddleware:
 
     def test_middleware_type_attribute(self):
         """BaseHTTPMiddleware has the _fastapi_turbo_middleware_type attribute."""
-        from fastapi_turbo.middleware.base import BaseHTTPMiddleware
+        from starlette.middleware.base import BaseHTTPMiddleware
         assert BaseHTTPMiddleware._fastapi_turbo_middleware_type == "base_http"
 
     def test_default_dispatch_raises(self):
         """Default dispatch raises NotImplementedError."""
         import asyncio
-        from fastapi_turbo.middleware.base import BaseHTTPMiddleware
+        from starlette.middleware.base import BaseHTTPMiddleware
 
         mw = BaseHTTPMiddleware()
         with pytest.raises(NotImplementedError):
@@ -223,7 +229,7 @@ class TestStaticFiles:
 
     def test_import_from_module(self):
         """StaticFiles is importable from staticfiles module."""
-        from fastapi_turbo.staticfiles import StaticFiles
+        from fastapi.staticfiles import StaticFiles
         assert StaticFiles is not None
 
     def test_import_from_starlette_shim(self):
@@ -233,25 +239,25 @@ class TestStaticFiles:
 
     def test_constructor_with_directory(self, tmp_path):
         """StaticFiles accepts a directory parameter."""
-        from fastapi_turbo.staticfiles import StaticFiles
+        from fastapi.staticfiles import StaticFiles
         sf = StaticFiles(directory=str(tmp_path))
         assert sf.directory == str(tmp_path)
 
     def test_check_dir_raises_on_missing(self):
         """StaticFiles raises RuntimeError when directory does not exist."""
-        from fastapi_turbo.staticfiles import StaticFiles
+        from fastapi.staticfiles import StaticFiles
         with pytest.raises(RuntimeError, match="does not exist"):
             StaticFiles(directory="/nonexistent/path/xyz123")
 
     def test_check_dir_false_no_raise(self):
         """StaticFiles with check_dir=False does not raise on missing dir."""
-        from fastapi_turbo.staticfiles import StaticFiles
+        from fastapi.staticfiles import StaticFiles
         sf = StaticFiles(directory="/nonexistent/path/xyz123", check_dir=False)
         assert sf.directory == "/nonexistent/path/xyz123"
 
     def test_lookup_path_existing_file(self, tmp_path):
         """lookup_path finds an existing file and returns its media type."""
-        from fastapi_turbo.staticfiles import StaticFiles
+        from fastapi.staticfiles import StaticFiles
 
         test_file = tmp_path / "style.css"
         test_file.write_text("body { color: red; }")
@@ -263,7 +269,7 @@ class TestStaticFiles:
 
     def test_lookup_path_missing_file(self, tmp_path):
         """lookup_path returns empty string for missing files."""
-        from fastapi_turbo.staticfiles import StaticFiles
+        from fastapi.staticfiles import StaticFiles
         sf = StaticFiles(directory=str(tmp_path))
         path, media_type = sf.lookup_path("nonexistent.txt")
         assert path == ""
@@ -271,7 +277,7 @@ class TestStaticFiles:
 
     def test_lookup_path_prevents_traversal(self, tmp_path):
         """lookup_path rejects directory traversal attempts."""
-        from fastapi_turbo.staticfiles import StaticFiles
+        from fastapi.staticfiles import StaticFiles
         sf = StaticFiles(directory=str(tmp_path))
         path, media_type = sf.lookup_path("../../etc/passwd")
         assert path == ""
@@ -279,7 +285,7 @@ class TestStaticFiles:
 
     def test_html_mode_index(self, tmp_path):
         """In html mode, lookup_path finds index.html for directories."""
-        from fastapi_turbo.staticfiles import StaticFiles
+        from fastapi.staticfiles import StaticFiles
 
         index = tmp_path / "index.html"
         index.write_text("<h1>Hello</h1>")
@@ -291,7 +297,7 @@ class TestStaticFiles:
 
     def test_constructor_kwargs(self):
         """StaticFiles stores html and packages kwargs."""
-        from fastapi_turbo.staticfiles import StaticFiles
+        from fastapi.staticfiles import StaticFiles
         sf = StaticFiles(directory=None, packages=["mypackage"], html=True, check_dir=False)
         assert sf.html is True
         assert sf.packages == ["mypackage"]
@@ -307,7 +313,7 @@ class TestJinja2Templates:
 
     def test_import_from_module(self):
         """Jinja2Templates is importable from templating module."""
-        from fastapi_turbo.templating import Jinja2Templates
+        from fastapi.templating import Jinja2Templates
         assert Jinja2Templates is not None
 
     def test_import_from_starlette_shim(self):
@@ -317,8 +323,8 @@ class TestJinja2Templates:
 
     def test_render_template(self, tmp_path):
         """TemplateResponse renders a template and returns HTMLResponse."""
-        from fastapi_turbo.templating import Jinja2Templates
-        from fastapi_turbo.responses import HTMLResponse
+        from fastapi.templating import Jinja2Templates
+        from fastapi.responses import HTMLResponse
 
         tpl_file = tmp_path / "hello.html"
         tpl_file.write_text("<h1>Hello {{ name }}!</h1>")
@@ -332,7 +338,7 @@ class TestJinja2Templates:
 
     def test_render_with_custom_status_code(self, tmp_path):
         """TemplateResponse respects custom status_code."""
-        from fastapi_turbo.templating import Jinja2Templates
+        from fastapi.templating import Jinja2Templates
 
         tpl_file = tmp_path / "error.html"
         tpl_file.write_text("<h1>Error</h1>")
@@ -343,7 +349,7 @@ class TestJinja2Templates:
 
     def test_render_with_headers(self, tmp_path):
         """TemplateResponse passes extra headers."""
-        from fastapi_turbo.templating import Jinja2Templates
+        from fastapi.templating import Jinja2Templates
 
         tpl_file = tmp_path / "page.html"
         tpl_file.write_text("<p>page</p>")
@@ -356,7 +362,7 @@ class TestJinja2Templates:
 
     def test_get_template(self, tmp_path):
         """get_template returns a jinja2 Template object."""
-        from fastapi_turbo.templating import Jinja2Templates
+        from fastapi.templating import Jinja2Templates
 
         tpl_file = tmp_path / "test.html"
         tpl_file.write_text("{{ x }}")
@@ -367,7 +373,7 @@ class TestJinja2Templates:
 
     def test_template_with_loop(self, tmp_path):
         """Templates support Jinja2 features like for loops."""
-        from fastapi_turbo.templating import Jinja2Templates
+        from fastapi.templating import Jinja2Templates
 
         tpl_file = tmp_path / "list.html"
         tpl_file.write_text("{% for i in items %}{{ i }},{% endfor %}")
@@ -452,7 +458,9 @@ class TestMultipleBodyParams:
     def test_multiple_body_params_server(self, server_app):
         """Multiple body params work end-to-end via the server."""
         url = server_app("""
-            from fastapi_turbo import FastAPI
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI
             from pydantic import BaseModel
 
             app = FastAPI()
@@ -487,13 +495,13 @@ class TestBodyEmbed:
 
     def test_body_embed_attribute(self):
         """Body marker has an embed attribute."""
-        from fastapi_turbo.param_functions import Body
+        from fastapi.param_functions import Body
         b = Body(embed=True)
         assert b.embed is True
 
     def test_body_embed_default_none(self):
         """Body marker defaults embed to None (FastAPI-compatible — means auto-detect)."""
-        from fastapi_turbo.param_functions import Body
+        from fastapi.param_functions import Body
         b = Body()
         assert b.embed is None
 
@@ -501,7 +509,7 @@ class TestBodyEmbed:
         """Single body param with embed=True is combined."""
         from pydantic import BaseModel
         from fastapi_turbo._introspect import introspect_endpoint
-        from fastapi_turbo.param_functions import Body
+        from fastapi.param_functions import Body
 
         class Item(BaseModel):
             name: str
@@ -517,7 +525,9 @@ class TestBodyEmbed:
     def test_embed_server(self, server_app):
         """Body(embed=True) works end-to-end: expects {"item": {...}}."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Body
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Body
             from pydantic import BaseModel
 
             app = FastAPI()
@@ -550,39 +560,39 @@ class TestTrustedHostMiddleware:
 
     def test_import(self):
         """TrustedHostMiddleware is importable."""
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         assert TrustedHostMiddleware is not None
 
     def test_allow_all(self):
         """Wildcard allows all hosts."""
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         mw = TrustedHostMiddleware(allowed_hosts=["*"])
         assert mw.is_valid_host("example.com") is True
         assert mw.is_valid_host("anything.org") is True
 
     def test_default_allows_all(self):
         """Default configuration allows all hosts."""
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         mw = TrustedHostMiddleware()
         assert mw.is_valid_host("example.com") is True
 
     def test_specific_host(self):
         """Only the specified host is allowed."""
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         mw = TrustedHostMiddleware(allowed_hosts=["example.com"])
         assert mw.is_valid_host("example.com") is True
         assert mw.is_valid_host("evil.com") is False
 
     def test_host_with_port(self):
         """Port is stripped before matching."""
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         mw = TrustedHostMiddleware(allowed_hosts=["example.com"])
         assert mw.is_valid_host("example.com:8000") is True
         assert mw.is_valid_host("evil.com:8000") is False
 
     def test_wildcard_subdomain(self):
         """Wildcard subdomain pattern matches."""
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         mw = TrustedHostMiddleware(allowed_hosts=["*.example.com"])
         assert mw.is_valid_host("api.example.com") is True
         assert mw.is_valid_host("deep.sub.example.com") is True
@@ -591,19 +601,19 @@ class TestTrustedHostMiddleware:
 
     def test_case_insensitive(self):
         """Host matching is case-insensitive."""
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         mw = TrustedHostMiddleware(allowed_hosts=["Example.COM"])
         assert mw.is_valid_host("example.com") is True
         assert mw.is_valid_host("EXAMPLE.COM") is True
 
     def test_middleware_type_attribute(self):
         """Has _fastapi_turbo_middleware_type attribute."""
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         assert TrustedHostMiddleware._fastapi_turbo_middleware_type == "trustedhost"
 
     def test_multiple_allowed_hosts(self):
         """Multiple hosts can be specified."""
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         mw = TrustedHostMiddleware(allowed_hosts=["a.com", "b.com"])
         assert mw.is_valid_host("a.com") is True
         assert mw.is_valid_host("b.com") is True
@@ -620,49 +630,49 @@ class TestHTTPSRedirectMiddleware:
 
     def test_import(self):
         """HTTPSRedirectMiddleware is importable."""
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
         assert HTTPSRedirectMiddleware is not None
 
     def test_redirect_url_http(self):
         """HTTP URLs are redirected to HTTPS."""
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
         url = HTTPSRedirectMiddleware.redirect_url("http://example.com/path")
         assert url == "https://example.com/path"
 
     def test_redirect_url_https_unchanged(self):
         """HTTPS URLs are returned unchanged."""
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
         url = HTTPSRedirectMiddleware.redirect_url("https://example.com/path")
         assert url == "https://example.com/path"
 
     def test_should_redirect_http(self):
         """HTTP scheme triggers redirect."""
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
         assert HTTPSRedirectMiddleware.should_redirect("http") is True
 
     def test_should_redirect_https(self):
         """HTTPS scheme does not trigger redirect."""
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
         assert HTTPSRedirectMiddleware.should_redirect("https") is False
 
     def test_should_redirect_wss(self):
         """WSS scheme does not trigger redirect."""
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
         assert HTTPSRedirectMiddleware.should_redirect("wss") is False
 
     def test_middleware_type_attribute(self):
         """Has _fastapi_turbo_middleware_type attribute."""
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
         assert HTTPSRedirectMiddleware._fastapi_turbo_middleware_type == "httpsredirect"
 
     def test_redirect_url_with_port(self):
         """HTTP URL with port is correctly redirected."""
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
         url = HTTPSRedirectMiddleware.redirect_url("http://example.com:8080/path")
         assert url == "https://example.com:8080/path"
 
     def test_redirect_url_with_query(self):
         """HTTP URL with query string is correctly redirected."""
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
         url = HTTPSRedirectMiddleware.redirect_url("http://example.com/path?q=1")
         assert url == "https://example.com/path?q=1"

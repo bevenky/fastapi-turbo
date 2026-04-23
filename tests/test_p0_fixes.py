@@ -1,5 +1,7 @@
 """Tests for all 6 P0 critical feature gap fixes."""
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import json
 import os
 import socket
@@ -74,7 +76,9 @@ class TestDependencyOverrides:
     def test_override_basic(self, server_app):
         """dependency_overrides replaces a dep function at runtime."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Depends
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Depends
             app = FastAPI()
 
             def get_db():
@@ -97,7 +101,9 @@ class TestDependencyOverrides:
     def test_override_with_sub_deps(self, server_app):
         """Overrides work on nested dependencies."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Depends
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Depends
             app = FastAPI()
 
             def get_db():
@@ -123,7 +129,7 @@ class TestDependencyOverrides:
 
     def test_override_dict_exists(self):
         """FastAPI has a dependency_overrides dict."""
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
         app = FastAPI()
         assert hasattr(app, "dependency_overrides")
         assert isinstance(app.dependency_overrides, dict)
@@ -131,7 +137,9 @@ class TestDependencyOverrides:
     def test_no_override_uses_original(self, server_app):
         """When no override is set, the original dep runs."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Depends
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Depends
             app = FastAPI()
 
             def get_db():
@@ -160,7 +168,9 @@ class TestStartupShutdown:
     def test_startup_handler_runs(self, server_app):
         """Startup handler executes before server starts accepting requests."""
         url = server_app("""
-            from fastapi_turbo import FastAPI
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI
             app = FastAPI()
             app.state.started = False
 
@@ -181,7 +191,9 @@ class TestStartupShutdown:
     def test_async_startup_handler_runs(self, server_app):
         """Async startup handler executes before server starts."""
         url = server_app("""
-            from fastapi_turbo import FastAPI
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI
             app = FastAPI()
             app.state.async_started = False
 
@@ -202,7 +214,9 @@ class TestStartupShutdown:
     def test_multiple_startup_handlers(self, server_app):
         """Multiple startup handlers all execute in order."""
         url = server_app("""
-            from fastapi_turbo import FastAPI
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI
             app = FastAPI()
             app.state.steps = []
 
@@ -226,7 +240,7 @@ class TestStartupShutdown:
 
     def test_shutdown_handler_registered(self):
         """Shutdown handlers are stored in _on_shutdown list."""
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
         import warnings
         app = FastAPI()
 
@@ -241,7 +255,7 @@ class TestStartupShutdown:
 
     def test_on_event_returns_decorator(self):
         """on_event returns the original function."""
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
         import warnings
         app = FastAPI()
 
@@ -268,7 +282,8 @@ class TestLifespan:
         """Lifespan startup phase sets state on the app."""
         url = server_app("""
             from contextlib import asynccontextmanager
-            from fastapi_turbo import FastAPI
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+            from fastapi import FastAPI
 
             @asynccontextmanager
             async def lifespan(app):
@@ -292,7 +307,8 @@ class TestLifespan:
         """Lifespan that yields a state dict populates app.state."""
         url = server_app("""
             from contextlib import asynccontextmanager
-            from fastapi_turbo import FastAPI
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+            from fastapi import FastAPI
 
             @asynccontextmanager
             async def lifespan(app):
@@ -314,7 +330,7 @@ class TestLifespan:
 
     def test_lifespan_stored(self):
         """The lifespan callable is stored on the app."""
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
         from contextlib import asynccontextmanager
 
         @asynccontextmanager
@@ -326,7 +342,7 @@ class TestLifespan:
 
     def test_lifespan_none_by_default(self):
         """Lifespan is None by default."""
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
         app = FastAPI()
         assert app.lifespan is None
 
@@ -342,7 +358,9 @@ class TestYieldDependencies:
     def test_generator_dep_basic(self, server_app):
         """Basic generator dep yields a value to the handler."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Depends
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Depends
             app = FastAPI()
 
             def get_db():
@@ -361,7 +379,9 @@ class TestYieldDependencies:
     def test_generator_dep_cleanup_runs(self, server_app):
         """Generator dep cleanup code runs after the handler."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Depends
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Depends
             import json
             app = FastAPI()
 
@@ -397,7 +417,9 @@ class TestYieldDependencies:
     def test_generator_dep_with_params(self, server_app):
         """Generator dep that consumes query parameters."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Depends
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Depends
             app = FastAPI()
 
             def get_session(user_id: int = 0):
@@ -426,7 +448,9 @@ class TestResponseModel:
     def test_response_model_filters_extra_fields(self, server_app):
         """response_model removes fields not in the model."""
         url = server_app("""
-            from fastapi_turbo import FastAPI
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI
             from pydantic import BaseModel
 
             app = FastAPI()
@@ -451,7 +475,9 @@ class TestResponseModel:
     def test_response_model_with_deps(self, server_app):
         """response_model works alongside dependency injection."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Depends
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Depends
             from pydantic import BaseModel
 
             app = FastAPI()
@@ -477,7 +503,7 @@ class TestResponseModel:
 
     def test_response_model_stored_on_route(self):
         """response_model is stored on the APIRoute."""
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
         from pydantic import BaseModel
 
         class Out(BaseModel):
@@ -494,7 +520,7 @@ class TestResponseModel:
 
     def test_response_model_none_by_default(self):
         """response_model defaults to None."""
-        from fastapi_turbo import FastAPI
+        from fastapi import FastAPI
 
         app = FastAPI()
 
@@ -517,7 +543,9 @@ class TestGlobalDependencies:
     def test_app_level_dependency_runs(self, server_app):
         """App-level dependency runs for every route."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Depends
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Depends
             app = FastAPI()
 
             call_count = 0
@@ -551,8 +579,10 @@ class TestGlobalDependencies:
     def test_router_level_dependency_runs(self, server_app):
         """Router-level dependency runs for routes on that router."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Depends
-            from fastapi_turbo.routing import APIRouter
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Depends
+            from fastapi.routing import APIRouter
             app = FastAPI()
 
             auth_log = []
@@ -582,7 +612,7 @@ class TestGlobalDependencies:
 
     def test_app_dependencies_constructor(self):
         """FastAPI constructor accepts dependencies parameter."""
-        from fastapi_turbo import FastAPI, Depends
+        from fastapi import FastAPI, Depends
 
         def my_dep():
             pass
@@ -592,8 +622,8 @@ class TestGlobalDependencies:
 
     def test_router_dependencies_constructor(self):
         """APIRouter constructor accepts dependencies parameter."""
-        from fastapi_turbo.routing import APIRouter
-        from fastapi_turbo import Depends
+        from fastapi.routing import APIRouter
+        from fastapi import Depends
 
         def my_dep():
             pass
@@ -604,7 +634,9 @@ class TestGlobalDependencies:
     def test_route_level_dependency(self, server_app):
         """Route-level dependencies (on the decorator) are enforced."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Depends
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Depends
             app = FastAPI()
 
             dep_log = []
@@ -625,8 +657,10 @@ class TestGlobalDependencies:
     def test_combined_app_router_route_deps(self, server_app):
         """All three levels of dependencies run together."""
         url = server_app("""
-            from fastapi_turbo import FastAPI, Depends
-            from fastapi_turbo.routing import APIRouter
+            import fastapi_turbo  # noqa: F401 — installs compat shim
+
+            from fastapi import FastAPI, Depends
+            from fastapi.routing import APIRouter
             app = FastAPI()
 
             log = []

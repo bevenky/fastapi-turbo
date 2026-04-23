@@ -3,6 +3,8 @@
 Usage:
     sqla_runner.py {pg3|pg2|async} {fastapi-turbo|uvicorn} PORT
 """
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import os
 import sys
 

@@ -1,5 +1,7 @@
 """Phase 6 integration tests: Tower-native middleware (CORS, GZip)."""
 
+import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
+
 import json
 import socket
 import subprocess
@@ -62,8 +64,10 @@ def server_app(tmp_path):
 def test_cors_middleware(server_app):
     """CORS headers are present on normal requests."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.middleware.cors import CORSMiddleware
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from starlette.middleware.cors import CORSMiddleware
         app = FastAPI()
         app.add_middleware(
             CORSMiddleware,
@@ -87,8 +91,10 @@ def test_cors_middleware(server_app):
 def test_cors_preflight(server_app):
     """CORS preflight OPTIONS request returns correct headers."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.middleware.cors import CORSMiddleware
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from starlette.middleware.cors import CORSMiddleware
         app = FastAPI()
         app.add_middleware(
             CORSMiddleware,
@@ -118,8 +124,10 @@ def test_cors_preflight(server_app):
 def test_cors_specific_origin(server_app):
     """CORS with a specific origin only allows that origin."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.middleware.cors import CORSMiddleware
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from starlette.middleware.cors import CORSMiddleware
         app = FastAPI()
         app.add_middleware(
             CORSMiddleware,
@@ -150,7 +158,9 @@ def test_cors_specific_origin(server_app):
 def test_string_middleware(server_app):
     """Add middleware by string name."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
         app = FastAPI()
         app.add_middleware("cors", allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -171,8 +181,10 @@ def test_string_middleware(server_app):
 def test_gzip_middleware(server_app):
     """GZip compression is applied when client sends Accept-Encoding: gzip."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.middleware.gzip import GZipMiddleware
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from starlette.middleware.gzip import GZipMiddleware
         app = FastAPI()
         app.add_middleware(GZipMiddleware, minimum_size=10)
 
@@ -192,7 +204,9 @@ def test_gzip_middleware(server_app):
 def test_gzip_string_middleware(server_app):
     """Add gzip middleware by string name."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
         app = FastAPI()
         app.add_middleware("gzip")
 
@@ -213,7 +227,9 @@ def test_gzip_string_middleware(server_app):
 def test_no_middleware(server_app):
     """Server works fine with no middleware at all (backward compat)."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
         app = FastAPI()
 
         @app.get("/hello")
@@ -232,9 +248,9 @@ def test_no_middleware(server_app):
 
 def test_middleware_imports():
     """All middleware classes are importable from the package."""
-    from fastapi_turbo.middleware import CORSMiddleware, GZipMiddleware
-    from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
-    from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+    from starlette.middleware import CORSMiddleware, GZipMiddleware
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 
     assert CORSMiddleware._fastapi_turbo_middleware_type == "cors"
     assert GZipMiddleware._fastapi_turbo_middleware_type == "gzip"
@@ -244,7 +260,7 @@ def test_middleware_imports():
 
 def test_middleware_class_attributes():
     """Middleware classes store their config correctly."""
-    from fastapi_turbo.middleware.cors import CORSMiddleware
+    from starlette.middleware.cors import CORSMiddleware
 
     mw = CORSMiddleware(
         allow_origins=["http://example.com"],
@@ -262,9 +278,9 @@ def test_middleware_class_attributes():
 
 def test_build_middleware_config():
     """FastAPI._build_middleware_config produces correct dicts."""
-    from fastapi_turbo import FastAPI
-    from fastapi_turbo.middleware.cors import CORSMiddleware
-    from fastapi_turbo.middleware.gzip import GZipMiddleware
+    from fastapi import FastAPI
+    from starlette.middleware.cors import CORSMiddleware
+    from starlette.middleware.gzip import GZipMiddleware
 
     app = FastAPI()
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"])
@@ -290,9 +306,9 @@ def test_build_middleware_config_trustedhost():
     Tower) so Sentry / other ASGI middleware can wrap around it and
     observe host-rejected requests. Functional check: an installed
     TrustedHostMiddleware actually rejects disallowed hosts."""
-    from fastapi_turbo import FastAPI
-    from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
-    from fastapi_turbo.testclient import TestClient
+    from fastapi import FastAPI
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    from fastapi.testclient import TestClient
 
     app = FastAPI()
     app.add_middleware(
@@ -319,8 +335,8 @@ def test_build_middleware_config_trustedhost():
 
 def test_build_middleware_config_httpsredirect():
     """_build_middleware_config handles HTTPSRedirectMiddleware."""
-    from fastapi_turbo import FastAPI
-    from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+    from fastapi import FastAPI
+    from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 
     app = FastAPI()
     app.add_middleware(HTTPSRedirectMiddleware)
@@ -341,8 +357,10 @@ def test_static_files_rust(server_app, tmp_path):
     (static_dir / "data.json").write_text('{"key": "value"}')
 
     url = server_app(f"""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.staticfiles import StaticFiles
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from fastapi.staticfiles import StaticFiles
         app = FastAPI()
         app.mount("/static", StaticFiles(directory="{static_dir}"))
 
@@ -378,8 +396,10 @@ def test_static_files_rust(server_app, tmp_path):
 def test_trustedhost_middleware_allowed(server_app):
     """TrustedHostMiddleware allows requests with valid Host header."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         app = FastAPI()
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1"])
 
@@ -397,8 +417,10 @@ def test_trustedhost_middleware_allowed(server_app):
 def test_trustedhost_middleware_blocked(server_app):
     """TrustedHostMiddleware rejects requests with invalid Host header."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         app = FastAPI()
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=["trusted.com"])
 
@@ -415,8 +437,10 @@ def test_trustedhost_middleware_blocked(server_app):
 def test_trustedhost_middleware_wildcard(server_app):
     """TrustedHostMiddleware with wildcard allows all hosts."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
         app = FastAPI()
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 
@@ -436,8 +460,10 @@ def test_trustedhost_middleware_wildcard(server_app):
 def test_httpsredirect_middleware(server_app):
     """HTTPSRedirectMiddleware redirects HTTP to HTTPS."""
     url = server_app("""
-        from fastapi_turbo import FastAPI
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+
+        from fastapi import FastAPI
+        from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
         app = FastAPI()
         app.add_middleware(HTTPSRedirectMiddleware)
 
