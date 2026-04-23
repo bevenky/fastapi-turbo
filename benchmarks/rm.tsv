@@ -1,0 +1,13 @@
+label	endpoint	rps	p50	p99
+Rust-Axum	/health (GET)	51440	19	32
+Rust-Axum	/cache/get (GET)	22097	44	64
+Rust-Axum	/cache/set (POST)	21232	46	66
+fastapi-rs_sync(redis-py)	/health (GET)	37630	26	39
+fastapi-rs_sync(redis-py)	/cache/get (GET)	16584	59	78
+fastapi-rs_sync(redis-py)	/cache/set (POST)	14927	67	87
+fastapi-rs_async(redis.asyncio)	/health (GET)	32517	30	45
+fastapi-rs_async(redis.asyncio)	/cache/get (GET)	6945	133	301
+fastapi-rs_async(redis.asyncio)	/cache/set (POST)	5305	160	311
+FastAPI_uvicorn(redis.asyncio)	/health (GET)	8279	120	157
+FastAPI_uvicorn(redis.asyncio)	/cache/get (GET)	4383	225	317
+FastAPI_uvicorn(redis.asyncio)	/cache/set (POST)	3828	242	511
