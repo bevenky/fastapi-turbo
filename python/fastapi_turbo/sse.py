@@ -77,3 +77,22 @@ KEEPALIVE_COMMENT = b": ping\n\n"
 # Seconds between keep-alive pings when a generator is idle.
 # Private but importable so tests can monkeypatch it.
 _PING_INTERVAL: float = 15.0
+
+
+def __getattr__(name: str):
+    # Lazy re-export so `from fastapi_turbo.sse import EventSourceResponse`
+    # mirrors `fastapi.sse.EventSourceResponse`. The class lives in
+    # fastapi_turbo.responses; importing it at module load would create a
+    # circular import (responses.py re-uses ServerSentEvent from here).
+    if name == "EventSourceResponse":
+        from fastapi_turbo.responses import EventSourceResponse as _ESR
+        return _ESR
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "ServerSentEvent",
+    "EventSourceResponse",
+    "format_sse_event",
+    "KEEPALIVE_COMMENT",
+]

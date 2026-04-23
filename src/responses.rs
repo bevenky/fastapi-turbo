@@ -120,6 +120,20 @@ fn dict_to_json_bytes(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<u8> {
 /// Response objects, then primitives. BaseModel and dataclass live at the
 /// bottom so we don't pay their cost on every call.
 pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
+    py_to_response_with_request(py, obj, None)
+}
+
+/// Request-aware variant: `range_header` is the inbound `Range:` header
+/// (if any) so `FileResponse` can answer with `206 Partial Content`.
+///
+/// The router uses this at every handler-result conversion site; plain
+/// `py_to_response()` stays valid for call sites that don't have request
+/// context (e.g., recursive JSON-mode model dumps).
+pub fn py_to_response_with_request(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    range_header: Option<&str>,
+) -> Response {
     // dict or list -> JSON (MOST COMMON — check first, skip attr lookups)
     if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() {
         let bytes = dict_to_json_bytes(py, obj);
@@ -188,7 +202,11 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
                     .ok()
                     .and_then(|a| a.extract::<String>().ok());
                 let headers = extract_response_headers(obj);
-                return file_response(&path_str, media_type, headers);
+                return if range_header.is_some() {
+                    file_response_with_range(&path_str, media_type, headers, range_header)
+                } else {
+                    file_response(&path_str, media_type, headers)
+                };
             }
         }
     }
@@ -204,7 +222,11 @@ pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
                         .ok()
                         .and_then(|a| a.extract::<String>().ok());
                     let headers = extract_response_headers(obj);
-                    return file_response(&path_str, media_type, headers);
+                    return if range_header.is_some() {
+                        file_response_with_range(&path_str, media_type, headers, range_header)
+                    } else {
+                        file_response(&path_str, media_type, headers)
+                    };
                 }
             }
         }
@@ -958,6 +980,157 @@ pub fn file_response(
     resp
 }
 
-// Range header parsing lives in tower-http's ServeDir — we no longer parse
-// ranges ourselves since FileResponse delegates full-file serving to
-// `file_response()` and range requests fall through to ServeDir.
+/// Parse an RFC 7233 `Range: bytes=…` header for a resource of `total_len` bytes.
+///
+/// Supports the three single-range forms FastAPI users hit in practice:
+///   * `bytes=N-M`  — absolute window
+///   * `bytes=N-`   — from N through end
+///   * `bytes=-N`   — last N bytes (suffix)
+///
+/// Returns `Ok(Some((start, end_inclusive)))` when the range is valid,
+/// `Ok(None)` when the header is absent/malformed (caller should serve 200),
+/// and `Err(())` when the range is syntactically valid but unsatisfiable
+/// (caller should return 416).
+pub fn parse_byte_range(header: &str, total_len: u64) -> Result<Option<(u64, u64)>, ()> {
+    let rest = match header.trim().strip_prefix("bytes=") {
+        Some(r) => r.trim(),
+        None => return Ok(None),
+    };
+    // Multi-range (`bytes=0-0,-1`) not supported — fall back to full body.
+    if rest.contains(',') {
+        return Ok(None);
+    }
+    let (a, b) = match rest.split_once('-') {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
+    let a = a.trim();
+    let b = b.trim();
+    if total_len == 0 {
+        return Err(());
+    }
+    let (start, end) = if a.is_empty() {
+        // Suffix: last N bytes.
+        let n: u64 = match b.parse() {
+            Ok(n) if n > 0 => n,
+            _ => return Ok(None),
+        };
+        let n = n.min(total_len);
+        (total_len - n, total_len - 1)
+    } else if b.is_empty() {
+        let s: u64 = match a.parse() {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        if s >= total_len {
+            return Err(());
+        }
+        (s, total_len - 1)
+    } else {
+        let s: u64 = match a.parse() {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        let e: u64 = match b.parse() {
+            Ok(e) => e,
+            Err(_) => return Ok(None),
+        };
+        if s > e || s >= total_len {
+            return Err(());
+        }
+        (s, e.min(total_len - 1))
+    };
+    Ok(Some((start, end)))
+}
+
+/// Variant of [`file_response`] that honours a request `Range:` header.
+///
+/// `range_header` is the raw header value (e.g. `bytes=0-99`). When present
+/// and satisfiable, returns `206 Partial Content` with `Content-Range` and
+/// a sliced body. Unsatisfiable ranges return `416`. Absent or unparseable
+/// ranges fall back to the full-file `200` response.
+pub fn file_response_with_range(
+    path_str: &str,
+    media_type: Option<String>,
+    extra_headers: Vec<(String, String)>,
+    range_header: Option<&str>,
+) -> Response {
+    let path = Path::new(path_str);
+
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, format!("File not found: {path_str}")).into_response();
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("File read error: {e}"))
+                .into_response();
+        }
+    };
+
+    let total_len = data.len() as u64;
+    let mut ct = media_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    if ct.starts_with("text/") || ct == "application/javascript" || ct == "application/json" {
+        if !ct.to_lowercase().contains("charset=") {
+            ct.push_str("; charset=utf-8");
+        }
+    }
+
+    // Parse Range (if any). Malformed → full body. Unsatisfiable → 416.
+    let range = match range_header {
+        Some(h) => match parse_byte_range(h, total_len) {
+            Ok(r) => r,
+            Err(()) => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header("content-range", format!("bytes */{total_len}"))
+                    .header("content-type", &ct)
+                    .body(Body::empty())
+                    .expect("build 416");
+            }
+        },
+        None => None,
+    };
+
+    let (status, slice, content_range) = if let Some((start, end)) = range {
+        let s = start as usize;
+        let e = (end as usize) + 1; // end-inclusive → exclusive slice
+        let slice = data[s..e].to_vec();
+        (
+            StatusCode::PARTIAL_CONTENT,
+            slice,
+            Some(format!("bytes {start}-{end}/{total_len}")),
+        )
+    } else {
+        (StatusCode::OK, data, None)
+    };
+
+    let body_len = slice.len() as u64;
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", &ct)
+        .header("content-length", body_len)
+        .header("accept-ranges", "bytes");
+    if let Some(ref cr) = content_range {
+        builder = builder.header("content-range", cr);
+    }
+    let mut resp = builder.body(Body::from(slice)).expect("build file response");
+
+    for (k, v) in extra_headers {
+        let k_lower = k.to_ascii_lowercase();
+        if matches!(
+            k_lower.as_str(),
+            "content-type" | "content-length" | "accept-ranges" | "content-range"
+        ) {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (HeaderName::try_from(k.as_str()), HeaderValue::from_str(&v)) {
+            if k_lower == "set-cookie" {
+                resp.headers_mut().append(hn, hv);
+            } else {
+                resp.headers_mut().insert(hn, hv);
+            }
+        }
+    }
+    resp
+}

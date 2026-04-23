@@ -4,39 +4,26 @@ Open work only. Shipped items are deleted after completion.
 
 ---
 
-## FastAPI parity — critical gaps
+## FastAPI parity — remaining gaps
 
-Standard FastAPI code hits these and breaks or silently misbehaves.
-
-### P0 — large
-
-1. **File uploads** — `UploadFile` is a stub, `File(...)` marker not wired, multipart body parsing missing. Blocks the whole file-upload category of apps. ~250 LOC (Rust multipart parser + Python interface).
-
-2. **`FileResponse` + `Range: bytes=...` header support** — no way to return a file with proper content-type, no video/resumable download support. ~180 LOC.
-
-3. **`StaticFiles` mount serving files at scale** — mount helper exists but isn't wired. ~100 LOC.
-
-### P1 — common features
-
-4. **ASGI middleware bridge** — Sentry, OpenTelemetry, Prometheus middleware can't be installed today (we only accept Tower middleware). ~150 LOC.
-
-5. **Custom response headers on `accept(headers=...)`** — axum's `WebSocketUpgrade` doesn't expose them; needs hyper-level escape hatch. ~60 LOC.
+All former P0/P1 items (file uploads, FileResponse+Range, StaticFiles,
+ASGI middleware bridge, BaseHTTPMiddleware, WebSocket `accept(headers=…)`,
+TestClient `websocket_connect`, `redirect_slashes`, 405 handling) shipped
+and are covered by the 510-test suite. The items below are the
+long-tail rough edges not yet chased.
 
 ### P2 — less common
 
-6. TestClient WebSocket support (`client.websocket_connect(...)`).
-7. `AsyncClient` / `ASGITransport` for async tests.
-8. `HEAD` auto-handling from `GET` routes.
-9. `OPTIONS` auto-generation for CORS preflight.
-10. `405 Method Not Allowed` (currently returns 404 on wrong method).
-11. Request size limits enforcement.
-12. `redirect_slashes` parameter.
-13. `dataclass` / `TypedDict` / `msgspec.Struct` as response models.
-14. Per-route `servers` / `external_docs`.
-15. `webhooks=` app parameter + OpenAPI webhooks section.
-16. Multipart range responses (206 multipart).
-17. Custom `APIRoute` via `route_class`.
-18. `operation_id` uniqueness checks.
+1. `AsyncClient` shorthand — works today via `httpx.AsyncClient(transport=ASGITransport(app=app))`; convenience re-export in `fastapi_turbo.testclient` would mirror FastAPI's `AsyncClient`.
+2. `HEAD` auto-handling from `GET` routes (currently explicit 405 — matches FastAPI default, but Starlette can be configured the other way).
+3. `OPTIONS` auto-generation for CORS preflight — today the user must register OPTIONS or rely on CORSMiddleware.
+4. Multi-range responses (`Range: bytes=0-0,-1` → `multipart/byteranges` 206). Single-range 206 done.
+5. Per-route `servers` / `external_docs` in OpenAPI.
+6. `webhooks=` app parameter + OpenAPI webhooks section.
+7. Custom `APIRoute` via `route_class` — accepted but not fully honoured end-to-end.
+8. `operation_id` uniqueness checks and `generate_unique_id_function` plumbing.
+9. `dataclass` / `TypedDict` / `msgspec.Struct` as response models (Pydantic models, dicts, lists, and generic aliases already work).
+10. `Depends(scope="request")` — accepted, treated as default request scope; scope hint not differentiated.
 
 ---
 

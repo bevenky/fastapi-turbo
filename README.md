@@ -107,27 +107,30 @@ To disable this and use both FastAPI and fastapi-turbo side by side, set `FASTAP
 - All HTTP methods (GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD)
 - Path, Query, Header, Cookie, Body, Form, File parameters
 - `typing.Annotated` parameter pattern
-- `Depends()` with nested chains, caching, async deps
+- `Depends()` with nested chains, caching, async deps, `dependency_overrides`
 - Pydantic v2 body validation (via pydantic-core's Rust backend)
+- `response_model` — output filtering, aliases, `model_validate(obj)`
 - `status_code`, `tags`, `summary`, `description` on routes
-- WebSocket with `send_text/bytes/json`, `receive_text/bytes/json`
+- WebSocket with `send_text/bytes/json`, `receive_text/bytes/json`; sync + async parity
 - OpenAPI 3.1 auto-generation, Swagger UI (`/docs`), ReDoc (`/redoc`)
-- CORS and GZip middleware (Tower-backed, ~0.3 us per request)
-- StreamingResponse (sync and async generators)
-- BackgroundTasks
-- TestClient (real HTTP via httpx)
-- Security: OAuth2PasswordBearer, HTTPBearer, HTTPBasic, APIKey
-- `jsonable_encoder`, status code constants, `run_in_threadpool`
+- CORS, GZip, TrustedHost, HTTPSRedirect (Tower-backed, ~0.3 us per request)
+- ASGI middleware: `BaseHTTPMiddleware`, raw `(scope, receive, send)` — Sentry, Prometheus, SessionMiddleware work
+- StreamingResponse (sync + async generators), `EventSourceResponse` (SSE)
+- `FileResponse` with `Range:` → `206 Partial Content`, `StaticFiles`, `Jinja2Templates`
+- `app.mount("/sub", sub_app)` for sub-FastAPI / StaticFiles mounting
+- Lifespan (`lifespan=` context manager) + `on_event("startup"|"shutdown")`
+- Yield dependencies: teardown runs after middleware unwinds
+- BackgroundTasks (single-task `background=` and multi-task `BackgroundTasks`)
+- TestClient (httpx, real HTTP) — includes `websocket_connect(...)`
+- Security: OAuth2PasswordBearer, HTTPBearer, HTTPBasic, APIKeyHeader / Query / Cookie
+- `jsonable_encoder`, status code constants, `run_in_threadpool`, `redirect_slashes`
 
 ### Known limitations
 
-- `response_model` filtering not yet implemented
-- `app.mount()` for sub-applications not yet implemented
-- ASGI middleware (Sentry, Prometheus) not yet supported (only Tower middleware)
-- StaticFiles and Jinja2Templates not yet implemented
-- `dependency_overrides` stored but not yet checked at runtime
-- Startup/shutdown lifecycle events stored but not yet fired
-- Generator (yield) dependencies: cleanup not yet guaranteed
+- Multi-range responses (`bytes=0-0,-1` → `multipart/byteranges`) — single-range only
+- `Depends(scope="request")` caching scope hint — treated as default request-scope
+- HTTP/3 + QUIC not yet exposed (Axum stack is HTTP/1.1 + HTTP/2)
+- Free-threaded Python (3.13t/3.14t) works but hasn't been perf-tuned
 
 ## Database: Use psycopg3 (not psycopg2 or asyncpg)
 
@@ -358,9 +361,9 @@ python benchmarks/bench_hello.py
 
 ## Architecture
 
-- **Rust core** (1,800 lines): Axum 0.8, hyper, tokio, Tower, PyO3 0.25, crossbeam
-- **Python layer** (3,200 lines): FastAPI-compatible API, introspection, OpenAPI, compat shims
-- **Tests** (2,500 lines): 128 integration tests across 11 test files
+- **Rust core** (~8K lines): Axum 0.8, hyper, tokio, Tower, PyO3 0.25, crossbeam; HTTP, WebSocket, multipart, streaming, DB pool, HTTP client
+- **Python layer** (~22K lines): FastAPI-compatible API, introspection, OpenAPI 3.1 generator, Starlette/FastAPI `sys.modules` compat shims
+- **Tests** (~45K lines): 510 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
 
 See [CLAUDE.md](CLAUDE.md) for development guide and [benchmarks.md](benchmarks.md) for full benchmark data including Go Echo, Fastify, free-threaded Python, and WebSocket library comparisons.
 

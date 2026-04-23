@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::handler_bridge::call_async_handler;
 use crate::multipart::{parse_boundary, parse_multipart, ParsedField, PyUploadFile};
-use crate::responses::{py_to_response, pyerr_to_response, serde_to_pyobj};
+use crate::responses::{py_to_response, py_to_response_with_request, pyerr_to_response, serde_to_pyobj};
 use crate::websocket::handle_ws_upgrade;
 
 static BG_TASKS_CLS: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
@@ -1345,6 +1345,14 @@ async fn handle_request(
         None
     };
 
+    // Capture `Range` once so FileResponse can emit `206 Partial Content`
+    // without re-reading the request in every response-conversion site.
+    let range_header: Option<String> = request
+        .headers()
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     // Capture method/path/query for Request injection AND for middleware
     // that inspects request.url.path (e.g., Qwen's BasicAuthMiddleware).
     // Always captured — the 3 string copies cost <1μs.
@@ -1457,7 +1465,7 @@ async fn handle_request(
                         }
                     }
                     match state.handler.call(py, (), Some(&kwargs)) {
-                        Ok(py_result) => py_to_response(py, py_result.bind(py)),
+                        Ok(py_result) => py_to_response_with_request(py, py_result.bind(py), range_header.as_deref()),
                         Err(py_err) => pyerr_to_response(py, &py_err),
                     }
                 });
@@ -1465,7 +1473,7 @@ async fn handle_request(
             // Ultra-fast path: zero-param, no middleware
             return Python::attach(|py| {
                 match state.handler.call0(py) {
-                    Ok(py_result) => py_to_response(py, py_result.bind(py)),
+                    Ok(py_result) => py_to_response_with_request(py, py_result.bind(py), range_header.as_deref()),
                     Err(py_err) => pyerr_to_response(py, &py_err),
                 }
             });
@@ -1508,7 +1516,7 @@ async fn handle_request(
                 match state.handler.call(py, (), Some(&kwargs)) {
                     Ok(py_result) => {
                         drain_background_tasks(py, &kwargs, &state.params);
-                        let mut resp = py_to_response(py, py_result.bind(py));
+                        let mut resp = py_to_response_with_request(py, py_result.bind(py), range_header.as_deref());
                         apply_injected_response(py, &kwargs, &state.params, &mut resp);
                         resp
                     }
@@ -1546,7 +1554,7 @@ async fn handle_request(
                     match crate::handler_bridge::call_async_on_local_loop(
                         py, &state.handler, &kwargs,
                     ) {
-                        Ok(r) => py_to_response(py, r.bind(py)),
+                        Ok(r) => py_to_response_with_request(py, r.bind(py), range_header.as_deref()),
                         Err(e) => pyerr_to_response(py, &e),
                     }
                 } else if !state.has_dep_params {
@@ -1583,7 +1591,7 @@ async fn handle_request(
                     ) {
                         Ok(r) => {
                             drain_background_tasks(py, &kwargs, &state.params);
-                            let mut resp = py_to_response(py, r.bind(py));
+                            let mut resp = py_to_response_with_request(py, r.bind(py), range_header.as_deref());
                             apply_injected_response(py, &kwargs, &state.params, &mut resp);
                             resp
                         }
@@ -1621,7 +1629,7 @@ async fn handle_request(
                     match state.handler.call(py, (), Some(&kwargs)) {
                         Ok(r) => {
                             drain_background_tasks(py, &kwargs, &state.params);
-                            py_to_response(py, r.bind(py))
+                            py_to_response_with_request(py, r.bind(py), range_header.as_deref())
                         }
                         Err(e) => pyerr_to_response(py, &e),
                     }
@@ -1705,7 +1713,7 @@ async fn handle_request(
             };
 
             match result {
-                Ok(py_result) => py_to_response(py, py_result.bind(py)),
+                Ok(py_result) => py_to_response_with_request(py, py_result.bind(py), range_header.as_deref()),
                 Err(ref py_err) => {
                     // Check if this is "needs event loop" — signal for fallback
                     let msg = py_err.value(py).str().map(|s| s.to_string()).unwrap_or_default();
@@ -1747,7 +1755,7 @@ async fn handle_request(
 
         let handler = Python::attach(|py| state.handler.clone_ref(py));
         return match call_async_handler(handler, handler_kwargs).await {
-            Ok(py_result) => Python::attach(|py| py_to_response(py, py_result.bind(py))),
+            Ok(py_result) => Python::attach(|py| py_to_response_with_request(py, py_result.bind(py), range_header.as_deref())),
             Err(py_err) => Python::attach(|py| pyerr_to_response(py, &py_err)),
         };
     }
