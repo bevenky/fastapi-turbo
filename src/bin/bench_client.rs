@@ -23,6 +23,13 @@ fn main() {
         format!(
             "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n"
         )
+    } else if body.is_empty() {
+        // Methods like DELETE frequently carry no body. Don't force a
+        // Content-Type header (some servers, e.g. Fastify, 400 on an
+        // empty JSON body) and send Content-Length: 0.
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
+        )
     } else {
         format!(
             "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",

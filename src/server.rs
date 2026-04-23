@@ -910,11 +910,25 @@ async fn slashes_redirect_middleware_with_paths(
         .unwrap()
 }
 
-/// Wait for Ctrl-C (SIGINT).
+/// Wait for either SIGINT (Ctrl-C) or SIGTERM. Many bench runners / process
+/// supervisors send SIGTERM for orderly shutdown; the old handler only caught
+/// SIGINT, so SIGTERM left fastapi-rs hanging and the listener held its port
+/// past the bench's cleanup phase (zombie processes blocking next-run startup).
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install Ctrl-C handler");
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => {
+            // Fallback: only SIGINT.
+            tokio::signal::ctrl_c().await.ok();
+            println!("\nfastapi-rs shutting down...");
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
     println!("\nfastapi-rs shutting down...");
 }
 

@@ -1335,51 +1335,65 @@ def _try_compile_handler(
                     )
 
                 if is_generator:
-                    # Generator dep (yield) support — sync generators drive
-                    # via next(); async generators via the shared worker loop
-                    # so asyncpg / redis.asyncio connection pools (created on
-                    # the worker loop at startup) continue to work. Using a
-                    # one-shot loop here would invalidate pool state.
+                    # Generator dep (yield) support.
                     gen = actual_func(**dk)
                     if inspect.isasyncgen(gen):
-                        # Try-sync fast path: if the async gen doesn't
-                        # await anything before its first yield, drive it
-                        # via ``.__anext__().send(None)`` in the current
-                        # request thread. This keeps any ContextVar
-                        # changes visible to the handler (which runs in
-                        # the same thread/context) — FA parity via
-                        # ``test_dependency_contextvars``. If the gen
-                        # actually awaits, fall through to the worker
-                        # loop so async I/O libs keep their loop
-                        # affinity.
-                        _anext_coro = gen.__anext__()
-                        _sync_ok = False
-                        try:
-                            _anext_coro.send(None)
-                        except StopIteration as _stop:
-                            result = _stop.value
-                            _sync_ok = True
-                        except BaseException:
-                            _anext_coro.close()
-                            raise
-                        if _sync_ok:
-                            generators_to_cleanup.append((gen, None, dep_scope))
-                        else:
-                            # The coro suspended — continue the SAME
-                            # partially-driven coro on the worker loop.
-                            # Closing it here and calling ``gen.__anext__()``
-                            # afresh would leave the async-gen in a
-                            # half-stepped state whose next step yields
-                            # ``StopAsyncIteration`` — the dep value is
-                            # lost and the handler never runs (trace
-                            # fidelity bug with 5-middleware + async
-                            # yield-dep stacks).
-                            import asyncio as _asyncio
-                            from fastapi_rs._async_worker import get_loop as _get_loop
-                            _loop = _get_loop()
-                            _fut = _asyncio.run_coroutine_threadsafe(_anext_coro, _loop)
-                            result = _fut.result(timeout=30)
+                        # Dispatch strategy for async yield-deps:
+                        #
+                        # * ASYNC handler → run the whole dep lifecycle
+                        #   (setup + teardown) on the worker loop. This
+                        #   is the only path that is safe for async
+                        #   resources whose teardown uses
+                        #   ``asyncio.create_task`` /
+                        #   ``get_running_loop`` (SQLAlchemy's
+                        #   ``AsyncSession.__aexit__``, asyncpg pool
+                        #   release, redis.asyncio). Driving those
+                        #   teardowns via sync ``coro.send(None)`` on
+                        #   the request thread raises
+                        #   ``RuntimeError: no running event loop`` —
+                        #   and trying to recover by calling
+                        #   ``gen.__anext__()`` again corrupts the
+                        #   generator ("cannot reuse already awaited
+                        #   aclose()"). Always submit on the worker.
+                        #
+                        # * SYNC handler → keep the try-sync fast path
+                        #   so that contextvar mutations inside the
+                        #   async-gen are visible to the handler on the
+                        #   same thread (FA parity via
+                        #   ``test_dependency_contextvars``). No async
+                        #   resource teardown is expected here — if the
+                        #   gen is ContextVar-only, it never touches the
+                        #   loop.
+                        _handler_is_async = inspect.iscoroutinefunction(endpoint)
+                        if _handler_is_async:
+                            from fastapi_rs._async_worker import submit as _submit
+                            result = _submit(gen.__anext__())
                             generators_to_cleanup.append((gen, "worker", dep_scope))
+                        else:
+                            _anext_coro = gen.__anext__()
+                            _sync_ok = False
+                            try:
+                                _anext_coro.send(None)
+                            except StopIteration as _stop:
+                                result = _stop.value
+                                _sync_ok = True
+                            except BaseException:
+                                _anext_coro.close()
+                                raise
+                            if _sync_ok:
+                                generators_to_cleanup.append((gen, None, dep_scope))
+                            else:
+                                # Suspended on a real await — continue
+                                # the partial coro on the worker loop.
+                                # (Trace-fidelity tests with 5-middleware
+                                # + async yield-deps rely on this not
+                                # restarting a fresh __anext__.)
+                                import asyncio as _asyncio
+                                from fastapi_rs._async_worker import get_loop as _get_loop
+                                _loop = _get_loop()
+                                _fut = _asyncio.run_coroutine_threadsafe(_anext_coro, _loop)
+                                result = _fut.result(timeout=30)
+                                generators_to_cleanup.append((gen, "worker", dep_scope))
                     else:
                         result = next(gen)
                         generators_to_cleanup.append((gen, None, dep_scope))
@@ -1783,10 +1797,26 @@ def _run_pending_teardowns(
                 # wants to suspend.
                 import inspect as _ins
                 if _ins.isasyncgen(gen):
+                    # Async-gen teardown: try the sync fast path
+                    # (`_tcoro.send(None)`). If it either suspends on a
+                    # real await OR raises ``RuntimeError: no running
+                    # event loop`` (e.g. SQLAlchemy async's
+                    # ``__aexit__`` uses ``asyncio.create_task`` /
+                    # ``get_running_loop``), we can't reuse the
+                    # partially-driven coroutine — invoking the same
+                    # coro object via ``run_coroutine_threadsafe``
+                    # errors with "cannot reuse already awaited
+                    # aclose()/athrow()". Instead, start a FRESH
+                    # advancing coroutine on the worker loop via
+                    # ``submit(gen.__anext__())`` (or ``gen.athrow``).
+                    # The async-gen's internal state is preserved
+                    # across ``__anext__()`` calls, so this resumes
+                    # cleanly from where the yield paused.
                     if throw_exc is not None:
                         _tcoro = gen.athrow(throw_exc)
                     else:
                         _tcoro = gen.__anext__()
+                    _needs_worker = False
                     try:
                         _tcoro.send(None)
                     except StopIteration:
@@ -1795,12 +1825,28 @@ def _run_pending_teardowns(
                     except StopAsyncIteration:
                         if throw_exc is not None:
                             swallowed_handler_exc = True
+                    except RuntimeError as _rt_err:
+                        if "no running event loop" in str(_rt_err):
+                            _needs_worker = True
+                        else:
+                            _tcoro.close()
+                            raise
                     except BaseException:
                         _tcoro.close()
                         raise
                     else:
-                        # Suspended — finish on the worker loop.
-                        _tcoro.close()
+                        # Suspended on a real await — finish on worker.
+                        _needs_worker = True
+                    if _needs_worker:
+                        # Don't ``_tcoro.close()`` here — that throws
+                        # GeneratorExit INTO the async-gen via its
+                        # partially-driven __anext__ coro, which effectively
+                        # ``aclose``s the gen. The subsequent ``_submit(
+                        # gen.__anext__())`` would then raise "cannot reuse
+                        # already awaited aclose()/athrow()". Leaving the
+                        # orphan coro to GC is safe — it has no side-effects
+                        # beyond re-entering the gen body, which we're about
+                        # to do on the worker loop anyway.
                         from fastapi_rs._async_worker import submit as _submit
                         try:
                             if throw_exc is not None:

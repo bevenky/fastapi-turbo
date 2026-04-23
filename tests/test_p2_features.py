@@ -245,8 +245,12 @@ class TestUJSONResponse:
 
     def test_renders_json(self):
         """UJSONResponse renders content as JSON bytes."""
+        import warnings
+        from fastapi_rs.exceptions import FastAPIDeprecationWarning
         from fastapi_rs.responses import UJSONResponse
-        r = UJSONResponse(content={"hello": "world"})
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FastAPIDeprecationWarning)
+            r = UJSONResponse(content={"hello": "world"})
         data = json.loads(r.body)
         assert data == {"hello": "world"}
 

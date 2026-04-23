@@ -6,6 +6,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import warnings
 
 import pytest
 
@@ -406,11 +407,15 @@ def test_websocket_close_preserves_reason(server_app):
             try:
                 await ws.recv()
             except websockets.ConnectionClosedOK as e:
-                assert e.code == 3001
-                assert e.reason == "goodbye"
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    assert e.code == 3001
+                    assert e.reason == "goodbye"
             except websockets.ConnectionClosed as e:
-                assert e.code == 3001
-                assert e.reason == "goodbye"
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    assert e.code == 3001
+                    assert e.reason == "goodbye"
 
     asyncio.run(_test())
 
@@ -519,8 +524,10 @@ def test_websocket_close_flushes_frame(server_app):
             try:
                 await ws.recv()
             except websockets.ConnectionClosed as e:
-                # Peer should have received the 3100 close code
-                assert e.code == 3100
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    # Peer should have received the 3100 close code
+                    assert e.code == 3100
 
     asyncio.run(_test())
 
