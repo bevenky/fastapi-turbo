@@ -40,3 +40,38 @@ htmlcov/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Local agent / session config
+.claude/
+
+# Bench artifacts / compiled bench binaries (rebuilt by the matrix runners)
+node_modules/
+package-lock.json
+comparison/bench-app/bg-gin
+comparison/bench-app/db-gin
+comparison/bench-app/sse-gin
+comparison/bench-app/ws-gin
+comparison/bench-app/files-gin
+comparison/bench-app/db_express/
+comparison/bench-app/go-echo-ecommerce/ecommerce-echo
+comparison/bench-app/go-gin/ecommerce-gin
+comparison/bench-app/rust-axum-ecommerce/target/
+comparison/bench-app/rust-axum-redis/target/
+comparison/bench-app/db_rust_axum/target/
+comparison/bench-app/fastify/mini*.js
+comparison/node-fastify/node_modules/
+comparison/node-hyper-express/node_modules/
+
+# Session scratch artifacts
+log.txt
+real_world_smoke.md
+gaps_progress.md
+gaps_consolidated.md
+benchmarks/_bench_app.py
+benchmarks/run_bench.py
+benchmarks/go-gin/
+benchmarks/*.tsv
+!benchmarks/sqla.tsv
+!benchmarks/v3.tsv
+!benchmarks/dbm.tsv
+!benchmarks/rm.tsv
