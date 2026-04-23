@@ -1314,18 +1314,43 @@ async fn dispatch_404(req: axum::http::Request<axum::body::Body>) -> Response {
     if has_handler {
         let path = req.uri().path().to_string();
         let method = req.method().as_str().to_string();
+        let query = req.uri().query().unwrap_or("").to_string();
+        // Capture request headers as (bytes, bytes) tuples so the
+        // Python-side middleware chain can reconstruct the ASGI scope —
+        // ``SentryAsgiMiddleware``, ``SessionMiddleware``, etc. read
+        // scope["headers"] to assemble the request context. ~1μs cost,
+        // only on 404s.
+        let headers_list: Vec<(Vec<u8>, Vec<u8>)> = req
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect();
         let out = tokio::task::spawn_blocking(move || {
-            Python::attach(|py| -> Option<(u16, Vec<u8>)> {
+            Python::attach(|py| -> Option<(u16, Vec<u8>, Vec<(String, String)>)> {
                 let guard = NOT_FOUND_HANDLER.read().ok()?;
                 let handler = guard.as_ref()?;
+                // Try the extended 4-arg signature first
+                // (method, path, query, headers_list). Fall back to the
+                // 2-arg shape for handlers that haven't been upgraded.
+                let hdrs_py = pyo3::types::PyList::empty(py);
+                for (k, v) in &headers_list {
+                    let _ = hdrs_py.append((
+                        pyo3::types::PyBytes::new(py, k),
+                        pyo3::types::PyBytes::new(py, v),
+                    ));
+                }
                 let result = handler
-                    .call1(py, (method.as_str(), path.as_str()))
+                    .call1(py, (method.as_str(), path.as_str(), query.as_str(), hdrs_py))
+                    .or_else(|_| handler.call1(py, (method.as_str(), path.as_str())))
                     .ok()?;
-                // Expected shape: (status: int, body: bytes).
-                if let Ok(tup) = result.extract::<(u16, Vec<u8>)>(py) {
+                // Expected shape: (status: int, body: bytes) OR
+                // (status, body, [(hdr_name, hdr_val), ...])
+                if let Ok(tup) = result.extract::<(u16, Vec<u8>, Vec<(String, String)>)>(py) {
                     Some(tup)
+                } else if let Ok((status, body)) = result.extract::<(u16, Vec<u8>)>(py) {
+                    Some((status, body, Vec::new()))
                 } else if let Ok(bytes) = result.extract::<Vec<u8>>(py) {
-                    Some((404, bytes))
+                    Some((404, bytes, Vec::new()))
                 } else {
                     None
                 }
@@ -1334,12 +1359,20 @@ async fn dispatch_404(req: axum::http::Request<axum::body::Body>) -> Response {
         .await
         .ok()
         .flatten();
-        if let Some((status, body)) = out {
-            return axum::response::Response::builder()
-                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::NOT_FOUND))
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body))
-                .unwrap();
+        if let Some((status, body, extra_headers)) = out {
+            let mut builder = axum::response::Response::builder()
+                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::NOT_FOUND));
+            let mut has_ct = false;
+            for (k, v) in &extra_headers {
+                if k.eq_ignore_ascii_case("content-type") {
+                    has_ct = true;
+                }
+                builder = builder.header(k, v);
+            }
+            if !has_ct {
+                builder = builder.header("content-type", "application/json");
+            }
+            return builder.body(axum::body::Body::from(body)).unwrap();
         }
     }
     axum::response::Response::builder()

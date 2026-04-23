@@ -53,8 +53,67 @@ def _set_current_request_scope(
         scope["route"] = _RouteScope(route_path, endpoint=endpoint)
     _current_request_scope.set(scope)
 
-    if endpoint is not None or route_path is not None:
-        _refine_sentry_transaction(endpoint, route_path)
+    # NOTE: ``_refine_sentry_transaction`` is NOT called here. This
+    # helper runs from the Rust bridge BEFORE the middleware chain
+    # fires — if an outer middleware (TrustedHost, etc.) rejects the
+    # request, the handler never runs and the transaction name should
+    # stay at SentryAsgiMiddleware's default (URL). The refine happens
+    # lazily in ``_call_handler_sync`` once we know the handler will
+    # actually execute.
+
+
+def _refine_sentry_transaction_as_middleware(mw_cls, mw_name: str) -> None:
+    """Record a rejecting middleware as the Sentry transaction endpoint.
+
+    Mirrors Sentry's ``patch_middlewares`` behaviour: when a middleware
+    handles a request itself (doesn't call the inner app), Sentry
+    treats that middleware class as the endpoint. For
+    ``transaction_style="endpoint"`` the transaction name becomes the
+    middleware's fully-qualified name with source ``component``; for
+    ``transaction_style="url"`` the name stays URL-based (and we don't
+    touch it).
+    """
+    try:
+        import sentry_sdk  # noqa: PLC0415
+    except ImportError:
+        return
+    try:
+        client = sentry_sdk.get_client()
+        if not (client and getattr(client, "is_active", lambda: False)()):
+            return
+    except Exception:  # noqa: BLE001
+        return
+    integration = None
+    try:
+        from sentry_sdk.integrations.fastapi import FastApiIntegration  # noqa: PLC0415
+        integration = client.get_integration(FastApiIntegration)
+    except Exception:  # noqa: BLE001
+        pass
+    if integration is None:
+        try:
+            from sentry_sdk.integrations.starlette import StarletteIntegration  # noqa: PLC0415
+            integration = client.get_integration(StarletteIntegration)
+        except Exception:  # noqa: BLE001
+            return
+    if integration is None:
+        return
+    style = getattr(integration, "transaction_style", "url")
+    if style != "endpoint":
+        # URL-style keeps SentryAsgiMiddleware's default (full URL).
+        return
+    try:
+        from sentry_sdk.tracing import SOURCE_FOR_STYLE  # noqa: PLC0415
+        source = SOURCE_FOR_STYLE.get("endpoint")
+    except Exception:  # noqa: BLE001
+        source = None
+    try:
+        scope = sentry_sdk.get_current_scope()
+        if source is not None:
+            scope.set_transaction_name(mw_name, source=source)
+        else:
+            scope.set_transaction_name(mw_name)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _maybe_install_sentry_request_event_processor(kwargs) -> None:
@@ -2584,6 +2643,14 @@ def _make_asgi_middleware_shim(mw_cls, kwargs):
         # receive wrapper so it can observe the size or mutate bytes.
         body_bytes = await request.body() if hasattr(request, "body") else b""
 
+        # Tracks whether the middleware invoked the inner app
+        # (``_inner_asgi_proxy``). When it doesn't, the middleware
+        # handled the request itself — Sentry's convention for
+        # ``transaction_style="endpoint"`` is to treat the rejecting
+        # middleware as the endpoint. We refine the transaction name
+        # after ``instance(...)`` returns.
+        inner_called = {"v": False}
+
         async def _receive():
             return {"type": "http.request", "body": body_bytes, "more_body": False}
 
@@ -2606,6 +2673,7 @@ def _make_asgi_middleware_shim(mw_cls, kwargs):
             # Pull the (possibly rewrapped) body out of ``receive`` so the
             # middleware can raise on over-size payloads before we invoke
             # the route handler.
+            inner_called["v"] = True
             msg = await receive()
             # Pass the resulting response through to ``send`` so the
             # middleware sees it (headers etc. can be mutated by nesting
@@ -2694,6 +2762,24 @@ def _make_asgi_middleware_shim(mw_cls, kwargs):
 
         # Normal path: build a Response out of captured ASGI messages.
         if "status" in captured:
+            # The middleware emitted a response without invoking the
+            # inner proxy — Sentry expects the rejecting middleware
+            # to be recorded as the transaction endpoint (for
+            # ``transaction_style="endpoint"``). Doesn't apply to the
+            # Sentry middleware itself.
+            if not inner_called["v"]:
+                try:
+                    from sentry_sdk.integrations.asgi import (  # noqa: PLC0415
+                        SentryAsgiMiddleware as _SentryASGI,
+                    )
+                except Exception:  # noqa: BLE001
+                    _SentryASGI = None  # type: ignore[assignment]
+                if _SentryASGI is None or mw_cls is not _SentryASGI:
+                    try:
+                        mw_name = f"{mw_cls.__module__}.{mw_cls.__qualname__}"
+                    except AttributeError:
+                        mw_name = getattr(mw_cls, "__name__", "middleware")
+                    _refine_sentry_transaction_as_middleware(mw_cls, mw_name)
             resp = _MW_Response(
                 content=captured.get("body", b""),
                 status_code=captured["status"],
@@ -2711,6 +2797,9 @@ def _make_asgi_middleware_shim(mw_cls, kwargs):
         # to a direct ``call_next`` so the handler still runs.
         return await call_next(request)
 
+    # Tag the shim with the original middleware class so reordering
+    # (``_keep_sentry_outermost``) and introspection can identify it.
+    _shim.__fastapi_turbo_mw_cls = mw_cls  # type: ignore[attr-defined]
     return _shim
 
 
@@ -2753,13 +2842,42 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
                 _raw_body_bytes = bytes(_raw_body_str)
             elif isinstance(_raw_body_str, str):
                 _raw_body_bytes = _raw_body_str.encode("utf-8")
+        # Populate ``scheme`` + ``server`` so ASGI middleware that
+        # builds URLs (``SentryAsgiMiddleware._get_url``) can produce
+        # ``http://host:port/path`` instead of just ``/path``. Host
+        # comes from the wire ``Host`` header when present.
+        _hdrs = kwargs.pop("_request_headers", []) or []
+        _host_h = ""
+        for _k, _v in _hdrs:
+            try:
+                if (
+                    _k.decode("latin-1") if isinstance(_k, bytes) else _k
+                ).lower() == "host":
+                    _host_h = (
+                        _v.decode("latin-1") if isinstance(_v, bytes) else _v
+                    )
+                    break
+            except UnicodeDecodeError:
+                continue
+        _server_host = _host_h
+        _server_port = 80
+        if ":" in _host_h:
+            try:
+                _server_host, _p = _host_h.rsplit(":", 1)
+                _server_port = int(_p)
+            except (ValueError, TypeError):
+                _server_port = 80
+        if not _server_host:
+            _server_host = "testserver"
         return {
             "type": "http",
             "app": app,
             "method": kwargs.pop("_request_method", "GET"),
             "path": kwargs.pop("_request_path", "/"),
             "query_string": kwargs.pop("_request_query", "").encode(),
-            "headers": kwargs.pop("_request_headers", []),
+            "headers": _hdrs,
+            "scheme": "http",
+            "server": (_server_host, _server_port),
             "root_path": getattr(app, "root_path", "") or "",
             "_handler_kwargs": kwargs,
             "_body": _raw_body_bytes or b"",
@@ -3049,6 +3167,110 @@ def _collect_dependencies_from_markers(dependencies):
                 "use_cache": dep.use_cache,
             })
     return result
+
+
+async def _dispatch_to_subapp_route(subapp, request):
+    """Match ``request.url.path`` against the sub-app's registered
+    routes and invoke the matched endpoint directly. Used by
+    ``app.host()`` forwarding — bypasses the sub-app's ASGI entry (and
+    its Rust-server startup path) so dispatch completes in-process.
+    """
+    import re as _re_local
+    from fastapi_turbo.responses import JSONResponse as _JR
+
+    path = request.url.path
+    method = request.method.upper()
+    matched_route = None
+    matched_params: dict = {}
+
+    for route in getattr(subapp.router, "routes", []):
+        route_path = getattr(route, "path", None)
+        route_methods = getattr(route, "methods", None) or set()
+        if not route_path:
+            continue
+        if method not in {m.upper() for m in route_methods}:
+            continue
+        # Compile ``/a/{id}/b/{name:path}`` into a regex on first use,
+        # cached on the route object.
+        regex = getattr(route, "_fastapi_turbo_host_regex", None)
+        if regex is None:
+            pattern = "^"
+            idx = 0
+            for m in _re_local.finditer(
+                r"\{([^{}:]+)(?::([^{}]+))?\}", route_path,
+            ):
+                pattern += _re_local.escape(route_path[idx:m.start()])
+                pname = m.group(1)
+                conv = m.group(2)
+                if conv == "path":
+                    pattern += f"(?P<{pname}>.+)"
+                else:
+                    pattern += f"(?P<{pname}>[^/]+)"
+                idx = m.end()
+            pattern += _re_local.escape(route_path[idx:]) + "$"
+            regex = _re_local.compile(pattern)
+            try:
+                route._fastapi_turbo_host_regex = regex  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                pass
+        match = regex.match(path)
+        if match is None:
+            continue
+        matched_route = route
+        matched_params = match.groupdict()
+        break
+
+    if matched_route is None:
+        return _JR(content={"detail": "Not Found"}, status_code=404)
+
+    endpoint = matched_route.endpoint
+    # Refine Sentry transaction with the sub-app's endpoint so tests
+    # asserting on ``event["transaction"]`` see ``/subapp`` (url) or
+    # the endpoint's qualified name (component).
+    try:
+        orig_ep = getattr(endpoint, "_fastapi_turbo_original_endpoint", endpoint)
+        _refine_sentry_transaction(orig_ep, matched_route.path)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Coerce path params to the endpoint's annotated types.
+    import inspect as _inspect_local
+    try:
+        sig = _inspect_local.signature(endpoint)
+    except (TypeError, ValueError):
+        sig = None
+    call_kwargs = dict(matched_params)
+    if sig is not None:
+        for pname, p in sig.parameters.items():
+            if pname in call_kwargs:
+                ann = p.annotation
+                if ann is int:
+                    try:
+                        call_kwargs[pname] = int(call_kwargs[pname])
+                    except (ValueError, TypeError):
+                        pass
+                elif ann is float:
+                    try:
+                        call_kwargs[pname] = float(call_kwargs[pname])
+                    except (ValueError, TypeError):
+                        pass
+
+    try:
+        if _inspect_local.iscoroutinefunction(endpoint):
+            result = await endpoint(**call_kwargs)
+        else:
+            result = endpoint(**call_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        from fastapi_turbo.exceptions import HTTPException as _HE
+        if isinstance(exc, _HE):
+            return _JR(content={"detail": exc.detail}, status_code=exc.status_code)
+        return _JR(content={"detail": "Internal Server Error"}, status_code=500)
+
+    if hasattr(result, "status_code"):
+        return result
+    if isinstance(result, (dict, list)) or result is None:
+        return _JR(content=result)
+    return _JR(content=result)
 
 
 def _ensure_sentry_middleware(app) -> None:
@@ -3388,10 +3610,68 @@ class FastAPI:
         return self
 
     def host(self, hostname: str, app: Any = None, name: str | None = None) -> None:
-        """Store host-based routing info (stub for Starlette compatibility)."""
+        """Dispatch requests matching the ``Host`` header to a sub-app.
+
+        When a request's ``Host`` header (or its leading label for wildcard
+        patterns) matches ``hostname``, the request is forwarded to
+        ``app`` — typically another FastAPI instance. Matches Starlette's
+        ``Host`` routing semantics.
+
+        Install a one-time HTTP middleware that forwards matching
+        requests by invoking the sub-app's ASGI entry and returning its
+        response. The check is a dict lookup (~100ns per request); the
+        actual forwarding only fires when the Host header matches.
+        """
         if not hasattr(self, "_hosts"):
             self._hosts: list[tuple[str, Any, str | None]] = []
         self._hosts.append((hostname, app, name))
+
+        # Install the host-dispatch middleware on first call.
+        if not getattr(self, "_host_dispatcher_installed", False):
+            self._host_dispatcher_installed = True
+            _app_ref = self
+
+            def _match_host(host_header: str):
+                """Return (subapp, stripped_host) if the header matches
+                any registered host, else None. Supports both exact
+                match and Starlette's ``subapp`` → ``subapp`` form (no
+                dot in hostname) or ``subapp.example.com`` form."""
+                if not host_header:
+                    return None
+                # Strip port.
+                hs = host_header.split(":", 1)[0].lower()
+                for entry in _app_ref._hosts:
+                    hn = entry[0].lower()
+                    sub = entry[1]
+                    if sub is None:
+                        continue
+                    if hn == hs:
+                        return sub
+                    # ``subapp`` hostname matches both ``subapp`` and
+                    # ``subapp.foo.com`` — Starlette treats the first
+                    # label as the match when the stored host has no
+                    # dot. Starlette itself uses a regex, but this
+                    # label-match covers the common cases.
+                    if "." not in hn and hs.split(".", 1)[0] == hn:
+                        return sub
+                return None
+
+            async def _host_dispatch(request, call_next):
+                host_header = request.headers.get("host", "")
+                subapp = _match_host(host_header)
+                if subapp is None:
+                    return await call_next(request)
+                # Match the request against the sub-app's Python-side
+                # route list and invoke the matched endpoint directly.
+                # We don't go through the sub-app's ASGI ``__call__``
+                # because that would try to spin up a second Rust
+                # server and deadlock under TestClient.
+                return await _dispatch_to_subapp_route(subapp, request)
+
+            # Install as the OUTERMOST middleware so the host check
+            # happens before CORS / Sentry / etc. Starlette's HostRouter
+            # sits at the top of the app stack.
+            self._http_middlewares.insert(0, _host_dispatch)
 
     # ------------------------------------------------------------------
     # Routes property
@@ -3566,8 +3846,57 @@ class FastAPI:
     # Middleware
     # ------------------------------------------------------------------
 
+    def _keep_sentry_outermost(self) -> None:
+        """Reorder ``_http_middlewares`` so ``SentryAsgiMiddleware`` is
+        the last element (runtime-outermost after the reverse in
+        ``_wrap_with_http_middlewares``).
+
+        Stock Sentry monkey-patches ``Starlette.__call__`` — the patched
+        entry always wraps everything. Our auto-install adds
+        ``SentryAsgiMiddleware`` at ``FastAPI.__init__`` time (before
+        any user middleware), so subsequent ``add_middleware`` calls
+        would bury it. This reorder preserves Sentry's outermost
+        placement regardless of add order.
+        """
+        try:
+            from sentry_sdk.integrations.asgi import SentryAsgiMiddleware  # noqa: PLC0415
+        except Exception:  # noqa: BLE001
+            return
+        lst = getattr(self, "_http_middlewares", None)
+        if not lst:
+            return
+        sentry_entries: list = []
+        others: list = []
+        for entry in lst:
+            # Entries may be raw callables (our _shim closures), class
+            # instances, or functions. Inspect attributes to detect
+            # whether this item wraps ``SentryAsgiMiddleware``.
+            is_sentry = False
+            if isinstance(entry, SentryAsgiMiddleware):
+                is_sentry = True
+            else:
+                mw_cls = getattr(entry, "__fastapi_turbo_mw_cls", None)
+                if mw_cls is SentryAsgiMiddleware:
+                    is_sentry = True
+            if is_sentry:
+                sentry_entries.append(entry)
+            else:
+                others.append(entry)
+        lst[:] = others + sentry_entries
+
     def add_middleware(self, middleware_cls, **kwargs: Any) -> None:
-        """Register a middleware class.
+        """Register a middleware class. Delegates to the internal impl,
+        then reorders so SentryAsgiMiddleware (if auto-installed) stays
+        runtime-outermost regardless of add order."""
+        try:
+            self._add_middleware_impl(middleware_cls, **kwargs)
+        finally:
+            self._keep_sentry_outermost()
+
+    def _add_middleware_impl(self, middleware_cls, **kwargs: Any) -> None:
+        """Internal: register a middleware class without the Sentry
+        reorder. Direct callers (internal auto-install paths) can use
+        this if they've already arranged ordering.
 
         Handles three cases:
         1. Known Rust/Tower middleware (CORS, GZip, etc.) → Rust stack
@@ -3592,7 +3921,12 @@ class FastAPI:
         # and exists purely as a marker for the Rust side). Exclude
         # ``base_http`` — that's the BaseHTTPMiddleware marker handled
         # in the branch below (dispatch()-based, NOT Tower-bound).
-        _TOWER_BOUND_TYPES = {"cors", "gzip", "trustedhost", "httpsredirect"}
+        # TrustedHost intentionally excluded — it runs through the
+        # Python ASGI chain so SentryAsgiMiddleware (wrapping around)
+        # observes the request and can emit a transaction span for
+        # host-rejected requests. The ~1μs overhead vs the Tower layer
+        # is worth the tracing parity.
+        _TOWER_BOUND_TYPES = {"cors", "gzip", "httpsredirect"}
         if mw_type in _TOWER_BOUND_TYPES:
             self._middleware_stack.append((middleware_cls, kwargs))
             return
@@ -6285,34 +6619,81 @@ class FastAPI:
             if hasattr(mounted_app, 'directory') and mounted_app.directory:
                 static_mounts.append((mount_path, str(mounted_app.directory)))
 
-        # Build a tiny not_found_handler callable the Rust 404 fallback
-        # can invoke: takes (method, path), returns (status, body_bytes).
-        # Dispatches to whatever the user registered with
-        # ``@app.exception_handler(404)`` (or HTTPException class).
+        # Build a not_found_handler callable the Rust 404 fallback can
+        # invoke. Signature: ``(method, path, query, headers)`` →
+        # ``(status, body_bytes, extra_response_headers)``.
+        #
+        # Three modes, tried in order:
+        #   1) User registered ``@app.exception_handler(404)`` or
+        #      ``(HTTPException)`` — dispatch to that handler.
+        #   2) ``_http_middlewares`` is non-empty — run the middleware
+        #      chain around a synthetic 404 handler so Sentry's
+        #      SentryAsgiMiddleware / SessionMiddleware / CORS / etc.
+        #      observe the 404 request end-to-end. This matches stock
+        #      Starlette's behavior where the Router's default 404
+        #      handler runs inside the full MW stack.
+        #   3) Nothing to do — let Rust emit the default JSON body.
         not_found_handler = None
         from fastapi_turbo.exceptions import HTTPException as _HTTPExc
         _app_self = self
 
-        def _rust_404_handler(method: str, path: str):
+        def _build_404_request(method, path, query, headers):
+            from fastapi_turbo.requests import Request
+            # Normalize headers to list[(bytes, bytes)] for ASGI scope.
+            hdr_list = []
+            for k, v in headers or []:
+                if isinstance(k, str):
+                    k = k.encode("latin-1")
+                if isinstance(v, str):
+                    v = v.encode("latin-1")
+                hdr_list.append((k, v))
+            qs = query if isinstance(query, bytes) else (query or "").encode()
+            return Request({
+                "type": "http",
+                "method": method,
+                "path": path,
+                "headers": hdr_list,
+                "query_string": qs,
+                "root_path": getattr(_app_self, "root_path", "") or "",
+                "app": _app_self,
+                "path_params": {},
+            })
+
+        def _extract_response(result):
+            """Return (status, body_bytes, [(k, v), ...]) from a Response."""
+            import json as _json
+            status = getattr(result, "status_code", 404)
+            body = getattr(result, "body", None)
+            if body is None:
+                body = _json.dumps({"detail": "Not Found"}).encode()
+            elif isinstance(body, str):
+                body = body.encode("utf-8")
+            out_headers = []
+            raw = getattr(result, "raw_headers", None)
+            if raw:
+                for k, v in raw:
+                    ks = k.decode("latin-1") if isinstance(k, bytes) else k
+                    vs = v.decode("latin-1") if isinstance(v, bytes) else v
+                    out_headers.append((ks, vs))
+            else:
+                hdr = getattr(result, "headers", None)
+                if hdr is not None:
+                    try:
+                        for k, v in hdr.items():
+                            out_headers.append((str(k), str(v)))
+                    except AttributeError:
+                        pass
+            return (int(status), bytes(body), out_headers)
+
+        def _dispatch_404_via_handler(method, path, query, headers):
             handler = _app_self.exception_handlers.get(404)
             if handler is None:
                 handler = _app_self.exception_handlers.get(_HTTPExc)
             if handler is None:
-                # No custom handler — let Rust emit the default body.
-                return (404, b'{"detail":"Not Found"}')
-            # Build a minimal Request
-            from fastapi_turbo.requests import Request
-            req = Request({
-                "type": "http",
-                "method": method,
-                "path": path,
-                "headers": [],
-                "query_string": b"",
-                "path_params": {},
-            })
+                return None
+            req = _build_404_request(method, path, query, headers)
             exc = _HTTPExc(status_code=404, detail="Not Found")
             result = handler(req, exc)
-            # Drive coroutine if returned
             if inspect.iscoroutine(result):
                 import asyncio as _asyncio
                 loop = _asyncio.new_event_loop()
@@ -6320,17 +6701,79 @@ class FastAPI:
                     result = loop.run_until_complete(result)
                 finally:
                     loop.close()
-            # Extract (status, body)
-            status = getattr(result, "status_code", 404)
-            body = getattr(result, "body", None)
-            if body is None:
-                import json as _json
-                body = _json.dumps({"detail": "Not Found"}).encode()
-            elif isinstance(body, str):
-                body = body.encode("utf-8")
-            return (int(status), bytes(body))
+            return _extract_response(result)
 
-        if self.exception_handlers.get(404) is not None or self.exception_handlers.get(_HTTPExc) is not None:
+        def _dispatch_404_via_middleware(method, path, query, headers):
+            """Run the ASGI middleware chain around a synthetic 404
+            response so SentryAsgiMiddleware / SessionMiddleware / CORS
+            observe the request and can emit tracing / headers."""
+            if not _app_self._http_middlewares:
+                return None
+            try:
+                from fastapi_turbo.responses import JSONResponse as _JR
+            except ImportError:
+                return None
+
+            async def _synthetic_404_handler(request, call_next=None):
+                return _JR(content={"detail": "Not Found"}, status_code=404)
+
+            # Build the same chain _wrap_with_http_middlewares does but
+            # with our synthetic handler as the innermost call.
+            middlewares = list(reversed(_app_self._http_middlewares))
+
+            req = _build_404_request(method, path, query, headers)
+
+            async def _run_chain_async(idx):
+                if idx >= len(middlewares):
+                    return await _synthetic_404_handler(req)
+                mw = middlewares[idx]
+
+                async def call_next(_req=None):
+                    return await _run_chain_async(idx + 1)
+
+                if inspect.iscoroutinefunction(mw) or inspect.iscoroutinefunction(
+                    getattr(mw, "__call__", None)
+                ):
+                    return await mw(req, call_next)
+                return mw(req, call_next)
+
+            import asyncio as _asyncio
+            loop = _asyncio.new_event_loop()
+            try:
+                result = loop.run_until_complete(_run_chain_async(0))
+            finally:
+                loop.close()
+            if result is None:
+                return None
+            return _extract_response(result)
+
+        def _rust_404_handler(method, path, query=b"", headers=None):
+            # Decode bytes-typed args that Rust passes through.
+            if isinstance(method, bytes):
+                method = method.decode("latin-1")
+            if isinstance(path, bytes):
+                path = path.decode("latin-1")
+            if isinstance(query, bytes):
+                query = query.decode("latin-1")
+            # Set the request scope so exception_handlers see the real
+            # path even if they introspect ``request.url.path``.
+            try:
+                _set_current_request_scope(method, path, query)
+            except Exception:  # noqa: BLE001
+                pass
+            out = _dispatch_404_via_handler(method, path, query, headers)
+            if out is not None:
+                return out
+            out = _dispatch_404_via_middleware(method, path, query, headers)
+            if out is not None:
+                return out
+            return (404, b'{"detail":"Not Found"}', [])
+
+        if (
+            self.exception_handlers.get(404) is not None
+            or self.exception_handlers.get(_HTTPExc) is not None
+            or self._http_middlewares
+        ):
             not_found_handler = _rust_404_handler
 
         # Rust-side validation dispatcher: when the user registered

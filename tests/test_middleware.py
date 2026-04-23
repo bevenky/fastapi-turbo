@@ -286,17 +286,35 @@ def test_build_middleware_config():
 
 
 def test_build_middleware_config_trustedhost():
-    """_build_middleware_config handles TrustedHostMiddleware."""
+    """TrustedHostMiddleware routes through the Python ASGI chain (not
+    Tower) so Sentry / other ASGI middleware can wrap around it and
+    observe host-rejected requests. Functional check: an installed
+    TrustedHostMiddleware actually rejects disallowed hosts."""
     from fastapi_turbo import FastAPI
     from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
+    from fastapi_turbo.testclient import TestClient
 
     app = FastAPI()
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["example.com", "*.example.com"])
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["example.com", "*.example.com"],
+    )
 
+    @app.get("/x")
+    def x():
+        return {"ok": 1}
+
+    # Tower layer is no longer wired, so _build_middleware_config
+    # shouldn't include it.
     config = app._build_middleware_config()
-    assert len(config) == 1
-    assert config[0]["type"] == "trustedhost"
-    assert config[0]["allowed_hosts"] == ["example.com", "*.example.com"]
+    assert not any(c.get("type") == "trustedhost" for c in config)
+
+    # Functional: disallowed host returns 400.
+    with TestClient(app, base_url="http://evil.com") as cli:
+        assert cli.get("/x").status_code == 400
+    # Allowed host passes through.
+    with TestClient(app, base_url="http://example.com") as cli:
+        assert cli.get("/x").status_code == 200
 
 
 def test_build_middleware_config_httpsredirect():

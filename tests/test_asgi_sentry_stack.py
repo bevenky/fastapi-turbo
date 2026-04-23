@@ -249,15 +249,32 @@ def test_sentry_captures_error_and_transactions(sentry_capture):
         elif (j.get("exception") or {}).get("values"):
             errors.append(j)
 
+    # Transaction names are now full URLs (SentryAsgiMiddleware default)
+    # because our ASGI scope populates scheme+server. Accept either
+    # form.
     tx_paths = {t.get("transaction") for t in transactions}
-    assert "/health" in tx_paths
-    assert "/missing" in tx_paths
-    assert "/boom" in tx_paths
+
+    def _matches(name, path):
+        return name == path or name.endswith(path)
+
+    assert any(_matches(n, "/health") for n in tx_paths), tx_paths
+    assert any(_matches(n, "/missing") for n in tx_paths), tx_paths
+    assert any(_matches(n, "/boom") for n in tx_paths), tx_paths
 
     # Status code mapping
-    by_path = {t.get("transaction"): t for t in transactions}
-    assert (by_path["/missing"].get("contexts") or {}).get("trace", {}).get("status") == "not_found"
-    assert (by_path["/boom"].get("contexts") or {}).get("trace", {}).get("status") == "internal_error"
+    by_path_suffix = {}
+    for t in transactions:
+        n = t.get("transaction") or ""
+        for suf in ("/missing", "/boom", "/health"):
+            if n.endswith(suf):
+                by_path_suffix[suf] = t
+                break
+    assert (by_path_suffix["/missing"].get("contexts") or {}).get("trace", {}).get(
+        "status"
+    ) == "not_found"
+    assert (by_path_suffix["/boom"].get("contexts") or {}).get("trace", {}).get(
+        "status"
+    ) == "internal_error"
 
     # Error event for the /boom ValueError
     err_types = [

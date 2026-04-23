@@ -292,8 +292,25 @@ class TestClient:
         # request.url.scheme behave as Starlette does.
         _forced_scheme = (parsed.scheme or "http").lower()
 
+        # The URL-derived Host httpx sets automatically (connection
+        # netloc, e.g. ``127.0.0.1:61234``). Any value other than this
+        # or our synthesized one must have been caller-supplied via
+        # ``headers={"Host": ...}`` — preserve in that case so tests
+        # exercising Host-based routing / TrustedHost see the literal
+        # value they asked for.
+        _auto_host_url = httpx.URL(f"http://127.0.0.1:{self._port}").host
+        _auto_host_with_port = f"127.0.0.1:{self._port}"
+
         def _force_host(request: httpx.Request) -> None:
-            request.headers["host"] = _forced_host
+            current_host = request.headers.get("host", "")
+            is_auto = (
+                not current_host
+                or current_host == _forced_host
+                or current_host == _auto_host_url
+                or current_host == _auto_host_with_port
+            )
+            if is_auto:
+                request.headers["host"] = _forced_host
             if _forced_scheme == "https" and "x-forwarded-proto" not in request.headers:
                 request.headers["x-forwarded-proto"] = "https"
             # Starlette's TestClient uses ``user-agent: testclient`` — FA
