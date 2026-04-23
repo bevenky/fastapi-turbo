@@ -84,6 +84,7 @@ fn set_request_scope_ctxvar(
     method: &Option<String>,
     path: &Option<String>,
     query: &Option<String>,
+    state: &RouteState,
 ) {
     let func = SET_REQUEST_SCOPE.get_or_init(|| {
         py.import("fastapi_turbo.applications")
@@ -94,16 +95,41 @@ fn set_request_scope_ctxvar(
     if func.is_none(py) {
         return;
     }
-    // (method, path, query) — all Option<String>. None-safe: send py.None().
+
+    // Pull the user endpoint and route path off the RouteState for
+    // Sentry-style transaction refinement. The handler is a compiled
+    // wrapper; the original endpoint lives on its
+    // ``_fastapi_turbo_original_endpoint`` attribute (set at compile).
+    // Fall back to the wrapper itself if the original wasn't stashed.
+    let endpoint_obj = state.handler
+        .bind(py)
+        .getattr("_fastapi_turbo_original_endpoint")
+        .unwrap_or_else(|_| state.handler.bind(py).clone());
+    let route_path_opt: Option<String> = state
+        .route_obj
+        .as_ref()
+        .and_then(|r| r.bind(py).getattr("path").ok())
+        .and_then(|p| p.extract::<String>().ok());
+
     let m = method.as_deref().map(|s| pyo3::types::PyString::new(py, s));
     let p = path.as_deref().map(|s| pyo3::types::PyString::new(py, s));
     let q = query.as_deref().map(|s| pyo3::types::PyString::new(py, s));
+    let rp = route_path_opt
+        .as_deref()
+        .map(|s| pyo3::types::PyString::new(py, s));
+
+    let kwargs = pyo3::types::PyDict::new(py);
+    let _ = kwargs.set_item("endpoint", endpoint_obj);
+    if let Some(rp_str) = rp {
+        let _ = kwargs.set_item("route_path", rp_str);
+    }
+
     let args = (
         m.map(|b| b.into_any()).unwrap_or_else(|| py.None().into_bound(py)),
         p.map(|b| b.into_any()).unwrap_or_else(|| py.None().into_bound(py)),
         q.map(|b| b.into_any()).unwrap_or_else(|| py.None().into_bound(py)),
     );
-    let _ = func.bind(py).call1(args);
+    let _ = func.bind(py).call(args, Some(&kwargs));
 }
 
 /// Inject request metadata (method, path, query, headers) into kwargs for
@@ -1485,7 +1511,7 @@ async fn handle_request(
             if state.has_http_middleware {
                 // Middleware wrapper needs metadata kwargs
                 return Python::attach(|py| {
-                    set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query);
+                    set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
                     let kwargs = PyDict::new(py);
                     if state.has_http_middleware {
                         inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
@@ -1506,7 +1532,7 @@ async fn handle_request(
             }
             // Ultra-fast path: zero-param, no middleware
             return Python::attach(|py| {
-                set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query);
+                set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
                 match state.handler.call0(py) {
                     Ok(py_result) => py_to_response_with_request(py, py_result.bind(py), range_header.as_deref()),
                     Err(py_err) => pyerr_to_response(py, &py_err),
@@ -1517,7 +1543,7 @@ async fn handle_request(
         // Sync handler with params — use block_in_place for GIL-safe concurrency
         return tokio::task::block_in_place(|| {
             Python::attach(|py| {
-                set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query);
+                set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
                 let body_json_opt = if state.has_body_params { body_json.as_ref() } else { None };
                 let kwargs = match extract_params_to_pydict_full(
                     py, &state.params, &path_map, &query_params, &query_multi,
@@ -1569,7 +1595,7 @@ async fn handle_request(
     if state.is_async {
         return tokio::task::block_in_place(|| {
             Python::attach(|py| {
-                set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query);
+                set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
                 // Build kwargs from params
                 let body_json_opt = if state.has_body_params { body_json.as_ref() } else { None };
 
@@ -1678,7 +1704,7 @@ async fn handle_request(
     // === Unified path: sync handlers with dependencies ===
     let resp = tokio::task::block_in_place(|| {
         Python::attach(|py| -> Response {
-            set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query);
+            set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
             let mut resolved: HashMap<String, Py<PyAny>> = HashMap::new();
             let mut dep_cache: HashMap<u64, String> = HashMap::new();
 

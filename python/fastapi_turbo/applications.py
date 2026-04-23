@@ -24,13 +24,18 @@ def _set_current_request_scope(
     method: str | None,
     path: str | None,
     query_string: str | None,
+    endpoint=None,
+    route_path: str | None = None,
 ) -> None:
     """Populate the per-request ContextVar so exception handlers can see
     the real request path/method via ``request.url.path``.
 
     Called from the Rust bridge once per request (before the user
-    handler dispatches). Handler wrappers also refresh this if they
-    later construct a proper ASGI scope with more fields.
+    handler dispatches). When ``endpoint`` and ``route_path`` are
+    supplied, also refines any active Sentry transaction name from
+    URL-source to route/endpoint source — mirrors what Sentry's
+    ``patch_get_request_handler`` hook would do if our router called
+    ``fastapi.routing.get_request_handler``.
     """
     scope = {
         "type": "http",
@@ -42,7 +47,227 @@ def _set_current_request_scope(
         scope["raw_path"] = path.encode("latin-1")
     if query_string is not None:
         scope["query_string"] = query_string.encode("latin-1")
+    if endpoint is not None:
+        scope["endpoint"] = endpoint
+    if route_path is not None:
+        scope["route"] = _RouteScope(route_path, endpoint=endpoint)
     _current_request_scope.set(scope)
+
+    if endpoint is not None or route_path is not None:
+        _refine_sentry_transaction(endpoint, route_path)
+
+
+def _maybe_install_sentry_request_event_processor(kwargs) -> None:
+    """Attach a Sentry scope event processor that enriches captured
+    events with the current request's body + cookies (scrubbed by
+    Sentry's default data-scrubber). Mirrors stock FastAPI's
+    ``patch_get_request_handler`` extractor flow, which doesn't fire
+    for us because the Rust router doesn't call
+    ``fastapi.routing.get_request_handler``.
+    """
+    try:
+        import sentry_sdk  # noqa: PLC0415
+    except ImportError:
+        return
+    try:
+        client = sentry_sdk.get_client()
+        if not (client and getattr(client, "is_active", lambda: False)()):
+            return
+        from sentry_sdk.integrations.starlette import StarletteIntegration  # noqa: PLC0415
+        if client.get_integration(StarletteIntegration) is None:
+            try:
+                from sentry_sdk.integrations.fastapi import FastApiIntegration  # noqa: PLC0415
+                if client.get_integration(FastApiIntegration) is None:
+                    return
+            except Exception:  # noqa: BLE001
+                return
+    except Exception:  # noqa: BLE001
+        return
+
+    # Recover body / cookies / headers from the kwargs Rust handed us.
+    raw_body = kwargs.get("__fastapi_turbo_raw_body_bytes__")
+    if raw_body is None:
+        raw_body_str = kwargs.get("__fastapi_turbo_raw_body_str__")
+        if isinstance(raw_body_str, (bytes, bytearray)):
+            raw_body = bytes(raw_body_str)
+        elif isinstance(raw_body_str, str):
+            raw_body = raw_body_str.encode("utf-8")
+    hdr_list = kwargs.get("_request_headers") or []
+    cookies: dict = {}
+    for k, v in hdr_list or []:
+        try:
+            kstr = k.decode("latin-1") if isinstance(k, bytes) else k
+            vstr = v.decode("latin-1") if isinstance(v, bytes) else v
+        except Exception:  # noqa: BLE001
+            continue
+        if kstr.lower() == "cookie":
+            from http.cookies import SimpleCookie  # noqa: PLC0415
+            jar = SimpleCookie()
+            try:
+                jar.load(vstr)
+                for ck, morsel in jar.items():
+                    cookies[ck] = morsel.value
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _processor(event, hint):
+        request_info = event.get("request") or {}
+        # Body: try to parse as JSON, fall back to raw string. Sentry's
+        # scrubber runs on the dict keys next (``password`` / ``token``
+        # / ``authorization`` get filtered before the event is sent).
+        if raw_body:
+            try:
+                import json as _json  # noqa: PLC0415
+                parsed = _json.loads(raw_body.decode("utf-8"))
+                request_info["data"] = parsed
+            except Exception:  # noqa: BLE001
+                try:
+                    request_info["data"] = raw_body.decode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    pass
+        if cookies:
+            request_info["cookies"] = cookies
+        event["request"] = request_info
+        return event
+
+    try:
+        sentry_sdk.get_isolation_scope().add_event_processor(_processor)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _maybe_sentry_capture_failed_request(exc) -> None:
+    """Mirror Sentry's StarletteIntegration ``failed_request_status_codes``
+    behaviour for HTTPException raised from a handler.
+
+    Stock Starlette routes the exception through ExceptionMiddleware,
+    which Sentry monkey-patches to emit an event when the status is in
+    the configured set. Our dispatch converts HTTPException to a JSON
+    response directly, so Sentry's patch never fires. Emit the event
+    ourselves when the integration's list matches.
+    """
+    if exc is None:
+        return
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        return
+    try:
+        import sentry_sdk  # noqa: PLC0415
+    except ImportError:
+        return
+    try:
+        client = sentry_sdk.get_client()
+        if not (client and getattr(client, "is_active", lambda: False)()):
+            return
+        from sentry_sdk.integrations.starlette import StarletteIntegration  # noqa: PLC0415
+        integration = client.get_integration(StarletteIntegration)
+        if integration is None:
+            return
+        codes = getattr(integration, "failed_request_status_codes", None)
+        if codes is None:
+            return
+        if status not in codes:
+            return
+        try:
+            sentry_sdk.capture_exception(exc)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _refine_sentry_transaction(endpoint, route_path: str | None) -> None:
+    """Ask Sentry to re-label the current transaction from URL source to
+    route/endpoint source. No-op when Sentry isn't active.
+    """
+    try:
+        import sentry_sdk  # noqa: PLC0415
+    except ImportError:
+        return
+    try:
+        client = sentry_sdk.get_client()
+        if not (client and getattr(client, "is_active", lambda: False)()):
+            return
+    except Exception:  # noqa: BLE001
+        return
+    integration = None
+    try:
+        from sentry_sdk.integrations.fastapi import FastApiIntegration  # noqa: PLC0415
+        integration = client.get_integration(FastApiIntegration)
+    except Exception:  # noqa: BLE001
+        pass
+    if integration is None:
+        try:
+            from sentry_sdk.integrations.starlette import StarletteIntegration  # noqa: PLC0415
+            integration = client.get_integration(StarletteIntegration)
+        except Exception:  # noqa: BLE001
+            return
+    if integration is None:
+        return
+    style = getattr(integration, "transaction_style", "url")
+    name = ""
+    if style == "endpoint" and endpoint is not None:
+        try:
+            from sentry_sdk.utils import transaction_from_function  # noqa: PLC0415
+            name = transaction_from_function(endpoint) or ""
+        except Exception:  # noqa: BLE001
+            name = getattr(endpoint, "__name__", "") or ""
+    elif style == "url" and route_path is not None:
+        name = route_path
+    if not name:
+        return
+    try:
+        from sentry_sdk.tracing import SOURCE_FOR_STYLE  # noqa: PLC0415
+        source = SOURCE_FOR_STYLE.get(style)
+    except Exception:  # noqa: BLE001
+        source = None
+    try:
+        sentry_scope = sentry_sdk.get_current_scope()
+        if source is not None:
+            sentry_scope.set_transaction_name(name, source=source)
+        else:
+            sentry_scope.set_transaction_name(name)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+class _RouteScope:
+    """Lightweight route-like object with a ``.path`` attribute.
+
+    Sentry's ``StarletteIntegration`` reads ``request.scope["route"].path``
+    for URL-style transaction naming. Our compiled route state doesn't
+    match Starlette's Route class, so we wrap the path in this stub
+    when populating the request scope.
+    """
+
+    __slots__ = ("path", "name", "endpoint")
+
+    def __init__(self, path: str, name: str | None = None, endpoint=None):
+        self.path = path
+        self.name = name
+        self.endpoint = endpoint
+
+
+def _refine_request_scope_for_route(endpoint, route_path: str | None) -> None:
+    """Stamp ``endpoint`` and ``route`` onto the current request scope AND
+    refresh Sentry's transaction name if a Sentry client is active.
+
+    Called from the top of each compiled handler wrapper — at that
+    point we know which route matched, so Sentry can switch from a
+    URL-source transaction (set by ``SentryAsgiMiddleware``) to a
+    route-source one (``/items/{item_id}``) or endpoint-source
+    (``package.module.handler_fn``).
+    """
+    scope = _current_request_scope.get()
+    if scope is None:
+        scope = {"type": "http"}
+    scope = dict(scope)
+    if endpoint is not None:
+        scope["endpoint"] = endpoint
+    if route_path is not None:
+        scope["route"] = _RouteScope(route_path, endpoint=endpoint)
+    _current_request_scope.set(scope)
+    _refine_sentry_transaction(endpoint, route_path)
 
 from fastapi_turbo._introspect import introspect_endpoint
 from fastapi_turbo._openapi import generate_openapi_schema
@@ -907,8 +1132,15 @@ def _try_compile_handler(
                 handler_func = _make_sync_wrapper(handler_func, for_handler=True)
 
             _app_ref = app
+            _route_path_for_scope = path
+            _endpoint_for_scope = endpoint
 
             def _compiled_no_deps(**kwargs):
+                # Stamp endpoint/route onto the request scope so Sentry's
+                # ``_set_transaction_name_and_source`` switches from
+                # URL-based naming (``http://host/path``) to route-based
+                # (``/items/{item_id}``) or endpoint-based (``pkg.mod.fn``).
+                _refine_request_scope_for_route(_endpoint_for_scope, _route_path_for_scope)
                 # Drain any deferred extraction errors from Rust and
                 # surface them as a single 422 — matches FA's "one JSON
                 # body listing EVERY missing required field" behaviour
@@ -981,6 +1213,12 @@ def _try_compile_handler(
                     result = handler_func(**filtered)
                 except Exception as exc:
                     _maybe_print_debug_traceback(_app_ref, exc)
+                    # Sentry parity: HTTPException status codes in the
+                    # integration's ``failed_request_status_codes`` set
+                    # should emit events. Covers the no-custom-handler
+                    # path where ``_invoke_exception_handler`` isn't
+                    # reached.
+                    _maybe_sentry_capture_failed_request(exc)
                     # Handler-response semantics (Starlette parity):
                     #   - specific exception class handled → NOT re-raised
                     #   - ``Exception`` catch-all handled → still re-raised
@@ -1064,6 +1302,7 @@ def _try_compile_handler(
                 _close_upload_files(filtered)
                 return result
 
+            _compiled_no_deps._fastapi_turbo_original_endpoint = endpoint  # type: ignore[attr-defined]
             _compiled_no_deps._fastapi_turbo_defers_extraction_errors = True  # type: ignore[attr-defined]
             # Expose the endpoint-context dict so the mount-prefix path
             # patcher (``_collect_all_routes``) can rewrite ``ctx["path"]``
@@ -1272,6 +1511,9 @@ def _try_compile_handler(
             break
 
     def _compiled(**kwargs):
+        # Stamp endpoint/route onto the request scope so Sentry can
+        # refine transaction names from URL to route / endpoint style.
+        _refine_request_scope_for_route(endpoint, path)
         # FastAPI semantics: a ``Depends(...)`` that raises
         # ``HTTPException`` short-circuits BEFORE parameter validation
         # errors surface. Rust collects extraction errors and stashes
@@ -1762,6 +2004,7 @@ def _try_compile_handler(
     # consume a deferred extraction-errors blob, so Rust should stash
     # (not raise) 422s and let dep bodies run first — matching FA's
     # "HTTPException from Depends wins over param validation" rule.
+    _compiled._fastapi_turbo_original_endpoint = endpoint  # type: ignore[attr-defined]
     _compiled._fastapi_turbo_defers_extraction_errors = True  # type: ignore[attr-defined]
     # Mount-prefix patching hook — see ``_compiled_no_deps``.
     _compiled._fastapi_turbo_endpoint_ctx = _endpoint_ctx  # type: ignore[attr-defined]
@@ -1835,6 +2078,9 @@ def _try_compile_handler(
         _fp_endpoint = _orig_endpoint  # the true async handler
 
         def _compiled_fast(**kwargs):
+            # Stamp endpoint/route onto the request scope so Sentry can
+            # refine transaction names from URL to route / endpoint style.
+            _refine_request_scope_for_route(endpoint, path)
             # Runtime escape hatches — fall back to the generic path.
             if _app is not None and _app.dependency_overrides:
                 return _compiled(**kwargs)
@@ -2047,6 +2293,7 @@ def _try_compile_handler(
             finally:
                 pass
 
+        _compiled_fast._fastapi_turbo_original_endpoint = endpoint  # type: ignore[attr-defined]
         _compiled_fast._fastapi_turbo_defers_extraction_errors = True  # type: ignore[attr-defined]
         _compiled_fast._fastapi_turbo_endpoint_ctx = _endpoint_ctx  # type: ignore[attr-defined]
         return _compiled_fast
@@ -2363,7 +2610,32 @@ def _make_asgi_middleware_shim(mw_cls, kwargs):
             # Pass the resulting response through to ``send`` so the
             # middleware sees it (headers etc. can be mutated by nesting
             # middlewares).
-            resp = await call_next(request)
+            try:
+                resp = await call_next(request)
+            except BaseException:
+                # The handler raised a non-HTTPException. Starlette's
+                # ``ServerErrorMiddleware`` would emit a 500 response via
+                # ``send`` before the exception propagates, letting the
+                # outer ASGI middlewares (e.g. ``SentryAsgiMiddleware``)
+                # observe the status code in their wrapped ``send`` and
+                # stamp ``transaction.status = internal_error``. Mirror
+                # that pattern: emit the 500 frames, then re-raise.
+                try:
+                    await send({
+                        "type": "http.response.start",
+                        "status": 500,
+                        "headers": [
+                            (b"content-type", b"text/plain; charset=utf-8"),
+                        ],
+                    })
+                    await send({
+                        "type": "http.response.body",
+                        "body": b"Internal Server Error",
+                        "more_body": False,
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
             # Materialise our Response into ASGI messages.
             status = getattr(resp, "status_code", 200)
             raw_headers = getattr(resp, "raw_headers", None) or [
@@ -2495,6 +2767,27 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
 
     def _call_handler_sync(kwargs):
         """Run the underlying handler, returning a Response-normalized value."""
+        # Sentry transaction refinement — runs INSIDE any active
+        # ``SentryAsgiMiddleware`` ``with start_transaction(...)`` block,
+        # so set_transaction_name actually modifies the captured span.
+        # The earlier Rust-bridge call only wins for exception_handler
+        # request scope; transaction naming needs to happen here.
+        try:
+            _scope_now = _current_request_scope.get()
+            if _scope_now is not None:
+                _ep_now = _scope_now.get("endpoint")
+                _rt_now = _scope_now.get("route")
+                _rp_now = getattr(_rt_now, "path", None) if _rt_now is not None else None
+                if _ep_now is not None or _rp_now is not None:
+                    _refine_sentry_transaction(_ep_now, _rp_now)
+            # Attach a Sentry event processor that fills
+            # ``event["request"]["data"]`` (body) + ``cookies``. Stock
+            # Sentry does this in its patched get_request_handler; that
+            # patch is inert for us, so add the processor here where
+            # we're inside Sentry's isolation scope.
+            _maybe_install_sentry_request_event_processor(kwargs)
+        except Exception:  # noqa: BLE001
+            pass
         # Keep `_middleware_request` in kwargs (don't pop) so the compiled
         # handler can see it and defer yield-dep teardown onto the MW
         # wrapper's finally block — Starlette's ordering semantics.
@@ -2529,6 +2822,8 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
             _PRIVATE = {
                 "_middleware_request",
                 "__fastapi_turbo_extraction_errors__",
+                "__fastapi_turbo_raw_body_str__",
+                "__fastapi_turbo_raw_body_bytes__",
                 "_request_method",
                 "_request_path",
                 "_request_query",
@@ -2552,6 +2847,12 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
             raise
         except BaseException as exc:  # noqa: BLE001
             from fastapi_turbo.exceptions import HTTPException as _HTTPExc
+            # Sentry's ``failed_request_status_codes`` integration option
+            # expects events for HTTPExceptions whose status is in the
+            # configured set; stock Starlette fires these via
+            # ExceptionMiddleware. We convert the exception right here,
+            # so we have to trigger the capture ourselves.
+            _maybe_sentry_capture_failed_request(exc)
             if isinstance(exc, _HTTPExc):
                 # Build a JSONResponse with the exception's status/detail —
                 # matches Starlette's ExceptionMiddleware conversion.
@@ -2564,9 +2865,22 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
             elif app is not None and app.exception_handlers:
                 handled = app._invoke_exception_handler(exc)
                 if handled is None:
+                    # Capture so TestClient(raise_server_exceptions=True)
+                    # re-raises in the caller, matching Starlette's ASGI
+                    # test-client semantics.
+                    try:
+                        app._captured_server_exceptions.append(exc)
+                    except Exception:  # noqa: BLE001
+                        pass
                     raise
                 result = handled
             else:
+                # No custom handler — capture for TestClient re-raise.
+                if app is not None:
+                    try:
+                        app._captured_server_exceptions.append(exc)
+                    except Exception:  # noqa: BLE001
+                        pass
                 raise
         # Normalize raw handler return values into a ``Response`` before
         # the middleware chain sees them — FA's ExceptionMiddleware does
@@ -2657,6 +2971,16 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
                 request._pending_teardowns = []
 
     wrapped_sync._has_http_middleware = True
+    # Preserve the original user endpoint reference through the
+    # middleware wrapper so Sentry endpoint-style transaction naming
+    # (which calls ``transaction_from_function(endpoint)``) sees
+    # ``tests.foo._message`` instead of our wrapper's qualified name.
+    try:
+        wrapped_sync._fastapi_turbo_original_endpoint = getattr(  # type: ignore[attr-defined]
+            endpoint, "_fastapi_turbo_original_endpoint", endpoint,
+        )
+    except (AttributeError, TypeError):
+        pass
     return wrapped_sync
 
 
@@ -2725,6 +3049,104 @@ def _collect_dependencies_from_markers(dependencies):
                 "use_cache": dep.use_cache,
             })
     return result
+
+
+def _ensure_sentry_middleware(app) -> None:
+    """Auto-install ``SentryAsgiMiddleware`` when a Sentry client with
+    ``StarletteIntegration`` / ``FastApiIntegration`` is active.
+
+    Stock Starlette/FastAPI gets Sentry tracing via a monkey-patch of
+    ``Starlette.__call__``; our Rust HTTP server bypasses that entry,
+    so the patch would be inert. Doing an explicit ``add_middleware``
+    here routes the request through Sentry's ASGI wrapper via our
+    ASGI middleware chain instead — transactions and error events
+    flow end-to-end.
+
+    Idempotent and silent when Sentry isn't installed. Also called
+    lazily from ``_ensure_sentry_middleware_lazy`` on the first
+    request so ``sentry_sdk.init(...)`` after ``FastAPI(...)`` still
+    works.
+    """
+    if getattr(app, "_fastapi_turbo_sentry_installed", False):
+        return
+    try:
+        import sentry_sdk  # noqa: PLC0415
+    except ImportError:
+        return
+    try:
+        client = sentry_sdk.get_client()
+    except Exception:  # noqa: BLE001
+        return
+    if client is None or not getattr(client, "is_active", lambda: False)():
+        return
+    # Either integration triggers — StarletteIntegration is the parent,
+    # FastApiIntegration subclasses it, so checking for either works.
+    found = False
+    try:
+        from sentry_sdk.integrations.starlette import StarletteIntegration  # noqa: PLC0415
+        if client.get_integration(StarletteIntegration) is not None:
+            found = True
+    except Exception:  # noqa: BLE001
+        pass
+    if not found:
+        try:
+            from sentry_sdk.integrations.fastapi import FastApiIntegration  # noqa: PLC0415
+            if client.get_integration(FastApiIntegration) is not None:
+                found = True
+        except Exception:  # noqa: BLE001
+            pass
+    if not found:
+        return
+    from sentry_sdk.integrations.asgi import SentryAsgiMiddleware  # noqa: PLC0415
+    # Don't double-install if the user (or another call) already added it.
+    for _cls, _ in getattr(app, "_middleware_stack", []):
+        if _cls is SentryAsgiMiddleware:
+            app._fastapi_turbo_sentry_installed = True
+            return
+    for _cls, _ in getattr(app, "_raw_asgi_middlewares", []):
+        if _cls is SentryAsgiMiddleware:
+            app._fastapi_turbo_sentry_installed = True
+            return
+
+    # Seed the auto-installed middleware with the integration's
+    # configuration so test-visible knobs
+    # (``transaction_style``, ``http_methods_to_capture``) propagate.
+    try:
+        from sentry_sdk.integrations.starlette import StarletteIntegration  # noqa: PLC0415
+        starlette_integ = client.get_integration(StarletteIntegration)
+    except Exception:  # noqa: BLE001
+        starlette_integ = None
+    try:
+        from sentry_sdk.integrations.fastapi import FastApiIntegration  # noqa: PLC0415
+        fastapi_integ = client.get_integration(FastApiIntegration)
+    except Exception:  # noqa: BLE001
+        fastapi_integ = None
+    primary = fastapi_integ or starlette_integ
+
+    mw_kwargs: dict = {}
+    if primary is not None:
+        style = getattr(primary, "transaction_style", None)
+        if style is not None:
+            mw_kwargs["transaction_style"] = style
+        hmtc = getattr(primary, "http_methods_to_capture", None)
+        if hmtc is not None:
+            mw_kwargs["http_methods_to_capture"] = hmtc
+        origin = getattr(primary, "origin", None)
+        if origin is not None:
+            mw_kwargs["span_origin"] = origin
+        mtype = getattr(primary, "identifier", None)
+        if mtype is not None:
+            mw_kwargs["mechanism_type"] = mtype
+    try:
+        app.add_middleware(SentryAsgiMiddleware, **mw_kwargs)
+        app._fastapi_turbo_sentry_installed = True
+    except Exception:  # noqa: BLE001
+        # Some older SentryAsgiMiddleware signatures reject extra kwargs.
+        try:
+            app.add_middleware(SentryAsgiMiddleware)
+            app._fastapi_turbo_sentry_installed = True
+        except Exception:  # noqa: BLE001
+            app._fastapi_turbo_sentry_installed = True
 
 
 class FastAPI:
@@ -2885,6 +3307,15 @@ class FastAPI:
                 self.add_middleware(cls, **kwargs_m)
 
         self.extra = kwargs
+
+        # Sentry's ``FastApiIntegration`` / ``StarletteIntegration``
+        # install by monkey-patching ``Starlette.__call__`` so every
+        # request gets wrapped in ``SentryAsgiMiddleware``. Our Rust
+        # server bypasses ``app.__call__``, so that patch never fires.
+        # Auto-install ``SentryAsgiMiddleware`` here whenever a Sentry
+        # client with one of those integrations is already active, so
+        # the tracing / error-capture path works end-to-end.
+        _ensure_sentry_middleware(self)
 
     # ------------------------------------------------------------------
     # HTTP-method decorators — delegate straight to the root router
@@ -3362,6 +3793,12 @@ class FastAPI:
         Returns None if no handler is found. The caller is responsible for
         falling back to the default FastAPI error response.
         """
+        # Sentry's ``StarletteIntegration.failed_request_status_codes``
+        # asks us to capture HTTPException events when the status falls
+        # in the configured set (default: [500..599]). Stock Starlette
+        # routes through ExceptionMiddleware where Sentry's monkey-patch
+        # lives; our dispatch doesn't, so emit the event ourselves.
+        _maybe_sentry_capture_failed_request(exc)
         handler = self._lookup_exception_handler(exc)
         if handler is None:
             return None

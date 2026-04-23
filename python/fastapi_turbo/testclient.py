@@ -35,6 +35,95 @@ from typing import Any
 import httpx
 
 
+class _ASGISyncClientShim:
+    """Sync httpx-like facade over an async ``httpx.AsyncClient`` backed
+    by ``ASGITransport``. Used when the wrapped app is a bare ASGI
+    callable (e.g. ``SentryAsgiMiddleware(fastapi_app)``) — Sentry's
+    own tests use this form.
+    """
+
+    def __init__(
+        self,
+        app,
+        base_url: str,
+        follow_redirects: bool,
+        headers=None,
+        cookies=None,
+    ):
+        self._app = app
+        self._base_url = base_url
+        self._follow_redirects = follow_redirects
+        self._headers = dict(headers or {})
+        self._cookies = cookies
+
+        # Persistent event loop on a background thread so sync code can
+        # issue many requests without re-initializing each time.
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever,
+            daemon=True,
+            name="fastapi-turbo-asgi-client",
+        )
+        self._thread.start()
+
+        transport = httpx.ASGITransport(app=app)
+
+        async def _mk_client():
+            return httpx.AsyncClient(
+                transport=transport,
+                base_url=base_url,
+                follow_redirects=follow_redirects,
+                headers=self._headers or None,
+                cookies=self._cookies,
+            )
+
+        self._client = asyncio.run_coroutine_threadsafe(
+            _mk_client(), self._loop,
+        ).result()
+
+    def _run(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self._run(self._client.get(url, **kwargs))
+
+    def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self._run(self._client.post(url, **kwargs))
+
+    def put(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self._run(self._client.put(url, **kwargs))
+
+    def patch(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self._run(self._client.patch(url, **kwargs))
+
+    def delete(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self._run(self._client.delete(url, **kwargs))
+
+    def head(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self._run(self._client.head(url, **kwargs))
+
+    def options(self, url: str, **kwargs: Any) -> httpx.Response:
+        return self._run(self._client.options(url, **kwargs))
+
+    def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        return self._run(self._client.request(method, url, **kwargs))
+
+    @property
+    def headers(self):
+        return self._client.headers
+
+    @property
+    def cookies(self):
+        return self._client.cookies
+
+    def close(self) -> None:
+        try:
+            self._run(self._client.aclose())
+        except Exception:  # noqa: BLE001
+            pass
+        self._loop.call_soon_threadsafe(self._loop.stop)
+
+
 class TestClient:
     """HTTP test client that launches a real fastapi-turbo server in a background thread."""
 
@@ -115,8 +204,34 @@ class TestClient:
         (``client = TestClient(app); client.get(...)``) work verbatim.
         Reuses a single background server per ``app`` instance across
         TestClient invocations (see ``_app_servers`` cache above).
+
+        When the app is a bare ASGI callable (e.g. ``SentryAsgiMiddleware
+        (fastapi_app)``) rather than a FastAPI instance with ``.run()``,
+        falls back to ``httpx.ASGITransport`` for an in-process
+        Starlette-style transport — this mirrors how Starlette's own
+        TestClient wraps arbitrary ASGI apps.
         """
         if self._started:
+            return
+        # ASGI-transport fallback: the caller handed us a wrapped ASGI
+        # callable that doesn't expose ``.run()`` (e.g. ``SentryAsgi
+        # Middleware(fastapi_app)``). httpx's ASGITransport is async-
+        # only, so drive an ``AsyncClient`` on a dedicated event loop
+        # and expose a sync ``.get``/``.post``/... facade.
+        if not hasattr(self.app, "run"):
+            import httpx as _httpx
+            self._client = _ASGISyncClientShim(
+                app=self.app,
+                base_url=self._base_url,
+                follow_redirects=self._follow_redirects,
+                headers=dict(self._seed_headers or {}) or None,
+                cookies=self._seed_cookies,
+            )
+            self._started = True
+            self._port = None
+            self._thread = None
+            self._follow_state = threading.local()
+            self._follow_state.follow = self._follow_redirects
             return
         key = id(self.app)
         with TestClient._app_lock:
