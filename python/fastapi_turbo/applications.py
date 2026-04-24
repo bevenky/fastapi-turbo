@@ -6012,8 +6012,25 @@ class FastAPI:
                                     val = val.decode("utf-8", errors="replace")
                                 form_fields[fname] = val
             except Exception as _exc:  # noqa: BLE001
+                # Body has already been drained; we cannot fall back to
+                # the proxy (it would see an empty body). Surface the
+                # error in-process so the client gets a FA-shaped 422
+                # and the server doesn't silently re-run the handler
+                # against a stripped payload.
                 _log.debug("in-process form parse: %r", _exc)
-                return False
+                from fastapi_turbo.exceptions import (
+                    RequestValidationError as _RVE_form,
+                )
+                await _asgi_emit_exception(
+                    self, scope, send,
+                    _RVE_form([{
+                        "type": "form_parse_error",
+                        "loc": ["body"],
+                        "msg": f"form parse failed: {_exc}",
+                        "input": None,
+                    }]),
+                )
+                return True
 
         # ── Shared helpers used by dep resolution + kwarg assembly ──
         from fastapi_turbo.exceptions import RequestValidationError as _RVE_err

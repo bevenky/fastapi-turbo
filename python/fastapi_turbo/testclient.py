@@ -163,8 +163,29 @@ class TestClient:
         headers: dict | None = None,
         follow_redirects: bool = True,
         client: tuple[str, int] | None = None,
+        in_process: bool | None = None,
         **_ignored: Any,
     ):
+        """TestClient for fastapi-turbo apps.
+
+        ``in_process``:
+          * ``None`` (default): start the Rust/Axum server on a free
+            loopback port — "real HTTP" path. Exercises the production
+            code path end-to-end including every Tower layer.
+          * ``True``: dispatch through our in-process ASGI adapter via
+            ``httpx.ASGITransport`` — no port bound, works in sandboxed
+            environments. Matches Starlette's TestClient semantics.
+            Middleware registered via ``add_middleware`` still fires;
+            Rust-only Tower layers (native CompressionLayer, etc.) do
+            NOT — that's the trade-off for avoiding a socket.
+          * ``False``: force the real-HTTP path even if loopback bind
+            fails (useful when a test specifically targets the Rust
+            hot path).
+
+        ``FASTAPI_TURBO_TESTCLIENT_IN_PROCESS=1`` in the environment
+        flips the default so an entire suite can run sandboxed without
+        touching every ``TestClient(...)`` call.
+        """
         self.app = app
         self._base_url = base_url
         self._port: int | None = None
@@ -172,6 +193,13 @@ class TestClient:
         self._client: httpx.Client | None = None
         self._raise_server_exceptions = raise_server_exceptions
         self._started = False
+
+        if in_process is None:
+            import os as _os
+            env = _os.environ.get("FASTAPI_TURBO_TESTCLIENT_IN_PROCESS")
+            self._in_process = env is not None and env.lower() in ("1", "true", "yes")
+        else:
+            self._in_process = bool(in_process)
         # Optional defaults to seed into the httpx client once it's lazy-
         # created — matches Starlette's TestClient kwargs surface.
         self._seed_cookies = cookies
@@ -220,12 +248,11 @@ class TestClient:
         """
         if self._started:
             return
-        # ASGI-transport fallback: the caller handed us a wrapped ASGI
-        # callable that doesn't expose ``.run()`` (e.g. ``SentryAsgi
-        # Middleware(fastapi_app)``). httpx's ASGITransport is async-
-        # only, so drive an ``AsyncClient`` on a dedicated event loop
-        # and expose a sync ``.get``/``.post``/... facade.
-        if not hasattr(self.app, "run"):
+        # in_process=True (or env var) → same ASGI-transport path we
+        # already use for wrapped-ASGI apps. Bypasses the loopback
+        # server entirely so sandboxed / serverless environments work
+        # out of the box.
+        if self._in_process or not hasattr(self.app, "run"):
             import httpx as _httpx
             self._client = _ASGISyncClientShim(
                 app=self.app,
