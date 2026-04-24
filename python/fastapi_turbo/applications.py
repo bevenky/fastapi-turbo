@@ -4808,7 +4808,29 @@ class FastAPI:
                     _handle_ws_exc(ws, _vexc)
                     return
                 if is_async_endpoint:
-                    await endpoint(**kwargs)
+                    # Fast path: drive the user handler on the current
+                    # thread via ``coro.send``. Works when the handler
+                    # only awaits our ChannelAwaitable (thread-safe,
+                    # releases GIL via py.detach). Fails with
+                    # ``RuntimeError: no running event loop`` when the
+                    # user calls real asyncio primitives
+                    # (``asyncio.sleep(delay)``, ``asyncio.wait``, etc.)
+                    # — in that case re-run on the shared async worker
+                    # loop where ``get_running_loop()`` resolves.
+                    try:
+                        await endpoint(**kwargs)
+                    except RuntimeError as _rt_exc:
+                        msg = str(_rt_exc)
+                        if (
+                            "no running event loop" in msg
+                            or "no current event loop" in msg
+                        ):
+                            from fastapi_turbo._async_worker import (
+                                submit as _w_submit,
+                            )
+                            _w_submit(endpoint(**kwargs))
+                        else:
+                            raise
                 else:
                     endpoint(**kwargs)
 

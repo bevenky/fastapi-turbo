@@ -293,9 +293,13 @@ pub fn py_to_response_with_request(
             .into_response();
     }
 
-    // str -> JSON-wrapped string (matches FastAPI: strings are JSON-serialized)
+    // str -> JSON-wrapped string (matches FastAPI: strings are JSON-serialized).
+    // Hand-rolled escape only handled `\` + `"` — control chars (\n, \t,
+    // \r, \x00..\x1f) produced invalid JSON per RFC 8259. Delegate to
+    // serde_json::to_string which encodes every case correctly AND
+    // escapes non-ASCII to \uXXXX when needed.
     if let Ok(s) = obj.extract::<String>() {
-        let json = format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+        let json = serde_json::to_string(&s).unwrap_or_else(|_| "\"\"".to_string());
         return (StatusCode::OK, [("content-type", "application/json")], json).into_response();
     }
 

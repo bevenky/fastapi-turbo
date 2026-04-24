@@ -1477,7 +1477,15 @@ async fn handle_request(
         Option<HashMap<String, Vec<ParsedField>>>,
         Option<bytes::Bytes>,
     ) = if needs_body {
-        let bb = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+        // Upper bound on the in-memory body buffer. The app's
+        // ``max_request_size`` (set on ``FastAPI(...)``) is already
+        // enforced by ``tower_http::limit::RequestBodyLimitLayer``
+        // above this handler, returning 413 on oversized requests.
+        // We keep a very large ceiling here (``usize::MAX``) so apps
+        // that set ``max_request_size=50_000_000`` don't hit a hidden
+        // 10 MiB cap inside the router. FastAPI/Starlette impose no
+        // default limit — only what the user configures wins.
+        let bb = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
             Ok(b) => b,
             Err(e) => {
                 return (StatusCode::BAD_REQUEST, format!("Failed to read body: {e}")).into_response();

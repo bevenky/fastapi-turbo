@@ -80,13 +80,25 @@ fn submit_to_async_worker(
 /// SLOW path (fallback): If handler's DB pool was created on a different event loop
 /// (e.g., in on_event("startup")), we get an event loop mismatch error.
 /// Fall back to the dedicated async worker thread.
-/// Run a coroutine-producing handler where the caller has already built the
-/// coroutine (e.g. via positional args). Shared tail shared with
-/// `call_async_on_local_loop` which builds the coroutine from kwargs.
-pub fn drive_coroutine_on_local_loop(
+///
+/// Probe a coroutine with send(None); if it suspends, close it and build
+/// a **fresh** coroutine via ``make_coro`` to submit to the async worker.
+///
+/// ``make_coro`` is a closure that produces a new coroutine object on
+/// each call. Required for the worker fallback: a closed coroutine
+/// cannot be resumed, so we must reinvoke the handler to get a fresh
+/// one. Previous signature took a pre-built coro and reused it after
+/// close — any async handler that suspended produced a 500 in the
+/// worker-fallback path (e.g. WebSocket handler with ``await
+/// asyncio.sleep(0)`` before ``accept()``).
+pub fn drive_coroutine_on_local_loop<F>(
     py: Python<'_>,
-    coro: Py<PyAny>,
-) -> PyResult<Py<PyAny>> {
+    mut make_coro: F,
+) -> PyResult<Py<PyAny>>
+where
+    F: FnMut(Python<'_>) -> PyResult<Py<PyAny>>,
+{
+    let coro = make_coro(py)?;
     match coro.call_method1(py, "send", (py.None(),)) {
         Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
             let v = e.value(py);
@@ -106,8 +118,10 @@ pub fn drive_coroutine_on_local_loop(
     // Handler suspended — route to the dedicated async worker where
     // loop.run_forever() keeps background tasks (pool housekeeping) alive.
     init_async_worker();
-    // Re-create coro since the probed one was consumed.
-    submit_to_async_worker(py, coro)
+    // Fresh coroutine for the worker — the probed one is closed and a
+    // closed coroutine cannot be resumed.
+    let fresh = make_coro(py)?;
+    submit_to_async_worker(py, fresh)
 }
 
 /// Call an async handler with a single positional arg. Used by the WebSocket
@@ -118,8 +132,10 @@ pub fn call_async_on_local_loop_positional(
     handler: &Py<PyAny>,
     arg: Py<PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    let coro = handler.call1(py, (arg.bind(py),))?;
-    drive_coroutine_on_local_loop(py, coro)
+    let arg_clone = arg.clone_ref(py);
+    drive_coroutine_on_local_loop(py, move |py| {
+        handler.call1(py, (arg_clone.bind(py),))
+    })
 }
 
 /// Call an async handler with a single positional arg + keyword args.
@@ -130,8 +146,12 @@ pub fn call_async_on_local_loop_positional_with_kwargs(
     arg: Py<PyAny>,
     kwargs: &pyo3::Bound<'_, PyDict>,
 ) -> PyResult<Py<PyAny>> {
-    let coro = handler.call(py, (arg.bind(py),), Some(kwargs))?;
-    drive_coroutine_on_local_loop(py, coro)
+    let arg_clone = arg.clone_ref(py);
+    let kwargs_unbound: Py<PyDict> = kwargs.clone().unbind();
+    drive_coroutine_on_local_loop(py, move |py| {
+        let kw = kwargs_unbound.bind(py);
+        handler.call(py, (arg_clone.bind(py),), Some(kw))
+    })
 }
 
 /// Handler classification — determined on the FIRST call, reused forever.

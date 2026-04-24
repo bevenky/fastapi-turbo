@@ -193,17 +193,24 @@ fn iterate_sync_generator(
         }
     };
 
+    let py = py_iter.py();
     loop {
         match py_iter.call_method0("__next__") {
             Ok(val) => {
                 let chunk = python_val_to_bytes(&val);
-                if tx.blocking_send(Ok(chunk)).is_err() {
+                // Release the GIL while the downstream channel might
+                // block (slow client backpressure). Holding the GIL
+                // through ``blocking_send`` stalls every other Python
+                // thread in the process — a slow consumer could pin
+                // the interpreter for seconds.
+                let send_err = py.detach(|| tx.blocking_send(Ok(chunk)).is_err());
+                if send_err {
                     break; // Client disconnected
                 }
             }
             Err(e) => {
                 // StopIteration means we're done
-                if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py_iter.py()) {
+                if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
                     break;
                 }
                 // Capture the exception in ``app._captured_server_exceptions``
@@ -211,7 +218,6 @@ fn iterate_sync_generator(
                 // surfaces it to the caller (FA parity — streaming-body
                 // failures must reach the test just like synchronous
                 // handler failures).
-                let py = py_iter.py();
                 if let Ok(app_lock) = crate::router::APP_INSTANCE.read() {
                     if let Some(ref app_obj) = *app_lock {
                         if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
@@ -296,7 +302,10 @@ fn iterate_async_generator(
         match loop_obj.call_method1(py, "run_until_complete", (coro.bind(py),)) {
             Ok(val) => {
                 let chunk = python_val_to_bytes(val.bind(py));
-                if tx.blocking_send(Ok(chunk)).is_err() {
+                // Release the GIL while the downstream channel might
+                // block on backpressure — see sync path for rationale.
+                let send_err = py.detach(|| tx.blocking_send(Ok(chunk)).is_err());
+                if send_err {
                     break;
                 }
             }

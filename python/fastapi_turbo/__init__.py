@@ -46,28 +46,13 @@ from fastapi_turbo import authentication  # noqa: F401 (re-exported via module)
 
 __version__ = "0.1.0"
 
-# ── Auto-optimize psycopg3 connection pools ─────────────────────────────
-# When psycopg_pool is available, patch ConnectionPool to default to
-# autocommit=True. This eliminates BEGIN/COMMIT overhead per query (~46μs
-# saved), matching Go's pgx behavior. Users who need explicit transactions
-# can still pass autocommit=False or use conn.transaction().
-try:
-    import psycopg_pool as _pp
-
-    _orig_pool_init = _pp.ConnectionPool.__init__
-
-    def _patched_pool_init(self, conninfo="", *, kwargs=None, configure=None, **kw):
-        # Default to autocommit=True unless user explicitly provided kwargs
-        if kwargs is None:
-            kwargs = {"autocommit": True}
-        elif "autocommit" not in kwargs:
-            kwargs = {**kwargs, "autocommit": True}
-
-        _orig_pool_init(self, conninfo, kwargs=kwargs, configure=configure, **kw)
-
-    _pp.ConnectionPool.__init__ = _patched_pool_init
-except ImportError:
-    pass
+# NOTE: we intentionally do NOT monkey-patch ``psycopg_pool.ConnectionPool``.
+# Silently changing the ``autocommit`` default for every connection pool in
+# the process — including ones from unrelated libraries — would reshape
+# transaction semantics for code that never asked for it. Users who want
+# the autocommit-by-default optimisation should construct pools via
+# ``fastapi_turbo.db.create_pool(dsn)`` (an opt-in helper) or pass
+# ``kwargs={"autocommit": True}`` to ``ConnectionPool`` explicitly.
 __all__ = [
     "FastAPI",
     "Depends",
