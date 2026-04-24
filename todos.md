@@ -29,13 +29,29 @@ long-tail rough edges not yet chased.
 
 ## Post-audit follow-ups (deferred from the P0/P1/P2 pass — 2026-04-24)
 
-P0 / P1 items are all shipped. The following P2 items shipped partially and still have room:
+P0 / P1 items are all shipped. P2 status:
 
-### Maintainability
+### Maintainability — partially shipped
 
-- **`applications.py` full split.** Extracted `_sentry_compat.py` (~370 LoC). The remaining 6,761 LoC still holds `_dep_resolution`, `_middleware_wrap`, `_exception_dispatch`, `_ws_endpoint` logic as inline closures. Splitting those cleanly requires flattening the closure state into explicit types — a 1-2 day refactor that should go through a design doc first.
-- **`except Exception: pass` — 57 remaining.** Narrowed the two pure-import cases to `ImportError`. The rest are mixed (introspection + import + attribute access); tightening each requires reading the surrounding code. Do this incrementally, case-by-case, when touching nearby code.
-- **PyO3 `downcast` → `cast` migration.** Silenced with a crate-level `#[allow(deprecated)]`. Mechanical but affects ~7 call sites; schedule alongside the next PyO3 bump.
+- **`applications.py` split.** Three extracted modules so far:
+  `_sentry_compat.py` (383 LoC), `_middleware_wrap.py` (585 LoC),
+  `_route_helpers.py` (712 LoC). `applications.py` is now 5,594 LoC
+  (from 7,127 — 21% reduction). **Deferred:** the 1,300-LoC
+  `_try_compile_handler` monolith. Its inner `_compiled*` closures
+  capture ~30 variables from the enclosing function; cleanly
+  splitting it needs a design-doc-backed refactor to a
+  `HandlerPlan` class (or similar). Schedule alongside the next
+  handler-pipeline feature.
+- **`except Exception: pass` — all 57 sites now logged.** Each
+  still catches `Exception` (behavioural equivalence) but binds
+  the exception and emits a DEBUG-level record via
+  `fastapi_turbo.applications` logger. Narrowing each to a
+  specific exception type (`AttributeError`/`TypeError`/...) is
+  deferred — do it incrementally when touching nearby code.
+- **PyO3 `downcast` → `cast` migration.** Shipped. 7 call sites
+  in `src/responses.rs` + `src/streaming.rs` renamed; the
+  crate-level `#[allow(deprecated)]` is gone; `cargo clippy
+  -- -D warnings` exits 0.
 
 ### Observability / CI
 
