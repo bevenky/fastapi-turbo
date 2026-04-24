@@ -962,21 +962,34 @@ pub fn file_response(
 ) -> Response {
     let path = Path::new(path_str);
 
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
+    // Read metadata synchronously — needed for Content-Length before
+    // we start streaming the body. Catches NotFound / permission
+    // errors here so the early-return 404/500 responses still work.
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return (StatusCode::NOT_FOUND, format!("File not found: {path_str}")).into_response();
         }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("File read error: {e}"),
+                format!("File stat error: {e}"),
             )
                 .into_response();
         }
     };
+    let total_len = meta.len();
 
-    let total_len = data.len() as u64;
+    // Small-file fast path: fully buffer if ≤ 256 KiB. Avoids the
+    // per-chunk ReaderStream overhead for icon/css/json assets where
+    // memory is irrelevant and throughput matters.
+    const STREAM_THRESHOLD: u64 = 256 * 1024;
+    let small_body: Option<Vec<u8>> = if total_len <= STREAM_THRESHOLD {
+        std::fs::read(path).ok()
+    } else {
+        None
+    };
+
     let mut ct = media_type.unwrap_or_else(|| "application/octet-stream".to_string());
     // FastAPI/Starlette append `; charset=utf-8` to textual types if absent.
     if (ct.starts_with("text/") || ct == "application/javascript" || ct == "application/json")
@@ -985,12 +998,36 @@ pub fn file_response(
         ct.push_str("; charset=utf-8");
     }
 
+    let body = if let Some(data) = small_body {
+        Body::from(data)
+    } else {
+        // Large file → stream. ``tokio::fs::File::from_std`` + a
+        // ``ReaderStream`` produce a ``Stream<Item = io::Result<Bytes>>``
+        // that axum's body protocol consumes chunk-by-chunk — memory
+        // is one chunk (default 8 KiB) per concurrent request, not
+        // the full file.
+        match std::fs::File::open(path) {
+            Ok(std_file) => {
+                let tokio_file = tokio::fs::File::from_std(std_file);
+                let stream = tokio_util::io::ReaderStream::new(tokio_file);
+                Body::from_stream(stream)
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("File open error: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    };
+
     let mut resp = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", &ct)
         .header("content-length", total_len)
         .header("accept-ranges", "bytes")
-        .body(Body::from(data))
+        .body(body)
         .expect("build file response");
 
     for (k, v) in extra_headers {

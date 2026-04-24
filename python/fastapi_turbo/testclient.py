@@ -233,6 +233,26 @@ class TestClient:
             s.bind(("127.0.0.1", 0))
             return s.getsockname()[1]
 
+    def _switch_to_in_process(self) -> None:
+        """Auto-fallback path: the user didn't explicitly ask for
+        in-process, but the loopback bind failed (sandboxed env,
+        serverless, a network namespace without loopback access). Flip
+        to ASGI dispatch so the TestClient stays usable without
+        requiring every call site to pass ``in_process=True``."""
+        self._client = _ASGISyncClientShim(
+            app=self.app,
+            base_url=self._base_url,
+            follow_redirects=self._follow_redirects,
+            headers=dict(self._seed_headers or {}) or None,
+            cookies=self._seed_cookies,
+        )
+        self._started = True
+        self._port = None
+        self._thread = None
+        self._in_process = True
+        self._follow_state = threading.local()
+        self._follow_state.follow = self._follow_redirects
+
     def _ensure_started(self) -> None:
         """Lazily boot the server on first request. Starlette's TestClient
         is usable without ``with``; we match that so FastAPI-style tests
@@ -253,19 +273,21 @@ class TestClient:
         # server entirely so sandboxed / serverless environments work
         # out of the box.
         if self._in_process or not hasattr(self.app, "run"):
-            import httpx as _httpx
-            self._client = _ASGISyncClientShim(
-                app=self.app,
-                base_url=self._base_url,
-                follow_redirects=self._follow_redirects,
-                headers=dict(self._seed_headers or {}) or None,
-                cookies=self._seed_cookies,
-            )
-            self._started = True
-            self._port = None
-            self._thread = None
-            self._follow_state = threading.local()
-            self._follow_state.follow = self._follow_redirects
+            self._switch_to_in_process()
+            return
+        # Auto-fallback: if bind() fails (sandboxed env, serverless,
+        # CAP_NET_BIND_SERVICE missing), flip to in-process rather
+        # than forcing the user to rewrite every call site. Starlette's
+        # TestClient never needs a socket, so this restores drop-in
+        # behaviour for the common sandboxed case.
+        try:
+            _probe_port = self._find_free_port()
+        except (OSError, PermissionError) as _bind_exc:
+            _log_tc = getattr(threading, "_dummy_log", None)
+            # Silent fallback — users who need real-HTTP specifically
+            # opt in via FASTAPI_TURBO_TESTCLIENT_IN_PROCESS=0 (forces
+            # real HTTP and surfaces the bind error).
+            self._switch_to_in_process()
             return
         key = id(self.app)
         with TestClient._app_lock:

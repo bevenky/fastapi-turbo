@@ -149,13 +149,39 @@ fn build_request(cfg: &Config) -> String {
 
 fn main() {
     let cfg = parse_args();
+
+    // ── Arg validation ──
+    // Reject configurations that would produce nonsense numbers or
+    // panic later on empty sample vectors.
+    if cfg.connections == 0 {
+        eprintln!("bench_client: --connections must be >= 1");
+        std::process::exit(2);
+    }
+    if cfg.requests == 0 {
+        eprintln!("bench_client: --requests must be >= 1");
+        std::process::exit(2);
+    }
+    if cfg.connections > cfg.requests {
+        eprintln!(
+            "bench_client: connections ({}) > requests ({}) — each worker \
+             would send zero requests. Reduce --connections or raise --requests.",
+            cfg.connections, cfg.requests
+        );
+        std::process::exit(2);
+    }
+
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let request = build_request(&cfg);
     let request_bytes = Arc::new(request.into_bytes());
 
-    // Per-connection warmup is cheap, so run it on the first connection.
-    let requests_per_worker = cfg.requests / cfg.connections;
-    let warmup_per_worker = cfg.warmup / cfg.connections.max(1);
+    // ── Work distribution ──
+    // Integer division drops the remainder; distribute it across the
+    // first N workers so total samples == cfg.requests exactly. Same
+    // for warmup.
+    let base_req = cfg.requests / cfg.connections;
+    let req_remainder = cfg.requests % cfg.connections;
+    let base_warm = cfg.warmup / cfg.connections.max(1);
+    let warm_remainder = cfg.warmup % cfg.connections.max(1);
 
     // Aggregation: each worker pushes its samples into a shared vec at
     // end of run, avoiding per-request lock contention during the hot
@@ -164,47 +190,62 @@ fn main() {
     let server_samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let total_bytes: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
 
+    let bad_status_count: Arc<std::sync::atomic::AtomicU64> =
+        Arc::new(std::sync::atomic::AtomicU64::new(0));
     let total_start = Instant::now();
     let handles: Vec<_> = (0..cfg.connections)
-        .map(|_| {
+        .map(|worker_idx| {
             let addr = addr.clone();
             let request_bytes = request_bytes.clone();
             let samples = samples.clone();
             let server_samples = server_samples.clone();
             let total_bytes = total_bytes.clone();
+            let bad_status_count = bad_status_count.clone();
+            // First ``req_remainder`` / ``warm_remainder`` workers get
+            // one extra request / warmup each, so the total comes out
+            // to exactly ``cfg.requests`` / ``cfg.warmup``.
+            let my_req_count = base_req + if worker_idx < req_remainder { 1 } else { 0 };
+            let my_warm_count = base_warm + if worker_idx < warm_remainder { 1 } else { 0 };
             thread::spawn(move || {
                 let mut stream = TcpStream::connect(&addr).expect("connect failed");
                 stream.set_nodelay(true).ok();
-                // Warmup: also sanity-check the first response's status
-                // line. A misrouted method (the old CLI silently ran
-                // POSTs as GETs) would otherwise produce steady 405s
-                // whose latency got benchmarked as "fast", poisoning
-                // comparisons. Abort early with a clear message.
-                for iter in 0..warmup_per_worker {
+                // Warmup + every measured response: validate the
+                // status line. A misrouted method (the old CLI
+                // silently ran POSTs as GETs) would otherwise
+                // produce steady 4xx/5xx whose latency got
+                // benchmarked as "fast", poisoning comparisons.
+                for _ in 0..my_warm_count {
                     let resp = send_recv(&mut stream, &request_bytes);
-                    if iter == 0 {
-                        let status = parse_status_code(&resp).unwrap_or(0);
-                        if !(200..400).contains(&status) {
-                            eprintln!(
-                                "bench_client: bad status {status} on first warmup \
-                                 request — check method/path. aborting."
-                            );
-                            std::process::exit(2);
-                        }
+                    let status = parse_status_code(&resp).unwrap_or(0);
+                    if !(200..400).contains(&status) {
+                        eprintln!(
+                            "bench_client: bad status {status} during warmup \
+                             (worker {worker_idx}) — check method/path. aborting."
+                        );
+                        std::process::exit(2);
                     }
                 }
-                let mut local: Vec<f64> = Vec::with_capacity(requests_per_worker);
+                let mut local: Vec<f64> = Vec::with_capacity(my_req_count);
                 let mut local_server: Vec<f64> = Vec::new();
                 let mut local_bytes: usize = 0;
-                for _ in 0..requests_per_worker {
+                let mut local_bad: u64 = 0;
+                for _ in 0..my_req_count {
                     let start = Instant::now();
                     let response = send_recv(&mut stream, &request_bytes);
                     let us = start.elapsed().as_nanos() as f64 / 1000.0;
+                    let status = parse_status_code(&response).unwrap_or(0);
+                    if !(200..400).contains(&status) {
+                        local_bad += 1;
+                        continue; // don't count non-2xx/3xx in the latency set
+                    }
                     local.push(us);
                     local_bytes += response.len();
                     if let Some(st) = parse_server_timing(&response) {
                         local_server.push(st);
                     }
+                }
+                if local_bad > 0 {
+                    bad_status_count.fetch_add(local_bad, std::sync::atomic::Ordering::Relaxed);
                 }
                 samples.lock().unwrap().extend(local);
                 server_samples.lock().unwrap().extend(local_server);
@@ -222,6 +263,20 @@ fn main() {
     let bytes = *total_bytes.lock().unwrap();
     client.sort_by(|a, b| a.partial_cmp(b).unwrap());
     server.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let bad = bad_status_count.load(std::sync::atomic::Ordering::Relaxed);
+    if bad > 0 {
+        eprintln!(
+            "bench_client: {bad} measured responses had non-2xx/3xx status \
+             and were EXCLUDED from latency aggregation (results reflect \
+             the {} successful responses only)",
+            client.len()
+        );
+    }
+    if client.is_empty() {
+        eprintln!("bench_client: zero successful responses — aborting report");
+        std::process::exit(3);
+    }
 
     let n = client.len().max(1);
     let percentile = |p: f64| -> f64 {

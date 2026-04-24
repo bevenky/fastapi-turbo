@@ -95,6 +95,27 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
           manylinux: auto
+      # Smoke-test the ACTUAL wheel by installing it (not the source
+      # tree) and running a TestClient roundtrip. Skip aarch64 cross
+      # builds since the runner can't execute the artefact locally.
+      - name: Smoke-test wheel
+        if: matrix.platform.target == 'x86_64'
+        run: |
+          python -m pip install -U pip httpx "pydantic>=2"
+          python -m pip install dist/*.whl
+          python -c "
+          import fastapi_turbo, uuid
+          from fastapi import FastAPI
+          from fastapi.testclient import TestClient
+          marker = str(uuid.uuid4())
+          app = FastAPI()
+          @app.get('/m')
+          def m(): return {'marker': marker}
+          with TestClient(app, in_process=True) as c:
+              body = c.get('/m').json()
+          assert body == {'marker': marker}, body
+          print(f'wheel smoke ok: {marker}')
+          "
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.platform.target }}-py${{ matrix.python }}
@@ -122,6 +143,23 @@ jobs:
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
+      - name: Smoke-test wheel
+        run: |
+          python -m pip install -U pip httpx "pydantic>=2"
+          python -m pip install dist/*.whl
+          python -c "
+          import fastapi_turbo, uuid
+          from fastapi import FastAPI
+          from fastapi.testclient import TestClient
+          marker = str(uuid.uuid4())
+          app = FastAPI()
+          @app.get('/m')
+          def m(): return {'marker': marker}
+          with TestClient(app, in_process=True) as c:
+              body = c.get('/m').json()
+          assert body == {'marker': marker}, body
+          print(f'wheel smoke ok: {marker}')
+          "
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.platform.target }}-py${{ matrix.python }}
@@ -145,6 +183,18 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           args: --release --out dist
+      - name: Smoke-test wheel (PowerShell)
+        shell: pwsh
+        run: |
+          python -m pip install -U pip httpx "pydantic>=2"
+          $whl = Get-ChildItem dist\*.whl | Select-Object -First 1
+          python -m pip install $whl.FullName
+          python -c "import fastapi_turbo, uuid; from fastapi import FastAPI; from fastapi.testclient import TestClient; m=str(uuid.uuid4()); app=FastAPI();
+          @app.get('/m')
+          def _m(): return {'marker': m}
+          with TestClient(app, in_process=True) as c:
+              assert c.get('/m').json() == {'marker': m}
+          print(f'wheel smoke ok: {m}')"
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-${{ matrix.target }}-py${{ matrix.python }}

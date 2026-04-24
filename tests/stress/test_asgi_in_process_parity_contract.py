@@ -8,19 +8,19 @@ A contract test that runs both stacks on the same endpoint and
 compares outputs catches every class of divergence in one place —
 and prevents regression when we add new features.
 
+NOTE: does NOT use ``from __future__ import annotations`` — Annotated
+markers inside nested test functions need their references (Query,
+Body, Header, etc.) to stay concrete so Pydantic's TypeAdapter can
+resolve them. PEP 563 stringifies annotations which breaks this in
+both upstream FA and our stack when the marker is a local name.
+
 Each case:
   1. Build the same app shape against upstream FastAPI.
   2. Drive it with httpx.ASGITransport → capture response.
   3. Build the same app shape against fastapi_turbo.
   4. Drive it with fastapi_turbo's ASGITransport → capture response.
   5. Assert status / json / selected headers match.
-
-We don't assert on every byte because FA and fastapi_turbo legitimately
-diverge on some non-semantic fields (server timestamp, openapi schema
-ordering, etc.). Each test calls out what it compares.
 """
-from __future__ import annotations
-
 import asyncio
 import importlib
 import sys
@@ -407,6 +407,183 @@ def test_custom_exception_handler_fires():
         return app
 
     _parity(build, "GET", "/boom", compare=("status", "body"))
+
+
+# ── 14. Annotated[int, Query(...)] coerces to int ─────────────────
+def test_annotated_int_query_coerces():
+    def build(fa):
+        from typing import Annotated
+        app = fa.FastAPI()
+
+        @app.get("/n")
+        def _n(n: Annotated[int, fa.Query()] = 0):
+            return {"n": n, "type": type(n).__name__}
+
+        return app
+
+    _parity(build, "GET", "/n", params={"n": "42"})
+
+
+# ── 15. Annotated[int, Header(...)] coerces to int ────────────────
+def test_annotated_int_header_coerces():
+    def build(fa):
+        from typing import Annotated
+        app = fa.FastAPI()
+
+        @app.get("/h")
+        def _h(x_count: Annotated[int, fa.Header()] = 0):
+            return {"n": x_count, "type": type(x_count).__name__}
+
+        return app
+
+    _parity(build, "GET", "/h", headers={"x-count": "7"})
+
+
+# ── 16. Annotated[Model, Body(...)] validates & injects ───────────
+def test_annotated_model_body_validates():
+    def build(fa):
+        from typing import Annotated
+        from pydantic import BaseModel
+
+        class Item(BaseModel):
+            qty: int
+
+        app = fa.FastAPI()
+
+        @app.post("/i")
+        def _i(item: Annotated[Item, fa.Body()]):
+            return {"q": item.qty}
+
+        return app
+
+    _parity(build, "POST", "/i", json={"qty": 5})
+
+
+# ── 17. Query(..., ge=10) rejects q=1 ─────────────────────────────
+def test_query_ge_constraint_rejects():
+    def build(fa):
+        app = fa.FastAPI()
+
+        @app.get("/q")
+        def _q(q: int = fa.Query(..., ge=10)):
+            return {"q": q}
+
+        return app
+
+    _parity(build, "GET", "/q", params={"q": 1}, compare=("status",))
+
+
+# ── 18. list[str] query param aggregates repeated values ──────────
+def test_list_query_aggregates_repeats():
+    def build(fa):
+        app = fa.FastAPI()
+
+        @app.get("/tags")
+        def _t(tags: list[str] = fa.Query([])):
+            return {"tags": tags}
+
+        return app
+
+    _parity(build, "GET", "/tags?tags=a&tags=b&tags=c")
+
+
+# ── 19. Header(convert_underscores=False) keeps underscores ───────
+def test_header_no_convert_underscores():
+    def build(fa):
+        app = fa.FastAPI()
+
+        @app.get("/h")
+        def _h(x_token: str = fa.Header(..., convert_underscores=False)):
+            return {"t": x_token}
+
+        return app
+
+    _parity(build, "GET", "/h", headers={"x_token": "abc"})
+
+
+# ── 20. Body(embed=True) wraps the single param ──────────────────
+def test_body_embed_true_wraps_single():
+    def build(fa):
+        app = fa.FastAPI()
+
+        @app.post("/e")
+        def _e(qty: int = fa.Body(..., embed=True)):
+            return {"qty": qty}
+
+        return app
+
+    _parity(build, "POST", "/e", json={"qty": 7})
+
+
+# ── 21. Multiple body params (implicit embed) ─────────────────────
+def test_multiple_body_params():
+    def build(fa):
+        from pydantic import BaseModel
+
+        class A(BaseModel):
+            a: int
+
+        class B(BaseModel):
+            b: int
+
+        app = fa.FastAPI()
+
+        @app.post("/m")
+        def _m(a: A, b: B):
+            return {"sum": a.a + b.b}
+
+        return app
+
+    _parity(build, "POST", "/m", json={"a": {"a": 2}, "b": {"b": 3}})
+
+
+# ── 22. Dep with Annotated[int, Query(ge=10)] ─────────────────────
+def test_dep_annotated_constraints():
+    def build(fa):
+        from typing import Annotated
+        app = fa.FastAPI()
+
+        def pager(limit: Annotated[int, fa.Query(ge=10, alias="pageSize")] = 10):
+            return {"limit": limit}
+
+        @app.get("/list")
+        def _list(p=fa.Depends(pager)):
+            return p
+
+        return app
+
+    _parity(build, "GET", "/list?pageSize=50")
+
+
+# ── 23. Unhandled exception re-raises (ASGI contract) ─────────────
+def test_unhandled_exception_raises_through_asgi():
+    """Upstream ASGITransport re-raises unhandled exceptions through
+    the caller. Catching + 500-ing hides real test failures."""
+    def build(fa):
+        app = fa.FastAPI()
+
+        @app.get("/boom")
+        def _b():
+            raise ValueError("unhandled!")
+
+        return app
+
+    # Upstream: raises ValueError.
+    import httpx
+    up_raised = False
+    try:
+        _run(_drive_asgi(_build_with_upstream(build), "GET", "/boom"))
+    except Exception:
+        up_raised = True
+
+    turbo_raised = False
+    try:
+        _run(_drive_asgi(_build_with_turbo(build), "GET", "/boom"))
+    except Exception:
+        turbo_raised = True
+
+    assert up_raised, "upstream stopped raising? check fa version"
+    assert turbo_raised, "turbo swallowed the exception into a 500 response"
 
 
 # ── 13. Custom HTTPException handler override ──────────────────────

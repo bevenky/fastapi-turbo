@@ -1748,12 +1748,13 @@ async def _asgi_emit_exception(app, scope, send, exc):
             send, _JR(content={"detail": exc.errors()}, status_code=422)
         )
         return
-    # Anything else → 500. Include the message in dev only; upstream
-    # just emits "Internal Server Error".
-    await _send_asgi_response(
-        send,
-        _JR(content={"detail": "Internal Server Error"}, status_code=500),
-    )
+    # Unhandled non-FA exception. Upstream FastAPI / Starlette
+    # RE-RAISE these through the ASGI callable so TestClient /
+    # ASGITransport users see the real exception (and can assert
+    # on it). We match that contract: only synthesise a 500 when
+    # the app has registered an ``Exception`` handler to explicitly
+    # swallow it. Otherwise raise.
+    raise exc
 
 
 async def _send_asgi_response(send, response) -> None:
@@ -5852,95 +5853,55 @@ class FastAPI:
         # signature uses a feature we don't cover (Form, File, Depends,
         # OAuth scopes, …) bail NOW — before draining the body — so the
         # proxy can serve it.
-        endpoint = getattr(matched_route, "endpoint", None)
-        if endpoint is None:
+        #
+        # The route's ``endpoint`` is the ``_try_compile_handler``
+        # wrapper that expects Rust-synthesised kwargs
+        # (``_combined_body``, ``_request_*`` metadata, etc.). The
+        # in-process path builds user-shape kwargs (``a=A(...)``), so
+        # we dispatch to the UNWRAPPED user function via the
+        # ``_fastapi_turbo_original_endpoint`` breadcrumb set at
+        # compile time.
+        raw_endpoint = getattr(matched_route, "endpoint", None)
+        if raw_endpoint is None:
             return False
+        endpoint = getattr(raw_endpoint, "_fastapi_turbo_original_endpoint", raw_endpoint)
         import inspect as _insp
         try:
             sig = _insp.signature(endpoint)
         except (TypeError, ValueError):
             return False
 
-        # Resolve forward-ref annotations once up front.
-        import typing as _tp_sig
-        try:
-            resolved_hints = _tp_sig.get_type_hints(endpoint, include_extras=True)
-        except Exception:  # noqa: BLE001
-            resolved_hints = {}
-
-        # Survey the signature without calling anything. If we detect
-        # a kwarg we can't serve, fall back before touching receive.
+        # ── Build the param plan via ``_introspect.introspect_endpoint`` ──
+        # Same introspection the Rust hot path uses, so we get Pydantic-
+        # full semantics (ge/le constraints, list[T] aggregation, alias
+        # + convert_underscores, Annotated[T, marker] unwrapping,
+        # Body(embed=True), multi-body combination, scalar_validator
+        # TypeAdapters) without maintaining a second resolver.
+        from fastapi_turbo._introspect import introspect_endpoint
         from fastapi_turbo.responses import Response as _Resp_cls
         from fastapi_turbo.background import BackgroundTasks as _BGT
         from fastapi_turbo.requests import HTTPConnection as _HC
-        from fastapi_turbo._route_helpers import _looks_like_body
 
-        survey_needs_body = False
-        survey_plan: list[tuple[str, str, object]] = []
-        for pname, p in sig.parameters.items():
-            if p.kind in (_insp.Parameter.VAR_POSITIONAL, _insp.Parameter.VAR_KEYWORD):
-                survey_plan.append((pname, "skip", None))
-                continue
-            ann = resolved_hints.get(pname, p.annotation)
-            # Depends(...) / Security(...) default — resolve before
-            # invoking the endpoint. We pass the MARKER (not just the
-            # dep fn) so Security's ``scopes=`` contribute to the
-            # accumulated scopes seen by inner SecurityScopes params.
-            from fastapi_turbo.dependencies import Depends as _Dep_check
-            if isinstance(p.default, _Dep_check):
-                if p.default.dependency is None and ann is not _insp.Parameter.empty:
-                    # Attach fallback callable from the annotation.
-                    # We keep the marker intact for scopes.
-                    pass
-                survey_plan.append((pname, "depends", p.default))
-                continue
-            # Param markers: Form / File / Header / Cookie / Query / Path / Body.
-            from fastapi_turbo.param_functions import _ParamMarker as _PM_check
-            marker = p.default if isinstance(p.default, _PM_check) else None
-            # ``Annotated[T, Query()]`` carries marker in metadata —
-            # sniff that too.
-            if marker is None:
-                try:
-                    origin = _tp_sig.get_origin(ann)
-                    if origin is _tp_sig.Annotated:
-                        for meta in _tp_sig.get_args(ann)[1:]:
-                            if isinstance(meta, _PM_check):
-                                marker = meta
-                                break
-                except Exception:  # noqa: BLE001
-                    pass
-            if marker is not None:
-                _pm_kind = getattr(marker, "_kind", None)
-                if _pm_kind in ("form", "file"):
-                    survey_plan.append((pname, _pm_kind, (ann, marker)))
-                    survey_needs_body = True
-                    continue
-                if _pm_kind in ("header", "cookie", "query", "path", "body"):
-                    survey_plan.append((pname, _pm_kind, (ann, marker)))
-                    if _pm_kind == "body":
-                        survey_needs_body = True
-                    continue
-            if pname in path_params:
-                survey_plan.append((pname, "path", ann))
-                continue
-            if isinstance(ann, type):
-                if issubclass(ann, (_Req, _HC)):
-                    survey_plan.append((pname, "request", ann))
-                    continue
-                if issubclass(ann, _Resp_cls):
-                    survey_plan.append((pname, "response", ann))
-                    continue
-                if issubclass(ann, _BGT):
-                    survey_plan.append((pname, "background", ann))
-                    continue
-            if _looks_like_body(ann):
-                survey_plan.append((pname, "body", ann))
-                survey_needs_body = True
-                continue
-            # Query or default
-            survey_plan.append((pname, "query_or_default", (ann, p.default)))
-        # Now it's safe to drain the body (only after we know the
-        # dispatch plan is satisfiable).
+        _plan_cache_attr = "_fastapi_turbo_asgi_param_plan"
+        introspect_params = getattr(matched_route, _plan_cache_attr, None)
+        if introspect_params is None:
+            try:
+                introspect_params = introspect_endpoint(
+                    endpoint, getattr(matched_route, "path", "/") or "/"
+                )
+            except Exception as _exc:  # noqa: BLE001
+                _log.debug("introspect_endpoint failed: %r", _exc)
+                return False
+            try:
+                setattr(matched_route, _plan_cache_attr, introspect_params)
+            except (AttributeError, TypeError):
+                pass
+
+        # Pre-scan: does the endpoint need a body? (so we know whether
+        # to drain receive.)
+        survey_needs_body = any(
+            p.get("kind") in ("body", "form", "file") for p in introspect_params
+        )
 
         # Build a FastAPI-ish Request scope.
         req_scope = dict(scope)
@@ -5956,7 +5917,7 @@ class FastAPI:
         # ``File(...)`` params are present on the endpoint. Done once
         # up-front so subsequent kwarg assembly is O(1) per param.
         form_fields: dict[str, object] = {}
-        if any(k in ("form", "file") for _, k, _ in survey_plan) and body_bytes:
+        if any(p.get("kind") in ("form", "file") for p in introspect_params) and body_bytes:
             import io
             content_type = ""
             for hk, hv in scope.get("headers", []) or []:
@@ -6148,7 +6109,91 @@ class FastAPI:
                 sub_hints = _tp.get_type_hints(actual_fn)
             except Exception:  # noqa: BLE001
                 pass
+            # First try to use the SAME introspect plan for the dep
+            # that we use for the top-level endpoint — this covers
+            # ``Annotated[int, Query(ge=10, alias=...)]`` and every
+            # other Pydantic-constraint case correctly.
+            try:
+                _dep_plan = introspect_endpoint(actual_fn, "/")
+            except Exception:  # noqa: BLE001
+                _dep_plan = None
             sub_kwargs = {}
+            if _dep_plan is not None and sub_sig is not None:
+                for dp in _dep_plan:
+                    dname = dp["name"]
+                    dkind = dp.get("kind")
+                    dalias = dp.get("alias") or dname
+                    drequired = dp.get("required", False)
+                    ddefault = dp.get("default_value")
+                    dscalar = dp.get("scalar_validator")
+                    dann = dp.get("_unwrapped_annotation")
+                    if dkind == "dependency":
+                        # Nested Depends/Security inside the dep.
+                        inner_call = dp.get("dep_callable")
+                        if inner_call is None:
+                            sub_kwargs[dname] = None
+                            continue
+                        # Accumulate scopes from any Security markers
+                        # attached to this sub-dep (captured in
+                        # ``_security_scopes_top``).
+                        next_scopes = list(accumulated_scopes) + list(
+                            dp.get("_security_scopes_top") or []
+                        )
+                        sub_kwargs[dname] = await _resolve_dep(
+                            inner_call, cache, next_scopes
+                        )
+                        continue
+                    if dkind == "query":
+                        raw_q = None
+                        for qk, qv in _qp_items:
+                            if qk == dalias:
+                                raw_q = qv
+                                break
+                        if raw_q is None:
+                            if drequired:
+                                raise _RVE_err([_missing("query", dalias)])
+                            sub_kwargs[dname] = ddefault
+                        else:
+                            sub_kwargs[dname] = _validate(
+                                dscalar, raw_q, "query", dalias, annotation=dann
+                            )
+                        continue
+                    if dkind == "header":
+                        raw_h = _scope_headers.get(dalias)
+                        if raw_h is None:
+                            if drequired:
+                                raise _RVE_err([_missing("header", dalias)])
+                            sub_kwargs[dname] = ddefault
+                        else:
+                            sub_kwargs[dname] = _validate(
+                                dscalar, raw_h, "header", dalias, annotation=dann
+                            )
+                        continue
+                    if dkind == "cookie":
+                        raw_c = _scope_cookies.get(dalias)
+                        if raw_c is None:
+                            if drequired:
+                                raise _RVE_err([_missing("cookie", dalias)])
+                            sub_kwargs[dname] = ddefault
+                        else:
+                            sub_kwargs[dname] = _validate(
+                                dscalar, raw_c, "cookie", dalias, annotation=dann
+                            )
+                        continue
+                    # SecurityScopes → inject.
+                    raw_ann = dp.get("_raw_annotation")
+                    if isinstance(raw_ann, type) and issubclass(raw_ann, _SS_cls):
+                        sub_kwargs[dname] = _SS_cls(scopes=list(accumulated_scopes))
+                        continue
+                    # Fallback: parameter default.
+                    if drequired:
+                        # Legacy non-marker scalar; no sensible fallback.
+                        pass
+                    else:
+                        sub_kwargs[dname] = ddefault
+                # Skip the legacy sub_sig-walk below; the introspect
+                # plan has already populated ``sub_kwargs``.
+                sub_sig = None
             if sub_sig is not None:
                 from fastapi_turbo.param_functions import _ParamMarker as _PM_dep
                 for sname, sp in sub_sig.parameters.items():
@@ -6242,163 +6287,304 @@ class FastAPI:
         bg_injected = None
         dep_cache: dict = {}
 
-        # Everything below may raise — wrap once so RequestValidationError /
-        # HTTPException / generic exceptions all route through the app's
-        # exception_handlers (matches upstream FA's dispatch envelope).
+        # Pre-compute the full query-params multi-dict (preserves
+        # repeats for list[T] aggregation).
+        from urllib.parse import parse_qsl
+        _qp_items: list[tuple[str, str]] = []
+        if _qs_bytes:
+            _qp_items = parse_qsl(_qs_bytes.decode("latin-1"), keep_blank_values=True)
+
+        def _alias_for_header(marker, pname):
+            """Honour ``convert_underscores`` / ``alias`` on Header(...)."""
+            if getattr(marker, "alias", None):
+                return marker.alias
+            convert = getattr(marker, "convert_underscores", True)
+            return pname.replace("_", "-") if convert else pname
+
+        def _extract_list_from_query(alias):
+            return [v for k, v in _qp_items if k == alias]
+
+        # Cache auto-built TypeAdapters for primitive annotations so
+        # we don't re-construct one per request for `int` / `float` /
+        # `bool` params that ``introspect`` left with
+        # ``scalar_validator = None``.
+        _auto_adapters: dict = {}
+
+        def _get_adapter(adapter, annotation):
+            """Pick the adapter to use: ``adapter`` if present, else
+            build one on the fly for primitive annotations that need
+            string→T coercion (int / float / bool / etc.)."""
+            if adapter is not None:
+                return adapter
+            if annotation in _auto_adapters:
+                return _auto_adapters[annotation]
+            if annotation in (None, inspect.Parameter.empty, _insp.Parameter.empty):
+                return None
+            try:
+                from pydantic import TypeAdapter as _TA
+                built = _TA(annotation)
+            except Exception:  # noqa: BLE001
+                built = None
+            _auto_adapters[annotation] = built
+            return built
+
+        def _validate(adapter, raw, loc_kind, loc_name, annotation=None):
+            """Run a Pydantic TypeAdapter against a raw value. Errors
+            become FA-shaped 422 RequestValidationErrors. When
+            ``adapter`` is None and ``annotation`` is a primitive, we
+            auto-build an adapter so ``?n=42`` coerces to int."""
+            eff = _get_adapter(adapter, annotation)
+            if eff is None:
+                return raw
+            from pydantic import ValidationError as _PyVE
+            try:
+                return eff.validate_python(raw)
+            except _PyVE as pve:
+                errs = []
+                for e in pve.errors():
+                    new = {k: v for k, v in e.items() if k not in ("url", "ctx")}
+                    loc = list(new.get("loc", ()))
+                    new["loc"] = [loc_kind, loc_name, *loc] if loc else [loc_kind, loc_name]
+                    errs.append(new)
+                raise _RVE_err(errs) from None
+
         try:
-            for pname, kind, ann_or_info in survey_plan:
-                if kind == "skip":
+            import typing as _tp_local
+            from fastapi_turbo.dependencies import Depends as _Dep_marker2
+
+            # Collect every Body()-kind param so we can support
+            # multi-body (implicit embed) and explicit embed=True.
+            body_params = [p for p in introspect_params if p.get("kind") == "body"]
+            body_embed_single = (
+                len(body_params) == 1
+                and body_params[0].get("_embed")
+            )
+            multi_body = len(body_params) > 1
+
+            # Parse JSON body once if any body param exists.
+            parsed_body: object = None
+            body_parsed = False
+            if body_params and body_bytes:
+                import json as _json
+                try:
+                    parsed_body = _json.loads(body_bytes)
+                    body_parsed = True
+                except _json.JSONDecodeError as jde:
+                    raise _RVE_err([{
+                        "type": "json_invalid",
+                        "loc": ["body", jde.pos],
+                        "msg": f"JSON decode error: {jde.msg}",
+                        "input": {},
+                    }]) from None
+            elif body_params and not body_bytes:
+                # Body expected but empty — emit a missing-body 422
+                # matching FA's shape (first body param's name).
+                for _bp in body_params:
+                    if _bp.get("required"):
+                        raise _RVE_err([{
+                            "type": "missing",
+                            "loc": ["body"],
+                            "msg": "Field required",
+                            "input": None,
+                        }])
+
+            for p in introspect_params:
+                name = p["name"]
+                kind = p.get("kind")
+                alias = p.get("alias") or name
+                required = p.get("required", False)
+                has_default = p.get("has_default", False)
+                default_val = p.get("default_value")
+                scalar_validator = p.get("scalar_validator")
+                model_class = p.get("model_class")
+                container_type = p.get("container_type")
+                is_list_param = container_type is not None or (
+                    _tp_local.get_origin(p.get("_unwrapped_annotation")) is list
+                )
+
+                if kind == "dependency":
+                    dep_callable = p.get("dep_callable")
+                    if dep_callable is None:
+                        kwargs[name] = None
+                        continue
+                    # Seed with scopes from a top-level ``Security(...)``
+                    # marker so the inner-dep ``SecurityScopes`` param
+                    # sees them (matches FA semantics).
+                    top_scopes = list(p.get("_security_scopes_top") or [])
+                    kwargs[name] = await _resolve_dep(dep_callable, dep_cache, top_scopes)
                     continue
-                if kind == "depends":
-                    kwargs[pname] = await _resolve_dep(ann_or_info, dep_cache, [])
-                    continue
-                if kind in ("form", "file"):
-                    val = form_fields.get(pname)
-                    if val is None:
-                        ann_tuple = ann_or_info
-                        marker = ann_tuple[1]  # type: ignore[index]
-                        if getattr(marker, "default", ...) is ...:
-                            raise _RVE_err([_missing("form", pname)])
-                        kwargs[pname] = getattr(marker, "default", None)
-                    else:
-                        kwargs[pname] = val
-                    continue
+
                 if kind == "path":
-                    # Legacy survey path: annotation-only (no marker)
-                    val = path_params.get(pname, "")
-                    ann = ann_or_info
-                    try:
-                        kwargs[pname] = _coerce(val, ann)
-                    except (ValueError, TypeError):
-                        raise _RVE_err(
-                            [_bad_type("path", pname, getattr(ann, "__name__", "int"), val)]
-                        ) from None
+                    raw = path_params.get(alias, "")
+                    kwargs[name] = _validate(
+                        scalar_validator, raw, "path", alias,
+                        annotation=p.get("_unwrapped_annotation"),
+                    )
                     continue
-                if kind == "header":
-                    ann_tuple = ann_or_info
-                    ann, marker = ann_tuple  # type: ignore[misc]
-                    alias = getattr(marker, "alias", None) or pname.replace("_", "-")
-                    raw = _scope_headers.get(alias)
+
+                if kind == "query":
+                    if is_list_param:
+                        vals = _extract_list_from_query(alias)
+                        if not vals:
+                            if required:
+                                raise _RVE_err([_missing("query", alias)])
+                            kwargs[name] = list(default_val) if default_val is not None else []
+                            continue
+                        kwargs[name] = _validate(
+                            scalar_validator, vals, "query", alias,
+                            annotation=p.get("_unwrapped_annotation"),
+                        )
+                        continue
+                    # Scalar query: first occurrence wins (FA semantics)
+                    raw = None
+                    for k, v in _qp_items:
+                        if k == alias:
+                            raw = v
+                            break
                     if raw is None:
-                        default = getattr(marker, "default", ...)
-                        if _is_required_default(default):
-                            raise _RVE_err([_missing("header", alias)])
-                        kwargs[pname] = default
-                    else:
-                        try:
-                            kwargs[pname] = _coerce(raw, ann)
-                        except (ValueError, TypeError):
-                            raise _RVE_err(
-                                [_bad_type("header", alias, getattr(ann, "__name__", "str"), raw)]
-                            ) from None
+                        if required:
+                            raise _RVE_err([_missing("query", alias)])
+                        kwargs[name] = default_val
+                        continue
+                    kwargs[name] = _validate(
+                        scalar_validator, raw, "query", alias,
+                        annotation=p.get("_unwrapped_annotation"),
+                    )
                     continue
+
+                if kind == "header":
+                    marker = p.get("_raw_marker")
+                    # ``alias`` from introspect already honours
+                    # convert_underscores, but fall back to compute
+                    # here for safety.
+                    hdr_alias = alias
+                    if marker is not None and not getattr(marker, "alias", None):
+                        hdr_alias = _alias_for_header(marker, name)
+                    if is_list_param:
+                        vals = _scope_headers.getlist(hdr_alias)
+                        if not vals:
+                            if required:
+                                raise _RVE_err([_missing("header", hdr_alias)])
+                            kwargs[name] = list(default_val) if default_val is not None else []
+                            continue
+                        kwargs[name] = _validate(
+                            scalar_validator, vals, "header", hdr_alias,
+                            annotation=p.get("_unwrapped_annotation"),
+                        )
+                        continue
+                    raw = _scope_headers.get(hdr_alias)
+                    if raw is None:
+                        if required:
+                            raise _RVE_err([_missing("header", hdr_alias)])
+                        kwargs[name] = default_val
+                        continue
+                    kwargs[name] = _validate(
+                        scalar_validator, raw, "header", hdr_alias,
+                        annotation=p.get("_unwrapped_annotation"),
+                    )
+                    continue
+
                 if kind == "cookie":
-                    ann_tuple = ann_or_info
-                    ann, marker = ann_tuple  # type: ignore[misc]
-                    alias = getattr(marker, "alias", None) or pname
                     raw = _scope_cookies.get(alias)
                     if raw is None:
-                        default = getattr(marker, "default", ...)
-                        if _is_required_default(default):
+                        if required:
                             raise _RVE_err([_missing("cookie", alias)])
-                        kwargs[pname] = default
-                    else:
+                        kwargs[name] = default_val
+                        continue
+                    kwargs[name] = _validate(
+                        scalar_validator, raw, "cookie", alias,
+                        annotation=p.get("_unwrapped_annotation"),
+                    )
+                    continue
+
+                if kind == "body":
+                    # ``introspect_endpoint`` collapses multi-body or
+                    # ``Body(embed=True)`` endpoints to a single synthetic
+                    # ``_combined_body`` param whose ``model_class`` is a
+                    # Pydantic model with one field per original body
+                    # param. We validate the incoming JSON against that
+                    # model, then split the instance back into per-param
+                    # kwargs matching the user function signature.
+                    from pydantic import ValidationError as _PyVE2
+                    is_combined = name == "_combined_body" and model_class is not None
+                    if is_combined:
+                        if parsed_body is None:
+                            if required:
+                                raise _RVE_err([_missing("body", pname) for pname in sig.parameters])
+                            continue
                         try:
-                            kwargs[pname] = _coerce(raw, ann)
-                        except (ValueError, TypeError):
-                            raise _RVE_err(
-                                [_bad_type("cookie", alias, getattr(ann, "__name__", "str"), raw)]
-                            ) from None
-                    continue
-                if kind == "query":
-                    ann_tuple = ann_or_info
-                    ann, marker = ann_tuple  # type: ignore[misc]
-                    alias = getattr(marker, "alias", None) or pname
-                    raw = qp.get(alias)
-                    if raw is None:
-                        default = getattr(marker, "default", ...)
-                        if _is_required_default(default):
-                            raise _RVE_err([_missing("query", alias)])
-                        kwargs[pname] = default
-                    else:
+                            if hasattr(model_class, "model_validate"):
+                                instance = model_class.model_validate(parsed_body)
+                            elif hasattr(model_class, "validate_python"):
+                                instance = model_class.validate_python(parsed_body)
+                            else:
+                                instance = parsed_body
+                        except _PyVE2 as pve:
+                            errs = []
+                            for e in pve.errors():
+                                new = {k: v for k, v in e.items() if k not in ("url", "ctx")}
+                                loc = list(new.get("loc", ()))
+                                new["loc"] = ["body", *loc] if loc else ["body"]
+                                errs.append(new)
+                            raise _RVE_err(errs, body=parsed_body) from None
+                        # Split fields back into user-signature kwargs.
+                        field_names = getattr(model_class, "model_fields", {}) or {}
+                        for field_name in field_names:
+                            kwargs[field_name] = getattr(instance, field_name)
+                        continue
+
+                    # Simple single body — pass parsed_body through the
+                    # model_class if one exists, else scalar-validate.
+                    val = parsed_body
+                    if model_class is not None:
                         try:
-                            kwargs[pname] = _coerce(raw, ann)
-                        except (ValueError, TypeError):
-                            raise _RVE_err(
-                                [_bad_type("query", alias, getattr(ann, "__name__", "str"), raw)]
-                            ) from None
+                            if hasattr(model_class, "model_validate"):
+                                kwargs[name] = model_class.model_validate(val)
+                            elif hasattr(model_class, "validate_python"):
+                                kwargs[name] = model_class.validate_python(val)
+                            else:
+                                kwargs[name] = val
+                        except _PyVE2 as pve:
+                            errs = []
+                            for e in pve.errors():
+                                new = {k: v for k, v in e.items() if k not in ("url", "ctx")}
+                                loc = list(new.get("loc", ()))
+                                new["loc"] = ["body", *loc] if loc else ["body"]
+                                errs.append(new)
+                            raise _RVE_err(errs, body=val) from None
+                        continue
+                    kwargs[name] = _validate(
+                        scalar_validator, val, "body", alias,
+                        annotation=p.get("_unwrapped_annotation"),
+                    )
                     continue
-                if kind == "request":
-                    kwargs[pname] = _Req(req_scope)
+
+                if kind in ("form", "file"):
+                    val = form_fields.get(alias)
+                    if val is None:
+                        if required:
+                            raise _RVE_err([_missing(kind, alias)])
+                        kwargs[name] = default_val
+                    else:
+                        kwargs[name] = val
                     continue
-                if kind == "response":
-                    ann = ann_or_info
-                    resp_inst = ann() if callable(ann) else _Resp_cls()
+
+                if kind in ("inject_request",):
+                    kwargs[name] = _Req(req_scope)
+                    continue
+                if kind in ("inject_response",):
+                    resp_inst = _Resp_cls()
                     response_injected = resp_inst
-                    kwargs[pname] = resp_inst
+                    kwargs[name] = resp_inst
                     continue
-                if kind == "background":
-                    ann = ann_or_info
-                    bg_inst = ann()
+                if kind in ("inject_background_tasks",):
+                    bg_inst = _BGT()
                     bg_inst._app = self
                     bg_injected = bg_inst
-                    kwargs[pname] = bg_inst
+                    kwargs[name] = bg_inst
                     continue
-                if kind == "body":
-                    ann = ann_or_info
-                    # ann here is either the bare annotation or (ann, marker)
-                    # depending on survey branch taken.
-                    if isinstance(ann, tuple):
-                        ann = ann[0]
-                    import json as _json
-                    from pydantic import BaseModel as _BM, ValidationError as _PyVE
-                    if not body_bytes:
-                        raise _RVE_err([_missing("body", pname)])
-                    try:
-                        parsed = _json.loads(body_bytes)
-                    except _json.JSONDecodeError as jde:
-                        raise _RVE_err([{
-                            "type": "json_invalid",
-                            "loc": ["body", jde.pos],
-                            "msg": f"JSON decode error: {jde.msg}",
-                            "input": {},
-                        }]) from None
-                    try:
-                        if (
-                            isinstance(ann, type)
-                            and issubclass(ann, _BM)
-                            and isinstance(parsed, dict)
-                        ):
-                            kwargs[pname] = ann.model_validate(parsed)
-                            continue
-                    except _PyVE as pve:
-                        errs = []
-                        for e in pve.errors():
-                            new = {
-                                k: v for k, v in e.items()
-                                if k not in ("url", "ctx")
-                            }
-                            loc = list(new.get("loc", ()))
-                            new["loc"] = ["body", *loc] if loc else ["body"]
-                            errs.append(new)
-                        raise _RVE_err(errs, body=parsed) from None
-                    kwargs[pname] = parsed
-                    continue
-                if kind == "query_or_default":
-                    ann, default = ann_or_info  # type: ignore[misc]
-                    if pname in qp:
-                        raw = qp[pname]
-                        try:
-                            kwargs[pname] = _coerce(raw, ann)
-                        except (ValueError, TypeError):
-                            raise _RVE_err(
-                                [_bad_type("query", pname, getattr(ann, "__name__", "str"), raw)]
-                            ) from None
-                    elif default is not _insp.Parameter.empty:
-                        kwargs[pname] = default
-                    else:
-                        raise _RVE_err([_missing("query", pname)])
-                    continue
+
+                # Unknown kind — skip (defer to endpoint default).
         except Exception as exc:
             # Any param-resolution failure → route through the app's
             # exception handlers. This includes RequestValidationError
@@ -6420,35 +6606,6 @@ class FastAPI:
                 except Exception:  # noqa: BLE001
                     pass
             return True
-            if kind == "query_or_default":
-                ann, default = ann_or_info  # type: ignore[misc]
-                if pname in qp:
-                    raw = qp[pname]
-                    if ann is int:
-                        try:
-                            raw = int(raw)
-                        except (ValueError, TypeError):
-                            await _send_asgi_response(
-                                send,
-                                _JR(
-                                    content={"detail": [{"loc": ["query", pname], "msg": "not an int"}]},
-                                    status_code=422,
-                                ),
-                            )
-                            return True
-                    kwargs[pname] = raw
-                elif default is not _insp.Parameter.empty:
-                    kwargs[pname] = default
-                else:
-                    # Required param missing.
-                    await _send_asgi_response(
-                        send,
-                        _JR(
-                            content={"detail": [{"loc": ["query", pname], "msg": "field required"}]},
-                            status_code=422,
-                        ),
-                    )
-                    return True
 
         # Invoke the endpoint, wrapped in any ``@app.middleware('http')``
         # functions. ``_http_middlewares`` is stored in declaration
