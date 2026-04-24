@@ -7,10 +7,6 @@
     clippy::manual_strip,             // a few paths use starts_with + &s[n..] for clarity
     clippy::needless_return,          // `return` in early-exit arms reads more clearly
     clippy::only_used_in_recursion,   // recursive helpers use their own params
-    // PyO3 API transition: `downcast` → `cast` rename landed late in
-    // PyO3 0.28. Migration is mechanical but large; silence until we
-    // do a dedicated bump (tracked in todos.md).
-    deprecated,
 )]
 
 use pyo3::prelude::*;

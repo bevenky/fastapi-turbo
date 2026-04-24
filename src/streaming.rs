@@ -33,7 +33,7 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
     let mut headers = HeaderMap::with_capacity(4);
     if let Ok(hdr_attr) = obj.getattr(pyo3::intern!(py, "headers")) {
         // Support both plain dict and MutableHeaders (which has .items())
-        if let Ok(dict) = hdr_attr.downcast::<PyDict>() {
+        if let Ok(dict) = hdr_attr.cast::<PyDict>() {
             for (k, v) in dict.iter() {
                 let (Ok(key), Ok(val)) = (k.extract::<String>(), v.extract::<String>()) else {
                     continue;
@@ -45,7 +45,7 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
                 }
             }
         } else if let Ok(items_list) = hdr_attr.call_method0("items") {
-            if let Ok(list) = items_list.downcast::<pyo3::types::PyList>() {
+            if let Ok(list) = items_list.cast::<pyo3::types::PyList>() {
                 for item in list.iter() {
                     if let Ok((key, val)) = item.extract::<(String, String)>() {
                         if let (Ok(hname), Ok(hval)) =

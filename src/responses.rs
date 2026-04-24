@@ -106,7 +106,7 @@ fn orjson_kwargs(py: Python<'_>) -> &'static Py<PyAny> {
 fn dict_to_json_bytes(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<u8> {
     if let Some(dumps) = orjson_dumps(py) {
         let kw = orjson_kwargs(py);
-        if let Ok(bytes) = dumps.call(py, (obj,), Some(kw.bind(py).downcast().unwrap())) {
+        if let Ok(bytes) = dumps.call(py, (obj,), Some(kw.bind(py).cast().unwrap())) {
             if let Ok(b) = bytes.extract::<Vec<u8>>(py) {
                 return b;
             }
@@ -359,7 +359,7 @@ fn response_object_to_response(
     let mut headers = HeaderMap::new();
     if let Ok(hdr_obj) = obj.getattr("headers") {
         // Support both plain dict and MutableHeaders (which has .items())
-        if let Ok(dict) = hdr_obj.downcast::<PyDict>() {
+        if let Ok(dict) = hdr_obj.cast::<PyDict>() {
             if !dict.is_empty() {
                 for (k, v) in dict.iter() {
                     if let (Ok(key), Ok(val)) = (k.extract::<String>(), v.extract::<String>()) {
@@ -376,7 +376,7 @@ fn response_object_to_response(
                 }
             }
         } else if let Ok(items_list) = hdr_obj.call_method0("items") {
-            if let Ok(list) = items_list.downcast::<pyo3::types::PyList>() {
+            if let Ok(list) = items_list.cast::<pyo3::types::PyList>() {
                 for item in list.iter() {
                     if let Ok((key, val)) = item.extract::<(String, String)>() {
                         if raw_header_keys.contains(&key.to_ascii_lowercase()) {
@@ -895,14 +895,14 @@ fn extract_response_headers(obj: &Bound<'_, PyAny>) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Ok(hdr) = obj.getattr("headers") {
         // Support both plain dict and MutableHeaders (which has .items())
-        if let Ok(dict) = hdr.downcast::<PyDict>() {
+        if let Ok(dict) = hdr.cast::<PyDict>() {
             for (k, v) in dict.iter() {
                 if let (Ok(ks), Ok(vs)) = (k.extract::<String>(), v.extract::<String>()) {
                     out.push((ks, vs));
                 }
             }
         } else if let Ok(items_list) = hdr.call_method0("items") {
-            if let Ok(list) = items_list.downcast::<PyList>() {
+            if let Ok(list) = items_list.cast::<PyList>() {
                 for item in list.iter() {
                     if let Ok((ks, vs)) = item.extract::<(String, String)>() {
                         out.push((ks, vs));
