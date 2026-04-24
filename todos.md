@@ -27,6 +27,32 @@ long-tail rough edges not yet chased.
 
 ---
 
+## Post-audit follow-ups (deferred from the P0/P1/P2 pass — 2026-04-24)
+
+P0 / P1 items are all shipped. The following P2 items shipped partially and still have room:
+
+### Maintainability
+
+- **`applications.py` full split.** Extracted `_sentry_compat.py` (~370 LoC). The remaining 6,761 LoC still holds `_dep_resolution`, `_middleware_wrap`, `_exception_dispatch`, `_ws_endpoint` logic as inline closures. Splitting those cleanly requires flattening the closure state into explicit types — a 1-2 day refactor that should go through a design doc first.
+- **`except Exception: pass` — 57 remaining.** Narrowed the two pure-import cases to `ImportError`. The rest are mixed (introspection + import + attribute access); tightening each requires reading the surrounding code. Do this incrementally, case-by-case, when touching nearby code.
+- **PyO3 `downcast` → `cast` migration.** Silenced with a crate-level `#[allow(deprecated)]`. Mechanical but affects ~7 call sites; schedule alongside the next PyO3 bump.
+
+### Observability / CI
+
+- **CI pipeline.** No GitHub Actions / CI yet. Targets: `cargo test`, `cargo clippy -- -D warnings`, `pytest tests/`, FastAPI 0.136.0 upstream run, Sentry-SDK integration run, `ruff check`. Each should run on PR open + push to main.
+- **Compatibility matrix freshness.** `COMPATIBILITY.md` is a snapshot. Needs an automated "does this row still match reality?" check — e.g., a pytest parameterised over the matrix rows, or a doctest-style assert per claim.
+
+### Benchmark methodology
+
+- **Server-side CPU measurement.** The rewritten `fastapi-turbo-bench` measures wall-time latency + client-side throughput. It doesn't capture server CPU usage under load, warm vs cold state, or memory high-water marks.
+- **wrk / oha comparison.** Our bench is single-process. A quick `wrk -c256 -t8` run would cross-validate our numbers against an industry-standard tool.
+
+### Profiling gap
+
+- **Sentry active-thread-id profiling under the manual `SentryAsgiMiddleware(app)` wrap.** Requires thread-ident propagation across tokio→httpx→asyncio. 2 tests fail in `sentry-python/tests/integrations/fastapi/test_fastapi.py::test_active_thread_id`; documented in `COMPATIBILITY.md`.
+
+---
+
 ## `fastapi_turbo.audio` helper modules
 
 Opt-in modules that let users build real-time voice-agent apps in pure Python FastAPI code with Rust-native performance on per-frame hot operations. None change the WebSocket API.
