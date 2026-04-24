@@ -662,15 +662,24 @@ class FileResponse(Response):
         background=None,
     ):
         import mimetypes
+        from urllib.parse import quote
 
         self.path = str(path)
         self.filename = filename
         self.content_disposition_type = content_disposition_type
         self.stat_result = stat_result
-        # Infer media type from extension if not explicitly given
+        # Infer media type — prefer the client-facing filename's
+        # extension if provided (matches Starlette: a JSON download
+        # served from an extensionless cache-key path still gets the
+        # right Content-Type).
         if media_type is None:
-            guessed, _ = mimetypes.guess_type(self.path)
-            media_type = guessed or "application/octet-stream"
+            guessed, _ = mimetypes.guess_type(filename or self.path)
+            # Starlette parity: fall back to ``text/plain`` for files
+            # whose name doesn't map to a known MIME type (``README``,
+            # ``Dockerfile``, scripts without ``.sh``). The Rust
+            # full-file path still adds ``; charset=utf-8`` for textual
+            # types, so this also lets clients render inline.
+            media_type = guessed or "text/plain"
 
         super().__init__(
             content=b"",
@@ -679,18 +688,41 @@ class FileResponse(Response):
             media_type=media_type,
             background=background,
         )
-        # Stamp Content-Disposition if filename provided
+        # Stamp Content-Disposition if filename provided.
+        # Starlette parity: URL-quote the filename; if quoting produced
+        # a different string (non-ASCII, spaces, reserved chars) use
+        # the RFC 5987 ``filename*=utf-8''<quoted>`` form — plain
+        # ``filename="..."`` stuffing would emit non-ASCII bytes in
+        # the header and break strict HTTP parsers.
         if self.filename:
-            self.headers["content-disposition"] = (
-                f'{self.content_disposition_type}; filename="{self.filename}"'
-            )
+            quoted = quote(self.filename)
+            if quoted != self.filename:
+                disposition = (
+                    f"{self.content_disposition_type}; "
+                    f"filename*=utf-8''{quoted}"
+                )
+            else:
+                disposition = (
+                    f'{self.content_disposition_type}; filename="{self.filename}"'
+                )
+            self.headers.setdefault("content-disposition", disposition)
         # Apply stat headers if stat_result was provided
         if self.stat_result is not None:
             self.set_stat_headers(self.stat_result)
 
     def set_stat_headers(self, stat_result) -> None:
-        """Set content-length and last-modified headers from an os.stat_result."""
-        self.headers["content-length"] = str(stat_result.st_size)
-        self.headers["last-modified"] = email.utils.formatdate(
-            stat_result.st_mtime, usegmt=True
+        """Set content-length, last-modified, and etag headers from an
+        ``os.stat_result``. The ETag is the MD5 of ``"{mtime}-{size}"`` —
+        identical to upstream Starlette so clients built against either
+        server can re-validate partial downloads."""
+        import hashlib
+
+        content_length = str(stat_result.st_size)
+        last_modified = email.utils.formatdate(stat_result.st_mtime, usegmt=True)
+        etag_base = f"{stat_result.st_mtime}-{stat_result.st_size}"
+        etag = (
+            f'"{hashlib.md5(etag_base.encode(), usedforsecurity=False).hexdigest()}"'
         )
+        self.headers.setdefault("content-length", content_length)
+        self.headers.setdefault("last-modified", last_modified)
+        self.headers.setdefault("etag", etag)

@@ -1758,49 +1758,111 @@ async def _asgi_emit_exception(app, scope, send, exc):
 
 
 def _parse_range_header(header_val: str, total_len: int):
-    """Parse an RFC 7233 single-range spec (``bytes=N-M`` / ``N-`` /
-    ``-N``) against a known file length. Returns
-    ``('full',)`` when header is absent/unparseable,
-    ``('range', start, end_inclusive)`` when satisfiable,
-    ``('unsatisfiable',)`` when syntactically valid but out of bounds.
-    Multi-range (``bytes=N-M,X-Y``) returns ``('full',)`` here — the
-    in-process path doesn't build multipart/byteranges (the Rust path
-    does); a multi-range client falls back to the full body.
+    """Parse an RFC 7233 ``Range:`` header against a known file length.
+
+    Returns one of:
+      * ``('full',)`` — header absent/unparseable, wrong unit, or all
+        sub-ranges were syntactic no-ops (e.g. ``bytes=-0``). Caller
+        serves 200 full body.
+      * ``('range', start, end_inclusive)`` — exactly one satisfiable
+        sub-range after dropping unsatisfiable ones.
+      * ``('multi', [(s0, e0), (s1, e1), ...])`` — two or more
+        satisfiable sub-ranges. Caller emits 206 multipart/byteranges.
+      * ``('unsatisfiable',)`` — at least one sub-range parsed cleanly
+        but every one was out of bounds. Caller returns 416.
+
+    Edge-case handling mirrors Starlette/upstream FastAPI:
+      * Unit must be exactly ``bytes=`` (case-insensitive token, but
+        the spec on-the-wire is lowercase — ``Bytes=`` falls through).
+      * ``-0`` (zero-length suffix) is a syntactic no-op.
+      * Reversed ranges (``5-3``) bail the whole header to full body —
+        Starlette treats these as malformed.
+      * Mixed satisfiable + past-EOF sub-ranges: serve only the
+        satisfiable ones.
     """
     if not header_val:
         return ("full",)
     v = header_val.strip()
-    if not v.startswith("bytes="):
+    # Unit is case-insensitive per RFC, but Starlette lower-cases and
+    # compares exactly to ``bytes``. Match that.
+    if "=" not in v:
         return ("full",)
-    rest = v[len("bytes="):].strip()
-    if "," in rest:
+    unit, _, rest = v.partition("=")
+    if unit.strip().lower() != "bytes":
         return ("full",)
+    rest = rest.strip()
     if total_len == 0:
+        # Any well-formed range against an empty resource is
+        # unsatisfiable per RFC 7233.
         return ("unsatisfiable",)
-    try:
-        a, _, b = rest.partition("-")
+
+    specs = [p.strip() for p in rest.split(",")]
+    # Drop truly empty specs and single-dash placeholders.
+    specs = [p for p in specs if p and p != "-"]
+    if not specs:
+        return ("full",)
+
+    satisfiable: list[tuple[int, int]] = []
+    saw_any_parseable = False
+    for spec in specs:
+        if "-" not in spec:
+            # Malformed sub-range → bail the whole header.
+            return ("full",)
+        a, _, b = spec.partition("-")
         a = a.strip()
         b = b.strip()
-        if a == "" and b != "":
-            n = int(b)
-            if n <= 0:
+        try:
+            if a == "" and b != "":
+                # Suffix: last-N-bytes.
+                n = int(b)
+                if n <= 0:
+                    # Zero-length suffix — no-op, not a bail signal.
+                    continue
+                saw_any_parseable = True
+                n = min(n, total_len)
+                satisfiable.append((total_len - n, total_len - 1))
+            elif b == "" and a != "":
+                # Open-ended: start through EOF.
+                s = int(a)
+                saw_any_parseable = True
+                if s >= total_len:
+                    # Unsatisfiable sub-range — skip, don't bail.
+                    continue
+                satisfiable.append((s, total_len - 1))
+            elif a != "" and b != "":
+                s = int(a)
+                e = int(b)
+                if s > e:
+                    # Reversed range — Starlette treats as malformed,
+                    # which bails the whole header to full body.
+                    return ("full",)
+                saw_any_parseable = True
+                if s >= total_len:
+                    continue
+                satisfiable.append((s, min(e, total_len - 1)))
+            else:
+                # Both halves empty — garbage.
                 return ("full",)
-            n = min(n, total_len)
-            return ("range", total_len - n, total_len - 1)
-        if b == "" and a != "":
-            s = int(a)
-            if s >= total_len:
-                return ("unsatisfiable",)
-            return ("range", s, total_len - 1)
-        if a != "" and b != "":
-            s = int(a)
-            e = int(b)
-            if s > e or s >= total_len:
-                return ("unsatisfiable",)
-            return ("range", s, min(e, total_len - 1))
+        except (ValueError, TypeError):
+            return ("full",)
+
+    if not saw_any_parseable:
+        # All specs were zero-length suffixes or similar no-ops.
         return ("full",)
-    except (ValueError, TypeError):
-        return ("full",)
+    if not satisfiable:
+        return ("unsatisfiable",)
+    if len(satisfiable) == 1:
+        s, e = satisfiable[0]
+        return ("range", s, e)
+    return ("multi", satisfiable)
+
+
+def _make_byteranges_boundary() -> str:
+    """Generate a multipart/byteranges boundary. 26 hex chars —
+    process-nanos ⊕ per-call counter for uniqueness across bursts."""
+    import secrets
+    import time
+    return f"{int(time.time() * 1e9):016x}{secrets.token_hex(5)}"
 
 
 async def _send_file_response_asgi(send, response, scope=None) -> None:
@@ -1838,16 +1900,49 @@ async def _send_file_response_asgi(send, response, scope=None) -> None:
         ))
         return
 
+    import stat as _stat_mod
+    if not _stat_mod.S_ISREG(stat.st_mode):
+        # A directory (or device / fifo) reached FileResponse — this
+        # is a server-side routing bug, not a client error. Match
+        # Starlette: raise RuntimeError so the traceback surfaces in
+        # dev logs; the ASGI error handler (or the surrounding
+        # exception middleware) converts it to 500 for the client.
+        # Silently returning a JSON 500 here would mask the misuse.
+        raise RuntimeError(f"File at path {path} is not a file.")
+
     total_len = stat.st_size
 
-    # Extract Range from scope headers (if provided).
+    # Stamp Last-Modified + ETag at serve-time (matches Starlette).
+    # ``set_stat_headers`` uses ``setdefault`` so any user-supplied
+    # overrides on the response survive.
+    try:
+        response.set_stat_headers(stat)
+    except Exception:
+        # Don't let a header-stamp failure break the response.
+        pass
+
+    # Extract Range + If-Range from scope headers (if provided).
     range_header = ""
+    if_range_header = ""
     if scope is not None:
         for hk, hv in scope.get("headers", []) or []:
             hkn = hk.decode("latin-1") if isinstance(hk, bytes) else hk
-            if hkn.lower() == "range":
+            kl = hkn.lower()
+            if kl == "range":
                 range_header = hv.decode("latin-1") if isinstance(hv, bytes) else hv
-                break
+            elif kl == "if-range":
+                if_range_header = hv.decode("latin-1") if isinstance(hv, bytes) else hv
+
+    # If-Range gating: ignore Range when the validator doesn't match.
+    # Per RFC 7233 §3.2, If-Range carries either the entity's ETag or
+    # its Last-Modified — if neither matches, the server must serve the
+    # full representation (status 200) rather than a 206.
+    if range_header and if_range_header:
+        lm = response.headers.get("last-modified", "")
+        et = response.headers.get("etag", "")
+        if if_range_header != lm and if_range_header != et:
+            range_header = ""
+
     parsed = _parse_range_header(range_header, total_len) if range_header else ("full",)
 
     # 416 short-circuit.
@@ -1862,6 +1957,77 @@ async def _send_file_response_asgi(send, response, scope=None) -> None:
             ],
         })
         await send({"type": "http.response.body", "body": b""})
+        return
+
+    # Multi-range: emit 206 multipart/byteranges, streaming each part.
+    if parsed[0] == "multi":
+        ranges: list[tuple[int, int]] = parsed[1]
+        media = getattr(response, "media_type", None) or "application/octet-stream"
+        boundary = _make_byteranges_boundary()
+
+        # Precompute each part's preamble and the total body length so
+        # we can stamp Content-Length without buffering the whole body.
+        preambles: list[bytes] = []
+        body_len = 0
+        for start, end in ranges:
+            pre = (
+                f"\r\n--{boundary}\r\n"
+                f"Content-Type: {media}\r\n"
+                f"Content-Range: bytes {start}-{end}/{total_len}\r\n"
+                f"\r\n"
+            ).encode("latin-1")
+            preambles.append(pre)
+            body_len += len(pre) + (end - start + 1)
+        closing = f"\r\n--{boundary}--\r\n".encode("latin-1")
+        body_len += len(closing)
+
+        # Override headers for multipart response. We drop the upstream
+        # response's content-type/content-length — the part media_type
+        # lives inside each preamble now.
+        response.headers["content-length"] = str(body_len)
+        response.headers["content-type"] = (
+            f"multipart/byteranges; boundary={boundary}"
+        )
+        if "accept-ranges" not in response.headers:
+            response.headers["accept-ranges"] = "bytes"
+        # Drop any single-range content-range left by earlier logic.
+        response.headers.pop("content-range", None)
+
+        norm_headers = _pack_asgi_headers(response)
+        await send({
+            "type": "http.response.start",
+            "status": 206,
+            "headers": norm_headers,
+        })
+
+        CHUNK = 64 * 1024
+        try:
+            with open(path, "rb") as fh:
+                for (start, end), pre in zip(ranges, preambles):
+                    await send({
+                        "type": "http.response.body",
+                        "body": pre,
+                        "more_body": True,
+                    })
+                    fh.seek(start)
+                    remaining = end - start + 1
+                    while remaining > 0:
+                        chunk = fh.read(min(CHUNK, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        await send({
+                            "type": "http.response.body",
+                            "body": chunk,
+                            "more_body": True,
+                        })
+        except OSError:
+            pass
+        await send({
+            "type": "http.response.body",
+            "body": closing,
+            "more_body": False,
+        })
         return
 
     # Compute slice window.
@@ -1886,24 +2052,7 @@ async def _send_file_response_asgi(send, response, scope=None) -> None:
     if "accept-ranges" not in response.headers:
         response.headers["accept-ranges"] = "bytes"
 
-    # Pack headers (same shape as generic _send_asgi_response).
-    hdrs = response.headers
-    raw_headers = getattr(response, "raw_headers", None) or []
-    norm_headers: list[tuple[bytes, bytes]] = []
-    seen_exact: set[tuple[str, str]] = set()
-    if hdrs is not None and hasattr(hdrs, "items"):
-        for k, v in hdrs.items():
-            kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
-            vs = v if isinstance(v, str) else v.decode("latin-1")
-            seen_exact.add((kl, vs))
-            norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
-    for k, v in raw_headers:
-        kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
-        vs = v if isinstance(v, str) else v.decode("latin-1")
-        if (kl, vs) in seen_exact:
-            continue
-        seen_exact.add((kl, vs))
-        norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
+    norm_headers = _pack_asgi_headers(response)
 
     await send({
         "type": "http.response.start",
@@ -1937,6 +2086,32 @@ async def _send_file_response_asgi(send, response, scope=None) -> None:
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
+def _pack_asgi_headers(response) -> list[tuple[bytes, bytes]]:
+    """Serialize a Response's headers into ASGI's ``[(bytes, bytes)]``
+    shape, honouring both the ``MutableHeaders`` view (the canonical
+    single-value-per-name dict-ish) and any ``raw_headers`` (preserves
+    duplicate-allowed names like ``Set-Cookie``). De-duplicates exact
+    (name, value) collisions between the two sources."""
+    hdrs = response.headers
+    raw_headers = getattr(response, "raw_headers", None) or []
+    norm_headers: list[tuple[bytes, bytes]] = []
+    seen_exact: set[tuple[str, str]] = set()
+    if hdrs is not None and hasattr(hdrs, "items"):
+        for k, v in hdrs.items():
+            kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
+            vs = v if isinstance(v, str) else v.decode("latin-1")
+            seen_exact.add((kl, vs))
+            norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
+    for k, v in raw_headers:
+        kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
+        vs = v if isinstance(v, str) else v.decode("latin-1")
+        if (kl, vs) in seen_exact:
+            continue
+        seen_exact.add((kl, vs))
+        norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
+    return norm_headers
+
+
 async def _send_asgi_response(send, response, scope=None) -> None:
     # ``FileResponse`` stores ``content=b""`` because the Rust server
     # reads ``response.path`` from disk at serve time. Over the in-
@@ -1944,11 +2119,18 @@ async def _send_asgi_response(send, response, scope=None) -> None:
     # file ourselves — and honour the request's ``Range:`` header.
     try:
         from fastapi_turbo.responses import FileResponse as _FR
-        if isinstance(response, _FR):
-            await _send_file_response_asgi(send, response, scope=scope)
-            return
-    except Exception:  # noqa: BLE001
-        pass
+    except ImportError:
+        _FR = None  # type: ignore[assignment]
+    if _FR is not None and isinstance(response, _FR):
+        # Bare propagation — if ``_send_file_response_asgi`` raises
+        # (e.g. ``RuntimeError`` on directory paths, mirroring
+        # Starlette), let the ASGI error handler surface it with a
+        # traceback. The previous ``except Exception: pass`` swallowed
+        # these and fell through to the generic path, which then
+        # emitted a 200-empty body for a FileResponse that never
+        # legitimately ran.
+        await _send_file_response_asgi(send, response, scope=scope)
+        return
     """Serialize a fastapi-turbo ``Response`` (or Starlette-compatible
     response with ``status_code`` / ``headers`` / ``body``) into ASGI
     ``http.response.start`` + ``http.response.body`` messages.

@@ -121,11 +121,14 @@ fn dict_to_json_bytes(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<u8> {
 /// Response objects, then primitives. BaseModel and dataclass live at the
 /// bottom so we don't pay their cost on every call.
 pub fn py_to_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Response {
-    py_to_response_with_request(py, obj, None)
+    py_to_response_with_request(py, obj, None, None)
 }
 
 /// Request-aware variant: `range_header` is the inbound `Range:` header
-/// (if any) so `FileResponse` can answer with `206 Partial Content`.
+/// (if any) so `FileResponse` can answer with `206 Partial Content`;
+/// `if_range_header` is the inbound `If-Range:` value so the server can
+/// fall back to `200` when the client's cached validator is stale
+/// (RFC 7233 §3.2).
 ///
 /// The router uses this at every handler-result conversion site; plain
 /// `py_to_response()` stays valid for call sites that don't have request
@@ -134,6 +137,7 @@ pub fn py_to_response_with_request(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
     range_header: Option<&str>,
+    if_range_header: Option<&str>,
 ) -> Response {
     // dict or list -> JSON (MOST COMMON — check first, skip attr lookups)
     if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() {
@@ -202,8 +206,14 @@ pub fn py_to_response_with_request(
                     .ok()
                     .and_then(|a| a.extract::<String>().ok());
                 let headers = extract_response_headers(obj);
-                return if range_header.is_some() {
-                    file_response_with_range(&path_str, media_type, headers, range_header)
+                return if range_header.is_some() || if_range_header.is_some() {
+                    file_response_with_range(
+                        &path_str,
+                        media_type,
+                        headers,
+                        range_header,
+                        if_range_header,
+                    )
                 } else {
                     file_response(&path_str, media_type, headers)
                 };
@@ -223,8 +233,14 @@ pub fn py_to_response_with_request(
                         .ok()
                         .and_then(|a| a.extract::<String>().ok());
                     let headers = extract_response_headers(obj);
-                    return if range_header.is_some() {
-                        file_response_with_range(&path_str, media_type, headers, range_header)
+                    return if range_header.is_some() || if_range_header.is_some() {
+                        file_response_with_range(
+                            &path_str,
+                            media_type,
+                            headers,
+                            range_header,
+                            if_range_header,
+                        )
                     } else {
                         file_response(&path_str, media_type, headers)
                     };
@@ -978,6 +994,16 @@ pub fn file_response(
                 .into_response();
         }
     };
+    if !meta.is_file() {
+        // Directory / device / fifo reached FileResponse — routing
+        // bug. Return 500 rather than silently serving an empty 200
+        // (Starlette parity).
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("File at path {path_str} is not a file."),
+        )
+            .into_response();
+    }
     let total_len = meta.len();
 
     // Small-file fast path: fully buffer if ≤ 256 KiB. Avoids the
@@ -1022,11 +1048,14 @@ pub fn file_response(
         }
     };
 
+    let (last_modified, etag) = compute_file_stat_headers(&meta);
     let mut resp = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", &ct)
         .header("content-length", total_len)
         .header("accept-ranges", "bytes")
+        .header("last-modified", &last_modified)
+        .header("etag", &etag)
         .body(body)
         .expect("build file response");
 
@@ -1035,7 +1064,7 @@ pub fn file_response(
         // Skip headers we've already set (avoids duplicate Content-Type/Length)
         if matches!(
             k_lower.as_str(),
-            "content-type" | "content-length" | "accept-ranges"
+            "content-type" | "content-length" | "accept-ranges" | "last-modified" | "etag"
         ) {
             continue;
         }
@@ -1077,11 +1106,20 @@ pub fn parse_byte_ranges(header: &str, total_len: u64) -> Result<Option<Vec<(u64
     const MAX_RANGES: usize = 16;
     let max_total_bytes: u64 = total_len.saturating_mul(2).max(1);
 
-    let rest = match header.trim().strip_prefix("bytes=") {
-        Some(r) => r.trim(),
+    // Unit parse: split on '=', lower-case unit token, compare to
+    // ``bytes`` (Starlette-parity — ``Bytes=`` / ``items=`` fall through
+    // to 200 full body).
+    let trimmed = header.trim();
+    let (unit, rest) = match trimmed.split_once('=') {
+        Some((u, r)) => (u.trim(), r.trim()),
         None => return Ok(None),
     };
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return Ok(None);
+    }
     if total_len == 0 {
+        // Any well-formed range against an empty resource is
+        // unsatisfiable per RFC 7233.
         return Err(());
     }
     // Early-reject headers with too many comma-separated parts BEFORE
@@ -1096,7 +1134,8 @@ pub fn parse_byte_ranges(header: &str, total_len: u64) -> Result<Option<Vec<(u64
     let mut saw_any_parseable = false;
     for part in rest.split(',') {
         let part = part.trim();
-        if part.is_empty() {
+        // Drop empty spec and bare "-" (syntactic no-op per Starlette).
+        if part.is_empty() || part == "-" {
             continue;
         }
         let (a, b) = match part.split_once('-') {
@@ -1109,13 +1148,20 @@ pub fn parse_byte_ranges(header: &str, total_len: u64) -> Result<Option<Vec<(u64
         let a = a.trim();
         let b = b.trim();
         let (start, end) = if a.is_empty() {
-            let n: u64 = match b.parse() {
-                Ok(n) if n > 0 => n,
-                _ => return Ok(None),
-            };
-            saw_any_parseable = true;
-            let n = n.min(total_len);
-            (total_len - n, total_len - 1)
+            // Suffix ``-N``: last N bytes.
+            match b.parse::<u64>() {
+                Ok(0) => {
+                    // Zero-length suffix is a syntactic no-op — skip,
+                    // don't bail the whole header (matches Starlette).
+                    continue;
+                }
+                Ok(n) => {
+                    saw_any_parseable = true;
+                    let n = n.min(total_len);
+                    (total_len - n, total_len - 1)
+                }
+                Err(_) => return Ok(None),
+            }
         } else if b.is_empty() {
             let s: u64 = match a.parse() {
                 Ok(s) => s,
@@ -1135,8 +1181,13 @@ pub fn parse_byte_ranges(header: &str, total_len: u64) -> Result<Option<Vec<(u64
                 Ok(e) => e,
                 Err(_) => return Ok(None),
             };
+            if s > e {
+                // Reversed sub-range is malformed per Starlette — bail
+                // the whole header to full body.
+                return Ok(None);
+            }
             saw_any_parseable = true;
-            if s > e || s >= total_len {
+            if s >= total_len {
                 continue;
             }
             (s, e.min(total_len - 1))
@@ -1158,6 +1209,193 @@ pub fn parse_byte_ranges(header: &str, total_len: u64) -> Result<Option<Vec<(u64
         return Ok(None);
     }
     Ok(Some(out))
+}
+
+/// Compute the Last-Modified and ETag pair for a file, based on its
+/// ``mtime`` and ``size``. Output formats mirror upstream Starlette:
+///
+///   * ``Last-Modified`` is RFC 1123 GMT (``formatdate(usegmt=True)``).
+///   * ``ETag`` is ``"<md5_hex>"`` where the pre-image is
+///     ``"{mtime_float_str}-{size}"``. Python's ``str(float)`` produces
+///     the shortest repr that round-trips; we emulate by using the
+///     nanosecond-precision seconds field plus a 9-digit fractional
+///     part, trimming trailing zeros but keeping at least one digit
+///     after the decimal to match ``str(float)`` on whole seconds
+///     (``1234567890.0``).
+pub fn compute_file_stat_headers(meta: &std::fs::Metadata) -> (String, String) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let dur = mtime
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0));
+    let secs = dur.as_secs();
+    let nanos = dur.subsec_nanos();
+    let size = meta.len();
+
+    // Format ``mtime`` as ``str(float)`` would — shortest repr that
+    // round-trips. We build a fixed-precision string then trim.
+    let mtime_str = format_python_float_secs_nanos(secs, nanos);
+    let etag_base = format!("{mtime_str}-{size}");
+
+    let md5_hex = md5_hex_str(etag_base.as_bytes());
+    let etag = format!("\"{md5_hex}\"");
+
+    let last_modified = format_http_date(secs);
+    (last_modified, etag)
+}
+
+/// Emulate Python's ``str(float)`` for ``secs + nanos/1e9`` — shortest
+/// fractional repr that round-trips. Used for ETag pre-image parity
+/// with Starlette.
+fn format_python_float_secs_nanos(secs: u64, nanos: u32) -> String {
+    if nanos == 0 {
+        // Whole seconds — ``str(1234.0)`` → ``"1234.0"``.
+        return format!("{secs}.0");
+    }
+    // 9-digit fractional, then trim trailing zeros (keep one digit min).
+    let mut s = format!("{secs}.{nanos:09}");
+    while s.ends_with('0') && !s.ends_with(".0") {
+        s.pop();
+    }
+    s
+}
+
+/// Tiny MD5 implementation — avoids pulling in the ``md5`` crate just
+/// for ETag hashing. RFC 1321 reference implementation; constant-time
+/// is NOT needed (ETags are not secrets).
+fn md5_hex_str(data: &[u8]) -> String {
+    let digest = md5_digest(data);
+    let mut out = String::with_capacity(32);
+    for b in digest.iter() {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn md5_digest(data: &[u8]) -> [u8; 16] {
+    // Standard MD5 implementation (RFC 1321).
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+
+    let mut a0: u32 = 0x67452301;
+    let mut b0: u32 = 0xefcdab89;
+    let mut c0: u32 = 0x98badcfe;
+    let mut d0: u32 = 0x10325476;
+
+    // Pad: append 0x80, then zero bytes, then length in bits as u64 LE.
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded: Vec<u8> = Vec::with_capacity(data.len() + 72);
+    padded.extend_from_slice(data);
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_le_bytes());
+
+    for chunk in padded.chunks_exact(64) {
+        let mut m = [0u32; 16];
+        for i in 0..16 {
+            m[i] = u32::from_le_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        let mut a = a0;
+        let mut b = b0;
+        let mut c = c0;
+        let mut d = d0;
+        for i in 0..64 {
+            let (f, g) = if i < 16 {
+                ((b & c) | (!b & d), i)
+            } else if i < 32 {
+                ((d & b) | (!d & c), (5 * i + 1) % 16)
+            } else if i < 48 {
+                (b ^ c ^ d, (3 * i + 5) % 16)
+            } else {
+                (c ^ (b | !d), (7 * i) % 16)
+            };
+            let tmp = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(
+                a.wrapping_add(f)
+                    .wrapping_add(K[i])
+                    .wrapping_add(m[g])
+                    .rotate_left(S[i]),
+            );
+            a = tmp;
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..16].copy_from_slice(&d0.to_le_bytes());
+    out
+}
+
+/// RFC 1123 / ``HTTP-date`` format — ``"Sun, 06 Nov 1994 08:49:37 GMT"``.
+/// Uses only Unix seconds so there are no locale / TZ dependencies.
+fn format_http_date(secs: u64) -> String {
+    // Days since 1970-01-01 (Thursday).
+    const SECS_PER_DAY: u64 = 86_400;
+    let days = secs / SECS_PER_DAY;
+    let rem = secs % SECS_PER_DAY;
+    let hour = (rem / 3600) as u32;
+    let minute = ((rem % 3600) / 60) as u32;
+    let second = (rem % 60) as u32;
+
+    // Day-of-week: 1970-01-01 was a Thursday (index 4).
+    let dow_idx = ((days + 4) % 7) as usize;
+    let dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][dow_idx];
+
+    let (year, month, day) = days_to_ymd(days as i64);
+    let month_name = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][(month - 1) as usize];
+
+    format!(
+        "{dow}, {day:02} {month_name} {year:04} {hour:02}:{minute:02}:{second:02} GMT"
+    )
+}
+
+/// Civil date from days-since-epoch. Howard Hinnant's algorithm
+/// (``chrono::days_from_civil`` inverse). Returns (year, month, day).
+fn days_to_ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Generate a 26-hex-char boundary string for a `multipart/byteranges`
@@ -1185,6 +1423,7 @@ pub fn file_response_with_range(
     media_type: Option<String>,
     extra_headers: Vec<(String, String)>,
     range_header: Option<&str>,
+    if_range_header: Option<&str>,
 ) -> Response {
     let path = Path::new(path_str);
 
@@ -1204,6 +1443,13 @@ pub fn file_response_with_range(
                 .into_response();
         }
     };
+    if !meta.is_file() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("File at path {path_str} is not a file."),
+        )
+            .into_response();
+    }
     let total_len = meta.len();
     let mut ct = media_type.unwrap_or_else(|| "application/octet-stream".to_string());
     if (ct.starts_with("text/") || ct == "application/javascript" || ct == "application/json")
@@ -1212,8 +1458,23 @@ pub fn file_response_with_range(
         ct.push_str("; charset=utf-8");
     }
 
+    // Compute stat headers once — the ETag/Last-Modified pair is
+    // stamped on every response path (full, 416, single-range, multi-
+    // range). ``If-Range`` gating also needs these values BEFORE we
+    // commit to a Range-derived status code.
+    let (last_modified, etag) = compute_file_stat_headers(&meta);
+
+    // If-Range gating: if the validator doesn't match our entity's
+    // Last-Modified or ETag, behave as if Range wasn't sent (RFC 7233
+    // §3.2). The client is acting on a stale validator and must
+    // re-download the full resource.
+    let effective_range = match if_range_header {
+        Some(v) if v != last_modified && v != etag => None,
+        _ => range_header,
+    };
+
     // Parse Range (if any). Malformed → full body. Unsatisfiable → 416.
-    let ranges = match range_header {
+    let ranges = match effective_range {
         Some(h) => match parse_byte_ranges(h, total_len) {
             Ok(r) => r,
             Err(()) => {
@@ -1221,6 +1482,8 @@ pub fn file_response_with_range(
                     .status(StatusCode::RANGE_NOT_SATISFIABLE)
                     .header("content-range", format!("bytes */{total_len}"))
                     .header("content-type", &ct)
+                    .header("last-modified", &last_modified)
+                    .header("etag", &etag)
                     .body(Body::empty())
                     .expect("build 416");
             }
@@ -1228,73 +1491,103 @@ pub fn file_response_with_range(
         None => None,
     };
 
-    // Multi-range → multipart/byteranges (matches Starlette). We
-    // open the file once and seek+read ONLY the requested slices.
-    // Previous implementation ``std::fs::read(path)``'d the whole
-    // file — on a 10 GB file, a ``Range: bytes=0-0,2-2`` allocated
-    // 10 GB before slicing. The DoS cap bounds the output body at
-    // ≤ 2× file size with ≤ 16 ranges but NOT the intermediate
-    // allocation. Now the intermediate memory is bounded by the
-    // requested-byte sum (which the cap already limits).
+    // Multi-range → multipart/byteranges (matches Starlette).
+    //
+    // Stream the response: a producer task opens the file once, seeks
+    // + reads each slice in 64 KiB chunks, and pushes
+    // preamble/body/closing frames into an mpsc channel. The response
+    // body consumes from the receiver, so peak memory is one chunk
+    // per concurrent request — not the full capped ``2 × total_len``
+    // that the previous ``Vec<u8>``-accumulation approach used.
+    //
+    // Content-Length is still computed upfront (sum of preamble
+    // lengths + slice lengths + closing length) so clients can
+    // progress-bar accurately without chunked framing.
     if let Some(rs) = &ranges {
         if rs.len() > 1 {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut fh = match std::fs::File::open(path) {
-                Ok(f) => f,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("File open error: {e}"),
-                    )
-                        .into_response();
-                }
-            };
             let boundary = make_byteranges_boundary();
-            let mut body: Vec<u8> = Vec::new();
+
+            // Precompute every preamble + closing + total body length.
+            let mut preambles: Vec<bytes::Bytes> = Vec::with_capacity(rs.len());
+            let mut body_len: u64 = 0;
             for (start, end) in rs {
-                let part_len = (*end as usize) + 1 - *start as usize;
-                if let Err(e) = fh.seek(SeekFrom::Start(*start)) {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("File seek error: {e}"),
-                    )
-                        .into_response();
-                }
-                let mut slice_buf = vec![0u8; part_len];
-                if let Err(e) = fh.read_exact(&mut slice_buf) {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("File read error: {e}"),
-                    )
-                        .into_response();
-                }
-                body.extend_from_slice(b"--");
-                body.extend_from_slice(boundary.as_bytes());
-                body.extend_from_slice(b"\r\nContent-Type: ");
-                body.extend_from_slice(ct.as_bytes());
-                body.extend_from_slice(b"\r\nContent-Range: bytes ");
-                body.extend_from_slice(format!("{start}-{end}/{total_len}").as_bytes());
-                body.extend_from_slice(b"\r\n\r\n");
-                body.extend_from_slice(&slice_buf);
-                body.extend_from_slice(b"\r\n");
+                let pre = format!(
+                    "\r\n--{boundary}\r\nContent-Type: {ct}\r\nContent-Range: bytes {start}-{end}/{total_len}\r\n\r\n"
+                );
+                body_len += pre.len() as u64 + (end - start + 1);
+                preambles.push(bytes::Bytes::from(pre));
             }
-            body.extend_from_slice(b"--");
-            body.extend_from_slice(boundary.as_bytes());
-            body.extend_from_slice(b"--");
-            let body_len = body.len() as u64;
+            let closing = bytes::Bytes::from(format!("\r\n--{boundary}--\r\n"));
+            body_len += closing.len() as u64;
+
+            // Spawn producer. The axum handler context already runs
+            // inside the tokio runtime, so ``tokio::spawn`` picks up
+            // the ambient handle.
+            let path_buf = path.to_path_buf();
+            let ranges_owned: Vec<(u64, u64)> = rs.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                let mut fh = match tokio::fs::File::open(&path_buf).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                const CHUNK: usize = 64 * 1024;
+                let mut buf = vec![0u8; CHUNK];
+                for ((start, end), pre) in ranges_owned.into_iter().zip(preambles.into_iter()) {
+                    if tx.send(Ok(pre)).await.is_err() {
+                        return;
+                    }
+                    if let Err(e) = fh.seek(std::io::SeekFrom::Start(start)).await {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                    let mut remaining: u64 = end - start + 1;
+                    while remaining > 0 {
+                        let want = (remaining as usize).min(CHUNK);
+                        let slice = &mut buf[..want];
+                        if let Err(e) = fh.read_exact(slice).await {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                        remaining -= want as u64;
+                        if tx
+                            .send(Ok(bytes::Bytes::copy_from_slice(slice)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                let _ = tx.send(Ok(closing)).await;
+            });
+
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+            let body = Body::from_stream(stream);
             let multipart_ct = format!("multipart/byteranges; boundary={boundary}");
             let mut resp = Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header("content-type", multipart_ct)
                 .header("content-length", body_len)
                 .header("accept-ranges", "bytes")
-                .body(Body::from(body))
+                .header("last-modified", &last_modified)
+                .header("etag", &etag)
+                .body(body)
                 .expect("build multi-range response");
             for (k, v) in extra_headers {
                 let k_lower = k.to_ascii_lowercase();
                 if matches!(
                     k_lower.as_str(),
-                    "content-type" | "content-length" | "accept-ranges" | "content-range"
+                    "content-type"
+                        | "content-length"
+                        | "accept-ranges"
+                        | "content-range"
+                        | "last-modified"
+                        | "etag"
                 ) {
                     continue;
                 }
@@ -1330,17 +1623,39 @@ pub fn file_response_with_range(
 
     const STREAM_THRESHOLD: u64 = 256 * 1024;
     let body = if slice_len <= STREAM_THRESHOLD {
-        // Small: read just the slice we need into memory.
-        match std::fs::read(path) {
-            Ok(all) => {
-                let s = start_off as usize;
-                let e = (start_off + slice_len) as usize;
-                Body::from(all[s..e].to_vec())
+        // Small slice — read only the requested bytes into memory.
+        // Previously this branch did ``std::fs::read(path)`` which
+        // loaded the full file before slicing: a 1-byte range from
+        // a 10 GB file allocated 10 GB. The 256 KiB threshold is
+        // about OUTPUT body size (buffered vs streamed), not about
+        // how many source bytes we can read — source reads must
+        // always be bounded by the requested slice.
+        use std::io::{Read, Seek, SeekFrom};
+        match std::fs::File::open(path) {
+            Ok(mut fh) => {
+                if start_off > 0 {
+                    if let Err(e) = fh.seek(SeekFrom::Start(start_off)) {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("File seek error: {e}"),
+                        )
+                            .into_response();
+                    }
+                }
+                let mut buf = vec![0u8; slice_len as usize];
+                if let Err(e) = fh.read_exact(&mut buf) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("File read error: {e}"),
+                    )
+                        .into_response();
+                }
+                Body::from(buf)
             }
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("File read error: {e}"),
+                    format!("File open error: {e}"),
                 )
                     .into_response();
             }
@@ -1390,7 +1705,9 @@ pub fn file_response_with_range(
         .status(status)
         .header("content-type", &ct)
         .header("content-length", slice_len)
-        .header("accept-ranges", "bytes");
+        .header("accept-ranges", "bytes")
+        .header("last-modified", &last_modified)
+        .header("etag", &etag);
     if let Some(ref cr) = content_range {
         builder = builder.header("content-range", cr);
     }
@@ -1400,7 +1717,12 @@ pub fn file_response_with_range(
         let k_lower = k.to_ascii_lowercase();
         if matches!(
             k_lower.as_str(),
-            "content-type" | "content-length" | "accept-ranges" | "content-range"
+            "content-type"
+                | "content-length"
+                | "accept-ranges"
+                | "content-range"
+                | "last-modified"
+                | "etag"
         ) {
             continue;
         }

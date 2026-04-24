@@ -58,8 +58,8 @@ def test_multi_range_two(file20):
     # Payload bytes present
     assert b"01234" in r.content
     assert b"ABCDE" in r.content
-    # Closing boundary at end
-    assert r.content.endswith(f"--{boundary}--".encode())
+    # Closing boundary at end (trailing CRLF is optional per RFC 2046).
+    assert r.content.rstrip().endswith(f"--{boundary}--".encode())
     # Content-Length matches body
     assert int(r.headers["content-length"]) == len(r.content)
 
