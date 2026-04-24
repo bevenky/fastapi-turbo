@@ -1757,15 +1757,61 @@ async def _asgi_emit_exception(app, scope, send, exc):
     raise exc
 
 
-async def _send_file_response_asgi(send, response) -> None:
-    """Serialize a ``FileResponse`` over ASGI.
+def _parse_range_header(header_val: str, total_len: int):
+    """Parse an RFC 7233 single-range spec (``bytes=N-M`` / ``N-`` /
+    ``-N``) against a known file length. Returns
+    ``('full',)`` when header is absent/unparseable,
+    ``('range', start, end_inclusive)`` when satisfiable,
+    ``('unsatisfiable',)`` when syntactically valid but out of bounds.
+    Multi-range (``bytes=N-M,X-Y``) returns ``('full',)`` here — the
+    in-process path doesn't build multipart/byteranges (the Rust path
+    does); a multi-range client falls back to the full body.
+    """
+    if not header_val:
+        return ("full",)
+    v = header_val.strip()
+    if not v.startswith("bytes="):
+        return ("full",)
+    rest = v[len("bytes="):].strip()
+    if "," in rest:
+        return ("full",)
+    if total_len == 0:
+        return ("unsatisfiable",)
+    try:
+        a, _, b = rest.partition("-")
+        a = a.strip()
+        b = b.strip()
+        if a == "" and b != "":
+            n = int(b)
+            if n <= 0:
+                return ("full",)
+            n = min(n, total_len)
+            return ("range", total_len - n, total_len - 1)
+        if b == "" and a != "":
+            s = int(a)
+            if s >= total_len:
+                return ("unsatisfiable",)
+            return ("range", s, total_len - 1)
+        if a != "" and b != "":
+            s = int(a)
+            e = int(b)
+            if s > e or s >= total_len:
+                return ("unsatisfiable",)
+            return ("range", s, min(e, total_len - 1))
+        return ("full",)
+    except (ValueError, TypeError):
+        return ("full",)
+
+
+async def _send_file_response_asgi(send, response, scope=None) -> None:
+    """Serialize a ``FileResponse`` over ASGI, honouring the request's
+    ``Range:`` header when present.
 
     ``FileResponse`` stores ``content=b""`` and relies on the Rust
     server to read ``self.path`` from disk at serve-time. Over the
-    in-process ASGI path that never runs, so we must open the file
-    here, stamp Content-Length/Content-Type if the user didn't set
-    them, and stream the body via multiple ``http.response.body``
-    frames."""
+    in-process ASGI path that never runs, so we open the file here,
+    compute the slice we actually need, and stream it via
+    ``http.response.body`` frames."""
     import os
     from fastapi_turbo.responses import JSONResponse as _JR_file
 
@@ -1792,16 +1838,55 @@ async def _send_file_response_asgi(send, response) -> None:
         ))
         return
 
-    # Stamp Content-Length from stat if the caller didn't set it.
-    if "content-length" not in response.headers:
-        response.headers["content-length"] = str(stat.st_size)
+    total_len = stat.st_size
+
+    # Extract Range from scope headers (if provided).
+    range_header = ""
+    if scope is not None:
+        for hk, hv in scope.get("headers", []) or []:
+            hkn = hk.decode("latin-1") if isinstance(hk, bytes) else hk
+            if hkn.lower() == "range":
+                range_header = hv.decode("latin-1") if isinstance(hv, bytes) else hv
+                break
+    parsed = _parse_range_header(range_header, total_len) if range_header else ("full",)
+
+    # 416 short-circuit.
+    if parsed[0] == "unsatisfiable":
+        await send({
+            "type": "http.response.start",
+            "status": 416,
+            "headers": [
+                (b"content-range", f"bytes */{total_len}".encode("latin-1")),
+                (b"content-type", (getattr(response, "media_type", None) or "application/octet-stream").encode("latin-1")),
+                (b"accept-ranges", b"bytes"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": b""})
+        return
+
+    # Compute slice window.
+    if parsed[0] == "range":
+        _, start_off, end_incl = parsed
+        slice_len = end_incl - start_off + 1
+        status_code = 206
+        content_range = f"bytes {start_off}-{end_incl}/{total_len}"
+    else:
+        start_off = 0
+        slice_len = total_len
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        content_range = None
+
+    # Stamp Content-Length from the slice we're about to send.
+    response.headers["content-length"] = str(slice_len)
     if "content-type" not in response.headers:
         media = getattr(response, "media_type", None) or "application/octet-stream"
         response.headers["content-type"] = media
+    if content_range is not None:
+        response.headers["content-range"] = content_range
+    if "accept-ranges" not in response.headers:
+        response.headers["accept-ranges"] = "bytes"
 
-    # Build the start message using the same header-pack logic as
-    # the generic path below.
-    status_code = int(getattr(response, "status_code", 200) or 200)
+    # Pack headers (same shape as generic _send_asgi_response).
     hdrs = response.headers
     raw_headers = getattr(response, "raw_headers", None) or []
     norm_headers: list[tuple[bytes, bytes]] = []
@@ -1826,35 +1911,41 @@ async def _send_file_response_asgi(send, response) -> None:
         "headers": norm_headers,
     })
 
-    # Stream 64 KiB chunks. We open with sync I/O and yield the GIL
-    # between chunks — keeps this simple without an async fs dep.
+    # Stream 64 KiB chunks, bounded to the requested slice.
     CHUNK = 64 * 1024
-    with open(path, "rb") as fh:
-        while True:
-            chunk = fh.read(CHUNK)
-            if not chunk:
-                break
-            await send({
-                "type": "http.response.body",
-                "body": chunk,
-                "more_body": True,
-            })
-    await send({
-        "type": "http.response.body",
-        "body": b"",
-        "more_body": False,
-    })
+    remaining = slice_len
+    try:
+        with open(path, "rb") as fh:
+            if start_off > 0:
+                fh.seek(start_off)
+            while remaining > 0:
+                chunk = fh.read(min(CHUNK, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                await send({
+                    "type": "http.response.body",
+                    "body": chunk,
+                    "more_body": remaining > 0,
+                })
+    except OSError:
+        # File disappeared mid-stream — client sees a truncated body.
+        pass
+    if remaining == slice_len:
+        # We sent no body frames (zero-length file) — emit the
+        # terminator.
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
-async def _send_asgi_response(send, response) -> None:
+async def _send_asgi_response(send, response, scope=None) -> None:
     # ``FileResponse`` stores ``content=b""`` because the Rust server
     # reads ``response.path`` from disk at serve time. Over the in-
     # process ASGI path no Rust runs, so we must open + stream the
-    # file ourselves.
+    # file ourselves — and honour the request's ``Range:`` header.
     try:
         from fastapi_turbo.responses import FileResponse as _FR
         if isinstance(response, _FR):
-            await _send_file_response_asgi(send, response)
+            await _send_file_response_asgi(send, response, scope=scope)
             return
     except Exception:  # noqa: BLE001
         pass
@@ -6814,8 +6905,9 @@ class FastAPI:
 
         # ``result`` is already a Response (either the MW-wrapped or
         # the raw endpoint return converted by ``_call_endpoint``).
+        # Thread scope through so FileResponse can honour ``Range:``.
         if isinstance(result, _Resp):
-            await _send_asgi_response(send, result)
+            await _send_asgi_response(send, result, scope=scope)
         else:
             final = _JR(content=_je(result))
             if response_injected is not None:
@@ -6823,7 +6915,7 @@ class FastAPI:
                     final.raw_headers.append((k, v))
                 if getattr(response_injected, "status_code", None):
                     final.status_code = response_injected.status_code
-            await _send_asgi_response(send, final)
+            await _send_asgi_response(send, final, scope=scope)
         # Run yield-dep teardowns in reverse order (LIFO — FA semantics).
         # These fire after the response has been sent so a slow
         # teardown doesn't delay the client. Any error is logged and

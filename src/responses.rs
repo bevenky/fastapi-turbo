@@ -1228,20 +1228,23 @@ pub fn file_response_with_range(
         None => None,
     };
 
-    // Multi-range → multipart/byteranges (matches Starlette). Kept
-    // buffered because the DoS cap bounds the total body at ≤ 2× file
-    // size with ≤ 16 ranges — the multipart wrapper is small and
-    // streaming multipart gains little. Large files only appear here
-    // when a client requests many small ranges, which is already
-    // capped above.
+    // Multi-range → multipart/byteranges (matches Starlette). We
+    // open the file once and seek+read ONLY the requested slices.
+    // Previous implementation ``std::fs::read(path)``'d the whole
+    // file — on a 10 GB file, a ``Range: bytes=0-0,2-2`` allocated
+    // 10 GB before slicing. The DoS cap bounds the output body at
+    // ≤ 2× file size with ≤ 16 ranges but NOT the intermediate
+    // allocation. Now the intermediate memory is bounded by the
+    // requested-byte sum (which the cap already limits).
     if let Some(rs) = &ranges {
         if rs.len() > 1 {
-            let data = match std::fs::read(path) {
-                Ok(d) => d,
+            use std::io::{Read, Seek, SeekFrom};
+            let mut fh = match std::fs::File::open(path) {
+                Ok(f) => f,
                 Err(e) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("File read error: {e}"),
+                        format!("File open error: {e}"),
                     )
                         .into_response();
                 }
@@ -1249,8 +1252,22 @@ pub fn file_response_with_range(
             let boundary = make_byteranges_boundary();
             let mut body: Vec<u8> = Vec::new();
             for (start, end) in rs {
-                let s = *start as usize;
-                let e = (*end as usize) + 1;
+                let part_len = (*end as usize) + 1 - *start as usize;
+                if let Err(e) = fh.seek(SeekFrom::Start(*start)) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("File seek error: {e}"),
+                    )
+                        .into_response();
+                }
+                let mut slice_buf = vec![0u8; part_len];
+                if let Err(e) = fh.read_exact(&mut slice_buf) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("File read error: {e}"),
+                    )
+                        .into_response();
+                }
                 body.extend_from_slice(b"--");
                 body.extend_from_slice(boundary.as_bytes());
                 body.extend_from_slice(b"\r\nContent-Type: ");
@@ -1258,7 +1275,7 @@ pub fn file_response_with_range(
                 body.extend_from_slice(b"\r\nContent-Range: bytes ");
                 body.extend_from_slice(format!("{start}-{end}/{total_len}").as_bytes());
                 body.extend_from_slice(b"\r\n\r\n");
-                body.extend_from_slice(&data[s..e]);
+                body.extend_from_slice(&slice_buf);
                 body.extend_from_slice(b"\r\n");
             }
             body.extend_from_slice(b"--");

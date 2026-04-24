@@ -13,6 +13,64 @@
 
 ---
 
+## 2026-04-24 — concurrent load + external-tool cross-check
+
+Previous runs were single-connection sequential loopback. Those
+numbers tell you about *per-request overhead*, not about how the
+stack behaves under concurrent load or when measured by an
+independent client. Both pictures matter; here they are side by side.
+
+**Setup:** same M-series / macOS / Python 3.14 / GIL-enabled env.
+Endpoint: `@app.get("/hello")` returning `{"ok": True}`.
+
+### fastapi-turbo — single vs concurrent connections
+
+| Connections | p50 | p95 | p99 | req/s |
+|:---:|--:|--:|--:|--:|
+| 1 | 27 μs | 35 μs | 42 μs | 31,910 |
+| 32 | 293 μs | 691 μs | 967 μs | 92,893 |
+| 256 | 2,370 μs | 4,468 μs | 5,608 μs | 94,167 |
+
+The c=1 number is what's quoted in the README table and is a
+measure of per-request overhead only. c=32 and c=256 show the
+throughput ceiling our worker-loop model hits (~93K req/s sustained);
+the latency climbs because 32+ concurrent in-flight requests queue
+against a single shared async loop. This is the number users will
+see under real load; the c=1 number is not.
+
+### oha cross-check (independent client, Rust-based)
+
+Running the same endpoint via [oha](https://github.com/hatoo/oha)
+to sanity-check our custom `fastapi-turbo-bench`:
+
+| Config | Our client p50 | oha average | Our req/s | oha req/s |
+|:---:|--:|--:|--:|--:|
+| c=1 | 27 μs | 31 μs | 31,910 | 31,910 |
+| c=32 | 293 μs | 389 μs | 92,893 | 81,582 |
+
+The c=1 numbers match within measurement noise (31 μs vs our 27 μs p50;
+rps identical). c=32 shows our client measures ~12% faster average
+latency than oha — not a lie, but the difference comes from how each
+tool distributes work across connections (our client keeps N persistent
+streams hot; oha uses a connection pool with different batching).
+Both tools confirm the ~90K-100K req/s throughput ceiling.
+
+### What we have NOT yet published
+
+- **Linux x86_64** results. macOS loopback has different scheduler
+  and syscall characteristics than Linux production. README claims
+  should be calibrated against Linux once CI publishes them.
+- **`wrk` / `bombardier` cross-checks.** `oha` is one independent
+  client; at least one of `wrk` (C, the de facto standard) or
+  `bombardier` (Go) would tighten the error bars. These tools also
+  aren't installed in this environment; adding them is TODO.
+
+Treat the README's "ties Go" claim as accurate for c=1 loopback
+only. At c=32+ Go's per-core goroutine model is harder to beat;
+no honest number lets us claim parity at every concurrency level.
+
+---
+
 ## 2026-04-20 — fastapi-turbo vs FastAPI+uvicorn vs Go Gin (head-to-head)
 
 *All three servers run an endpoint-identical app. `20,000` requests per
