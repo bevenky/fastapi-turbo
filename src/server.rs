@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::{Any as CorsAny, AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, Any as CorsAny, CorsLayer};
 use tower_http::services::ServeDir;
 
 use crate::router::{build_router, RouteInfo};
@@ -118,9 +118,7 @@ where
         let path = req.uri().path().to_string();
 
         // Only attempt cache for plain GET / HEAD without Range.
-        if !has_range
-            && (method == axum::http::Method::GET || method == axum::http::Method::HEAD)
-        {
+        if !has_range && (method == axum::http::Method::GET || method == axum::http::Method::HEAD) {
             let rel_clean = path.trim_start_matches('/');
             // Reject attempts to escape the root via ".."
             if rel_clean.split('/').any(|c| c == "..") {
@@ -199,12 +197,15 @@ where
                             let bytes = bytes::Bytes::from(bytes);
                             {
                                 let mut g = cache.lock().unwrap();
-                                g.insert(full_str, CachedFile {
-                                    bytes: bytes.clone(),
-                                    content_type: ct,
-                                    mtime,
-                                    validated_at: std::time::Instant::now(),
-                                });
+                                g.insert(
+                                    full_str,
+                                    CachedFile {
+                                        bytes: bytes.clone(),
+                                        content_type: ct,
+                                        mtime,
+                                        validated_at: std::time::Instant::now(),
+                                    },
+                                );
                             }
                             let body = if method == axum::http::Method::HEAD {
                                 axum::body::Body::empty()
@@ -454,6 +455,26 @@ pub fn run_server(
                 .collect();
             std::sync::Arc::new(opts)
         };
+        // Per-path declared-method map: the non-preflight OPTIONS
+        // middleware uses this to produce a path-specific `Allow:`
+        // header (matching upstream FastAPI), rather than a hardcoded
+        // generic list.
+        let allow_methods_by_path_arc: std::sync::Arc<
+            std::collections::HashMap<String, Vec<String>>,
+        > = {
+            let mut map: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for r in &routes {
+                let entry = map.entry(r.path.clone()).or_default();
+                for m in &r.methods {
+                    let up = m.to_ascii_uppercase();
+                    if !entry.iter().any(|x| x == &up) {
+                        entry.push(up);
+                    }
+                }
+            }
+            std::sync::Arc::new(map)
+        };
         // Also populate the legacy globals for any single-app code paths
         // (best-effort; authoritative is the per-server Arc).
         if let Ok(mut slot) = DECLARED_PATHS.write() {
@@ -612,10 +633,14 @@ pub fn run_server(
             // We add a pre-middleware that lets OPTIONS *without* those
             // headers fall through to method routing (→ 405 as expected).
             let opts_paths_arc = declared_options_paths_arc.clone();
+            let allow_by_path_arc = allow_methods_by_path_arc.clone();
             app = app.layer(axum::middleware::from_fn(
                 move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
                     let paths = opts_paths_arc.clone();
-                    async move { non_preflight_options_middleware_with_paths(req, next, paths).await }
+                    let allow = allow_by_path_arc.clone();
+                    async move {
+                        non_preflight_options_middleware_with_paths(req, next, paths, allow).await
+                    }
                 },
             ));
 
@@ -643,7 +668,7 @@ pub fn run_server(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-                .with_graceful_shutdown(shutdown_signal())
+                .with_graceful_shutdown(shutdown_signal_for_port(port))
                 .await
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -685,6 +710,7 @@ async fn non_preflight_options_middleware_with_paths(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
     declared_options_paths: std::sync::Arc<std::collections::HashSet<String>>,
+    allow_methods_by_path: std::sync::Arc<std::collections::HashMap<String, Vec<String>>>,
 ) -> axum::response::Response {
     if req.method() == axum::http::Method::OPTIONS {
         let has_origin = req.headers().contains_key("origin");
@@ -698,13 +724,40 @@ async fn non_preflight_options_middleware_with_paths(
                 .iter()
                 .any(|tpl| options_path_matches(tpl, path));
             if !has_explicit_opts {
-                // Not a preflight, no explicit OPTIONS — bypass CORS by
-                // bolting a short-circuit 405 response (the inner router
-                // would do this too but CorsLayer would override it to 200).
+                // Look up the actual methods declared for this path.
+                // Without this, CorsLayer would rewrite the 405 to a 200
+                // (its default OPTIONS handling), so we short-circuit —
+                // but we emit a path-specific `Allow:` matching upstream
+                // FastAPI (not a generic catch-all list).
+                //
+                // When multiple registered templates match (e.g. an
+                // incoming ``/items/special`` against both ``/items/{id}``
+                // and ``/items/special``), prefer the most specific one.
+                // ``allow_methods_by_path`` is a ``HashMap`` whose
+                // iteration order is non-deterministic, so without this
+                // step the emitted ``Allow`` header could flap between
+                // equivalent runs. Specificity = fewer ``{param}``
+                // segments; tie → lexicographically smaller template.
+                let best = allow_methods_by_path
+                    .iter()
+                    .filter(|(tpl, _)| options_path_matches(tpl, path))
+                    .min_by(|(a, _), (b, _)| {
+                        let pa = a.matches('{').count();
+                        let pb = b.matches('{').count();
+                        pa.cmp(&pb).then_with(|| a.cmp(b))
+                    });
+                let allow_header = best
+                    .map(|(_, methods)| methods.join(", "))
+                    .unwrap_or_else(String::new);
+                if allow_header.is_empty() {
+                    // Unknown path — let it through so the inner router
+                    // can 404 it.
+                    return next.run(req).await;
+                }
                 return axum::response::Response::builder()
                     .status(axum::http::StatusCode::METHOD_NOT_ALLOWED)
                     .header("content-type", "application/json")
-                    .header("allow", "GET, POST, PUT, DELETE, PATCH, HEAD")
+                    .header("allow", allow_header)
                     .body(axum::body::Body::from(r#"{"detail":"Method Not Allowed"}"#))
                     .unwrap();
             }
@@ -786,17 +839,48 @@ async fn cors_preflight_ok_body_middleware(
 }
 
 fn options_path_matches(template: &str, concrete: &str) -> bool {
+    // Starlette's ``{name:path}`` converter consumes multi-segment
+    // tails. ``axum::matchit`` models the same as ``{*name}``. We
+    // accept either form on the template side: when we see a
+    // ``{_:path}`` or ``{*_}`` segment, every remaining concrete
+    // segment is absorbed and the match succeeds.
     let t_segs: Vec<&str> = template.split('/').collect();
     let c_segs: Vec<&str> = concrete.split('/').collect();
-    if t_segs.len() != c_segs.len() { return false; }
-    for (t, c) in t_segs.iter().zip(c_segs.iter()) {
-        if t.starts_with('{') && t.ends_with('}') {
-            if c.is_empty() { return false; }
-            continue;
+    let mut ti = 0;
+    let mut ci = 0;
+    while ti < t_segs.len() {
+        let t = t_segs[ti];
+        // ``{*name}`` (axum form) or ``{name:path}`` (Starlette form)
+        let is_catchall = (t.starts_with("{*") && t.ends_with('}'))
+            || (t.starts_with('{') && t.ends_with('}') && t.contains(":path"));
+        if is_catchall {
+            // Must be the last template segment to absorb the tail.
+            if ti != t_segs.len() - 1 {
+                return false;
+            }
+            // At least one concrete segment (even empty) must remain,
+            // and it must be non-empty so ``/files/`` doesn't match.
+            if ci >= c_segs.len() {
+                return false;
+            }
+            let remainder_empty = c_segs[ci..].iter().all(|s| s.is_empty());
+            return !remainder_empty;
         }
-        if t != c { return false; }
+        if ci >= c_segs.len() {
+            return false;
+        }
+        let c = c_segs[ci];
+        if t.starts_with('{') && t.ends_with('}') {
+            if c.is_empty() {
+                return false;
+            }
+        } else if t != c {
+            return false;
+        }
+        ti += 1;
+        ci += 1;
     }
-    true
+    ci == c_segs.len()
 }
 
 /// Middleware that 307-redirects between `/foo` ↔ `/foo/` ONLY when the
@@ -914,22 +998,66 @@ async fn slashes_redirect_middleware_with_paths(
 /// supervisors send SIGTERM for orderly shutdown; the old handler only caught
 /// SIGINT, so SIGTERM left fastapi-turbo hanging and the listener held its port
 /// past the bench's cleanup phase (zombie processes blocking next-run startup).
-async fn shutdown_signal() {
+/// Per-port programmatic shutdown registry. ``TestClient.__exit__``
+/// and any other Python caller that wants to free a running server's
+/// thread / port can call ``request_server_shutdown(port)`` from Python
+/// to trip the ``Notify`` for that port. ``shutdown_signal_for_port``
+/// races the signal-based shutdown against this notify.
+static SERVER_SHUTDOWN_NOTIFIERS: std::sync::RwLock<
+    Option<std::collections::HashMap<u16, std::sync::Arc<tokio::sync::Notify>>>,
+> = std::sync::RwLock::new(None);
+
+fn register_shutdown_notifier(port: u16) -> std::sync::Arc<tokio::sync::Notify> {
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut slot = SERVER_SHUTDOWN_NOTIFIERS.write().unwrap();
+    let map = slot.get_or_insert_with(std::collections::HashMap::new);
+    map.insert(port, notify.clone());
+    notify
+}
+
+fn take_shutdown_notifier(port: u16) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+    let mut slot = SERVER_SHUTDOWN_NOTIFIERS.write().unwrap();
+    slot.as_mut().and_then(|m| m.remove(&port))
+}
+
+/// Trigger a graceful shutdown of the server listening on ``port``.
+/// Returns ``True`` if a running server was found and notified,
+/// ``False`` otherwise. Called by the Python ``TestClient`` on
+/// ``__exit__`` so long-running test suites don't leak ports/threads.
+#[pyfunction]
+pub fn request_server_shutdown(port: u16) -> bool {
+    if let Some(n) = take_shutdown_notifier(port) {
+        n.notify_waiters();
+        true
+    } else {
+        false
+    }
+}
+
+async fn shutdown_signal_for_port(port: u16) {
+    let notify = register_shutdown_notifier(port);
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(_) => {
-            // Fallback: only SIGINT.
-            tokio::signal::ctrl_c().await.ok();
-            println!("\nfastapi-turbo shutting down...");
+            // Fallback: only SIGINT or programmatic shutdown.
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = notify.notified() => {}
+            }
             return;
         }
     };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
+        _ = notify.notified() => {}
     }
-    println!("\nfastapi-turbo shutting down...");
+}
+
+#[allow(dead_code)]
+async fn shutdown_signal() {
+    shutdown_signal_for_port(0).await;
 }
 
 // ── Middleware configuration ─────────────────────────────────────────
@@ -965,9 +1093,7 @@ fn parse_middleware_configs(
         let mw_type: String = dict
             .get_item("type")?
             .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "Middleware config must have a 'type' key",
-                )
+                pyo3::exceptions::PyValueError::new_err("Middleware config must have a 'type' key")
             })?
             .extract()?;
 
@@ -1039,10 +1165,7 @@ fn parse_middleware_configs(
 /// Layers are applied in reverse order so the first middleware in the user's
 /// list wraps outermost (runs first on request, last on response), matching
 /// the Starlette/FastAPI convention.
-fn apply_middlewares(
-    router: axum::Router,
-    configs: &[MiddlewareConfig],
-) -> axum::Router {
+fn apply_middlewares(router: axum::Router, configs: &[MiddlewareConfig]) -> axum::Router {
     let mut app = router;
 
     for config in configs.iter().rev() {
@@ -1077,89 +1200,102 @@ fn apply_middlewares(
                 // streams the compressed body with Transfer-Encoding:
                 // chunked. Buffer compressed responses so Content-Length
                 // is present — FA tests assert on it.
-                app = app.layer(axum::middleware::from_fn(gzip_set_content_length_middleware));
+                app = app.layer(axum::middleware::from_fn(
+                    gzip_set_content_length_middleware,
+                ));
             }
             MiddlewareConfig::TrustedHost { allowed_hosts } => {
                 let hosts = allowed_hosts.clone();
-                app = app.layer(axum::middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-                    let hosts = hosts.clone();
-                    async move {
-                        // If wildcard, allow all
-                        if hosts.iter().any(|h| h == "*") {
-                            return next.run(req).await;
-                        }
-
-                        let host_header = req
-                            .headers()
-                            .get(axum::http::header::HOST)
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("");
-
-                        // Strip port from host
-                        let host_name = if host_header.contains(':') {
-                            host_header.split(':').next().unwrap_or("")
-                        } else {
-                            host_header
-                        }.to_lowercase();
-
-                        let is_valid = hosts.iter().any(|pattern| {
-                            let pattern = pattern.to_lowercase();
-                            if pattern == host_name {
-                                return true;
+                app = app.layer(axum::middleware::from_fn(
+                    move |req: axum::http::Request<axum::body::Body>,
+                          next: axum::middleware::Next| {
+                        let hosts = hosts.clone();
+                        async move {
+                            // If wildcard, allow all
+                            if hosts.iter().any(|h| h == "*") {
+                                return next.run(req).await;
                             }
-                            // Wildcard subdomain matching: "*.example.com"
-                            if let Some(suffix) = pattern.strip_prefix('*') {
-                                return host_name.ends_with(&suffix);
-                            }
-                            false
-                        });
 
-                        if is_valid {
-                            next.run(req).await
-                        } else {
-                            axum::http::Response::builder()
-                                .status(axum::http::StatusCode::BAD_REQUEST)
-                                .body(axum::body::Body::from("Invalid host header"))
-                                .unwrap()
-                        }
-                    }
-                }));
-            }
-            MiddlewareConfig::HttpsRedirect => {
-                app = app.layer(axum::middleware::from_fn(|req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-                    async move {
-                        // Check X-Forwarded-Proto header or URI scheme
-                        let is_https = req
-                            .headers()
-                            .get("x-forwarded-proto")
-                            .and_then(|v| v.to_str().ok())
-                            .map(|s| s.eq_ignore_ascii_case("https"))
-                            .unwrap_or_else(|| {
-                                req.uri().scheme_str().map(|s| s.eq_ignore_ascii_case("https")).unwrap_or(false)
+                            let host_header = req
+                                .headers()
+                                .get(axum::http::header::HOST)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+
+                            // Strip port from host
+                            let host_name = if host_header.contains(':') {
+                                host_header.split(':').next().unwrap_or("")
+                            } else {
+                                host_header
+                            }
+                            .to_lowercase();
+
+                            let is_valid = hosts.iter().any(|pattern| {
+                                let pattern = pattern.to_lowercase();
+                                if pattern == host_name {
+                                    return true;
+                                }
+                                // Wildcard subdomain matching: "*.example.com"
+                                if let Some(suffix) = pattern.strip_prefix('*') {
+                                    return host_name.ends_with(&suffix);
+                                }
+                                false
                             });
 
-                        if is_https {
-                            return next.run(req).await;
+                            if is_valid {
+                                next.run(req).await
+                            } else {
+                                axum::http::Response::builder()
+                                    .status(axum::http::StatusCode::BAD_REQUEST)
+                                    .body(axum::body::Body::from("Invalid host header"))
+                                    .unwrap()
+                            }
                         }
+                    },
+                ));
+            }
+            MiddlewareConfig::HttpsRedirect => {
+                app = app.layer(axum::middleware::from_fn(
+                    |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                        async move {
+                            // Check X-Forwarded-Proto header or URI scheme
+                            let is_https = req
+                                .headers()
+                                .get("x-forwarded-proto")
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.eq_ignore_ascii_case("https"))
+                                .unwrap_or_else(|| {
+                                    req.uri()
+                                        .scheme_str()
+                                        .map(|s| s.eq_ignore_ascii_case("https"))
+                                        .unwrap_or(false)
+                                });
 
-                        // Build the redirect URL
-                        let host = req
-                            .headers()
-                            .get(axum::http::header::HOST)
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("localhost");
-                        let path_and_query = req.uri().path_and_query()
-                            .map(|pq| pq.as_str())
-                            .unwrap_or("/");
-                        let redirect_url = format!("https://{host}{path_and_query}");
+                            if is_https {
+                                return next.run(req).await;
+                            }
 
-                        axum::http::Response::builder()
-                            .status(axum::http::StatusCode::TEMPORARY_REDIRECT)
-                            .header(axum::http::header::LOCATION, redirect_url)
-                            .body(axum::body::Body::empty())
-                            .unwrap()
-                    }
-                }));
+                            // Build the redirect URL
+                            let host = req
+                                .headers()
+                                .get(axum::http::header::HOST)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("localhost");
+                            let path_and_query = req
+                                .uri()
+                                .path_and_query()
+                                .map(|pq| pq.as_str())
+                                .unwrap_or("/");
+                            let redirect_url = format!("https://{host}{path_and_query}");
+
+                            axum::http::Response::builder()
+                                .status(axum::http::StatusCode::TEMPORARY_REDIRECT)
+                                .header(axum::http::header::LOCATION, redirect_url)
+                                .body(axum::body::Body::empty())
+                                .unwrap()
+                        }
+                    },
+                ));
             }
         }
     }

@@ -40,6 +40,7 @@ fn _fastapi_turbo_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_hello, m)?)?;
     m.add_function(wrap_pyfunction!(core_version, m)?)?;
     m.add_function(wrap_pyfunction!(server::run_server, m)?)?;
+    m.add_function(wrap_pyfunction!(server::request_server_shutdown, m)?)?;
     m.add_class::<config::ServerConfig>()?;
     m.add_class::<router::RouteInfo>()?;
     m.add_class::<router::ParamInfo>()?;

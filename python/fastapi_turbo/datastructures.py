@@ -85,61 +85,96 @@ class URL:
 
 
 class Headers:
-    """Case-insensitive dict-like for HTTP headers."""
+    """Case-insensitive, **duplicate-preserving** HTTP-header view.
+
+    Backed by a ``list[tuple[str, str]]`` rather than a plain dict so
+    that repeated headers (``Set-Cookie``, ``X-Forwarded-For``,
+    ``Accept-Language`` in test clients, etc.) survive round-trip. The
+    dict-like API (``headers["k"]`` / ``.get("k")`` / iteration) returns
+    the *first* match for a key — mirrors Starlette's ``Headers`` class.
+    ``getlist("k")`` returns every occurrence in wire order.
+    """
 
     def __init__(self, raw=None):
-        self._dict: dict[str, str] = {}
+        self._list: list[tuple[str, str]] = []
         if raw is None:
-            pass
-        elif isinstance(raw, dict):
+            return
+        if isinstance(raw, Headers):
+            self._list = list(raw._list)
+            return
+        if isinstance(raw, dict):
             for k, v in raw.items():
-                self._dict[k.lower()] = str(v)
-        elif isinstance(raw, (list, tuple)):
-            # list of (key, value) tuples — common in ASGI scope
+                self._list.append((k.lower(), str(v)))
+            return
+        if isinstance(raw, (list, tuple)):
             for k, v in raw:
                 if isinstance(k, bytes):
                     k = k.decode("latin-1")
                 if isinstance(v, bytes):
                     v = v.decode("latin-1")
-                self._dict[k.lower()] = v
-        else:
-            pass
+                self._list.append((k.lower(), v))
+            return
 
     def __getitem__(self, key: str) -> str:
-        return self._dict[key.lower()]
+        k = key.lower()
+        for kk, vv in self._list:
+            if kk == k:
+                return vv
+        raise KeyError(key)
 
     def __contains__(self, key: object) -> bool:
-        if isinstance(key, str):
-            return key.lower() in self._dict
-        return False
+        if not isinstance(key, str):
+            return False
+        k = key.lower()
+        return any(kk == k for kk, _ in self._list)
 
     def get(self, key: str, default: str | None = None) -> str | None:
-        return self._dict.get(key.lower(), default)
+        k = key.lower()
+        for kk, vv in self._list:
+            if kk == k:
+                return vv
+        return default
 
     def keys(self):
-        return self._dict.keys()
+        # Order-preserving unique keys.
+        seen: dict[str, None] = {}
+        for k, _ in self._list:
+            seen[k] = None
+        return list(seen.keys())
 
     def values(self):
-        return self._dict.values()
+        # First value per unique key — mirrors dict-like iteration.
+        seen: dict[str, str] = {}
+        for k, v in self._list:
+            if k not in seen:
+                seen[k] = v
+        return list(seen.values())
 
     def items(self):
-        return self._dict.items()
+        """Return **all** (k, v) pairs, including duplicates, in wire order."""
+        return list(self._list)
 
     def __iter__(self):
-        return iter(self._dict)
+        return iter(self.keys())
 
     def __len__(self) -> int:
-        return len(self._dict)
+        return len(self.keys())
 
     def __repr__(self) -> str:
-        return f"Headers({self._dict!r})"
+        return f"Headers({self._list!r})"
 
     def getlist(self, key: str) -> list[str]:
-        """Return all values for a header key (single value as one-element list)."""
-        val = self._dict.get(key.lower())
-        if val is None:
-            return []
-        return [val]
+        """Return all values for a header key, in wire order.
+
+        ``Set-Cookie: a`` / ``Set-Cookie: b`` → ``["a", "b"]``.
+        """
+        k = key.lower()
+        return [vv for kk, vv in self._list if kk == k]
+
+    def raw(self):
+        """List of ``(name: bytes, value: bytes)`` tuples — Starlette-
+        compatible low-level view."""
+        return [(k.encode("latin-1"), v.encode("latin-1")) for k, v in self._list]
 
 
 class QueryParams:

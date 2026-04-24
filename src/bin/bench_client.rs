@@ -43,6 +43,17 @@ struct Config {
 }
 
 fn parse_args() -> Config {
+    // Two CLI forms are supported:
+    //
+    //   new flag form:
+    //     HOST PORT PATH --requests N --warmup N --method POST --body '{}'
+    //                    --content-type application/json --connections 4
+    //
+    //   legacy positional form (kept for compat with older benchmark
+    //   scripts and shell wrappers):
+    //     HOST PORT PATH REQUESTS WARMUP [METHOD] [BODY] [CONTENT_TYPE]
+    //
+    // Flags always win — if both are present we use the flag value.
     let mut positional: Vec<String> = Vec::new();
     let mut opt: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -58,38 +69,57 @@ fn parse_args() -> Config {
             i += 1;
         }
     }
+
+    // Positional slots: HOST(0) PORT(1) PATH(2) REQUESTS(3) WARMUP(4)
+    // METHOD(5) BODY(6) CONTENT_TYPE(7). Flags override.
+    let method = opt
+        .get("method")
+        .cloned()
+        .unwrap_or_else(|| positional.get(5).cloned().unwrap_or_else(|| "GET".into()));
+    let body = opt
+        .get("body")
+        .cloned()
+        .unwrap_or_else(|| positional.get(6).cloned().unwrap_or_default());
+    let content_type = opt.get("content-type").cloned().unwrap_or_else(|| {
+        positional
+            .get(7)
+            .cloned()
+            .unwrap_or_else(|| "application/json".into())
+    });
+    let requests = opt
+        .get("requests")
+        .and_then(|s| s.parse().ok())
+        .or_else(|| positional.get(3).and_then(|s| s.parse().ok()))
+        .unwrap_or(20000);
+    let warmup = opt
+        .get("warmup")
+        .and_then(|s| s.parse().ok())
+        .or_else(|| positional.get(4).and_then(|s| s.parse().ok()))
+        .unwrap_or(1000);
+
     Config {
-        host: positional.first().cloned().unwrap_or_else(|| "127.0.0.1".into()),
+        host: positional
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1".into()),
         port: positional
             .get(1)
             .and_then(|s| s.parse().ok())
             .unwrap_or(8000),
-        path: positional.get(2).cloned().unwrap_or_else(|| "/hello".into()),
-        method: opt
-            .get("method")
+        path: positional
+            .get(2)
             .cloned()
-            .unwrap_or_else(|| "GET".into()),
-        body: opt.get("body").cloned().unwrap_or_default(),
-        content_type: opt
-            .get("content-type")
-            .cloned()
-            .unwrap_or_else(|| "application/json".into()),
+            .unwrap_or_else(|| "/hello".into()),
+        method,
+        body,
+        content_type,
         connections: opt
             .get("connections")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1),
-        requests: opt
-            .get("requests")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(20000),
-        warmup: opt
-            .get("warmup")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000),
-        format: opt
-            .get("format")
-            .cloned()
-            .unwrap_or_else(|| "human".into()),
+        requests,
+        warmup,
+        format: opt.get("format").cloned().unwrap_or_else(|| "human".into()),
     }
 }
 
@@ -145,8 +175,23 @@ fn main() {
             thread::spawn(move || {
                 let mut stream = TcpStream::connect(&addr).expect("connect failed");
                 stream.set_nodelay(true).ok();
-                for _ in 0..warmup_per_worker {
-                    let _ = send_recv(&mut stream, &request_bytes);
+                // Warmup: also sanity-check the first response's status
+                // line. A misrouted method (the old CLI silently ran
+                // POSTs as GETs) would otherwise produce steady 405s
+                // whose latency got benchmarked as "fast", poisoning
+                // comparisons. Abort early with a clear message.
+                for iter in 0..warmup_per_worker {
+                    let resp = send_recv(&mut stream, &request_bytes);
+                    if iter == 0 {
+                        let status = parse_status_code(&resp).unwrap_or(0);
+                        if !(200..400).contains(&status) {
+                            eprintln!(
+                                "bench_client: bad status {status} on first warmup \
+                                 request — check method/path. aborting."
+                            );
+                            std::process::exit(2);
+                        }
+                    }
                 }
                 let mut local: Vec<f64> = Vec::with_capacity(requests_per_worker);
                 let mut local_server: Vec<f64> = Vec::new();
@@ -242,13 +287,28 @@ fn send_recv(stream: &mut TcpStream, request: &[u8]) -> Vec<u8> {
         response.extend_from_slice(&buf[..n]);
         if let Some(header_end) = find_subsequence(&response, b"\r\n\r\n") {
             let headers = std::str::from_utf8(&response[..header_end]).unwrap_or("");
+            let is_chunked = headers.lines().any(|l| {
+                let l = l.to_ascii_lowercase();
+                l.starts_with("transfer-encoding:") && l.contains("chunked")
+            });
+            let body_start = header_end + 4;
+            if is_chunked {
+                // Drain the chunked body until we see the
+                // zero-length terminator ``0\r\n\r\n``. Any trailing
+                // bytes after that belong to the next response and
+                // would poison keep-alive measurements if we stopped
+                // early on Content-Length alone.
+                if response[body_start..].windows(5).any(|w| w == b"0\r\n\r\n") {
+                    break;
+                }
+                continue;
+            }
             let cl = headers
                 .lines()
                 .find(|l| l.to_lowercase().starts_with("content-length:"))
                 .and_then(|l| l.split(':').nth(1))
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .unwrap_or(0);
-            let body_start = header_end + 4;
             if response.len() >= body_start + cl {
                 break;
             }
@@ -259,6 +319,14 @@ fn send_recv(stream: &mut TcpStream, request: &[u8]) -> Vec<u8> {
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn parse_status_code(response: &[u8]) -> Option<u16> {
+    let eol = find_subsequence(response, b"\r\n")?;
+    let line = std::str::from_utf8(&response[..eol]).ok()?;
+    let mut parts = line.split_whitespace();
+    let _version = parts.next()?;
+    parts.next()?.parse().ok()
 }
 
 fn parse_server_timing(response: &[u8]) -> Option<f64> {

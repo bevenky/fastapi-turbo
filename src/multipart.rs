@@ -116,10 +116,13 @@ pub fn parse_multipart_sync(
         // bumps a refcount on the Arc backing the original buffer.
         let data = body.slice(body_start..data_end);
 
-        result
-            .entry(name.clone())
-            .or_default()
-            .push(ParsedField { name, filename, content_type, data, headers });
+        result.entry(name.clone()).or_default().push(ParsedField {
+            name,
+            filename,
+            content_type,
+            data,
+            headers,
+        });
 
         pos = data_end + 2; // position of the next `--boundary`
     }
@@ -256,7 +259,12 @@ impl PyUploadFile {
         let slice = &self.data[*cursor..*cursor + take];
         *cursor += take;
         let py_bytes = PyBytes::new(py, slice).unbind();
-        Py::new(py, ImmediateBytes { value: Some(py_bytes) })
+        Py::new(
+            py,
+            ImmediateBytes {
+                value: Some(py_bytes),
+            },
+        )
     }
 
     /// Async seek.
@@ -287,11 +295,7 @@ impl PyUploadFile {
     }
 
     /// Async write — not really writable, but matches signature.
-    fn write<'py>(
-        &self,
-        py: Python<'py>,
-        _data: Bound<'py, PyAny>,
-    ) -> PyResult<Py<ImmediateNone>> {
+    fn write<'py>(&self, py: Python<'py>, _data: Bound<'py, PyAny>) -> PyResult<Py<ImmediateNone>> {
         Py::new(py, ImmediateNone)
     }
 

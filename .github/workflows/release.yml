@@ -16,8 +16,65 @@ permissions:
   contents: read
 
 jobs:
+  # ── Gate: every wheel-build job below depends on this. The gate
+  # matrix covers ALL Python versions we ship wheels for (3.10–3.14)
+  # so a version-specific regression never sneaks past a "3.14-only"
+  # check. Rust fmt / clippy / tests run once (Python-independent) on
+  # the 3.14 leg; we suppress the redundant work on the others.
+  gate:
+    name: Test + lint gate (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install Python deps
+        run: |
+          python -m pip install -U pip
+          python -m pip install maturin pytest httpx "pydantic>=2" python-multipart \
+                                "websockets>=12" ruff
+      - name: Build extension (release) + install editable
+        run: maturin develop --release
+      - name: cargo fmt --check
+        if: matrix.python == '3.14'
+        run: cargo fmt --check
+      - name: cargo test
+        if: matrix.python == '3.14'
+        run: cargo test --release
+      - name: cargo clippy -- -D warnings
+        if: matrix.python == '3.14'
+        run: cargo clippy --all-targets --release -- -D warnings
+      - name: ruff check
+        if: matrix.python == '3.14'
+        run: ruff check python/ tests/
+      - name: pytest (fast subset, no live WebSocket servers)
+        run: pytest tests/ -x -q --ignore=tests/test_websocket.py --ignore=tests/parity
+      - name: pytest stress suite
+        run: pytest tests/stress -x -q
+      - name: Import smoke test (shim parity)
+        run: |
+          python -c "
+          import fastapi_turbo
+          from fastapi import FastAPI
+          from fastapi.testclient import TestClient, AsyncClient, ASGITransport
+          app = FastAPI()
+          @app.get('/p')
+          def p(): return {'ok': True}
+          assert TestClient(app).get('/p').json() == {'ok': True}
+          print('smoke ok on py${{ matrix.python }}')
+          "
+
   # ── Build wheels for Linux (x86_64 + aarch64) ──
   linux:
+    needs: gate
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -45,6 +102,7 @@ jobs:
 
   # ── Build wheels for macOS (x86_64 + arm64) ──
   macos:
+    needs: gate
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -71,6 +129,7 @@ jobs:
 
   # ── Build wheels for Windows ──
   windows:
+    needs: gate
     runs-on: windows-latest
     strategy:
       matrix:
@@ -93,6 +152,7 @@ jobs:
 
   # ── Build source distribution (fallback for exotic platforms) ──
   sdist:
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -34,6 +34,13 @@ from typing import Any
 
 import httpx
 
+# Convenience re-export — mirrors FastAPI's recommended async testing
+# recipe (``httpx.AsyncClient(transport=ASGITransport(app=app))``) so
+# users can write ``from fastapi.testclient import AsyncClient`` with
+# no extra import. Same class that httpx ships; no wrapping.
+AsyncClient = httpx.AsyncClient
+ASGITransport = httpx.ASGITransport
+
 
 class _ASGISyncClientShim:
     """Sync httpx-like facade over an async ``httpx.AsyncClient`` backed
@@ -416,13 +423,15 @@ class TestClient:
     def __exit__(self, *args: Any) -> None:
         # FA tests use ``with TestClient(app) as client:`` as a signal
         # that the app's lifespan (startup → shutdown) should complete
-        # before the block ends. Starlette's TestClient does this
-        # inherently; ours caches the background server to keep thread
-        # counts bounded, so we fire shutdown handlers explicitly here.
+        # AND the background server thread should be torn down before
+        # the block ends. Starlette's TestClient does this inherently;
+        # we need to:
+        #   1. Run shutdown handlers / lifespan teardown.
+        #   2. Trigger a graceful Rust-server shutdown on the port we
+        #      launched (via ``_fastapi_turbo_core.request_server_shutdown``).
+        #   3. Drop the ``_app_servers`` cache entry so the app ref is
+        #      GC-eligible.
         try:
-            # If the app started a lifespan-MW chain (raw ASGI middleware
-            # registered), stopping the chain drives shutdown through the
-            # MW stack AND runs shutdown handlers + lifespan-CM exit.
             stop_chain = getattr(self.app, "_stop_lifespan_mw_chain", None)
             if stop_chain is not None and stop_chain():
                 pass
@@ -441,6 +450,27 @@ class TestClient:
         if self._client:
             self._client.close()
             self._client = None
+        # Ask the Rust server on our port to shut down gracefully, then
+        # drop the cache entry. The daemon thread will exit once axum's
+        # ``with_graceful_shutdown`` resolves — typically within tens of
+        # ms for idle servers. We best-effort join with a short timeout
+        # so stragglers don't block test teardown, but the cache is
+        # cleared regardless.
+        try:
+            from fastapi_turbo._fastapi_turbo_core import request_server_shutdown
+            request_server_shutdown(self._port)
+        except Exception:  # noqa: BLE001
+            pass
+        if getattr(self, "_thread", None) is not None:
+            try:
+                self._thread.join(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+        key = id(self.app)
+        with TestClient._app_lock:
+            cached = TestClient._app_servers.get(key)
+            if cached is not None and cached[1] == self._port:
+                TestClient._app_servers.pop(key, None)
         self._started = False
 
     # ── Lifespan state ────────────────────────────────────────────────

@@ -95,7 +95,8 @@ static ORJSON_KWARGS: OnceLock<Py<PyAny>> = OnceLock::new();
 fn orjson_kwargs(py: Python<'_>) -> &'static Py<PyAny> {
     ORJSON_KWARGS.get_or_init(|| {
         let d = pyo3::types::PyDict::new(py);
-        d.set_item("default", json_default(py).bind(py)).expect("set default");
+        d.set_item("default", json_default(py).bind(py))
+            .expect("set default");
         d.unbind().into_any()
     })
 }
@@ -149,12 +150,7 @@ pub fn py_to_response_with_request(
     if obj.is_instance_of::<pyo3::types::PyTuple>() {
         let mut buf = String::new();
         write_any_json(py, obj, &mut buf);
-        return (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            buf,
-        )
-            .into_response();
+        return (StatusCode::OK, [("content-type", "application/json")], buf).into_response();
     }
 
     // None -> 200 with "null" body (matches FastAPI: json-serializes None to null)
@@ -188,7 +184,10 @@ pub fn py_to_response_with_request(
     // chat/completions request, so its dispatch sits on the TTFB hot path.
     // Exact-class check avoids the generic getattr("status_code") →
     // getattr("path") → getattr("body_iterator") probe below.
-    if STREAMING_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py))) {
+    if STREAMING_RESPONSE_CLS
+        .get()
+        .is_some_and(|c| ty.is(c.bind(py)))
+    {
         return crate::streaming::create_streaming_response(py, obj);
     }
 
@@ -198,7 +197,8 @@ pub fn py_to_response_with_request(
     if FILE_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py))) {
         if let Ok(path_attr) = obj.getattr("path") {
             if let Ok(path_str) = path_attr.extract::<String>() {
-                let media_type = obj.getattr("media_type")
+                let media_type = obj
+                    .getattr("media_type")
                     .ok()
                     .and_then(|a| a.extract::<String>().ok());
                 let headers = extract_response_headers(obj);
@@ -218,7 +218,8 @@ pub fn py_to_response_with_request(
         if let Ok(path_attr) = obj.getattr("path") {
             if !path_attr.is_none() {
                 if let Ok(path_str) = path_attr.extract::<String>() {
-                    let media_type = obj.getattr("media_type")
+                    let media_type = obj
+                        .getattr("media_type")
                         .ok()
                         .and_then(|a| a.extract::<String>().ok());
                     let headers = extract_response_headers(obj);
@@ -273,24 +274,14 @@ pub fn py_to_response_with_request(
     if obj.is_instance_of::<PyBool>() {
         let value = pyobj_to_serde(py, obj);
         let body = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
-        return (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            body,
-        )
-            .into_response();
+        return (StatusCode::OK, [("content-type", "application/json")], body).into_response();
     }
 
     // int / float -> JSON number (matches FastAPI: all scalars are JSON-serialized)
     if obj.is_instance_of::<PyInt>() || obj.is_instance_of::<PyFloat>() {
         let value = pyobj_to_serde(py, obj);
         let body = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
-        return (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            body,
-        )
-            .into_response();
+        return (StatusCode::OK, [("content-type", "application/json")], body).into_response();
     }
 
     // str -> JSON-wrapped string (matches FastAPI: strings are JSON-serialized).
@@ -311,12 +302,7 @@ pub fn py_to_response_with_request(
         if let Ok(dict) = d.cast::<PyDict>() {
             let mut buf = String::with_capacity(64);
             write_dict_json(py, dict, &mut buf);
-            return (
-                StatusCode::OK,
-                [("content-type", "application/json")],
-                buf,
-            )
-                .into_response();
+            return (StatusCode::OK, [("content-type", "application/json")], buf).into_response();
         }
     }
 
@@ -338,8 +324,7 @@ fn response_object_to_response(
     status_attr: &Bound<'_, PyAny>,
 ) -> Response {
     let status_code = status_attr.extract::<u16>().unwrap_or(200);
-    let status =
-        StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     // Collect raw_headers keys first so we can skip them in the headers
     // dict pass (duplicates must come from raw_headers only — the dict
@@ -366,10 +351,9 @@ fn response_object_to_response(
                         if raw_header_keys.contains(&key.to_ascii_lowercase()) {
                             continue;
                         }
-                        if let (Ok(hname), Ok(hval)) = (
-                            HeaderName::try_from(key),
-                            HeaderValue::from_str(&val),
-                        ) {
+                        if let (Ok(hname), Ok(hval)) =
+                            (HeaderName::try_from(key), HeaderValue::from_str(&val))
+                        {
                             headers.insert(hname, hval);
                         }
                     }
@@ -382,10 +366,9 @@ fn response_object_to_response(
                         if raw_header_keys.contains(&key.to_ascii_lowercase()) {
                             continue;
                         }
-                        if let (Ok(hname), Ok(hval)) = (
-                            HeaderName::try_from(key),
-                            HeaderValue::from_str(&val),
-                        ) {
+                        if let (Ok(hname), Ok(hval)) =
+                            (HeaderName::try_from(key), HeaderValue::from_str(&val))
+                        {
                             headers.insert(hname, hval);
                         }
                     }
@@ -400,10 +383,9 @@ fn response_object_to_response(
             if !list.is_empty() {
                 for item in list.iter() {
                     if let Ok(tup) = item.extract::<(String, String)>() {
-                        if let (Ok(hname), Ok(hval)) = (
-                            HeaderName::try_from(tup.0),
-                            HeaderValue::from_str(&tup.1),
-                        ) {
+                        if let (Ok(hname), Ok(hval)) =
+                            (HeaderName::try_from(tup.0), HeaderValue::from_str(&tup.1))
+                        {
                             headers.append(hname, hval);
                         }
                     }
@@ -430,9 +412,7 @@ fn response_object_to_response(
         } else {
             // Fallback: dict-like body (rare) — serialize to JSON.
             let val = pyobj_to_serde(py, &b);
-            bytes::Bytes::from(
-                serde_json::to_vec(&val).unwrap_or_default(),
-            )
+            bytes::Bytes::from(serde_json::to_vec(&val).unwrap_or_default())
         }
     } else {
         bytes::Bytes::new()
@@ -537,10 +517,9 @@ pub fn pyerr_to_response(py: Python<'_>, err: &PyErr) -> Response {
                 .body(axum::body::Body::from(body.to_string()))
                 .expect("build response");
             for (k, v) in extra_headers {
-                if let (Ok(hn), Ok(hv)) = (
-                    HeaderName::try_from(k.as_str()),
-                    HeaderValue::from_str(&v),
-                ) {
+                if let (Ok(hn), Ok(hv)) =
+                    (HeaderName::try_from(k.as_str()), HeaderValue::from_str(&v))
+                {
                     resp.headers_mut().append(hn, hv);
                 }
             }
@@ -582,7 +561,9 @@ fn write_dict_json(py: Python<'_>, dict: &Bound<'_, PyDict>, buf: &mut String) {
     buf.push('{');
     let mut first = true;
     for (k, v) in dict.iter() {
-        if !first { buf.push(','); }
+        if !first {
+            buf.push(',');
+        }
         first = false;
         // Key — always a string
         buf.push('"');
@@ -603,7 +584,9 @@ fn write_dict_json(py: Python<'_>, dict: &Bound<'_, PyDict>, buf: &mut String) {
 fn write_list_json(py: Python<'_>, list: &Bound<'_, PyList>, buf: &mut String) {
     buf.push('[');
     for (i, item) in list.iter().enumerate() {
-        if i > 0 { buf.push(','); }
+        if i > 0 {
+            buf.push(',');
+        }
         write_any_json(py, &item, buf);
     }
     buf.push(']');
@@ -621,17 +604,56 @@ fn write_any_json(py: Python<'_>, obj: &Bound<'_, PyAny>, buf: &mut String) {
         buf.push_str(if b.is_true() { "true" } else { "false" });
         return;
     }
-    // ``decimal.Decimal`` MUST come before int/float extraction —
-    // ``Decimal(5).__int__()`` succeeds, but FA (and its default
-    // ``jsonable_encoder``) serializes ``Decimal`` as a JSON STRING
-    // (preserving precision). Class-by-name check keeps this cheap.
+    // ``decimal.Decimal`` MUST come before int/float extraction so
+    // non-finite Decimals (Infinity / NaN) turn into JSON ``null``
+    // (matching FastAPI's ``jsonable_encoder``). Finite Decimals
+    // serialise as JSON **numbers** (int when the value is integral,
+    // float otherwise) — that's what upstream FA emits via its default
+    // encoder, and bytes-for-bytes compatibility matters for clients
+    // deserialising into strict numeric types. Class-by-name check
+    // keeps this cheap.
     {
         let ty = obj.get_type();
         if ty.name().map(|n| n == "Decimal").unwrap_or(false) {
-            let s = obj.str().map(|s| s.to_string()).unwrap_or_default();
-            buf.push('"');
-            json_escape_to(&s, buf);
-            buf.push('"');
+            use std::fmt::Write;
+            // is_finite?
+            let finite = obj
+                .call_method0("is_finite")
+                .ok()
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(false);
+            if !finite {
+                buf.push_str("null");
+                return;
+            }
+            // integral? -> int; else float.
+            let is_integral = obj
+                .call_method0("to_integral_value")
+                .and_then(|tv| obj.eq(&tv))
+                .ok()
+                .unwrap_or(false);
+            if is_integral {
+                if let Ok(i) = obj.call_method0("__int__").and_then(|v| v.extract::<i64>()) {
+                    let _ = write!(buf, "{i}");
+                    return;
+                }
+                // Fall through to string form on overflow — keeps
+                // precision rather than losing bits.
+                if let Ok(s) = obj.str().map(|s| s.to_string()) {
+                    buf.push_str(&s);
+                    return;
+                }
+            }
+            if let Ok(f) = obj
+                .call_method0("__float__")
+                .and_then(|v| v.extract::<f64>())
+            {
+                if f.is_finite() {
+                    let _ = write!(buf, "{f}");
+                    return;
+                }
+            }
+            buf.push_str("null");
             return;
         }
     }
@@ -667,7 +689,9 @@ fn write_any_json(py: Python<'_>, obj: &Bound<'_, PyAny>, buf: &mut String) {
         buf.push('[');
         let mut first = true;
         for item in tup.iter() {
-            if !first { buf.push(','); }
+            if !first {
+                buf.push(',');
+            }
             first = false;
             write_any_json(py, &item, buf);
         }
@@ -681,7 +705,9 @@ fn write_any_json(py: Python<'_>, obj: &Bound<'_, PyAny>, buf: &mut String) {
         let mut first = true;
         if let Ok(iter) = obj.try_iter() {
             for item in iter.flatten() {
-                if !first { buf.push(','); }
+                if !first {
+                    buf.push(',');
+                }
                 first = false;
                 write_any_json(py, &item, buf);
             }
@@ -848,7 +874,8 @@ pub fn pyobj_to_serde(py: Python<'_>, obj: &Bound<'_, PyAny>) -> serde_json::Val
         return serde_json::Value::Object(map);
     }
     if let Ok(list) = obj.cast::<PyList>() {
-        let arr: Vec<serde_json::Value> = list.iter().map(|item| pyobj_to_serde(py, &item)).collect();
+        let arr: Vec<serde_json::Value> =
+            list.iter().map(|item| pyobj_to_serde(py, &item)).collect();
         return serde_json::Value::Array(arr);
     }
     // Fallback: convert via str()
@@ -941,7 +968,10 @@ pub fn file_response(
             return (StatusCode::NOT_FOUND, format!("File not found: {path_str}")).into_response();
         }
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("File read error: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("File read error: {e}"),
+            )
                 .into_response();
         }
     };
@@ -950,9 +980,10 @@ pub fn file_response(
     let mut ct = media_type.unwrap_or_else(|| "application/octet-stream".to_string());
     // FastAPI/Starlette append `; charset=utf-8` to textual types if absent.
     if (ct.starts_with("text/") || ct == "application/javascript" || ct == "application/json")
-        && !ct.to_lowercase().contains("charset=") {
-            ct.push_str("; charset=utf-8");
-        }
+        && !ct.to_lowercase().contains("charset=")
+    {
+        ct.push_str("; charset=utf-8");
+    }
 
     let mut resp = Response::builder()
         .status(StatusCode::OK)
@@ -965,7 +996,10 @@ pub fn file_response(
     for (k, v) in extra_headers {
         let k_lower = k.to_ascii_lowercase();
         // Skip headers we've already set (avoids duplicate Content-Type/Length)
-        if matches!(k_lower.as_str(), "content-type" | "content-length" | "accept-ranges") {
+        if matches!(
+            k_lower.as_str(),
+            "content-type" | "content-length" | "accept-ranges"
+        ) {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (HeaderName::try_from(k.as_str()), HeaderValue::from_str(&v)) {
@@ -983,65 +1017,124 @@ pub fn file_response(
 
 /// Parse an RFC 7233 `Range: bytes=…` header for a resource of `total_len` bytes.
 ///
-/// Supports the three single-range forms FastAPI users hit in practice:
-///   * `bytes=N-M`  — absolute window
-///   * `bytes=N-`   — from N through end
-///   * `bytes=-N`   — last N bytes (suffix)
+/// Supports all four forms FastAPI users hit in practice:
+///   * `bytes=N-M`          — absolute window
+///   * `bytes=N-`           — from N through end
+///   * `bytes=-N`           — last N bytes (suffix)
+///   * `bytes=N-M,X-Y,...`  — multiple ranges (→ `multipart/byteranges` 206)
 ///
-/// Returns `Ok(Some((start, end_inclusive)))` when the range is valid,
-/// `Ok(None)` when the header is absent/malformed (caller should serve 200),
-/// and `Err(())` when the range is syntactically valid but unsatisfiable
-/// (caller should return 416).
-pub fn parse_byte_range(header: &str, total_len: u64) -> Result<Option<(u64, u64)>, ()> {
+/// Returns `Ok(Some(ranges))` when at least one range parses and is
+/// satisfiable. Returns `Ok(None)` when the header is absent/malformed
+/// (caller should serve 200). Returns `Err(())` when the header parsed
+/// cleanly but every range is unsatisfiable (caller should return 416).
+pub fn parse_byte_ranges(header: &str, total_len: u64) -> Result<Option<Vec<(u64, u64)>>, ()> {
+    // DoS protection:
+    //   * ``MAX_RANGES`` caps how many satisfiable parts we'll honour
+    //     (a hostile ``Range: bytes=0-0,0-0,0-0,...`` could otherwise
+    //     allocate an unbounded multipart body).
+    //   * ``max_total_bytes`` ensures the *sum* of range lengths stays
+    //     bounded by ``2 * total_len`` — prevents a single client from
+    //     forcing us to materialise many duplicate copies of the file
+    //     in memory.
+    // Both mirror Starlette's ``FileResponse`` conservative posture.
+    const MAX_RANGES: usize = 16;
+    let max_total_bytes: u64 = total_len.saturating_mul(2).max(1);
+
     let rest = match header.trim().strip_prefix("bytes=") {
         Some(r) => r.trim(),
         None => return Ok(None),
     };
-    // Multi-range (`bytes=0-0,-1`) not supported — fall back to full body.
-    if rest.contains(',') {
-        return Ok(None);
-    }
-    let (a, b) = match rest.split_once('-') {
-        Some(pair) => pair,
-        None => return Ok(None),
-    };
-    let a = a.trim();
-    let b = b.trim();
     if total_len == 0 {
         return Err(());
     }
-    let (start, end) = if a.is_empty() {
-        // Suffix: last N bytes.
-        let n: u64 = match b.parse() {
-            Ok(n) if n > 0 => n,
-            _ => return Ok(None),
+    // Early-reject headers with too many comma-separated parts BEFORE
+    // parsing — even ``split(',').count()`` is O(n) but bounded by the
+    // header-size limit the HTTP layer already enforces.
+    if rest.split(',').count() > MAX_RANGES {
+        // Too many ranges — fall back to full body (matches Starlette).
+        return Ok(None);
+    }
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut running_total: u64 = 0;
+    let mut saw_any_parseable = false;
+    for part in rest.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (a, b) = match part.split_once('-') {
+            Some(pair) => pair,
+            None => {
+                // Malformed sub-range → bail whole header (matches Starlette).
+                return Ok(None);
+            }
         };
-        let n = n.min(total_len);
-        (total_len - n, total_len - 1)
-    } else if b.is_empty() {
-        let s: u64 = match a.parse() {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
+        let a = a.trim();
+        let b = b.trim();
+        let (start, end) = if a.is_empty() {
+            let n: u64 = match b.parse() {
+                Ok(n) if n > 0 => n,
+                _ => return Ok(None),
+            };
+            saw_any_parseable = true;
+            let n = n.min(total_len);
+            (total_len - n, total_len - 1)
+        } else if b.is_empty() {
+            let s: u64 = match a.parse() {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            };
+            saw_any_parseable = true;
+            if s >= total_len {
+                continue; // unsatisfiable sub-range: skip, try next
+            }
+            (s, total_len - 1)
+        } else {
+            let s: u64 = match a.parse() {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            };
+            let e: u64 = match b.parse() {
+                Ok(e) => e,
+                Err(_) => return Ok(None),
+            };
+            saw_any_parseable = true;
+            if s > e || s >= total_len {
+                continue;
+            }
+            (s, e.min(total_len - 1))
         };
-        if s >= total_len {
+        let part_len = end - start + 1;
+        if running_total.saturating_add(part_len) > max_total_bytes {
+            // Sum of range sizes exceeds our cap → fall back to full
+            // body rather than build a multi-GB multipart response.
+            return Ok(None);
+        }
+        running_total = running_total.saturating_add(part_len);
+        out.push((start, end));
+    }
+    if out.is_empty() {
+        if saw_any_parseable {
+            // Every sub-range unsatisfiable → 416.
             return Err(());
         }
-        (s, total_len - 1)
-    } else {
-        let s: u64 = match a.parse() {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
-        };
-        let e: u64 = match b.parse() {
-            Ok(e) => e,
-            Err(_) => return Ok(None),
-        };
-        if s > e || s >= total_len {
-            return Err(());
-        }
-        (s, e.min(total_len - 1))
-    };
-    Ok(Some((start, end)))
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
+/// Generate a 26-hex-char boundary string for a `multipart/byteranges`
+/// response. We combine process-start-time nanos (high entropy) with a
+/// per-call atomic counter so back-to-back responses never collide.
+fn make_byteranges_boundary() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:016x}{c:010x}")
 }
 
 /// Variant of [`file_response`] that honours a request `Range:` header.
@@ -1064,7 +1157,10 @@ pub fn file_response_with_range(
             return (StatusCode::NOT_FOUND, format!("File not found: {path_str}")).into_response();
         }
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("File read error: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("File read error: {e}"),
+            )
                 .into_response();
         }
     };
@@ -1072,13 +1168,14 @@ pub fn file_response_with_range(
     let total_len = data.len() as u64;
     let mut ct = media_type.unwrap_or_else(|| "application/octet-stream".to_string());
     if (ct.starts_with("text/") || ct == "application/javascript" || ct == "application/json")
-        && !ct.to_lowercase().contains("charset=") {
-            ct.push_str("; charset=utf-8");
-        }
+        && !ct.to_lowercase().contains("charset=")
+    {
+        ct.push_str("; charset=utf-8");
+    }
 
     // Parse Range (if any). Malformed → full body. Unsatisfiable → 416.
-    let range = match range_header {
-        Some(h) => match parse_byte_range(h, total_len) {
+    let ranges = match range_header {
+        Some(h) => match parse_byte_ranges(h, total_len) {
             Ok(r) => r,
             Err(()) => {
                 return Response::builder()
@@ -1092,7 +1189,60 @@ pub fn file_response_with_range(
         None => None,
     };
 
-    let (status, slice, content_range) = if let Some((start, end)) = range {
+    // Multi-range → multipart/byteranges. Matches Starlette's FileResponse.
+    if let Some(rs) = &ranges {
+        if rs.len() > 1 {
+            let boundary = make_byteranges_boundary();
+            let mut body: Vec<u8> = Vec::new();
+            for (start, end) in rs {
+                let s = *start as usize;
+                let e = (*end as usize) + 1;
+                body.extend_from_slice(b"--");
+                body.extend_from_slice(boundary.as_bytes());
+                body.extend_from_slice(b"\r\nContent-Type: ");
+                body.extend_from_slice(ct.as_bytes());
+                body.extend_from_slice(b"\r\nContent-Range: bytes ");
+                body.extend_from_slice(format!("{start}-{end}/{total_len}").as_bytes());
+                body.extend_from_slice(b"\r\n\r\n");
+                body.extend_from_slice(&data[s..e]);
+                body.extend_from_slice(b"\r\n");
+            }
+            body.extend_from_slice(b"--");
+            body.extend_from_slice(boundary.as_bytes());
+            body.extend_from_slice(b"--");
+            let body_len = body.len() as u64;
+            let multipart_ct = format!("multipart/byteranges; boundary={boundary}");
+            let mut resp = Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header("content-type", multipart_ct)
+                .header("content-length", body_len)
+                .header("accept-ranges", "bytes")
+                .body(Body::from(body))
+                .expect("build multi-range response");
+            for (k, v) in extra_headers {
+                let k_lower = k.to_ascii_lowercase();
+                if matches!(
+                    k_lower.as_str(),
+                    "content-type" | "content-length" | "accept-ranges" | "content-range"
+                ) {
+                    continue;
+                }
+                if let (Ok(hn), Ok(hv)) =
+                    (HeaderName::try_from(k.as_str()), HeaderValue::from_str(&v))
+                {
+                    if k_lower == "set-cookie" {
+                        resp.headers_mut().append(hn, hv);
+                    } else {
+                        resp.headers_mut().insert(hn, hv);
+                    }
+                }
+            }
+            return resp;
+        }
+    }
+
+    let (status, slice, content_range) = if let Some(rs) = ranges {
+        let (start, end) = rs[0];
         let s = start as usize;
         let e = (end as usize) + 1; // end-inclusive → exclusive slice
         let slice = data[s..e].to_vec();
@@ -1114,7 +1264,9 @@ pub fn file_response_with_range(
     if let Some(ref cr) = content_range {
         builder = builder.header("content-range", cr);
     }
-    let mut resp = builder.body(Body::from(slice)).expect("build file response");
+    let mut resp = builder
+        .body(Body::from(slice))
+        .expect("build file response");
 
     for (k, v) in extra_headers {
         let k_lower = k.to_ascii_lowercase();

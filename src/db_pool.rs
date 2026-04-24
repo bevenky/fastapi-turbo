@@ -94,10 +94,23 @@ pub struct PyPool {
 impl PyPool {
     /// Create a new connection pool.
     /// dsn: "postgresql://user@localhost/dbname"
+    ///
+    /// Must be called from a context with an active Tokio runtime —
+    /// typically from inside a FastAPI request handler or lifespan
+    /// task. When constructed from a plain Python script (no runtime
+    /// attached) we raise ``RuntimeError`` instead of unwinding a panic
+    /// across the FFI boundary.
     #[new]
     #[pyo3(signature = (dsn, min_size=5, max_size=20))]
     fn new(dsn: &str, min_size: u32, max_size: u32) -> PyResult<Self> {
-        let rt = TokioHandle::current();
+        let rt = TokioHandle::try_current().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "fastapi_turbo.PyPool must be constructed from within \
+                 a running Tokio runtime (e.g. inside a FastAPI route \
+                 or lifespan hook). For bare scripts, build the pool \
+                 through fastapi_turbo's lifespan hooks instead.",
+            )
+        })?;
         let dsn = dsn.to_string();
 
         let pool = rt.block_on(async move {
@@ -125,7 +138,12 @@ impl PyPool {
 
     /// Execute a query and return a single row as a dict.
     /// Returns None if no rows found.
-    fn query_one(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyList>>) -> PyResult<Py<PyAny>> {
+    fn query_one(
+        &self,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<&Bound<'_, PyList>>,
+    ) -> PyResult<Py<PyAny>> {
         let pool = self.pool.clone();
         let sql = sql.to_string();
         let param_values = extract_params(py, params)?;
@@ -135,8 +153,10 @@ impl PyPool {
                 let conn = pool.get().await.map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("Connection error: {e}"))
                 })?;
-                let params_ref: Vec<&(dyn ToSql + Sync)> =
-                    param_values.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
+                let params_ref: Vec<&(dyn ToSql + Sync)> = param_values
+                    .iter()
+                    .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+                    .collect();
                 conn.query_opt(&sql, &params_ref).await.map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("Query error: {e}"))
                 })
@@ -150,7 +170,12 @@ impl PyPool {
     }
 
     /// Execute a query and return all rows as a list of dicts.
-    fn query(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyList>>) -> PyResult<Py<PyAny>> {
+    fn query(
+        &self,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<&Bound<'_, PyList>>,
+    ) -> PyResult<Py<PyAny>> {
         let pool = self.pool.clone();
         let sql = sql.to_string();
         let param_values = extract_params(py, params)?;
@@ -160,8 +185,10 @@ impl PyPool {
                 let conn = pool.get().await.map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("Connection error: {e}"))
                 })?;
-                let params_ref: Vec<&(dyn ToSql + Sync)> =
-                    param_values.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
+                let params_ref: Vec<&(dyn ToSql + Sync)> = param_values
+                    .iter()
+                    .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+                    .collect();
                 conn.query(&sql, &params_ref).await.map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("Query error: {e}"))
                 })
@@ -209,10 +236,14 @@ impl PyPool {
                     let pool = pool.clone();
                     let handle = tokio::spawn(async move {
                         let conn = pool.get().await.map_err(|e| {
-                            pyo3::exceptions::PyRuntimeError::new_err(format!("Connection error: {e}"))
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "Connection error: {e}"
+                            ))
                         })?;
-                        let params_ref: Vec<&(dyn ToSql + Sync)> =
-                            params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
+                        let params_ref: Vec<&(dyn ToSql + Sync)> = params
+                            .iter()
+                            .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+                            .collect();
                         conn.query(&sql, &params_ref).await.map_err(|e| {
                             pyo3::exceptions::PyRuntimeError::new_err(format!("Query error: {e}"))
                         })
@@ -223,9 +254,9 @@ impl PyPool {
                 // Wait for ALL queries to complete
                 let mut results = Vec::new();
                 for handle in handles {
-                    let rows = handle.await
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Task error: {e}")))?
-                        ?;
+                    let rows = handle.await.map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!("Task error: {e}"))
+                    })??;
                     results.push(rows);
                 }
                 Ok::<Vec<Vec<Row>>, PyErr>(results)
@@ -252,7 +283,12 @@ impl PyPool {
 
     /// Execute a query that doesn't return rows (INSERT/UPDATE/DELETE).
     /// Returns the number of rows affected.
-    fn execute(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyList>>) -> PyResult<u64> {
+    fn execute(
+        &self,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<&Bound<'_, PyList>>,
+    ) -> PyResult<u64> {
         let pool = self.pool.clone();
         let sql = sql.to_string();
         let param_values = extract_params(py, params)?;
@@ -262,8 +298,10 @@ impl PyPool {
                 let conn = pool.get().await.map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("Connection error: {e}"))
                 })?;
-                let params_ref: Vec<&(dyn ToSql + Sync)> =
-                    param_values.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
+                let params_ref: Vec<&(dyn ToSql + Sync)> = param_values
+                    .iter()
+                    .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+                    .collect();
                 conn.execute(&sql, &params_ref).await.map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("Execute error: {e}"))
                 })

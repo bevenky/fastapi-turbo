@@ -128,7 +128,10 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
 /// them (FA parity with streaming-body yield-dep teardown errors).
 fn drain_one_sync_chunk(iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
     let py = iter_bound.py();
-    if !iter_bound.hasattr(pyo3::intern!(py, "__next__")).unwrap_or(false) {
+    if !iter_bound
+        .hasattr(pyo3::intern!(py, "__next__"))
+        .unwrap_or(false)
+    {
         return None;
     }
     match iter_bound.call_method0(pyo3::intern!(py, "__next__")) {
@@ -155,8 +158,11 @@ fn drain_one_sync_chunk(iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
 /// continue from chunk 2 without duplicating chunk 1. If the coroutine
 /// suspends we return None WITHOUT closing the coro — closing would propagate
 /// GeneratorExit to the async generator, destroying it.
-#[allow(dead_code)]  // Unused fast-path — kept for a future TTFB optimization.
-fn drain_one_async_chunk_sync(py: Python<'_>, iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
+#[allow(dead_code)] // Unused fast-path — kept for a future TTFB optimization.
+fn drain_one_async_chunk_sync(
+    py: Python<'_>,
+    iter_bound: &Bound<'_, PyAny>,
+) -> Option<bytes::Bytes> {
     let anext_name = pyo3::intern!(py, "__anext__");
     if !iter_bound.hasattr(anext_name).unwrap_or(false) {
         return None;
@@ -165,9 +171,7 @@ fn drain_one_async_chunk_sync(py: Python<'_>, iter_bound: &Bound<'_, PyAny>) -> 
     match coro.call_method1("send", (py.None(),)) {
         Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
             let v = e.value(py);
-            v.getattr("value")
-                .ok()
-                .map(|val| python_val_to_bytes(&val))
+            v.getattr("value").ok().map(|val| python_val_to_bytes(&val))
         }
         Err(_) => None,
         Ok(_) => {

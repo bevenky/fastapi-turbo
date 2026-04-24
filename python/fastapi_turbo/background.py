@@ -34,6 +34,10 @@ class BackgroundTasks:
 
     def __init__(self) -> None:
         self._tasks: list[BackgroundTask] = []
+        # Set by the Rust router at injection time so async tasks
+        # submitted via ``run_sync`` honour the owning app's
+        # ``worker_timeout`` — see ``router.rs::inject_background_tasks``.
+        self._app: Any | None = None
 
     def add_task(self, func: Callable, *args: Any, **kwargs: Any) -> None:
         """Add a function to be called in the background after response."""
@@ -59,7 +63,7 @@ class BackgroundTasks:
                 # async deps and request handlers) so async DB / cache /
                 # HTTP clients reuse their existing connections.
                 from fastapi_turbo._async_worker import submit
-                submit(task.func(*task.args, **task.kwargs))
+                submit(task.func(*task.args, **task.kwargs), app=self._app)
             else:
                 task.func(*task.args, **task.kwargs)
         self._tasks.clear()

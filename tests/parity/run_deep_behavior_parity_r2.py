@@ -2532,7 +2532,7 @@ def run_all_tests(fa_port: int, fr_port: int):
                 # Content may differ (different run times), but shape/type same
                 _diff_list(f"misc_get{path}_type",
                            type(a).__name__, type(b).__name__, diffs)
-                return a, b, ok_status and type(a) == type(b)
+                return a, b, ok_status and type(a) is type(b)
             return t
         run_test(next_id(), f"assorted: {path} status + type",
                  "assorted", _mk())

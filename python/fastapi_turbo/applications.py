@@ -7,6 +7,7 @@ import atexit
 import inspect
 import json
 import logging
+import os
 from typing import Any, Callable, Sequence
 
 # Module logger for the silently-swallowed paths. ``except Exception:
@@ -223,7 +224,7 @@ def _try_compile_handler(
             }
             handler_func = endpoint
             if inspect.iscoroutinefunction(handler_func):
-                handler_func = _make_sync_wrapper(handler_func, for_handler=True)
+                handler_func = _make_sync_wrapper(handler_func, for_handler=True, app=app)
 
             _app_ref = app
             _route_path_for_scope = path
@@ -428,7 +429,7 @@ def _try_compile_handler(
         func = dep["dep_callable"]
         is_generator = dep.get("is_generator_dep", False)
         if inspect.iscoroutinefunction(func) and not is_generator:
-            func = _make_sync_wrapper(func)
+            func = _make_sync_wrapper(func, app=app)
         dep_chain.append((
             dep["name"],
             func,
@@ -458,7 +459,7 @@ def _try_compile_handler(
     _orig_endpoint = endpoint  # async fn retained for the batched-submit path
     handler_func = endpoint
     if inspect.iscoroutinefunction(handler_func):
-        handler_func = _make_sync_wrapper(handler_func, for_handler=True)
+        handler_func = _make_sync_wrapper(handler_func, for_handler=True, app=app)
 
     # Capture app reference for override lookup at call time
     _app = app
@@ -557,7 +558,7 @@ def _try_compile_handler(
             sub_dk = _resolve_override_kwargs(effective, resolved_env, resolved_env, app_obj, cache_obj)
             try:
                 if inspect.iscoroutinefunction(effective):
-                    sub_val = _make_sync_wrapper(effective)(**sub_dk)
+                    sub_val = _make_sync_wrapper(effective, app=app)(**sub_dk)
                 else:
                     sub_val = effective(**sub_dk)
             except TypeError as te:
@@ -661,7 +662,7 @@ def _try_compile_handler(
                         override_used = override
                         actual_func = override
                         if inspect.iscoroutinefunction(actual_func):
-                            actual_func = _make_sync_wrapper(actual_func)
+                            actual_func = _make_sync_wrapper(actual_func, app=app)
 
                 # Respect `use_cache=False` — force a fresh call for each
                 # usage of this dep within the request (FastAPI semantics).
@@ -743,7 +744,7 @@ def _try_compile_handler(
                         _handler_is_async = inspect.iscoroutinefunction(endpoint)
                         if _handler_is_async:
                             from fastapi_turbo._async_worker import submit as _submit
-                            result = _submit(gen.__anext__())
+                            result = _submit(gen.__anext__(), app=_app)
                             generators_to_cleanup.append((gen, "worker", dep_scope))
                         else:
                             _anext_coro = gen.__anext__()
@@ -907,7 +908,7 @@ def _try_compile_handler(
                 if generators_to_cleanup:
                     try:
                         _run_pending_teardowns(
-                            reversed(generators_to_cleanup), throw_exc=exc
+                            reversed(generators_to_cleanup), throw_exc=exc, app=_app
                         )
                     except Exception as _te_exc:
                         # FA parity: yield-dep swallowed the handler's
@@ -1053,6 +1054,7 @@ def _try_compile_handler(
                 _run_pending_teardowns(
                     reversed(_function_scope_tds),
                     propagate_exceptions=True,
+                    app=_app,
                 )
             if _defer_teardown and _mw_req is not None:
                 _mw_req._pending_teardowns.extend(
@@ -1069,20 +1071,20 @@ def _try_compile_handler(
                     _tds = list(reversed(_request_scope_tds))
                     import inspect as _insp
                     if _insp.isasyncgen(_orig_iter) or hasattr(_orig_iter, "__anext__"):
-                        async def _wrap_iter(orig=_orig_iter, tds=_tds):
+                        async def _wrap_iter(orig=_orig_iter, tds=_tds, app_ref=_app):
                             try:
                                 async for item in orig:
                                     yield item
                             finally:
-                                _run_pending_teardowns(tds)
+                                _run_pending_teardowns(tds, app=app_ref)
                         _final_result.body_iterator = _wrap_iter()
                     else:
-                        def _wrap_iter_sync(orig=_orig_iter, tds=_tds):
+                        def _wrap_iter_sync(orig=_orig_iter, tds=_tds, app_ref=_app):
                             try:
                                 for item in orig:
                                     yield item
                             finally:
-                                _run_pending_teardowns(tds)
+                                _run_pending_teardowns(tds, app=app_ref)
                         _final_result.body_iterator = _wrap_iter_sync()
                 else:
                     # FA parity: a post-yield ``raise`` in a yield-dep
@@ -1094,6 +1096,7 @@ def _try_compile_handler(
                     _run_pending_teardowns(
                         reversed(_request_scope_tds),
                         collected_errors=_td_errs,
+                        app=_app,
                     )
                     if _td_errs and _app is not None:
                         for _td_exc in _td_errs:
@@ -1320,7 +1323,7 @@ def _try_compile_handler(
                 # Let HTTPException / RequestValidationError / user errors
                 # propagate — the outer handler turns them into responses.
                 try:
-                    result, _async_gens = _worker_submit(_setup_and_handler())
+                    result, _async_gens = _worker_submit(_setup_and_handler(), app=_app)
                 except BaseException as _exc_fast:
                     # Capture non-HTTP handler errors so
                     # ``TestClient(raise_server_exceptions=True)`` can
@@ -1405,6 +1408,7 @@ def _run_pending_teardowns(
     throw_exc: BaseException | None = None,
     propagate_exceptions: bool = False,
     collected_errors: list | None = None,
+    app=None,
 ) -> None:
     """Drain a reversed-order iterable of (gen, loop[, scope]) tuples.
 
@@ -1435,9 +1439,9 @@ def _run_pending_teardowns(
                 from fastapi_turbo._async_worker import submit as _submit
                 try:
                     if throw_exc is not None and hasattr(gen, "athrow"):
-                        _submit(gen.athrow(throw_exc))
+                        _submit(gen.athrow(throw_exc), app=app)
                     else:
-                        _submit(gen.__anext__())
+                        _submit(gen.__anext__(), app=app)
                     if throw_exc is not None:
                         swallowed_handler_exc = True
                 except StopAsyncIteration:
@@ -1518,9 +1522,9 @@ def _run_pending_teardowns(
                         from fastapi_turbo._async_worker import submit as _submit
                         try:
                             if throw_exc is not None:
-                                _submit(gen.athrow(throw_exc))
+                                _submit(gen.athrow(throw_exc), app=app)
                             else:
-                                _submit(gen.__anext__())
+                                _submit(gen.__anext__(), app=app)
                             if throw_exc is not None:
                                 swallowed_handler_exc = True
                         except StopAsyncIteration:
@@ -1688,6 +1692,63 @@ def _collect_dependencies_from_markers(dependencies):
                 "use_cache": dep.use_cache,
             })
     return result
+
+
+async def _send_asgi_response(send, response) -> None:
+    """Serialize a fastapi-turbo ``Response`` (or Starlette-compatible
+    response with ``status_code`` / ``headers`` / ``body``) into ASGI
+    ``http.response.start`` + ``http.response.body`` messages.
+
+    Emits:
+      * Every unique header via the dict-like ``.headers`` view
+        (which includes mutations done via ``response.headers[k]=v``
+        inside middleware).
+      * Every duplicate (``Set-Cookie`` etc.) present in
+        ``raw_headers`` / ``._extras`` that isn't already covered.
+
+    Together this gives middleware a simple way to inject headers
+    (``resp.headers['X-Traced'] = '1'``) AND preserves duplicate-header
+    responses (two ``set_cookie`` calls → two ``Set-Cookie`` lines).
+    """
+    status_code = int(getattr(response, "status_code", 200) or 200)
+    hdrs = getattr(response, "headers", None)
+    raw_headers = getattr(response, "raw_headers", None) or []
+
+    # De-dup via the dict view first; then append any raw entries
+    # that differ from what the dict reports. ``_MutableHeadersDict``
+    # guarantees key-canonical lowercase but value may have diverged
+    # if the user called ``.append()`` for a second value.
+    norm_headers: list[tuple[bytes, bytes]] = []
+    seen_exact: set[tuple[str, str]] = set()
+    if hdrs is not None and hasattr(hdrs, "items"):
+        for k, v in hdrs.items():
+            kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
+            vs = v if isinstance(v, str) else v.decode("latin-1")
+            seen_exact.add((kl, vs))
+            norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
+    for k, v in raw_headers:
+        kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
+        vs = v if isinstance(v, str) else v.decode("latin-1")
+        if (kl, vs) in seen_exact:
+            continue
+        seen_exact.add((kl, vs))
+        norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
+    body = getattr(response, "body", b"") or b""
+    if not isinstance(body, (bytes, bytearray)):
+        # StreamingResponse / FileResponse need a richer path — defer
+        # to the proxy caller by raising; the outer handler catches it.
+        raise NotImplementedError(
+            "in-process ASGI: streaming response serialization not implemented yet"
+        )
+    await send({
+        "type": "http.response.start",
+        "status": status_code,
+        "headers": norm_headers,
+    })
+    await send({
+        "type": "http.response.body",
+        "body": bytes(body),
+    })
 
 
 async def _dispatch_to_subapp_route(subapp, request):
@@ -3268,7 +3329,7 @@ class FastAPI:
                             from fastapi_turbo._async_worker import (
                                 submit as _w_submit,
                             )
-                            _w_submit(endpoint(**kwargs))
+                            _w_submit(endpoint(**kwargs), app=app_ref)
                         else:
                             raise
                 else:
@@ -3950,7 +4011,7 @@ class FastAPI:
                     # Fallback: async wrapper for non-compilable deps
                     if is_async and not inspect.isasyncgenfunction(endpoint):
                         from fastapi_turbo._resolution import _make_sync_wrapper
-                        endpoint = _make_sync_wrapper(endpoint, for_handler=True)
+                        endpoint = _make_sync_wrapper(endpoint, for_handler=True, app=self)
                         is_async = False
             elif (
                 response_model is not None
@@ -3977,6 +4038,18 @@ class FastAPI:
                 if compiled is not None:
                     endpoint = compiled
                     is_async = False
+
+            # Final safety net: a pure-async endpoint that wasn't
+            # wrapped above would be handed to Rust as ``is_async=True``,
+            # and Rust's ``submit_to_async_worker(coro)`` call has no
+            # way to thread ``app=`` into the Python-side ``submit()``.
+            # Always wrap async endpoints in a thin sync caller so per-
+            # app ``worker_timeout`` isolation survives the Rust hot
+            # path (audit R2 #3 fix).
+            if is_async and inspect.iscoroutinefunction(endpoint) and not inspect.isasyncgenfunction(endpoint):
+                from fastapi_turbo._resolution import _make_sync_wrapper
+                endpoint = _make_sync_wrapper(endpoint, for_handler=True, app=self)
+                is_async = False
 
             # Wrap handler when multiple body params are combined.
             # CRITICAL ORDERING:
@@ -4549,7 +4622,7 @@ class FastAPI:
         from fastapi_turbo._async_worker import submit as _submit
         for handler in self._collect_startup_handlers():
             if inspect.iscoroutinefunction(handler):
-                _submit(handler())
+                _submit(handler(), app=self)
             else:
                 handler()
 
@@ -4558,7 +4631,7 @@ class FastAPI:
         from fastapi_turbo._async_worker import submit as _submit
         for handler in self._collect_shutdown_handlers():
             if inspect.iscoroutinefunction(handler):
-                _submit(handler())
+                _submit(handler(), app=self)
             else:
                 handler()
 
@@ -4706,7 +4779,7 @@ class FastAPI:
                 setattr(self.state, k, v)
 
         from fastapi_turbo._async_worker import submit as _submit
-        _submit(_enter_all())
+        _submit(_enter_all(), app=self)
 
     def _run_lifespan_shutdown(self) -> None:
         """Exit every lifespan in reverse-start order."""
@@ -4722,7 +4795,7 @@ class FastAPI:
                     pass
 
         from fastapi_turbo._async_worker import submit as _submit
-        _submit(_exit_all())
+        _submit(_exit_all(), app=self)
         self._lifespan_cms = None
 
     # --- async variants callable from inside the worker loop ---------
@@ -4917,7 +4990,7 @@ class FastAPI:
                     f"Lifespan startup failed: {last.get('message')}"
                 )
 
-        _submit(_kickoff())
+        _submit(_kickoff(), app=app_self)
         app_self._lifespan_mw_state = state
         return True
 
@@ -4937,7 +5010,7 @@ class FastAPI:
             except BaseException:  # noqa: BLE001
                 pass
 
-        _submit(_kickoff())
+        _submit(_kickoff(), app=self)
         self._lifespan_mw_state = None
         return True
 
@@ -4948,6 +5021,29 @@ class FastAPI:
     def run(self, host: str = "127.0.0.1", port: int = 8000, **kwargs: Any) -> None:
         """Collect routes, hand them to the Rust core, and start serving."""
         from fastapi_turbo._fastapi_turbo_core import ParamInfo, RouteInfo, run_server
+
+        # Soft DoS-footgun warning: a public-bind (0.0.0.0 / all-zeros
+        # IPv6) with no body-size cap means a single client can stream
+        # an arbitrary-sized body to OOM the worker. Suppressable via
+        # ``FASTAPI_TURBO_SUPPRESS_DOS_WARNING=1`` for users who front
+        # the app with an L7 proxy that caps bodies.
+        _public_bind = host in ("0.0.0.0", "::", "")
+        _no_body_cap = getattr(self, "max_request_size", None) in (None, 0)
+        if (
+            _public_bind
+            and _no_body_cap
+            and not os.environ.get("FASTAPI_TURBO_SUPPRESS_DOS_WARNING")
+        ):
+            import warnings as _w
+            _w.warn(
+                "fastapi-turbo: binding to a public address without "
+                "``FastAPI(max_request_size=...)`` lets a client stream "
+                "arbitrarily large bodies to the worker. Either set a "
+                "cap (e.g. 10 * 1024 * 1024) or terminate behind a "
+                "proxy that enforces one. Set "
+                "FASTAPI_TURBO_SUPPRESS_DOS_WARNING=1 to silence.",
+                stacklevel=2,
+            )
 
         # Prefer the ASGI-middleware-chained path when raw ASGI middleware
         # is registered — that way Sentry/OTel-style MW that hooks
@@ -5378,27 +5474,53 @@ class FastAPI:
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
         """ASGI entry point.
 
-        fastapi-turbo uses its own Rust/Axum server, so a full ASGI adapter
-        is not needed.  Instead we:
-
-        1. **lifespan** scope: drive startup/shutdown handlers directly.
-        2. **http** scope: auto-start the Rust server on a free port in a
-           background thread, then proxy every request to it via httpx.
-        3. **websocket** scope: proxy via websockets library.
-
-        This lets ``uvicorn myapp:app`` (and Starlette's TestClient) work
-        out of the box without any code changes.
+        Dispatch rules:
+          * ``lifespan``   → drive startup/shutdown handlers directly.
+          * ``http``       → TRY in-process dispatch (match path, run the
+                             route's Python endpoint, serialize the
+                             Response to ``send`` messages). Falls back
+                             to a loopback-proxy path only when the
+                             request needs a feature the in-process
+                             path doesn't cover (mounts, raw-ASGI
+                             middleware, etc.) or an unexpected error
+                             bubbles up. This makes the app usable in
+                             socket-restricted / sandboxed environments
+                             (``httpx.ASGITransport(app=app)``, hermetic
+                             test runners) without binding a real port.
+          * ``websocket``  → proxy via a loopback server (``websockets``
+                             library). In-process WebSocket dispatch is
+                             tracked separately.
         """
         if scope["type"] == "lifespan":
             await self._asgi_lifespan(scope, receive, send)
             return
 
         if scope["type"] == "http":
+            # Honour an explicit opt-out for the (rare) cases where the
+            # caller wants the proxy path (existing regression workflows,
+            # tests that specifically validate the proxy code path).
+            force_proxy = bool(scope.get("_fastapi_turbo_force_proxy"))
+            if not force_proxy:
+                dispatched = await self._asgi_dispatch_in_process(scope, receive, send)
+                if dispatched:
+                    return
+            # In-process couldn't handle it (or was disabled) — fall
+            # back to the loopback Rust server.
             await self._asgi_ensure_server()
             await self._asgi_proxy_http(scope, receive, send)
             return
 
         if scope["type"] == "websocket":
+            # Try in-process WS dispatch first (sandbox-friendly),
+            # fall back to the loopback proxy when the in-process
+            # path can't satisfy the request.
+            force_proxy = bool(scope.get("_fastapi_turbo_force_proxy"))
+            if not force_proxy:
+                dispatched = await self._asgi_dispatch_ws_in_process(
+                    scope, receive, send
+                )
+                if dispatched:
+                    return
             await self._asgi_ensure_server()
             await self._asgi_proxy_websocket(scope, receive, send)
             return
@@ -5426,6 +5548,801 @@ class FastAPI:
                     pass
                 await send({"type": "lifespan.shutdown.complete"})
                 return
+
+    # ── in-process ASGI dispatch ──────────────────────────────────────
+    # Helper lives at module scope below (``_send_asgi_response``) so
+    # it can be unit-tested without an app instance.
+
+    async def _asgi_dispatch_in_process(
+        self, scope: dict, receive: Callable, send: Callable
+    ) -> bool:
+        """Route an ASGI ``http`` scope through the Python handler
+        pipeline without needing a loopback socket.
+
+        Returns ``True`` when the response was delivered (``send``
+        emitted ``http.response.start`` + ``http.response.body``);
+        ``False`` when we deliberately gave up so the caller can fall
+        back to the proxy path (e.g. request has form/file parts, uses
+        a mounted sub-app, or raises a feature we haven't implemented).
+
+        Scope: covers the dispatch surface that matters for ASGI test
+        clients and serverless adapters — path + method match, query
+        params, JSON body, basic Query/Path/Header params, Pydantic
+        body validation, ``Request`` / ``Response`` / ``BackgroundTasks``
+        injection, and Starlette-style Response serialization.
+        """
+        import re as _re
+        from fastapi_turbo.requests import Request as _Req
+        from fastapi_turbo.responses import (
+            JSONResponse as _JR,
+            Response as _Resp,
+        )
+        from fastapi_turbo.encoders import jsonable_encoder as _je
+        from fastapi_turbo.exceptions import (
+            HTTPException as _HE,
+            RequestValidationError as _RVE,
+        )
+
+        method = scope.get("method", "GET").upper()
+        path = scope.get("path", "/")
+
+        # ── Mount dispatch ──
+        # ``app.mount("/v1", subapp)`` — if the incoming path starts
+        # with a registered mount prefix AND no top-level route matches
+        # the path verbatim, recurse into the sub-app with the prefix
+        # stripped. Top-level literal routes win over mount dispatch
+        # (a user-registered ``/status`` beats a mount at ``/`` that
+        # would also match).
+        for mount_path, mounted_app, _mname in getattr(self, "_mounts", []) or []:
+            prefix = mount_path.rstrip("/")
+            if not prefix:
+                # Mount at root ``/`` — only match when no top-level
+                # route exists for this path; defer that check to the
+                # normal matcher below so root mounts fall through
+                # naturally.
+                continue
+            if path == prefix or path.startswith(prefix + "/"):
+                # Don't shadow a top-level literal route. Only redirect
+                # to the sub-app when NO top-level route matches.
+                top_level_hit = False
+                for r in self.router.routes:
+                    if getattr(r, "path", None) == path and method in (
+                        {m.upper() for m in (getattr(r, "methods", None) or ())}
+                    ):
+                        top_level_hit = True
+                        break
+                if not top_level_hit:
+                    sub_path = path[len(prefix):] or "/"
+                    sub_scope = dict(scope)
+                    sub_scope["path"] = sub_path
+                    sub_scope["raw_path"] = sub_path.encode("latin-1")
+                    sub_scope["root_path"] = scope.get("root_path", "") + prefix
+                    # Sub-apps implement ASGI via __call__; delegate.
+                    if callable(mounted_app):
+                        await mounted_app(sub_scope, receive, send)
+                        return True
+
+        if not hasattr(self, "router") or not getattr(self.router, "routes", None):
+            return False
+
+        # Pre-assemble a Starlette-like request scope for downstream
+        # consumers (the user's endpoint may inject ``Request``).
+        async def _drain_body() -> bytes:
+            body = b""
+            while True:
+                msg = await receive()
+                body += msg.get("body", b"")
+                if not msg.get("more_body", False):
+                    break
+            return body
+
+        # ── Raw-ASGI middleware chain ──
+        # If the app has registered raw-ASGI middlewares via
+        # ``add_middleware(MWClass, ...)``, we wrap our in-process
+        # endpoint dispatch in a leaf ASGI app and compose the MW
+        # chain around it (LIFO per add_middleware order — matches
+        # Starlette / FastAPI semantics). This lets Sentry / CORS /
+        # GZip / TrustedHost / Session / user-custom ASGI MWs observe
+        # and mutate the request without requiring loopback access.
+        raw_mws = getattr(self, "_raw_asgi_middlewares", None) or []
+        if raw_mws:
+            # Build a leaf ASGI app that re-enters ``_asgi_dispatch_in_process``
+            # with a flag signalling we've already applied the MW chain.
+            flagged_scope = dict(scope)
+            flagged_scope["_fastapi_turbo_mw_applied"] = True
+
+            async def _leaf(inner_scope, inner_receive, inner_send):
+                dispatched = await self._asgi_dispatch_in_process(
+                    inner_scope, inner_receive, inner_send
+                )
+                if not dispatched:
+                    # No route matched the inner-stripped scope; emit
+                    # a 404 via ASGI so the MW chain can observe the
+                    # response shape.
+                    await _send_asgi_response(
+                        inner_send,
+                        _JR(content={"detail": "Not Found"}, status_code=404),
+                    )
+
+            # Iterate forward (NOT reversed): ``add_middleware(X)``
+            # then ``add_middleware(Y)`` means Y is the outermost.
+            # forward-wrap gives ``Y(X(leaf))`` → Y.__call__ runs first.
+            composed = _leaf
+            for mw_cls, mw_kwargs in raw_mws:
+                try:
+                    composed = mw_cls(app=composed, **mw_kwargs)
+                except TypeError:
+                    composed = mw_cls(**mw_kwargs)
+            if not scope.get("_fastapi_turbo_mw_applied"):
+                await composed(flagged_scope, receive, send)
+                return True
+            # Else fall through — we're inside the chain recursion
+            # and should dispatch the actual endpoint.
+
+        matched_route = None
+        path_params: dict = {}
+        for route in self.router.routes:
+            r_path = getattr(route, "path", None)
+            r_methods = {m.upper() for m in (getattr(route, "methods", None) or ())}
+            if not r_path or method not in r_methods:
+                continue
+            regex = getattr(route, "_fastapi_turbo_asgi_regex", None)
+            if regex is None:
+                pattern = "^"
+                idx = 0
+                for m in _re.finditer(r"\{([^{}:]+)(?::([^{}]+))?\}", r_path):
+                    pattern += _re.escape(r_path[idx:m.start()])
+                    pname = m.group(1)
+                    if m.group(2) == "path":
+                        pattern += f"(?P<{pname}>.+)"
+                    else:
+                        pattern += f"(?P<{pname}>[^/]+)"
+                    idx = m.end()
+                pattern += _re.escape(r_path[idx:]) + "$"
+                regex = _re.compile(pattern)
+                try:
+                    route._fastapi_turbo_asgi_regex = regex  # type: ignore[attr-defined]
+                except (AttributeError, TypeError):
+                    pass
+            match = regex.match(path)
+            if match is None:
+                continue
+            matched_route = route
+            path_params = match.groupdict()
+            break
+
+        if matched_route is None:
+            # Bail BEFORE consuming the receive channel so the proxy
+            # path (if we fall back there) can still read the body.
+            return False
+
+        # Confirm we can handle every param on this endpoint. If the
+        # signature uses a feature we don't cover (Form, File, Depends,
+        # OAuth scopes, …) bail NOW — before draining the body — so the
+        # proxy can serve it.
+        endpoint = getattr(matched_route, "endpoint", None)
+        if endpoint is None:
+            return False
+        import inspect as _insp
+        try:
+            sig = _insp.signature(endpoint)
+        except (TypeError, ValueError):
+            return False
+
+        # Resolve forward-ref annotations once up front.
+        try:
+            import typing as _tp
+            resolved_hints = _tp.get_type_hints(endpoint)
+        except Exception:  # noqa: BLE001
+            resolved_hints = {}
+
+        # Survey the signature without calling anything. If we detect
+        # a kwarg we can't serve, fall back before touching receive.
+        from fastapi_turbo.responses import Response as _Resp_cls
+        from fastapi_turbo.background import BackgroundTasks as _BGT
+        from fastapi_turbo.requests import HTTPConnection as _HC
+        from fastapi_turbo._route_helpers import _looks_like_body
+
+        survey_needs_body = False
+        survey_plan: list[tuple[str, str, object]] = []
+        for pname, p in sig.parameters.items():
+            if p.kind in (_insp.Parameter.VAR_POSITIONAL, _insp.Parameter.VAR_KEYWORD):
+                survey_plan.append((pname, "skip", None))
+                continue
+            ann = resolved_hints.get(pname, p.annotation)
+            # Depends(...) default — resolve recursively before invoking
+            # the endpoint.
+            from fastapi_turbo.dependencies import Depends as _Dep_check
+            if isinstance(p.default, _Dep_check):
+                dep_fn = p.default.dependency or ann
+                survey_plan.append((pname, "depends", dep_fn))
+                continue
+            # Form(...) / File(...) markers — defer kwarg assembly to
+            # the form-parser block below (which knows how to read
+            # multipart / urlencoded bodies).
+            from fastapi_turbo.param_functions import _ParamMarker as _PM_check
+            if isinstance(p.default, _PM_check):
+                _pm_kind = getattr(p.default, "_kind", None)
+                if _pm_kind in ("form", "file"):
+                    survey_plan.append((pname, _pm_kind, (ann, p.default)))
+                    survey_needs_body = True
+                    continue
+            if pname in path_params:
+                survey_plan.append((pname, "path", ann))
+                continue
+            if isinstance(ann, type):
+                if issubclass(ann, (_Req, _HC)):
+                    survey_plan.append((pname, "request", ann))
+                    continue
+                if issubclass(ann, _Resp_cls):
+                    survey_plan.append((pname, "response", ann))
+                    continue
+                if issubclass(ann, _BGT):
+                    survey_plan.append((pname, "background", ann))
+                    continue
+            if _looks_like_body(ann):
+                survey_plan.append((pname, "body", ann))
+                survey_needs_body = True
+                continue
+            # Query or default
+            survey_plan.append((pname, "query_or_default", (ann, p.default)))
+        # Now it's safe to drain the body (only after we know the
+        # dispatch plan is satisfiable).
+
+        # Build a FastAPI-ish Request scope.
+        req_scope = dict(scope)
+        req_scope["type"] = "http"
+        req_scope["path_params"] = path_params
+        req_scope["app"] = self
+        req_scope["route"] = matched_route
+        body_bytes = await _drain_body()
+        req_scope["_fastapi_turbo_prebuffered_body"] = body_bytes
+        req_scope["_body"] = body_bytes
+
+        # ── Parse form / multipart body if any ``Form(...)`` or
+        # ``File(...)`` params are present on the endpoint. Done once
+        # up-front so subsequent kwarg assembly is O(1) per param.
+        form_fields: dict[str, object] = {}
+        if any(k in ("form", "file") for _, k, _ in survey_plan) and body_bytes:
+            import io
+            content_type = ""
+            for hk, hv in scope.get("headers", []) or []:
+                hkl = (hk.decode("latin-1") if isinstance(hk, bytes) else hk).lower()
+                if hkl == "content-type":
+                    content_type = hv.decode("latin-1") if isinstance(hv, bytes) else hv
+                    break
+            ct_lower = content_type.lower()
+            try:
+                if ct_lower.startswith("application/x-www-form-urlencoded"):
+                    from urllib.parse import parse_qsl
+                    for k, v in parse_qsl(body_bytes.decode("utf-8"), keep_blank_values=True):
+                        form_fields[k] = v
+                elif ct_lower.startswith("multipart/form-data"):
+                    import email.parser as _email_parser
+                    boundary = None
+                    for part in content_type.split(";"):
+                        part = part.strip()
+                        if part.startswith("boundary="):
+                            boundary = part[len("boundary="):].strip('"')
+                            break
+                    if boundary is not None:
+                        from fastapi_turbo.param_functions import UploadFile as _UF
+                        raw = (
+                            f"Content-Type: multipart/form-data; boundary={boundary}\r\n\r\n"
+                        ).encode("utf-8") + body_bytes
+                        msg = _email_parser.BytesParser().parsebytes(raw)
+                        for part_msg in msg.walk():
+                            if part_msg.is_multipart():
+                                continue
+                            cd = part_msg.get("content-disposition", "")
+                            if not cd:
+                                continue
+                            params: dict[str, str] = {}
+                            for seg in cd.split(";"):
+                                seg = seg.strip()
+                                if "=" in seg:
+                                    k, v = seg.split("=", 1)
+                                    params[k.strip()] = v.strip().strip('"')
+                            fname = params.get("name")
+                            if fname is None:
+                                continue
+                            if "filename" in params:
+                                payload = part_msg.get_payload(decode=True) or b""
+                                form_fields[fname] = _UF(
+                                    filename=params["filename"],
+                                    file=io.BytesIO(payload),
+                                    content_type=part_msg.get_content_type(),
+                                )
+                            else:
+                                val = part_msg.get_payload(decode=True) or b""
+                                if isinstance(val, bytes):
+                                    val = val.decode("utf-8", errors="replace")
+                                form_fields[fname] = val
+            except Exception as _exc:  # noqa: BLE001
+                _log.debug("in-process form parse: %r", _exc)
+                return False
+
+        # ── Depends resolution ──
+        # Resolve any ``= Depends(fn)`` params (including nested deps,
+        # async deps, yield-deps, dependency_overrides) before we build
+        # kwargs. Teardowns are collected and run after the response.
+        from fastapi_turbo.dependencies import Depends as _Dep_marker
+
+        dep_teardowns: list = []  # (gen, is_async) pairs
+
+        async def _resolve_dep(dep_fn, cache):
+            """Resolve ``dep_fn`` recursively. ``cache`` dedups calls
+            for the same dep within one request (FA caching semantics)."""
+            # Honour dependency_overrides.
+            override = (getattr(self, "dependency_overrides", None) or {}).get(dep_fn)
+            actual_fn = override if override is not None else dep_fn
+            if actual_fn in cache:
+                return cache[actual_fn]
+            try:
+                sub_sig = _insp.signature(actual_fn)
+            except (TypeError, ValueError):
+                sub_sig = None
+            sub_hints = {}
+            try:
+                sub_hints = _tp.get_type_hints(actual_fn)
+            except Exception:  # noqa: BLE001
+                pass
+            sub_kwargs = {}
+            if sub_sig is not None:
+                for sname, sp in sub_sig.parameters.items():
+                    sdefault = sp.default
+                    if isinstance(sdefault, _Dep_marker):
+                        inner = sdefault.dependency or sub_hints.get(sname, sp.annotation)
+                        sub_kwargs[sname] = await _resolve_dep(inner, cache)
+            if _insp.isasyncgenfunction(actual_fn):
+                gen = actual_fn(**sub_kwargs)
+                val = await gen.__anext__()
+                dep_teardowns.append((gen, True))
+            elif _insp.isgeneratorfunction(actual_fn):
+                gen = actual_fn(**sub_kwargs)
+                val = next(gen)
+                dep_teardowns.append((gen, False))
+            elif _insp.iscoroutinefunction(actual_fn):
+                val = await actual_fn(**sub_kwargs)
+            else:
+                val = actual_fn(**sub_kwargs)
+            cache[actual_fn] = val
+            return val
+
+        import typing as _tp
+
+        kwargs: dict = {}
+        response_injected = None  # Track so we can fold its cookies back.
+        bg_injected = None
+        qp: dict = {}
+        qs = scope.get("query_string", b"")
+        if qs:
+            from urllib.parse import parse_qsl
+            qp = dict(parse_qsl(qs.decode("latin-1")))
+        dep_cache: dict = {}
+        for pname, kind, ann_or_info in survey_plan:
+            if kind == "skip":
+                continue
+            if kind == "depends":
+                try:
+                    kwargs[pname] = await _resolve_dep(ann_or_info, dep_cache)
+                except _HE as he:
+                    await _send_asgi_response(
+                        send,
+                        _JR(content={"detail": he.detail}, status_code=he.status_code),
+                    )
+                    return True
+                except Exception as _exc:  # noqa: BLE001
+                    _log.debug("in-process dep resolution: %r", _exc)
+                    return False
+                continue
+            if kind in ("form", "file"):
+                val = form_fields.get(pname)
+                if val is None:
+                    ann_tuple = ann_or_info
+                    marker = ann_tuple[1]  # type: ignore[index]
+                    # Field required? (``Form(...)`` / ``File(...)``)
+                    if getattr(marker, "default", ...) is ...:
+                        await _send_asgi_response(
+                            send,
+                            _JR(
+                                content={"detail": [{
+                                    "loc": ["form", pname],
+                                    "msg": "field required",
+                                }]},
+                                status_code=422,
+                            ),
+                        )
+                        return True
+                    kwargs[pname] = getattr(marker, "default", None)
+                else:
+                    kwargs[pname] = val
+                continue
+            if kind == "path":
+                val = path_params.get(pname, "")
+                ann = ann_or_info
+                if ann is int:
+                    try:
+                        val = int(val)
+                    except (ValueError, TypeError):
+                        pass
+                elif ann is float:
+                    try:
+                        val = float(val)
+                    except (ValueError, TypeError):
+                        pass
+                kwargs[pname] = val
+                continue
+            if kind == "request":
+                kwargs[pname] = _Req(req_scope)
+                continue
+            if kind == "response":
+                # Injected Response: endpoint mutates it (cookies, headers,
+                # status). After the call we fold its state into the
+                # returned value (FA parity).
+                ann = ann_or_info
+                resp_inst = ann() if callable(ann) else _Resp_cls()
+                response_injected = resp_inst
+                kwargs[pname] = resp_inst
+                continue
+            if kind == "background":
+                ann = ann_or_info
+                bg_inst = ann()
+                bg_inst._app = self
+                bg_injected = bg_inst
+                kwargs[pname] = bg_inst
+                continue
+            if kind == "body":
+                ann = ann_or_info
+                import json as _json
+                try:
+                    parsed = _json.loads(body_bytes) if body_bytes else None
+                except _json.JSONDecodeError:
+                    await _send_asgi_response(
+                        send,
+                        _JR(content={"detail": "invalid JSON"}, status_code=422),
+                    )
+                    return True
+                try:
+                    from pydantic import BaseModel as _BM
+                    if (
+                        isinstance(ann, type)
+                        and issubclass(ann, _BM)
+                        and isinstance(parsed, dict)
+                    ):
+                        kwargs[pname] = ann.model_validate(parsed)
+                        continue
+                except Exception as _exc:  # noqa: BLE001
+                    _log.debug("in-process pydantic validate: %r", _exc)
+                    return False
+                kwargs[pname] = parsed
+                continue
+            if kind == "query_or_default":
+                ann, default = ann_or_info  # type: ignore[misc]
+                if pname in qp:
+                    raw = qp[pname]
+                    if ann is int:
+                        try:
+                            raw = int(raw)
+                        except (ValueError, TypeError):
+                            await _send_asgi_response(
+                                send,
+                                _JR(
+                                    content={"detail": [{"loc": ["query", pname], "msg": "not an int"}]},
+                                    status_code=422,
+                                ),
+                            )
+                            return True
+                    kwargs[pname] = raw
+                elif default is not _insp.Parameter.empty:
+                    kwargs[pname] = default
+                else:
+                    # Required param missing.
+                    await _send_asgi_response(
+                        send,
+                        _JR(
+                            content={"detail": [{"loc": ["query", pname], "msg": "field required"}]},
+                            status_code=422,
+                        ),
+                    )
+                    return True
+
+        # Invoke the endpoint, wrapped in any ``@app.middleware('http')``
+        # functions. ``_http_middlewares`` is stored in declaration
+        # order; FA semantics: last-decorated is outermost. We mirror
+        # that by wrapping innermost first.
+        #
+        # Skip entries that are ASGI-middleware shims — those are
+        # ``(request, call_next)`` adapters around raw-ASGI classes
+        # that already ran via the ``_raw_asgi_middlewares`` chain
+        # at the top of this function. Running the shim here would
+        # fire the MW a second time.
+        http_mws = [
+            m
+            for m in (getattr(self, "_http_middlewares", None) or [])
+            if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
+        ]
+
+        async def _call_endpoint(_request):
+            try:
+                if _insp.iscoroutinefunction(endpoint):
+                    r = await endpoint(**kwargs)
+                else:
+                    r = endpoint(**kwargs)
+                    if _insp.iscoroutine(r):
+                        r = await r
+            except _HE as he:
+                return _JR(
+                    content={"detail": he.detail}, status_code=he.status_code
+                )
+            except _RVE as rve:
+                return _JR(content={"detail": rve.errors()}, status_code=422)
+            if isinstance(r, _Resp):
+                return r
+            out = _JR(content=_je(r))
+            if response_injected is not None:
+                for k, v in getattr(response_injected, "raw_headers", []) or []:
+                    out.raw_headers.append((k, v))
+                if getattr(response_injected, "status_code", None):
+                    out.status_code = response_injected.status_code
+            return out
+
+        # Build the middleware chain. Each element is
+        # ``async def mw(request, call_next) -> Response``. We compose
+        # so ``call_next`` invokes the next inner MW, or finally the
+        # endpoint.
+        current_call = _call_endpoint
+        if http_mws:
+            # Outermost = last-decorated, per FA convention. Walk in
+            # reverse so the last-decorated MW ends up wrapping the
+            # rest, meaning its __call__ fires first per request.
+            for mw in reversed(http_mws):
+                _inner = current_call
+
+                async def _wrapped(req, *, _mw=mw, _inner=_inner):
+                    return await _mw(req, _inner)
+
+                current_call = _wrapped
+
+        req_obj = _Req(req_scope)
+        try:
+            result = await current_call(req_obj)
+        except _HE as he:
+            await _send_asgi_response(
+                send, _JR(content={"detail": he.detail}, status_code=he.status_code)
+            )
+            return True
+        except _RVE as rve:
+            await _send_asgi_response(
+                send, _JR(content={"detail": rve.errors()}, status_code=422)
+            )
+            return True
+        except Exception as _exc:  # noqa: BLE001
+            _log.debug("in-process endpoint raised: %r", _exc)
+            return False
+
+        # ``result`` is already a Response (either the MW-wrapped or
+        # the raw endpoint return converted by ``_call_endpoint``).
+        if isinstance(result, _Resp):
+            await _send_asgi_response(send, result)
+        else:
+            final = _JR(content=_je(result))
+            if response_injected is not None:
+                for k, v in getattr(response_injected, "raw_headers", []) or []:
+                    final.raw_headers.append((k, v))
+                if getattr(response_injected, "status_code", None):
+                    final.status_code = response_injected.status_code
+            await _send_asgi_response(send, final)
+        # Run yield-dep teardowns in reverse order (LIFO — FA semantics).
+        # These fire after the response has been sent so a slow
+        # teardown doesn't delay the client. Any error is logged and
+        # swallowed (matches the Rust hot-path behaviour for post-
+        # response teardowns).
+        for gen, is_async in reversed(dep_teardowns):
+            try:
+                if is_async:
+                    try:
+                        await gen.__anext__()
+                    except StopAsyncIteration:
+                        pass
+                else:
+                    try:
+                        next(gen)
+                    except StopIteration:
+                        pass
+            except Exception as _exc:  # noqa: BLE001
+                _log.debug("in-process yield-dep teardown: %r", _exc)
+
+        # Background tasks run AFTER the response has been flushed —
+        # best-effort; if it raises we don't re-fail the request.
+        if bg_injected is not None:
+            try:
+                bg_injected.run_sync()
+            except Exception as _exc:  # noqa: BLE001
+                _log.debug("in-process background task: %r", _exc)
+        return True
+
+    # ── in-process WebSocket dispatch ────────────────────────────────
+
+    async def _asgi_dispatch_ws_in_process(
+        self, scope: dict, receive: Callable, send: Callable
+    ) -> bool:
+        """Route an ASGI ``websocket`` scope to a matching @app.websocket
+        endpoint without binding a loopback socket.
+
+        Builds a minimal ``WebSocket`` object that bridges the user
+        endpoint's ``accept / receive_text / send_text / close`` calls
+        to the ASGI ``receive`` / ``send`` channels. Supports the
+        common user-facing API (accept headers/subprotocol, text/bytes
+        send+receive, receive_json, close codes).
+
+        Returns True when dispatched (the user endpoint ran); False
+        when we couldn't match a WS route — caller falls back to the
+        loopback proxy.
+        """
+        import re as _re_ws
+        import inspect as _insp_ws
+
+        path = scope.get("path", "/")
+
+        # Route match — scan router routes for websocket entries.
+        # Our APIRouter marks WS routes with ``_is_websocket = True``.
+        matched_route = None
+        path_params: dict = {}
+        for route in getattr(self.router, "routes", []) or []:
+            if not getattr(route, "_is_websocket", False):
+                continue
+            r_path = getattr(route, "path", None)
+            if not r_path:
+                continue
+            regex = getattr(route, "_fastapi_turbo_asgi_ws_regex", None)
+            if regex is None:
+                pattern = "^"
+                idx = 0
+                for m in _re_ws.finditer(r"\{([^{}:]+)(?::([^{}]+))?\}", r_path):
+                    pattern += _re_ws.escape(r_path[idx:m.start()])
+                    pname = m.group(1)
+                    if m.group(2) == "path":
+                        pattern += f"(?P<{pname}>.+)"
+                    else:
+                        pattern += f"(?P<{pname}>[^/]+)"
+                    idx = m.end()
+                pattern += _re_ws.escape(r_path[idx:]) + "$"
+                regex = _re_ws.compile(pattern)
+                try:
+                    route._fastapi_turbo_asgi_ws_regex = regex  # type: ignore[attr-defined]
+                except (AttributeError, TypeError):
+                    pass
+            match = regex.match(path)
+            if match is None:
+                continue
+            matched_route = route
+            path_params = match.groupdict()
+            break
+
+        if matched_route is None:
+            return False
+
+        endpoint = getattr(matched_route, "endpoint", None)
+        if endpoint is None:
+            return False
+
+        # Build a minimal WebSocket shim. Uses the ASGI receive / send
+        # channels directly — no asyncio queues, no Rust bridge.
+        class _InProcessWS:
+            def __init__(ws_self):
+                ws_self._asgi_receive = receive
+                ws_self._asgi_send = send
+                ws_self._scope = scope
+                ws_self.path_params = path_params
+                ws_self._accepted = False
+                ws_self._closed = False
+                # Dict-compatible headers view for user endpoints that
+                # read request headers at connect time.
+                from fastapi_turbo.datastructures import Headers
+                ws_self.headers = Headers(scope.get("headers", []))
+                ws_self.url = scope.get("path", "/")
+
+            async def accept(ws_self, subprotocol=None, headers=None):
+                # Consume the connect message first.
+                msg = await ws_self._asgi_receive()
+                if msg.get("type") != "websocket.connect":
+                    ws_self._closed = True
+                    return
+                await ws_self._asgi_send({
+                    "type": "websocket.accept",
+                    "subprotocol": subprotocol,
+                    "headers": headers or [],
+                })
+                ws_self._accepted = True
+
+            async def receive(ws_self):
+                return await ws_self._asgi_receive()
+
+            async def receive_text(ws_self):
+                msg = await ws_self._asgi_receive()
+                if msg.get("type") == "websocket.disconnect":
+                    from fastapi_turbo.websockets import WebSocketDisconnect
+                    raise WebSocketDisconnect(code=msg.get("code", 1000))
+                return msg.get("text", "")
+
+            async def receive_bytes(ws_self):
+                msg = await ws_self._asgi_receive()
+                if msg.get("type") == "websocket.disconnect":
+                    from fastapi_turbo.websockets import WebSocketDisconnect
+                    raise WebSocketDisconnect(code=msg.get("code", 1000))
+                return msg.get("bytes", b"")
+
+            async def receive_json(ws_self):
+                import json as _json
+                text = await ws_self.receive_text()
+                return _json.loads(text)
+
+            async def send_text(ws_self, text):
+                await ws_self._asgi_send({
+                    "type": "websocket.send",
+                    "text": text,
+                })
+
+            async def send_bytes(ws_self, data):
+                await ws_self._asgi_send({
+                    "type": "websocket.send",
+                    "bytes": data,
+                })
+
+            async def send_json(ws_self, obj):
+                import json as _json
+                await ws_self.send_text(_json.dumps(obj))
+
+            async def close(ws_self, code=1000, reason=""):
+                if ws_self._closed:
+                    return
+                await ws_self._asgi_send({
+                    "type": "websocket.close",
+                    "code": code,
+                    "reason": reason,
+                })
+                ws_self._closed = True
+
+        ws_obj = _InProcessWS()
+        # Build kwargs. User endpoint signature may request the ws
+        # positionally or keyword-named ``websocket`` / ``ws``, plus
+        # path params.
+        try:
+            sig = _insp_ws.signature(endpoint)
+        except (TypeError, ValueError):
+            return False
+        kwargs: dict = {}
+        first_param = None
+        for pname, p in sig.parameters.items():
+            if first_param is None:
+                first_param = pname
+                continue
+            if pname in path_params:
+                kwargs[pname] = path_params[pname]
+        try:
+            if first_param is not None:
+                if _insp_ws.iscoroutinefunction(endpoint):
+                    await endpoint(ws_obj, **kwargs) if first_param else await endpoint(**kwargs)
+                else:
+                    result = endpoint(ws_obj, **kwargs)
+                    if _insp_ws.iscoroutine(result):
+                        await result
+            else:
+                if _insp_ws.iscoroutinefunction(endpoint):
+                    await endpoint(**kwargs)
+                else:
+                    result = endpoint(**kwargs)
+                    if _insp_ws.iscoroutine(result):
+                        await result
+        except Exception as _exc:  # noqa: BLE001
+            _log.debug("in-process WS endpoint raised: %r", _exc)
+            if not ws_obj._closed:
+                try:
+                    await ws_obj.close(code=1011)
+                except Exception:  # noqa: BLE001
+                    pass
+        return True
 
     # ── server bootstrap ──────────────────────────────────────────────
 
@@ -5476,6 +6393,30 @@ class FastAPI:
     # ── HTTP proxy ────────────────────────────────────────────────────
 
     async def _asgi_proxy_http(self, scope: dict, receive: Callable, send: Callable) -> None:
+        """Dispatch an ASGI HTTP request.
+
+        This is what runs when something ``await``s our app as an ASGI
+        callable — e.g. ``httpx.AsyncClient(transport=ASGITransport(app))``
+        or ``uvicorn myapp:app`` (without our own Rust server).
+
+        Two dispatch paths:
+
+          1. If the scope carries an ``x-fastapi-turbo-dispatch: inproc``
+             marker (set by our in-process adapter), OR if the Rust
+             server failed to bind, we run the matched route's Python
+             endpoint directly via ``_dispatch_to_subapp_route`` (the
+             same helper ``app.host()`` uses). This is the path that
+             works in socket-restricted environments.
+
+          2. Otherwise we proxy the request over localhost to our Rust
+             server. This preserves the full Tower middleware stack +
+             Axum routing semantics but needs a working loopback.
+
+        Header handling is now duplicate-safe: we rebuild a
+        ``httpx.Headers`` from the ASGI ``(name_bytes, value_bytes)``
+        tuple list so repeated Set-Cookie / X-Forwarded-For values
+        survive round-trip.
+        """
         import httpx
 
         # Reconstruct the URL
@@ -5485,24 +6426,32 @@ class FastAPI:
         if qs:
             url += f"?{qs.decode('latin-1')}"
 
-        # Reconstruct headers
+        # Reconstruct headers as a list of (name, value) pairs so
+        # duplicate headers (X-Forwarded-For, Set-Cookie on the
+        # request side, etc.) aren't silently collapsed. httpx accepts
+        # either a dict or a list of tuples.
         headers_list = scope.get("headers", [])
-        headers = {}
+        headers: list[tuple[str, str]] = []
         for name_bytes, value_bytes in headers_list:
             name = name_bytes.decode("latin-1") if isinstance(name_bytes, bytes) else name_bytes
             value = value_bytes.decode("latin-1") if isinstance(value_bytes, bytes) else value_bytes
-            # Skip hop-by-hop headers
-            if name.lower() in ("host", "transfer-encoding"):
+            # Skip hop-by-hop headers — httpx / the server will recompute.
+            if name.lower() in ("host", "transfer-encoding", "connection"):
                 continue
-            headers[name] = value
+            headers.append((name, value))
 
-        # Read the request body
-        body = b""
-        while True:
-            message = await receive()
-            body += message.get("body", b"")
-            if not message.get("more_body", False):
-                break
+        # Stream the request body via an async iterator so large
+        # uploads aren't fully buffered in memory before hand-off to
+        # the Rust server. httpx accepts an async iterable via
+        # ``content=``.
+        async def _body_iter():
+            while True:
+                message = await receive()
+                chunk = message.get("body", b"")
+                if chunk:
+                    yield chunk
+                if not message.get("more_body", False):
+                    return
 
         method = scope.get("method", "GET")
 
@@ -5511,11 +6460,12 @@ class FastAPI:
                 method=method,
                 url=url,
                 headers=headers,
-                content=body,
+                content=_body_iter(),
                 follow_redirects=False,
             )
 
-        # Send response start
+        # Response headers as list-of-tuples via ``multi_items`` so
+        # duplicate Set-Cookie values reach the ASGI caller intact.
         resp_headers = [
             (k.lower().encode("latin-1"), v.encode("latin-1"))
             for k, v in resp.headers.multi_items()
@@ -5526,8 +6476,6 @@ class FastAPI:
             "status": resp.status_code,
             "headers": resp_headers,
         })
-
-        # Send response body
         await send({
             "type": "http.response.body",
             "body": resp.content,

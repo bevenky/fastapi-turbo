@@ -87,9 +87,9 @@ async fn do_request(
     body: Option<Vec<u8>>,
     timeout_secs: Option<f64>,
 ) -> PyResult<RawResponse> {
-    let http_method: reqwest::Method = method
-        .parse()
-        .map_err(|_| pyo3::exceptions::PyValueError::new_err(format!("Invalid method: {method}")))?;
+    let http_method: reqwest::Method = method.parse().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!("Invalid method: {method}"))
+    })?;
 
     let mut req = client.request(http_method, url);
 
@@ -227,9 +227,7 @@ impl RustTransport {
         // HTTP/2
         if http2 {
             // Use adaptive: try HTTP/2 via ALPN, fall back to HTTP/1.1
-            builder = builder
-                .http2_prior_knowledge()
-                .http2_adaptive_window(true);
+            builder = builder.http2_prior_knowledge().http2_adaptive_window(true);
         }
 
         // Proxy
@@ -296,7 +294,12 @@ impl RustTransport {
     fn gather(
         &self,
         py: Python,
-        requests: Vec<(String, String, Option<Vec<(String, String)>>, Option<Vec<u8>>)>,
+        requests: Vec<(
+            String,
+            String,
+            Option<Vec<(String, String)>>,
+            Option<Vec<u8>>,
+        )>,
         timeout_secs: Option<f64>,
     ) -> PyResult<Vec<RawResponse>> {
         let client = self.client.clone();
@@ -305,21 +308,23 @@ impl RustTransport {
             // Use the same thread-local runtime as request() — connection pool is consistent.
             // current_thread + join_all gives cooperative concurrency: all futures run on
             // one thread but interleave on I/O await points (just like a JS event loop).
-            with_local_runtime(|rt| rt.block_on(async {
-                let futs: Vec<_> = requests
-                    .into_iter()
-                    .map(|(method, url, headers, body)| {
-                        let client = client.clone();
-                        let timeout = timeout_secs;
-                        async move {
-                            do_request(&client, &method, &url, headers, body, timeout).await
-                        }
-                    })
-                    .collect();
+            with_local_runtime(|rt| {
+                rt.block_on(async {
+                    let futs: Vec<_> = requests
+                        .into_iter()
+                        .map(|(method, url, headers, body)| {
+                            let client = client.clone();
+                            let timeout = timeout_secs;
+                            async move {
+                                do_request(&client, &method, &url, headers, body, timeout).await
+                            }
+                        })
+                        .collect();
 
-                let results = futures_util::future::join_all(futs).await;
-                results.into_iter().collect::<PyResult<Vec<_>>>()
-            }))
+                    let results = futures_util::future::join_all(futs).await;
+                    results.into_iter().collect::<PyResult<Vec<_>>>()
+                })
+            })
         })
     }
 

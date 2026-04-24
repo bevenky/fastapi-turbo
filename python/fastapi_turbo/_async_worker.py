@@ -93,13 +93,19 @@ def _release_event(ev: threading.Event) -> None:
         _event_pool.append(ev)
 
 
-def _default_timeout() -> float | None:
+def _default_timeout(app=None) -> float | None:
     """Resolve the default worker-loop submit timeout.
 
-    Priority: ``FASTAPI_TURBO_WORKER_TIMEOUT`` env var, then the app's
-    ``worker_timeout`` attribute (set via ``FastAPI(worker_timeout=...)``
-    if any app is installed), then ``None`` (no timeout — matches
-    FastAPI's default).
+    Priority:
+      1. ``FASTAPI_TURBO_WORKER_TIMEOUT`` env var (process-wide override).
+      2. If ``app`` is passed explicitly, ``app.worker_timeout``. Pass
+         ``app=<current_app>`` at submit sites that live inside a specific
+         app's pipeline to get per-app isolation in multi-app processes.
+      3. The ``_fastapi_turbo_current_instance`` class-level pointer —
+         last-constructed wins. Kept for single-app convenience so
+         ``FastAPI(worker_timeout=...)`` works without plumbing ``app=``
+         through every call site.
+      4. ``None`` (no timeout — matches FastAPI's default).
     """
     env = os.environ.get("FASTAPI_TURBO_WORKER_TIMEOUT")
     if env:
@@ -107,13 +113,22 @@ def _default_timeout() -> float | None:
             return float(env)
         except ValueError:
             pass
-    # Look up the currently-installed FastAPI app, if any, without
-    # importing applications.py at module load (circular).
+    # Explicit ``app=`` wins unconditionally. ``app.worker_timeout is
+    # None`` means "no framework-imposed timeout on this app" — don't
+    # fall through to the class-level fallback (which might carry a
+    # different app's stricter timeout).
+    if app is not None:
+        t = getattr(app, "worker_timeout", "__MISSING__")
+        if t != "__MISSING__":
+            return float(t) if t is not None else None
+    # No explicit app → fall back to the last-constructed FastAPI
+    # pointer. Single-app users get ``FastAPI(worker_timeout=…)`` for
+    # free; multi-app users must plumb ``app=`` explicitly.
     try:
         from fastapi_turbo.applications import FastAPI as _FA  # noqa: PLC0415
-        app = getattr(_FA, "_fastapi_turbo_current_instance", None)
-        if app is not None:
-            t = getattr(app, "worker_timeout", None)
+        fallback_app = getattr(_FA, "_fastapi_turbo_current_instance", None)
+        if fallback_app is not None:
+            t = getattr(fallback_app, "worker_timeout", None)
             if t is not None:
                 return float(t)
     except Exception:  # noqa: BLE001
@@ -121,7 +136,12 @@ def _default_timeout() -> float | None:
     return None
 
 
-def submit(coro, *, timeout: float | None = _SENTINEL) -> object:  # type: ignore[valid-type]
+def submit(
+    coro,
+    *,
+    timeout: float | None = _SENTINEL,  # type: ignore[valid-type]
+    app=None,
+) -> object:
     """Schedule coro on the worker's loop and block until done.
 
     ``timeout`` (seconds) controls how long we wait before giving up.
@@ -134,17 +154,26 @@ def submit(coro, *, timeout: float | None = _SENTINEL) -> object:  # type: ignor
     behaviour where long-running async handlers simply take as long
     as they need.
 
-    The sentinel default lets callers distinguish "I didn't pass a
-    timeout" (use ``_default_timeout()``) from "I want no timeout"
-    (pass ``None`` explicitly).
+    ``app`` is an optional per-submit hint used to resolve the default
+    timeout in multi-app processes: when passed, this app's
+    ``worker_timeout`` is consulted before falling back to the
+    class-level ``_fastapi_turbo_current_instance`` pointer.
+
+    The sentinel default on ``timeout`` lets callers distinguish "I
+    didn't pass a timeout" (use ``_default_timeout(app)``) from "I want
+    no timeout" (pass ``None`` explicitly).
     """
     if timeout is _SENTINEL:  # type: ignore[comparison-overlap]
-        timeout = _default_timeout()
+        timeout = _default_timeout(app)
     if _loop is None:
         init()
     ev = _acquire_event()
-    # [0] = result, [1] = exception, [2] = task handle (for cancellation).
-    box: list = [None, None, None]
+    # box slots:
+    #   [0] = result
+    #   [1] = exception
+    #   [2] = task handle (set by ``_kickoff`` on the loop)
+    #   [3] = cancel_requested (set by caller before scheduling cancel)
+    box: list = [None, None, None, False]
     loop = _loop
 
     async def _runner():
@@ -156,17 +185,40 @@ def submit(coro, *, timeout: float | None = _SENTINEL) -> object:  # type: ignor
             ev.set()
 
     def _kickoff():
-        box[2] = asyncio.ensure_future(_runner(), loop=loop)
+        # Both ``_kickoff`` and the cancel scheduled below run on the
+        # worker loop thread, so they're serialized by asyncio. If the
+        # caller already timed out (``box[3]`` is True), don't even
+        # start the coroutine — close it cleanly and signal completion
+        # so the event-pool slot gets released.
+        if box[3]:
+            try:
+                coro.close()
+            except Exception:  # noqa: BLE001
+                pass
+            ev.set()
+            return
+        task = asyncio.ensure_future(_runner(), loop=loop)
+        box[2] = task
+        # Between scheduling ``_kickoff`` and it actually running, the
+        # caller may have timed out and requested cancellation. Check
+        # the flag once more after task creation.
+        if box[3]:
+            task.cancel()
+
+    def _cancel_on_loop():
+        t = box[2]
+        if t is not None and not t.done():
+            t.cancel()
 
     loop.call_soon_threadsafe(_kickoff)
     # Interruptible wait — honors signals, unlike a bare Condition.wait().
     if not ev.wait(timeout=timeout):
-        # Cancel the underlying task on the worker loop so it doesn't
-        # keep running and consuming resources. Cancellation is
-        # thread-safe via call_soon_threadsafe.
-        task = box[2]
-        if task is not None:
-            loop.call_soon_threadsafe(task.cancel)
+        # Request cancellation. Both the ``cancel_requested`` flag and
+        # the scheduled ``_cancel_on_loop`` run on the same worker loop
+        # thread, so whichever of (``_kickoff``, cancel) runs first, the
+        # other sees the outcome — no race where the coroutine survives.
+        box[3] = True
+        loop.call_soon_threadsafe(_cancel_on_loop)
         raise TimeoutError(
             f"fastapi-turbo worker-loop submit timed out after {timeout}s"
         )

@@ -43,7 +43,7 @@ def _has_await_in_source(func) -> bool:
         return True
 
 
-def _make_sync_wrapper(async_func, *, for_handler: bool = False):
+def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
     """Wrap an async function so it can be called from sync code.
 
     Three execution paths:
@@ -95,14 +95,14 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False):
             except Exception:  # noqa: BLE001
                 pass
             from fastapi_turbo._async_worker import submit
-            return submit(async_func(**kwargs))
+            return submit(async_func(**kwargs), app=app)
         _noawait_caller._fastapi_turbo_wrapped_id = func_id
         return _noawait_caller
 
     if for_handler:
         def _submit_caller(**kwargs):
             from fastapi_turbo._async_worker import submit
-            return submit(async_func(**kwargs))
+            return submit(async_func(**kwargs), app=app)
         _submit_caller._fastapi_turbo_wrapped_id = func_id
         return _submit_caller
 
@@ -118,7 +118,7 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False):
     def _sync_caller(**kwargs):
         if needs_loop[0]:
             from fastapi_turbo._async_worker import submit
-            return submit(async_func(**kwargs))
+            return submit(async_func(**kwargs), app=app)
 
         coro = async_func(**kwargs)
         try:
@@ -132,7 +132,7 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False):
             except Exception:  # noqa: BLE001
                 pass
             from fastapi_turbo._async_worker import submit
-            return submit(async_func(**kwargs))
+            return submit(async_func(**kwargs), app=app)
         needs_loop[0] = True
         return _submit_partial(coro)
 

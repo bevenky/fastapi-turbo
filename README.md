@@ -127,10 +127,29 @@ To disable this and use both FastAPI and fastapi-turbo side by side, set `FASTAP
 
 ### Known limitations
 
-- Multi-range responses (`bytes=0-0,-1` → `multipart/byteranges`) — single-range only
-- `Depends(scope="request")` caching scope hint — treated as default request-scope
 - HTTP/3 + QUIC not yet exposed (Axum stack is HTTP/1.1 + HTTP/2)
 - Free-threaded Python (3.13t/3.14t) works but hasn't been perf-tuned
+- `AsyncClient(transport=ASGITransport(app=app))` routes through a background loopback Rust server — requires localhost socket access (in-process ASGI is tracked future work)
+
+### ⚠️ Public-internet checklist
+
+- **Always set `max_request_size` for public servers.** fastapi-turbo matches
+  Starlette's default (no framework-imposed body cap). A bare `FastAPI()`
+  with no limit lets a client stream an arbitrarily large body and consume
+  worker memory — a trivial DoS footgun. Set it:
+
+  ```python
+  from fastapi_turbo import FastAPI
+
+  app = FastAPI(max_request_size=10 * 1024 * 1024)  # 10 MiB
+  ```
+
+  Oversized requests respond `413 Payload Too Large` via the Tower layer.
+- Run behind a reverse proxy (nginx / Caddy / an L7 LB) that terminates
+  TLS and enforces a connection-level byte ceiling as a second line of
+  defense.
+- Set `FASTAPI_TURBO_WORKER_TIMEOUT` (or `FastAPI(worker_timeout=...)`)
+  so a single runaway async handler can't pin the shared worker loop.
 
 ## Database: Use psycopg3 (not psycopg2 or asyncpg)
 

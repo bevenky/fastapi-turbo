@@ -70,3 +70,23 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+
+[tool.ruff.lint]
+# Production code is held to *correctness* rules only — unused imports
+# and cosmetic style get cleaned up opportunistically, not gated on CI.
+# Expand this set when the codebase is ready for it.
+select = [
+    "F821", # undefined name
+    "F822", # undefined name in __all__
+    "F823", # local variable referenced before assignment
+    "F706", # return outside function
+    "F704", # yield outside function
+    "E711", # comparison to None (``== None``)
+    "E714", # not-is (``not x is y``)
+    "E721", # type() compare instead of isinstance
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use fixtures, parametrization, and monkey-patching patterns
+# that trip stylistic rules without being buggy.
+"tests/**" = ["F401", "F811", "F841", "E402", "E741"]

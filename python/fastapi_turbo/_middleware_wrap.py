@@ -235,6 +235,11 @@ def _make_asgi_middleware_shim(mw_cls, kwargs):
     # Tag the shim with the original middleware class so reordering
     # (``_keep_sentry_outermost``) and introspection can identify it.
     _shim.__fastapi_turbo_mw_cls = mw_cls  # type: ignore[attr-defined]
+    # Mark the shim so the in-process ASGI dispatcher can skip it
+    # (the raw-ASGI chain already handles these MWs end-to-end — the
+    # shim exists only for the Rust hot path, where requests arrive
+    # as kwargs and need an ASGI scope synthesised).
+    _shim._fastapi_turbo_is_asgi_shim = True  # type: ignore[attr-defined]
     return _shim
 
 

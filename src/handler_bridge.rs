@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 /// Uses `block_in_place` instead of `spawn_blocking` to avoid thread pool
 /// scheduling overhead (~3μs saved). The tokio runtime migrates other tasks
 /// off this worker thread while we hold the GIL.
-#[allow(dead_code)]  // Historical entry point — keep for binary stability.
+#[allow(dead_code)] // Historical entry point — keep for binary stability.
 pub async fn call_sync_handler(
     handler: Py<PyAny>,
     kwargs: HashMap<String, Py<PyAny>>,
@@ -28,7 +28,7 @@ pub async fn call_sync_handler(
 // ── Async worker: crossbeam + run_until_complete (15x faster than run_coroutine_threadsafe) ──
 
 /// A request to execute an async Python coroutine.
-#[allow(dead_code)]  // Retained for future inter-thread request protocol.
+#[allow(dead_code)] // Retained for future inter-thread request protocol.
 struct AsyncRequest {
     coro: Py<PyAny>,
     response_tx: crossbeam_channel::Sender<PyResult<Py<PyAny>>>,
@@ -53,7 +53,9 @@ pub fn init_async_worker() {
     let _ = ASYNC_WORKER_TX.set(tx);
 
     Python::attach(|py| {
-        let worker = py.import("fastapi_turbo._async_worker").expect("_async_worker");
+        let worker = py
+            .import("fastapi_turbo._async_worker")
+            .expect("_async_worker");
         worker.call_method0("init").expect("worker init");
         let submit = worker.getattr("submit").expect("submit").unbind();
         let _ = ASYNC_SUBMIT.set(submit);
@@ -64,13 +66,30 @@ pub fn init_async_worker() {
 /// The worker's Python `submit()` calls `run_coroutine_threadsafe` +
 /// `future.result()` — Python's `future.result()` releases the GIL
 /// internally while waiting, so the worker thread can drive the coroutine.
+///
+/// When ``app`` is supplied, we pass it as the ``app=`` kwarg so
+/// Python-side ``_default_timeout(app)`` picks up this specific app's
+/// ``worker_timeout`` rather than the class-level last-constructed
+/// pointer. The Python wrapper ``_make_sync_wrapper(app=app)`` already
+/// covers the common request path; this belt-and-suspenders plumbing
+/// ensures any Rust submit — including WebSocket-bridge callers and
+/// the needs-worker fallback — also carries per-app context.
 fn submit_to_async_worker(
     py: Python<'_>,
     coro: Py<PyAny>,
+    app: Option<&Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
-    let submit = ASYNC_SUBMIT.get()
+    let submit = ASYNC_SUBMIT
+        .get()
         .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Async worker not initialized"))?;
-    submit.call1(py, (coro.bind(py),))
+    match app {
+        None => submit.call1(py, (coro.bind(py),)),
+        Some(app_ref) => {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("app", app_ref.bind(py))?;
+            submit.call(py, (coro.bind(py),), Some(&kwargs))
+        }
+    }
 }
 
 /// Run an async Python handler — tries FAST path first (same-thread), falls back to SLOW path (worker thread).
@@ -93,9 +112,18 @@ fn submit_to_async_worker(
 /// close — any async handler that suspended produced a 500 in the
 /// worker-fallback path (e.g. WebSocket handler with ``await
 /// asyncio.sleep(0)`` before ``accept()``).
-pub fn drive_coroutine_on_local_loop<F>(
+#[allow(dead_code)]
+pub fn drive_coroutine_on_local_loop<F>(py: Python<'_>, make_coro: F) -> PyResult<Py<PyAny>>
+where
+    F: FnMut(Python<'_>) -> PyResult<Py<PyAny>>,
+{
+    drive_coroutine_on_local_loop_with_app(py, make_coro, None)
+}
+
+pub fn drive_coroutine_on_local_loop_with_app<F>(
     py: Python<'_>,
     mut make_coro: F,
+    app: Option<&Py<PyAny>>,
 ) -> PyResult<Py<PyAny>>
 where
     F: FnMut(Python<'_>) -> PyResult<Py<PyAny>>,
@@ -123,7 +151,7 @@ where
     // Fresh coroutine for the worker — the probed one is closed and a
     // closed coroutine cannot be resumed.
     let fresh = make_coro(py)?;
-    submit_to_async_worker(py, fresh)
+    submit_to_async_worker(py, fresh, app)
 }
 
 /// Call an async handler with a single positional arg. Used by the WebSocket
@@ -134,10 +162,21 @@ pub fn call_async_on_local_loop_positional(
     handler: &Py<PyAny>,
     arg: Py<PyAny>,
 ) -> PyResult<Py<PyAny>> {
+    call_async_on_local_loop_positional_with_app(py, handler, arg, None)
+}
+
+pub fn call_async_on_local_loop_positional_with_app(
+    py: Python<'_>,
+    handler: &Py<PyAny>,
+    arg: Py<PyAny>,
+    app: Option<&Py<PyAny>>,
+) -> PyResult<Py<PyAny>> {
     let arg_clone = arg.clone_ref(py);
-    drive_coroutine_on_local_loop(py, move |py| {
-        handler.call1(py, (arg_clone.bind(py),))
-    })
+    drive_coroutine_on_local_loop_with_app(
+        py,
+        move |py| handler.call1(py, (arg_clone.bind(py),)),
+        app,
+    )
 }
 
 /// Call an async handler with a single positional arg + keyword args.
@@ -148,28 +187,53 @@ pub fn call_async_on_local_loop_positional_with_kwargs(
     arg: Py<PyAny>,
     kwargs: &pyo3::Bound<'_, PyDict>,
 ) -> PyResult<Py<PyAny>> {
+    call_async_on_local_loop_positional_with_kwargs_and_app(py, handler, arg, kwargs, None)
+}
+
+pub fn call_async_on_local_loop_positional_with_kwargs_and_app(
+    py: Python<'_>,
+    handler: &Py<PyAny>,
+    arg: Py<PyAny>,
+    kwargs: &pyo3::Bound<'_, PyDict>,
+    app: Option<&Py<PyAny>>,
+) -> PyResult<Py<PyAny>> {
     let arg_clone = arg.clone_ref(py);
     let kwargs_unbound: Py<PyDict> = kwargs.clone().unbind();
-    drive_coroutine_on_local_loop(py, move |py| {
-        let kw = kwargs_unbound.bind(py);
-        handler.call(py, (arg_clone.bind(py),), Some(kw))
-    })
+    drive_coroutine_on_local_loop_with_app(
+        py,
+        move |py| {
+            let kw = kwargs_unbound.bind(py);
+            handler.call(py, (arg_clone.bind(py),), Some(kw))
+        },
+        app,
+    )
 }
 
 /// Handler classification — determined on the FIRST call, reused forever.
 /// "sync-fast": completes via StopIteration on send(None) — no I/O.
 /// "needs-worker": suspends on send(None) — real async I/O, route to worker.
-static HANDLER_CLASS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, bool>>> =
-    std::sync::OnceLock::new();
+static HANDLER_CLASS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, bool>>,
+> = std::sync::OnceLock::new();
 
 fn handler_class_map() -> &'static std::sync::Mutex<std::collections::HashMap<usize, bool>> {
     HANDLER_CLASS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+#[allow(dead_code)]
 pub fn call_async_on_local_loop(
     py: Python<'_>,
     handler: &Py<PyAny>,
     kwargs: &Bound<'_, PyDict>,
+) -> PyResult<Py<PyAny>> {
+    call_async_on_local_loop_with_app(py, handler, kwargs, None)
+}
+
+pub fn call_async_on_local_loop_with_app(
+    py: Python<'_>,
+    handler: &Py<PyAny>,
+    kwargs: &Bound<'_, PyDict>,
+    app: Option<&Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let handler_id = handler.as_ptr() as usize;
 
@@ -203,7 +267,7 @@ pub fn call_async_on_local_loop(
             // === KNOWN NEEDS-WORKER: skip probe, go straight to worker ===
             init_async_worker();
             let coro = handler.call(py, (), Some(kwargs))?;
-            return submit_to_async_worker(py, coro);
+            return submit_to_async_worker(py, coro, app);
         }
         None => {
             // === FIRST CALL: probe to classify ===
@@ -243,11 +307,8 @@ pub fn call_async_on_local_loop(
     // Fall through: route to async worker
     init_async_worker();
     let coro = handler.call(py, (), Some(kwargs))?;
-    submit_to_async_worker(py, coro)
+    submit_to_async_worker(py, coro, app)
 }
-
-
-
 
 // ── Async handler call (background event loop — for WS and legacy) ──
 
@@ -255,7 +316,7 @@ pub fn call_async_on_local_loop(
 static EVENT_LOOP: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Public accessor for the persistent event loop.
-#[allow(dead_code)]  // Exposed for future external callers.
+#[allow(dead_code)] // Exposed for future external callers.
 pub fn get_event_loop_pub(py: Python<'_>) -> PyResult<Py<PyAny>> {
     get_event_loop(py)
 }
@@ -266,8 +327,12 @@ fn get_event_loop(py: Python<'_>) -> PyResult<Py<PyAny>> {
         Python::attach(|py| {
             let asyncio = py.import("asyncio").expect("failed to import asyncio");
             let event_loop = match py.import("uvloop") {
-                Ok(uvloop) => uvloop.call_method0("new_event_loop").expect("uvloop.new_event_loop"),
-                Err(_) => asyncio.call_method0("new_event_loop").expect("new_event_loop"),
+                Ok(uvloop) => uvloop
+                    .call_method0("new_event_loop")
+                    .expect("uvloop.new_event_loop"),
+                Err(_) => asyncio
+                    .call_method0("new_event_loop")
+                    .expect("new_event_loop"),
             };
             let loop_py: Py<PyAny> = event_loop.unbind();
 
@@ -310,7 +375,7 @@ pub async fn call_async_handler(
     // they complete immediately via StopIteration. This avoids the ~50μs event loop round-trip.
     enum FastResult {
         Done(Py<PyAny>),
-        Suspended,   // Need to re-call with event loop
+        Suspended, // Need to re-call with event loop
         Error(PyErr),
     }
 
@@ -370,7 +435,7 @@ pub async fn call_async_handler(
 /// in an async wrapper running ON the event loop thread — this ensures
 /// `asyncio.get_event_loop()` works inside the handler.
 /// Public wrapper for WebSocket handlers that must always use the event loop.
-#[allow(dead_code)]  // Historical entry point.
+#[allow(dead_code)] // Historical entry point.
 pub async fn call_async_via_event_loop_pub(
     handler: Py<PyAny>,
     kwargs: HashMap<String, Py<PyAny>>,

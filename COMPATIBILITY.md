@@ -2,7 +2,7 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56.
+Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 841 tests (430 general + 22 WebSocket + 151 stress + 107 parity snapshots + 131 inline Rust tests).
 
 ## Routing
 
@@ -18,8 +18,8 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | `app.mount("/sub", sub_app)` for FastAPI / StaticFiles / ASGI | Full | |
 | `app.host("subdomain", sub_app)` | Full | Dispatched via a Python middleware; sub-app's routes are matched directly (no re-entry through its ASGI entry). |
 | `redirect_slashes` | Full | |
-| HEAD auto-handling from GET | Different-by-design | Explicit 405 unless HEAD is declared (matches FastAPI's default). |
-| OPTIONS auto-generation for CORS | Different-by-design | Use `CORSMiddleware`, which emits preflight headers. |
+| HEAD auto-handling from GET | Full | 405 + `Allow: <declared>` — matches upstream FastAPI byte-for-byte. |
+| OPTIONS auto-generation for CORS | Full | True preflights (`Origin` + `Access-Control-Request-Method`) are handled by `CORSMiddleware`; bare OPTIONS on undeclared method returns 405 + `Allow: <declared>` — matches upstream. |
 | 405 Method Not Allowed on wrong method | Full | |
 
 ## Dependencies
@@ -31,7 +31,7 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | yield dependencies (generator / async generator) with teardown | Full | Teardown runs in reverse (LIFO) after middleware unwinds. On handler exception, `gen.athrow(exc)` is driven so `except` clauses in the dep observe the error. |
 | `dependency_overrides` | Full | Checked at runtime. |
 | `Security()` + `SecurityScopes` | Full | |
-| `Depends(scope="request")` | Partial | Accepted; scope hint not differentiated — treated as request-scoped. |
+| `Depends(scope="request")` / `Depends(scope="function")` | Full | `.scope` attribute preserved for introspection; `yield`-dep teardown ordering matches upstream byte-for-byte under the TestClient across both scope values. |
 | `Depends(use_cache=False)` | Full | |
 
 ## Request / Response
@@ -42,12 +42,12 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | `Form`, `File`, `UploadFile`, multipart | Full | Rust multipart parser; `UploadFile.read/seek/write/close`. |
 | `Response`, `JSONResponse`, `HTMLResponse`, `PlainTextResponse`, `RedirectResponse`, `StreamingResponse`, `FileResponse` | Full | |
 | `FileResponse` with `Range: bytes=N-M` / `N-` / `-N` | Full | Returns 206 Partial Content with `Content-Range`; 416 on unsatisfiable; 200 on malformed. |
-| Multi-range responses (`bytes=0-0,-1` → `multipart/byteranges`) | Not-implemented | Single-range only. |
+| Multi-range responses (`bytes=0-0,-1` → `multipart/byteranges`) | Full | 206 with `multipart/byteranges; boundary=…`; per-part `Content-Type` + `Content-Range`; closing boundary; `Content-Length` set. DoS-capped: ≤ 16 ranges and sum-of-lengths ≤ 2× file size; hostile headers fall back to the full body rather than amplify. |
 | `ORJSONResponse`, `UJSONResponse` | Full | When the optional dep is installed. |
 | SSE: `EventSourceResponse`, `ServerSentEvent`, `format_sse_event` | Full | |
 | `BackgroundTasks` single-task and multi-task | Full | |
 | Request scalar / body returns (str, int, float, None, dict, list, dataclass, `BaseModel`) | Full | Top-level strings now produce RFC 8259-compliant JSON (control chars escaped). |
-| `dataclass` / `TypedDict` / `msgspec.Struct` as response model | Partial | `dict` / `list` / Pydantic / generic aliases work; `dataclass` serialises via `asdict`; `TypedDict`/`msgspec.Struct` not specialised. |
+| `dataclass` / `TypedDict` / `msgspec.Struct` as response model | Full | `dict` / `list` / Pydantic / generic aliases / `@dataclass` / `TypedDict` all pass through Pydantic's `TypeAdapter` — filter, serialise and OpenAPI-schema the same way upstream does. `msgspec.Struct` is rejected at decoration time (matches upstream — Pydantic can't adapt it). |
 | `max_request_size` on `FastAPI(...)` | Full | Enforced by Tower `RequestBodyLimitLayer`; the router no longer imposes a hidden 10 MiB cap. |
 
 ## Middleware
@@ -109,9 +109,9 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | Swagger UI (`/docs`), ReDoc (`/redoc`) | Full | |
 | `response_model`-derived schemas with `-Input`/`-Output` split | Full | |
 | `callbacks`, `summary`, `description`, `tags`, `deprecated`, `operation_id` | Full | |
-| `generate_unique_id_function` | Partial | Accepted; fully honoured for most routes; edge cases in `route_class`. |
-| Per-route `servers` / `external_docs` | Not-implemented | |
-| `webhooks=` app parameter + OpenAPI webhooks section | Not-implemented | |
+| `generate_unique_id_function` | Full | Honoured at app / router / route levels; duplicate `operation_id` emits `UserWarning`. Covered in `tests/stress/test_operation_id_and_unique_fn.py`. |
+| Per-route `servers` / `external_docs` | Full | Both via `openapi_extra={'servers': …, 'externalDocs': …}` (upstream-compatible) and via our own `servers=` / `external_docs=` decorator kwargs. Covered in `tests/stress/test_per_route_openapi_extras.py`. |
+| `webhooks=` app parameter + OpenAPI webhooks section | Full | `app.webhooks.post(...)` surfaces under the top-level `webhooks` key; `FastAPI(webhooks=router)` also accepted. Covered in `tests/stress/test_webhooks.py`. |
 
 ## Testing
 
@@ -121,7 +121,7 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | `TestClient.websocket_connect(...)` | Full | |
 | `TestClient(raise_server_exceptions=True/False)` | Full | Non-HTTP exceptions captured server-side and re-raised in the test thread. |
 | ASGI transport fallback (wrap with `SentryAsgiMiddleware(app)`, etc.) | Full | Detected via absence of `.run()` — falls back to an `httpx.AsyncClient` + `ASGITransport` with a sync facade. |
-| `AsyncClient` re-export | Full | |
+| `AsyncClient` re-export | Full | `from fastapi.testclient import AsyncClient, ASGITransport` works. Dispatch runs **entirely in-process** — no loopback socket needed — covering: path match (+ `{name:path}` converter), query + JSON body + Pydantic validation, `Request` / `Response` / `BackgroundTasks` injection, `Depends(...)` (simple, nested, async, yield-with-teardown, `dependency_overrides`), `Form(...)` / `File(...)` / `UploadFile`, `app.mount("/sub", subapp)` recursion, raw-ASGI `add_middleware(MW)` chains (LIFO composition), `@app.middleware("http")` functions, and WebSocket endpoints (`@app.websocket("/ws")` with path params). Duplicate request/response headers survive round-trip. |
 
 ## Database / HTTP client helpers
 
@@ -136,7 +136,7 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 
 | Feature | Status | Notes |
 |---|---|---|
-| Worker loop timeout on slow async handlers | Full | Default `None` (no timeout — matches FastAPI); overridable via `FASTAPI_TURBO_WORKER_TIMEOUT` env or `FastAPI(worker_timeout=)`. On timeout the underlying task is cancelled. |
+| Worker loop timeout on slow async handlers | Full | Default `None` (no timeout — matches FastAPI); overridable via `FASTAPI_TURBO_WORKER_TIMEOUT` env or `FastAPI(worker_timeout=…)`. On timeout the underlying task is cancelled — cancellation is race-free against the worker-loop kickoff (even ``timeout=0`` prevents the coroutine from running). Multi-app isolation is full: every submit site carries per-app context — the Python layer threads ``app=…`` through `_make_sync_wrapper`, `_run_pending_teardowns`, lifespan, and background-tasks; the Rust layer threads `APP_INSTANCE` through `submit_to_async_worker`. |
 | Streaming to a slow client | Full | `tx.blocking_send(...)` runs under `py.allow_threads` so the GIL is released during backpressure. |
 | Shim `import fastapi` / `import starlette` | Full | Installed on `import fastapi_turbo`. Reports `fastapi.__version__ = "0.136.0"` (the compat target), not our own `0.1.0`. |
 
@@ -145,7 +145,7 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 - **Active-thread-id profiling under manual `SentryAsgiMiddleware(app)` wrap** — `profiles_sample_rate=1.0` requires thread-ident alignment across our tokio→httpx→asyncio hops. Not wired. Use the `integrations=[FastApiIntegration()]` pattern instead — that path gives full profiling.
 - **HTTP/3 + QUIC** — stack is HTTP/1.1 + HTTP/2 via Axum.
 - **Free-threaded Python (3.13t / 3.14t)** — works but not performance-tuned.
-- **Multi-range 206 responses** — single range only.
+- **In-process ASGI dispatch** — HTTP + WebSocket scopes now dispatch entirely in-process (path match + query + JSON/form/multipart bodies + `Depends` graph + `@app.middleware('http')` + raw-ASGI `add_middleware` chains + mounts). The loopback proxy remains as a final fallback for the very-rare combinations that fall outside the in-process surface, so existing uvicorn-backed deployments aren't affected.
 
 ## How to run the regression suites
 

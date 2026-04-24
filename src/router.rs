@@ -1,9 +1,9 @@
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Path, Query, Request};
 use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{ConnectInfo, Path, Query, Request};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodRouter, any, get, post, put, delete, patch, head};
+use axum::routing::{any, delete, get, head, patch, post, put, MethodRouter};
 use axum::Router;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -26,13 +26,11 @@ static RESPONSE_CLS: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new()
 /// many ephemeral apps in sequence) rebind rather than silently keeping the
 /// first one's handler forever. Uses ``RwLock<Option<...>>`` instead of
 /// ``OnceLock`` so we can reassign.
-pub static APP_INSTANCE: std::sync::RwLock<Option<Py<PyAny>>> =
-    std::sync::RwLock::new(None);
+pub static APP_INSTANCE: std::sync::RwLock<Option<Py<PyAny>>> = std::sync::RwLock::new(None);
 /// Python callable invoked when Rust-side parameter/body validation fails.
 /// Called only when the app registers `@exception_handler(RequestValidationError)`
 /// — otherwise we use the default 422 body path.
-pub static VALIDATION_HANDLER: std::sync::RwLock<Option<Py<PyAny>>> =
-    std::sync::RwLock::new(None);
+pub static VALIDATION_HANDLER: std::sync::RwLock<Option<Py<PyAny>>> = std::sync::RwLock::new(None);
 
 /// (host, port) the server bound to — published by `server.rs` so request
 /// scopes can populate `scope["server"]` / `request.url.hostname` / `.port`
@@ -44,7 +42,9 @@ pub fn set_server_addr(host: String, port: u16) -> Result<(), (String, u16)> {
 }
 
 fn bg_tasks_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
-    if let Some(c) = BG_TASKS_CLS.get() { return Ok(c); }
+    if let Some(c) = BG_TASKS_CLS.get() {
+        return Ok(c);
+    }
     let cls: Py<PyAny> = py
         .import("fastapi_turbo.background")?
         .getattr("BackgroundTasks")?
@@ -54,7 +54,9 @@ fn bg_tasks_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
 }
 
 fn request_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
-    if let Some(c) = REQUEST_CLS.get() { return Ok(c); }
+    if let Some(c) = REQUEST_CLS.get() {
+        return Ok(c);
+    }
     let cls: Py<PyAny> = py
         .import("fastapi_turbo.requests")?
         .getattr("Request")?
@@ -64,7 +66,9 @@ fn request_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
 }
 
 fn response_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
-    if let Some(c) = RESPONSE_CLS.get() { return Ok(c); }
+    if let Some(c) = RESPONSE_CLS.get() {
+        return Ok(c);
+    }
     let cls: Py<PyAny> = py
         .import("fastapi_turbo.responses")?
         .getattr("Response")?
@@ -101,7 +105,8 @@ fn set_request_scope_ctxvar(
     // wrapper; the original endpoint lives on its
     // ``_fastapi_turbo_original_endpoint`` attribute (set at compile).
     // Fall back to the wrapper itself if the original wasn't stashed.
-    let endpoint_obj = state.handler
+    let endpoint_obj = state
+        .handler
         .bind(py)
         .getattr("_fastapi_turbo_original_endpoint")
         .unwrap_or_else(|_| state.handler.bind(py).clone());
@@ -125,9 +130,12 @@ fn set_request_scope_ctxvar(
     }
 
     let args = (
-        m.map(|b| b.into_any()).unwrap_or_else(|| py.None().into_bound(py)),
-        p.map(|b| b.into_any()).unwrap_or_else(|| py.None().into_bound(py)),
-        q.map(|b| b.into_any()).unwrap_or_else(|| py.None().into_bound(py)),
+        m.map(|b| b.into_any())
+            .unwrap_or_else(|| py.None().into_bound(py)),
+        p.map(|b| b.into_any())
+            .unwrap_or_else(|| py.None().into_bound(py)),
+        q.map(|b| b.into_any())
+            .unwrap_or_else(|| py.None().into_bound(py)),
     );
     let _ = func.bind(py).call(args, Some(&kwargs));
 }
@@ -195,10 +203,7 @@ fn inject_framework_objects(
                     scope.set_item("path", scope_path.as_deref().unwrap_or("/"))?;
                     let qs_bytes: &[u8] =
                         scope_query.as_deref().map(|s| s.as_bytes()).unwrap_or(b"");
-                    scope.set_item(
-                        "query_string",
-                        pyo3::types::PyBytes::new(py, qs_bytes),
-                    )?;
+                    scope.set_item("query_string", pyo3::types::PyBytes::new(py, qs_bytes))?;
                     // Headers as list of (bytes, bytes)
                     let hdrs_list = pyo3::types::PyList::empty(py);
                     if let Some(h) = headers {
@@ -257,10 +262,7 @@ fn inject_framework_objects(
                     // / .form() return the already-buffered bytes without needing
                     // a real ASGI receive() callable. vLLM parses bodies this way.
                     if !body_bytes.is_empty() {
-                        scope.set_item(
-                            "_body",
-                            pyo3::types::PyBytes::new(py, body_bytes),
-                        )?;
+                        scope.set_item("_body", pyo3::types::PyBytes::new(py, body_bytes))?;
                     }
                     // Client address (host, port) tuple for request.client.
                     // Starlette TestClient parity: when ``User-Agent:
@@ -292,6 +294,15 @@ fn inject_framework_objects(
             }
             "inject_background_tasks" => {
                 let bg = bg_tasks_cls(py)?.bind(py).call0()?;
+                // Stash the current app on the BackgroundTasks instance
+                // so ``run_sync`` can pass ``app=`` when submitting async
+                // tasks to the worker loop — preserves per-app timeout
+                // isolation for work that runs *after* the response.
+                if let Ok(app_slot) = APP_INSTANCE.read() {
+                    if let Some(app) = app_slot.as_ref() {
+                        let _ = bg.setattr("_app", app.bind(py));
+                    }
+                }
                 kwargs.set_item(&param.name, bg)?;
             }
             "inject_response" => {
@@ -319,11 +330,7 @@ fn inject_framework_objects(
 /// received gets DEFERRED — tasks run on a tokio blocking thread after
 /// the response is flushed, matching FastAPI/Starlette semantics.
 /// The handler doesn't wait for task completion.
-fn drain_background_tasks(
-    _py: Python<'_>,
-    kwargs: &Bound<'_, PyDict>,
-    params: &[ParamInfo],
-) {
+fn drain_background_tasks(_py: Python<'_>, kwargs: &Bound<'_, PyDict>, params: &[ParamInfo]) {
     let mut seen_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for param in params {
         if param.kind == "inject_background_tasks" {
@@ -371,7 +378,9 @@ fn apply_injected_response(
         if param.kind != "inject_response" {
             continue;
         }
-        let Ok(Some(obj)) = kwargs.get_item(&param.name) else { continue };
+        let Ok(Some(obj)) = kwargs.get_item(&param.name) else {
+            continue;
+        };
         // Apply status_code (but only if user set something non-default)
         if let Ok(sc_attr) = obj.getattr("status_code") {
             if let Ok(sc) = sc_attr.extract::<u16>() {
@@ -421,9 +430,10 @@ fn apply_injected_response(
             if let Ok(list) = raw.cast::<pyo3::types::PyList>() {
                 for item in list.iter() {
                     if let Ok((ks, vs)) = item.extract::<(String, String)>() {
-                        if let (Ok(hn), Ok(hv)) =
-                            (HeaderName::try_from(ks.as_str()), HeaderValue::from_str(&vs))
-                        {
+                        if let (Ok(hn), Ok(hv)) = (
+                            HeaderName::try_from(ks.as_str()),
+                            HeaderValue::from_str(&vs),
+                        ) {
                             response.headers_mut().append(hn, hv);
                         }
                     }
@@ -506,7 +516,10 @@ fn pydantic_error_details(
         for item in list.iter() {
             if let Ok(d) = item.cast::<PyDict>() {
                 let mut obj = serde_json::Map::new();
-                let err_type_str = d.get_item("type").ok().flatten()
+                let err_type_str = d
+                    .get_item("type")
+                    .ok()
+                    .flatten()
                     .and_then(|v| v.extract::<String>().ok());
                 if let Some(t) = err_type_str {
                     obj.insert("type".into(), serde_json::Value::String(t));
@@ -527,10 +540,22 @@ fn pydantic_error_details(
                     }
                 }
                 obj.insert("loc".into(), serde_json::Value::Array(loc));
-                if let Some(m) = d.get_item("msg").ok().flatten().and_then(|v| v.extract::<String>().ok()) {
-                    obj.insert("msg".into(), serde_json::Value::String(fastapi_normalize_error_msg(&m)));
+                if let Some(m) = d
+                    .get_item("msg")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract::<String>().ok())
+                {
+                    obj.insert(
+                        "msg".into(),
+                        serde_json::Value::String(fastapi_normalize_error_msg(&m)),
+                    );
                 }
-                let is_missing = obj.get("type").and_then(|v| v.as_str()).map(|s| s == "missing").unwrap_or(false);
+                let is_missing = obj
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "missing")
+                    .unwrap_or(false);
                 // FA parity: for combined-body ``missing`` errors, null
                 // the ``input`` only when the missing field is AT THE
                 // TOP of the combined body (loc = ["body", "<field>"]).
@@ -539,7 +564,8 @@ fn pydantic_error_details(
                 // see what they sent. Without this,
                 // ``test_tutorial002::test_post_missing_required_field_in_item``
                 // sees ``None`` instead of ``{"name": "Foo"}``.
-                let loc_len = obj.get("loc")
+                let loc_len = obj
+                    .get("loc")
                     .and_then(|v| v.as_array())
                     .map(|a| a.len())
                     .unwrap_or(0);
@@ -568,7 +594,10 @@ fn pydantic_error_details(
                     if let Ok(cx_dict) = cx.cast::<PyDict>() {
                         let mut ctx_map = serde_json::Map::new();
                         for (k, v) in cx_dict.iter() {
-                            let key = match k.extract::<String>() { Ok(s) => s, Err(_) => continue };
+                            let key = match k.extract::<String>() {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
                             let val: serde_json::Value = if let Ok(s) = v.extract::<String>() {
                                 serde_json::Value::String(s)
                             } else if let Ok(b) = v.extract::<bool>() {
@@ -576,7 +605,9 @@ fn pydantic_error_details(
                             } else if let Ok(i) = v.extract::<i64>() {
                                 serde_json::Value::Number(i.into())
                             } else if let Ok(f) = v.extract::<f64>() {
-                                serde_json::Number::from_f64(f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+                                serde_json::Number::from_f64(f)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::Null)
                             } else if v.is_none() {
                                 serde_json::Value::Null
                             } else if v.is_instance_of::<pyo3::exceptions::PyException>() {
@@ -607,11 +638,7 @@ fn pydantic_error_details(
 /// when the marker declares `default=None`, we pass Python `None` explicitly
 /// so the handler doesn't fall back to the function signature's default
 /// (which would be the marker object itself).
-fn apply_default<'py>(
-    py: Python<'py>,
-    kwargs: &Bound<'py, PyDict>,
-    param: &ParamInfo,
-) -> bool {
+fn apply_default<'py>(py: Python<'py>, kwargs: &Bound<'py, PyDict>, param: &ParamInfo) -> bool {
     if !param.has_default {
         return false;
     }
@@ -631,10 +658,7 @@ fn apply_default<'py>(
 /// (read/seek/close return `ImmediateBytes` / `ImmediateNone` awaitables).
 /// `isinstance(f, UploadFile)` still works via the ABCMeta subclasshook on
 /// the Python `UploadFile` class.
-fn make_upload_file<'py>(
-    py: Python<'py>,
-    field: ParsedField,
-) -> PyResult<Bound<'py, PyAny>> {
+fn make_upload_file<'py>(py: Python<'py>, field: ParsedField) -> PyResult<Bound<'py, PyAny>> {
     let up = PyUploadFile::from_field(field);
     let py_up = Py::new(py, up)?;
     Ok(py_up.into_bound(py).into_any())
@@ -732,11 +756,22 @@ impl ParamInfo {
         scalar_validator: Option<Py<PyAny>>,
     ) -> Self {
         ParamInfo {
-            name, kind, type_hint, required, default_value, has_default, model_class,
+            name,
+            kind,
+            type_hint,
+            required,
+            default_value,
+            has_default,
+            model_class,
             scalar_validator,
             cached_validator: None, // Populated at startup by build_router
-            alias, dep_callable, dep_callable_id, is_async_dep, is_generator_dep,
-            dep_input_names, is_handler_param,
+            alias,
+            dep_callable,
+            dep_callable_id,
+            is_async_dep,
+            is_generator_dep,
+            dep_input_names,
+            is_handler_param,
         }
     }
 }
@@ -779,11 +814,23 @@ impl RouteInfo {
     #[new]
     #[pyo3(signature = (path, methods, handler, is_async=false, handler_name="".to_string(), params=vec![], is_websocket=false))]
     fn new(
-        path: String, methods: Vec<String>, handler: Py<PyAny>,
-        is_async: bool, handler_name: String, params: Vec<ParamInfo>,
+        path: String,
+        methods: Vec<String>,
+        handler: Py<PyAny>,
+        is_async: bool,
+        handler_name: String,
+        params: Vec<ParamInfo>,
         is_websocket: bool,
     ) -> Self {
-        RouteInfo { path, methods, handler, is_async, handler_name, params, is_websocket }
+        RouteInfo {
+            path,
+            methods,
+            handler,
+            is_async,
+            handler_name,
+            params,
+            is_websocket,
+        }
     }
 }
 
@@ -796,7 +843,9 @@ fn convert_path(fastapi_path: &str) -> String {
         if ch == '{' {
             let mut param = String::new();
             for c in chars.by_ref() {
-                if c == '}' { break; }
+                if c == '}' {
+                    break;
+                }
                 param.push(c);
             }
             if let Some(name) = param.strip_suffix(":path") {
@@ -828,7 +877,7 @@ struct RouteState {
     params: Vec<ParamInfo>,
     is_async: bool,
     has_body_params: bool,
-    #[allow(dead_code)]  // Wired at compile time, consumed by a future fast path.
+    #[allow(dead_code)] // Wired at compile time, consumed by a future fast path.
     has_header_params: bool,
     has_dep_params: bool,
     has_any_params: bool,
@@ -875,7 +924,10 @@ async fn dispatch_ws(
     let uri = &req_parts.uri;
     let path = uri.path().to_string();
     let raw_path = path.as_bytes().to_vec();
-    let query_string = uri.query().map(|q| q.as_bytes().to_vec()).unwrap_or_default();
+    let query_string = uri
+        .query()
+        .map(|q| q.as_bytes().to_vec())
+        .unwrap_or_default();
     let headers: Vec<(String, String)> = req_parts
         .headers
         .iter()
@@ -899,8 +951,10 @@ async fn dispatch_ws(
     }
     .to_string();
     let client: Option<(String, u16)> = None;
-    let ws_path_params: Vec<(String, String)> =
-        path_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let ws_path_params: Vec<(String, String)> = path_map
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let subprotocols: Vec<String> = req_parts
         .headers
         .get("sec-websocket-protocol")
@@ -969,13 +1023,19 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
 
         // Pre-compute flags at startup to avoid per-request scanning
         let has_body = route.params.iter().any(|p| p.kind == "body");
-        let has_header = route.params.iter().any(|p| p.kind == "header" || p.kind == "cookie");
+        let has_header = route
+            .params
+            .iter()
+            .any(|p| p.kind == "header" || p.kind == "cookie");
         let has_dep = route.params.iter().any(|p| p.kind == "dependency");
         let has_any = !route.params.is_empty();
         let has_file = route.params.iter().any(|p| p.kind == "file");
         let has_form = route.params.iter().any(|p| p.kind == "form");
         let has_inj_req = route.params.iter().any(|p| p.kind == "inject_request");
-        let has_inj_bg = route.params.iter().any(|p| p.kind == "inject_background_tasks");
+        let has_inj_bg = route
+            .params
+            .iter()
+            .any(|p| p.kind == "inject_background_tasks");
         let has_inj_resp = route.params.iter().any(|p| p.kind == "inject_response");
 
         let state = Python::attach(|py| {
@@ -985,7 +1045,8 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
             // calls `validate_python(data, from_attributes=True)`. This
             // matches stock FastAPI's error shape (`model_attributes_type`
             // instead of `model_type`, FA-style messages, no ctx).
-            let fa_factory = py.import("fastapi_turbo._introspect")
+            let fa_factory = py
+                .import("fastapi_turbo._introspect")
                 .and_then(|m| m.getattr("_make_fa_body_validator"))
                 .ok();
             for param in &mut params {
@@ -1021,46 +1082,40 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                 has_inject_response: has_inj_resp,
                 has_file_params: has_file,
                 has_form_params: has_form,
-                has_http_middleware: route.handler
+                has_http_middleware: route
+                    .handler
                     .getattr(py, "_has_http_middleware")
                     .and_then(|v| v.extract::<bool>(py))
                     .unwrap_or(false),
-                defers_extraction_errors: route.handler
+                defers_extraction_errors: route
+                    .handler
                     .getattr(py, "_fastapi_turbo_defers_extraction_errors")
                     .and_then(|v| v.extract::<bool>(py))
                     .unwrap_or(false),
-                lax_content_type: route.handler
+                lax_content_type: route
+                    .handler
                     .getattr(py, "_fastapi_turbo_lax_content_type")
                     .and_then(|v| v.extract::<bool>(py))
                     .unwrap_or(false),
-                route_obj: route.handler
-                    .getattr(py, "_fastapi_turbo_route_obj")
-                    .ok(),
+                route_obj: route.handler.getattr(py, "_fastapi_turbo_route_obj").ok(),
             })
         });
 
         let mut method_router: Option<MethodRouter> = None;
         // Track which methods this route declares (for Allow header + auto-OPTIONS).
-        let declared_methods: Vec<String> = route
-            .methods
-            .iter()
-            .map(|m| m.to_uppercase())
-            .collect();
+        let declared_methods: Vec<String> =
+            route.methods.iter().map(|m| m.to_uppercase()).collect();
         let has_explicit_options = declared_methods.iter().any(|m| m == "OPTIONS");
 
         for method_str in &route.methods {
             let s = state.clone();
             let m = method_str.to_uppercase();
 
-            let handler_fn = move |
-                path_params: Option<Path<HashMap<String, String>>>,
-                query_params: Query<HashMap<String, String>>,
-                request: Request<Body>,
-            | {
+            let handler_fn = move |path_params: Option<Path<HashMap<String, String>>>,
+                                   query_params: Query<HashMap<String, String>>,
+                                   request: Request<Body>| {
                 let state = s.clone(); // Arc::clone — just refcount, no GIL
-                async move {
-                    handle_request(state, path_params, query_params, request).await
-                }
+                async move { handle_request(state, path_params, query_params, request).await }
             };
 
             let mr = match m.as_str() {
@@ -1071,9 +1126,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                 "PATCH" => patch(handler_fn),
                 "HEAD" => head(handler_fn),
                 "OPTIONS" => axum::routing::options(handler_fn),
-                "TRACE" => axum::routing::on(
-                    axum::routing::MethodFilter::TRACE, handler_fn,
-                ),
+                "TRACE" => axum::routing::on(axum::routing::MethodFilter::TRACE, handler_fn),
                 other => {
                     eprintln!("fastapi-turbo: unsupported HTTP method '{other}', skipping");
                     continue;
@@ -1123,7 +1176,13 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     );
                 }
             } else {
-                by_path.push((axum_path, mr, declared_methods, has_explicit_options, get_state_opt));
+                by_path.push((
+                    axum_path,
+                    mr,
+                    declared_methods,
+                    has_explicit_options,
+                    get_state_opt,
+                ));
             }
         }
     }
@@ -1161,9 +1220,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                                        query_params: Query<HashMap<String, String>>,
                                        request: Request<Body>| {
                     let state = state_clone.clone();
-                    async move {
-                        handle_request(state, path_params, query_params, request).await
-                    }
+                    async move { handle_request(state, path_params, query_params, request).await }
                 };
                 let piece = match m.as_str() {
                     "POST" => post(handler_fn),
@@ -1223,7 +1280,8 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                                     .map(|Path(m)| m.clone())
                                     .unwrap_or_default();
                                 let h = Python::attach(|py| ws_state.handler.clone_ref(py));
-                                return dispatch_ws(ws, path_map, &parts, h, ws_state.is_async).await;
+                                return dispatch_ws(ws, path_map, &parts, h, ws_state.is_async)
+                                    .await;
                             }
                             Err(rej) => return rej.into_response(),
                         }
@@ -1296,17 +1354,16 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
 /// the top level after middleware and WS branches have been merged, so the
 /// fallback fires only when nothing else matched.
 pub fn with_not_found_fallback(router: Router) -> Router {
-    router.fallback(|req: axum::http::Request<axum::body::Body>| async move {
-        dispatch_404(req).await
-    })
+    router.fallback(
+        |req: axum::http::Request<axum::body::Body>| async move { dispatch_404(req).await },
+    )
 }
 
 /// Python callable supplied by ``run_server(not_found_handler=...)``.
 /// Expected signature: ``fn(method: str, path: str) -> bytes`` where the
 /// returned bytes is a ready-to-send JSON body. The shim in
 /// ``applications.py`` wraps the user's handler into this shape.
-pub static NOT_FOUND_HANDLER: std::sync::RwLock<Option<Py<PyAny>>> =
-    std::sync::RwLock::new(None);
+pub static NOT_FOUND_HANDLER: std::sync::RwLock<Option<Py<PyAny>>> = std::sync::RwLock::new(None);
 
 async fn dispatch_404(req: axum::http::Request<axum::body::Body>) -> Response {
     let has_handler = NOT_FOUND_HANDLER
@@ -1343,7 +1400,10 @@ async fn dispatch_404(req: axum::http::Request<axum::body::Body>) -> Response {
                     ));
                 }
                 let result = handler
-                    .call1(py, (method.as_str(), path.as_str(), query.as_str(), hdrs_py))
+                    .call1(
+                        py,
+                        (method.as_str(), path.as_str(), query.as_str(), hdrs_py),
+                    )
                     .or_else(|_| handler.call1(py, (method.as_str(), path.as_str())))
                     .ok()?;
                 // Expected shape: (status: int, body: bytes) OR
@@ -1397,9 +1457,7 @@ async fn handle_request(
     // keys are preserved (used when a handler param is annotated as a list).
     let query_multi: HashMap<String, Vec<String>> = {
         let mut m: HashMap<String, Vec<String>> = HashMap::new();
-        for (k, v) in url::form_urlencoded::parse(
-            request.uri().query().unwrap_or("").as_bytes(),
-        ) {
+        for (k, v) in url::form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes()) {
             m.entry(k.into_owned()).or_default().push(v.into_owned());
         }
         m
@@ -1410,14 +1468,25 @@ async fn handle_request(
     // shapes for these: `multipart/form-data`, `application/x-www-form-urlencoded`,
     // or plain JSON. Detection here is just reading the header value.
     #[derive(Copy, Clone, PartialEq, Eq)]
-    enum FormKind { None, Multipart, UrlEncoded }
+    enum FormKind {
+        None,
+        Multipart,
+        UrlEncoded,
+    }
 
     let (multipart_boundary, form_kind): (Option<String>, FormKind) =
         if state.has_file_params || state.has_form_params {
-            if let Some(ct) = request.headers().get("content-type").and_then(|v| v.to_str().ok()) {
+            if let Some(ct) = request
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+            {
                 if let Some(b) = parse_boundary(ct) {
                     (Some(b), FormKind::Multipart)
-                } else if ct.to_ascii_lowercase().starts_with("application/x-www-form-urlencoded") {
+                } else if ct
+                    .to_ascii_lowercase()
+                    .starts_with("application/x-www-form-urlencoded")
+                {
                     (None, FormKind::UrlEncoded)
                 } else {
                     (None, FormKind::None)
@@ -1491,7 +1560,8 @@ async fn handle_request(
         let bb = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
             Ok(b) => b,
             Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("Failed to read body: {e}")).into_response();
+                return (StatusCode::BAD_REQUEST, format!("Failed to read body: {e}"))
+                    .into_response();
             }
         };
 
@@ -1518,20 +1588,20 @@ async fn handle_request(
             // so the "form" extraction path below works uniformly.
             let mut fields: HashMap<String, Vec<ParsedField>> = HashMap::new();
             for (k, v) in url::form_urlencoded::parse(&bb) {
-                fields.entry(k.to_string()).or_default().push(
-                    ParsedField {
-                        name: k.to_string(),
-                        filename: None,
-                        content_type: None,
-                        data: bytes::Bytes::from(v.into_owned().into_bytes()),
-                        headers: Vec::new(),
-                    },
-                );
+                fields.entry(k.to_string()).or_default().push(ParsedField {
+                    name: k.to_string(),
+                    filename: None,
+                    content_type: None,
+                    data: bytes::Bytes::from(v.into_owned().into_bytes()),
+                    headers: Vec::new(),
+                });
             }
             (bytes::Bytes::new(), None, Some(fields), mw_raw)
         } else {
             // JSON / raw bytes body path (existing behavior)
-            let all_have_models = state.params.iter()
+            let all_have_models = state
+                .params
+                .iter()
                 .filter(|p| p.kind == "body")
                 .all(|p| p.cached_validator.is_some() || p.model_class.is_some());
             let json = if all_have_models || bb.is_empty() {
@@ -1558,7 +1628,14 @@ async fn handle_request(
                     set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
                     let kwargs = PyDict::new(py);
                     if state.has_http_middleware {
-                        inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
+                        inject_request_metadata(
+                            py,
+                            &kwargs,
+                            &scope_method,
+                            &scope_path,
+                            &scope_query,
+                            &headers,
+                        );
                         if let Some(ref raw) = raw_body_for_mw {
                             if !raw.is_empty() {
                                 let _ = kwargs.set_item(
@@ -1569,7 +1646,11 @@ async fn handle_request(
                         }
                     }
                     match state.handler.call(py, (), Some(&kwargs)) {
-                        Ok(py_result) => py_to_response_with_request(py, py_result.bind(py), range_header.as_deref()),
+                        Ok(py_result) => py_to_response_with_request(
+                            py,
+                            py_result.bind(py),
+                            range_header.as_deref(),
+                        ),
                         Err(py_err) => pyerr_to_response(py, &py_err),
                     }
                 });
@@ -1578,7 +1659,9 @@ async fn handle_request(
             return Python::attach(|py| {
                 set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
                 match state.handler.call0(py) {
-                    Ok(py_result) => py_to_response_with_request(py, py_result.bind(py), range_header.as_deref()),
+                    Ok(py_result) => {
+                        py_to_response_with_request(py, py_result.bind(py), range_header.as_deref())
+                    }
                     Err(py_err) => pyerr_to_response(py, &py_err),
                 }
             });
@@ -1588,10 +1671,21 @@ async fn handle_request(
         return tokio::task::block_in_place(|| {
             Python::attach(|py| {
                 set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
-                let body_json_opt = if state.has_body_params { body_json.as_ref() } else { None };
+                let body_json_opt = if state.has_body_params {
+                    body_json.as_ref()
+                } else {
+                    None
+                };
                 let kwargs = match extract_params_to_pydict_full(
-                    py, &state.params, &path_map, &query_params, &query_multi,
-                    &headers, &body_json_opt, &body_bytes, &mut multipart_fields,
+                    py,
+                    &state.params,
+                    &path_map,
+                    &query_params,
+                    &query_multi,
+                    &headers,
+                    &body_json_opt,
+                    &body_bytes,
+                    &mut multipart_fields,
                     state.defers_extraction_errors,
                     state.lax_content_type,
                 ) {
@@ -1599,15 +1693,29 @@ async fn handle_request(
                     Err(resp) => return resp,
                 };
                 if let Err(e) = inject_framework_objects(
-                    py, &kwargs, &state,
-                    &scope_method, &scope_path, &scope_query,
-                    &headers, &path_map, &query_params,
-                    &body_bytes, &client_addr,
+                    py,
+                    &kwargs,
+                    &state,
+                    &scope_method,
+                    &scope_path,
+                    &scope_query,
+                    &headers,
+                    &path_map,
+                    &query_params,
+                    &body_bytes,
+                    &client_addr,
                 ) {
                     return pyerr_to_response(py, &e);
                 }
                 if state.has_http_middleware {
-                    inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
+                    inject_request_metadata(
+                        py,
+                        &kwargs,
+                        &scope_method,
+                        &scope_path,
+                        &scope_query,
+                        &headers,
+                    );
                     // Seed the middleware Request's ``_body`` cache with
                     // the raw (pre-multipart-parse) bytes.
                     if let Some(ref raw) = raw_body_for_mw {
@@ -1622,7 +1730,11 @@ async fn handle_request(
                 match state.handler.call(py, (), Some(&kwargs)) {
                     Ok(py_result) => {
                         drain_background_tasks(py, &kwargs, &state.params);
-                        let mut resp = py_to_response_with_request(py, py_result.bind(py), range_header.as_deref());
+                        let mut resp = py_to_response_with_request(
+                            py,
+                            py_result.bind(py),
+                            range_header.as_deref(),
+                        );
                         apply_injected_response(py, &kwargs, &state.params, &mut resp);
                         resp
                     }
@@ -1641,12 +1753,23 @@ async fn handle_request(
             Python::attach(|py| {
                 set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
                 // Build kwargs from params
-                let body_json_opt = if state.has_body_params { body_json.as_ref() } else { None };
+                let body_json_opt = if state.has_body_params {
+                    body_json.as_ref()
+                } else {
+                    None
+                };
 
                 if !state.has_any_params {
                     let kwargs = PyDict::new(py);
                     if state.has_http_middleware {
-                        inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
+                        inject_request_metadata(
+                            py,
+                            &kwargs,
+                            &scope_method,
+                            &scope_path,
+                            &scope_query,
+                            &headers,
+                        );
                         if let Some(ref raw) = raw_body_for_mw {
                             if !raw.is_empty() {
                                 let _ = kwargs.set_item(
@@ -1656,16 +1779,32 @@ async fn handle_request(
                             }
                         }
                     }
-                    match crate::handler_bridge::call_async_on_local_loop(
-                        py, &state.handler, &kwargs,
+                    let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
+                        .read()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
+                    match crate::handler_bridge::call_async_on_local_loop_with_app(
+                        py,
+                        &state.handler,
+                        &kwargs,
+                        app_for_submit.as_ref(),
                     ) {
-                        Ok(r) => py_to_response_with_request(py, r.bind(py), range_header.as_deref()),
+                        Ok(r) => {
+                            py_to_response_with_request(py, r.bind(py), range_header.as_deref())
+                        }
                         Err(e) => pyerr_to_response(py, &e),
                     }
                 } else if !state.has_dep_params {
                     let kwargs = match extract_params_to_pydict_full(
-                        py, &state.params, &path_map, &query_params, &query_multi,
-                        &headers, &body_json_opt, &body_bytes, &mut multipart_fields,
+                        py,
+                        &state.params,
+                        &path_map,
+                        &query_params,
+                        &query_multi,
+                        &headers,
+                        &body_json_opt,
+                        &body_bytes,
+                        &mut multipart_fields,
                         state.defers_extraction_errors,
                         state.lax_content_type,
                     ) {
@@ -1673,15 +1812,29 @@ async fn handle_request(
                         Err(resp) => return resp,
                     };
                     if let Err(e) = inject_framework_objects(
-                        py, &kwargs, &state,
-                        &scope_method, &scope_path, &scope_query,
-                        &headers, &path_map, &query_params,
-                        &body_bytes, &client_addr,
+                        py,
+                        &kwargs,
+                        &state,
+                        &scope_method,
+                        &scope_path,
+                        &scope_query,
+                        &headers,
+                        &path_map,
+                        &query_params,
+                        &body_bytes,
+                        &client_addr,
                     ) {
                         return pyerr_to_response(py, &e);
                     }
                     if state.has_http_middleware {
-                        inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
+                        inject_request_metadata(
+                            py,
+                            &kwargs,
+                            &scope_method,
+                            &scope_path,
+                            &scope_query,
+                            &headers,
+                        );
                         if let Some(ref raw) = raw_body_for_mw {
                             if !raw.is_empty() {
                                 let _ = kwargs.set_item(
@@ -1691,12 +1844,23 @@ async fn handle_request(
                             }
                         }
                     }
-                    match crate::handler_bridge::call_async_on_local_loop(
-                        py, &state.handler, &kwargs,
+                    let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
+                        .read()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
+                    match crate::handler_bridge::call_async_on_local_loop_with_app(
+                        py,
+                        &state.handler,
+                        &kwargs,
+                        app_for_submit.as_ref(),
                     ) {
                         Ok(r) => {
                             drain_background_tasks(py, &kwargs, &state.params);
-                            let mut resp = py_to_response_with_request(py, r.bind(py), range_header.as_deref());
+                            let mut resp = py_to_response_with_request(
+                                py,
+                                r.bind(py),
+                                range_header.as_deref(),
+                            );
                             apply_injected_response(py, &kwargs, &state.params, &mut resp);
                             resp
                         }
@@ -1704,8 +1868,15 @@ async fn handle_request(
                     }
                 } else {
                     let kwargs = match extract_params_to_pydict_full(
-                        py, &state.params, &path_map, &query_params, &query_multi,
-                        &headers, &body_json_opt, &body_bytes, &mut multipart_fields,
+                        py,
+                        &state.params,
+                        &path_map,
+                        &query_params,
+                        &query_multi,
+                        &headers,
+                        &body_json_opt,
+                        &body_bytes,
+                        &mut multipart_fields,
                         state.defers_extraction_errors,
                         state.lax_content_type,
                     ) {
@@ -1713,15 +1884,29 @@ async fn handle_request(
                         Err(resp) => return resp,
                     };
                     if let Err(e) = inject_framework_objects(
-                        py, &kwargs, &state,
-                        &scope_method, &scope_path, &scope_query,
-                        &headers, &path_map, &query_params,
-                        &body_bytes, &client_addr,
+                        py,
+                        &kwargs,
+                        &state,
+                        &scope_method,
+                        &scope_path,
+                        &scope_query,
+                        &headers,
+                        &path_map,
+                        &query_params,
+                        &body_bytes,
+                        &client_addr,
                     ) {
                         return pyerr_to_response(py, &e);
                     }
                     if state.has_http_middleware {
-                        inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
+                        inject_request_metadata(
+                            py,
+                            &kwargs,
+                            &scope_method,
+                            &scope_path,
+                            &scope_query,
+                            &headers,
+                        );
                         if let Some(ref raw) = raw_body_for_mw {
                             if !raw.is_empty() {
                                 let _ = kwargs.set_item(
@@ -1763,7 +1948,9 @@ async fn handle_request(
                             }
                         }
 
-                        let Some(ref dep_callable) = param.dep_callable else { continue };
+                        let Some(ref dep_callable) = param.dep_callable else {
+                            continue;
+                        };
 
                         // Build kwargs for this dep from previously resolved values
                         let dep_kwargs = PyDict::new(py);
@@ -1793,7 +1980,13 @@ async fn handle_request(
                     _ => {
                         // Extract non-dep params
                         if let Err(resp) = extract_single_param(
-                            py, param, &path_map, &query_params, &headers, &body_json, &mut resolved,
+                            py,
+                            param,
+                            &path_map,
+                            &query_params,
+                            &headers,
+                            &body_json,
+                            &mut resolved,
                         ) {
                             return resp;
                         }
@@ -1819,10 +2012,16 @@ async fn handle_request(
             };
 
             match result {
-                Ok(py_result) => py_to_response_with_request(py, py_result.bind(py), range_header.as_deref()),
+                Ok(py_result) => {
+                    py_to_response_with_request(py, py_result.bind(py), range_header.as_deref())
+                }
                 Err(ref py_err) => {
                     // Check if this is "needs event loop" — signal for fallback
-                    let msg = py_err.value(py).str().map(|s| s.to_string()).unwrap_or_default();
+                    let msg = py_err
+                        .value(py)
+                        .str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
                     if msg.contains("event loop") {
                         // Return a sentinel status to signal fallback needed
                         (StatusCode::from_u16(599).unwrap(), "NEEDS_EVENT_LOOP").into_response()
@@ -1844,7 +2043,15 @@ async fn handle_request(
             let mut resolved: HashMap<String, Py<PyAny>> = HashMap::new();
             for param in &state.params {
                 if param.kind != "dependency" {
-                    let _ = extract_single_param(py, param, &path_map, &query_params, &headers, &body_json, &mut resolved);
+                    let _ = extract_single_param(
+                        py,
+                        param,
+                        &path_map,
+                        &query_params,
+                        &headers,
+                        &body_json,
+                        &mut resolved,
+                    );
                 }
             }
             // Re-resolve deps via the old approach won't work here...
@@ -1861,7 +2068,9 @@ async fn handle_request(
 
         let handler = Python::attach(|py| state.handler.clone_ref(py));
         return match call_async_handler(handler, handler_kwargs).await {
-            Ok(py_result) => Python::attach(|py| py_to_response_with_request(py, py_result.bind(py), range_header.as_deref())),
+            Ok(py_result) => Python::attach(|py| {
+                py_to_response_with_request(py, py_result.bind(py), range_header.as_deref())
+            }),
             Err(py_err) => Python::attach(|py| pyerr_to_response(py, &py_err)),
         };
     }
@@ -1915,7 +2124,7 @@ fn try_call_async_sync(
 
 /// Extract ALL params directly into a PyDict (fast path for sync handlers without deps).
 /// Single GIL acquisition — no intermediate HashMap.
-#[allow(dead_code)]  // Superseded by extract_params_to_pydict_full; kept as reference.
+#[allow(dead_code)] // Superseded by extract_params_to_pydict_full; kept as reference.
 fn extract_params_to_pydict<'py>(
     py: Python<'py>,
     params: &[ParamInfo],
@@ -1929,8 +2138,15 @@ fn extract_params_to_pydict<'py>(
     lax_content_type: bool,
 ) -> Result<pyo3::Bound<'py, pyo3::types::PyDict>, Response> {
     extract_params_to_pydict_full(
-        py, params, path_map, query_params, &HashMap::new(),
-        headers, body_json, body_bytes, multipart_fields,
+        py,
+        params,
+        path_map,
+        query_params,
+        &HashMap::new(),
+        headers,
+        body_json,
+        body_bytes,
+        multipart_fields,
         defers_extraction_errors,
         lax_content_type,
     )
@@ -1969,7 +2185,9 @@ fn extract_params_to_pydict_full<'py>(
     }
 
     for param in params {
-        if !param.is_handler_param { continue; }
+        if !param.is_handler_param {
+            continue;
+        }
 
         match param.kind.as_str() {
             "path" => {
@@ -1986,7 +2204,10 @@ fn extract_params_to_pydict_full<'py>(
                             }
                             None => {
                                 extraction_errors.push(coercion_error_detail(
-                                    "path", p_lookup, raw, &param.type_hint,
+                                    "path",
+                                    p_lookup,
+                                    raw,
+                                    &param.type_hint,
                                 ));
                                 continue;
                             }
@@ -2007,10 +2228,7 @@ fn extract_params_to_pydict_full<'py>(
                 let q_lookup: &str = param.alias.as_deref().unwrap_or(&param.name);
                 // List types collect ALL values for repeated `?k=a&k=b`
                 if param.type_hint.starts_with("list_") {
-                    let values = query_multi
-                        .get(q_lookup)
-                        .cloned()
-                        .unwrap_or_default();
+                    let values = query_multi.get(q_lookup).cloned().unwrap_or_default();
                     if values.is_empty() {
                         if !apply_default(py, &kwargs, param) && param.required {
                             extraction_errors.push(missing_error_detail("query", q_lookup));
@@ -2022,7 +2240,9 @@ fn extract_params_to_pydict_full<'py>(
                         let mut any_err = false;
                         for (idx, v) in values.iter().enumerate() {
                             match try_coerce_str_to_py(py, v, inner) {
-                                Some(coerced) => { let _ = list.append(coerced.bind(py)); }
+                                Some(coerced) => {
+                                    let _ = list.append(coerced.bind(py));
+                                }
                                 None => {
                                     extraction_errors.push(coercion_error_detail_indexed(
                                         "query", q_lookup, idx, v, inner,
@@ -2044,8 +2264,13 @@ fn extract_params_to_pydict_full<'py>(
                     if param.scalar_validator.is_some() {
                         let raw_py = pyo3::types::PyString::new(py, raw).into_any();
                         match run_scalar_validator_detail(py, param, "query", &raw_py) {
-                            Ok(validated) => { let _ = kwargs.set_item(&param.name, validated); }
-                            Err(mut errs) => { extraction_errors.append(&mut errs); continue; }
+                            Ok(validated) => {
+                                let _ = kwargs.set_item(&param.name, validated);
+                            }
+                            Err(mut errs) => {
+                                extraction_errors.append(&mut errs);
+                                continue;
+                            }
                         }
                     } else {
                         match try_coerce_str_to_py(py, raw, &param.type_hint) {
@@ -2054,7 +2279,10 @@ fn extract_params_to_pydict_full<'py>(
                             }
                             None => {
                                 extraction_errors.push(coercion_error_detail(
-                                    "query", q_lookup, raw, &param.type_hint,
+                                    "query",
+                                    q_lookup,
+                                    raw,
+                                    &param.type_hint,
                                 ));
                                 continue;
                             }
@@ -2105,7 +2333,10 @@ fn extract_params_to_pydict_full<'py>(
                             if let Some(ref validator) = param.cached_validator {
                                 validator.call_method1(py, "validate_json", (py_bytes,))
                             } else {
-                                param.model_class.as_ref().unwrap()
+                                param
+                                    .model_class
+                                    .as_ref()
+                                    .unwrap()
                                     .getattr(py, "__pydantic_validator__")
                                     .and_then(|v| v.call_method1(py, "validate_json", (py_bytes,)))
                             }
@@ -2118,7 +2349,10 @@ fn extract_params_to_pydict_full<'py>(
                             if let Some(ref validator) = param.cached_validator {
                                 validator.call_method1(py, "validate_python", (py_str,))
                             } else {
-                                param.model_class.as_ref().unwrap()
+                                param
+                                    .model_class
+                                    .as_ref()
+                                    .unwrap()
                                     .getattr(py, "__pydantic_validator__")
                                     .and_then(|v| v.call_method1(py, "validate_python", (py_str,)))
                             }
@@ -2135,9 +2369,13 @@ fn extract_params_to_pydict_full<'py>(
                                     return Err(crate::responses::pyerr_to_response(py, &e));
                                 }
                                 if param.name == "_combined_body" {
-                                    return Err(pydantic_error_response_combined_with_body(py, &e, "body", body_bytes));
+                                    return Err(pydantic_error_response_combined_with_body(
+                                        py, &e, "body", body_bytes,
+                                    ));
                                 }
-                                return Err(pydantic_error_response_with_body(py, &e, "body", body_bytes));
+                                return Err(pydantic_error_response_with_body(
+                                    py, &e, "body", body_bytes,
+                                ));
                             }
                         }
                     } else if let Some(json_val) = body_json {
@@ -2199,15 +2437,21 @@ fn extract_params_to_pydict_full<'py>(
                     }
                     continue;
                 }
-                let header_val = headers.as_ref()
+                let header_val = headers
+                    .as_ref()
                     .and_then(|h| h.get(lookup.as_str()))
                     .and_then(|v| v.to_str().ok());
                 if let Some(raw) = header_val {
                     if param.scalar_validator.is_some() {
                         let raw_py = pyo3::types::PyString::new(py, raw).into_any();
                         match run_scalar_validator_detail(py, param, "header", &raw_py) {
-                            Ok(validated) => { let _ = kwargs.set_item(&param.name, validated); }
-                            Err(mut errs) => { extraction_errors.append(&mut errs); continue; }
+                            Ok(validated) => {
+                                let _ = kwargs.set_item(&param.name, validated);
+                            }
+                            Err(mut errs) => {
+                                extraction_errors.append(&mut errs);
+                                continue;
+                            }
                         }
                     } else {
                         match try_coerce_str_to_py(py, raw, &param.type_hint) {
@@ -2220,7 +2464,10 @@ fn extract_params_to_pydict_full<'py>(
                                 // identifier so `loc` matches FastAPI.
                                 let loc_name = param.alias.as_deref().unwrap_or(&param.name);
                                 extraction_errors.push(coercion_error_detail(
-                                    "header", loc_name, raw, &param.type_hint,
+                                    "header",
+                                    loc_name,
+                                    raw,
+                                    &param.type_hint,
                                 ));
                                 continue;
                             }
@@ -2239,7 +2486,8 @@ fn extract_params_to_pydict_full<'py>(
                 // wraps its value in `Cookie(alias="sessionid")`), else
                 // the Python parameter name.
                 let lookup = param.alias.as_deref().unwrap_or(&param.name);
-                let cookie_val = headers.as_ref()
+                let cookie_val = headers
+                    .as_ref()
                     .and_then(|h| h.get("cookie"))
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| parse_cookie_value(s, lookup));
@@ -2253,7 +2501,14 @@ fn extract_params_to_pydict_full<'py>(
                             Some(v) => {
                                 let _ = kwargs.set_item(&param.name, v.bind(py));
                             }
-                            None => return Err(coercion_error_response("cookie", &param.name, &raw, &param.type_hint)),
+                            None => {
+                                return Err(coercion_error_response(
+                                    "cookie",
+                                    &param.name,
+                                    &raw,
+                                    &param.type_hint,
+                                ))
+                            }
                         }
                     }
                 } else if apply_default(py, &kwargs, param) {
@@ -2264,7 +2519,11 @@ fn extract_params_to_pydict_full<'py>(
                         extraction_errors.push(missing_error_detail("cookie", loc_name));
                         continue;
                     }
-                    return Err(validation_error_response("cookie", loc_name, "field required"));
+                    return Err(validation_error_response(
+                        "cookie",
+                        loc_name,
+                        "field required",
+                    ));
                 }
             }
             "file" => {
@@ -2275,13 +2534,10 @@ fn extract_params_to_pydict_full<'py>(
                 // Look up by alias (File(alias=...) / File(validation_alias=...)
                 // — our introspect resolves to ``alias``) so the wire-side
                 // field name wins over the Python parameter identifier.
-                let wants_raw_bytes =
-                    param.type_hint == "bytes" || param.type_hint == "list_bytes";
+                let wants_raw_bytes = param.type_hint == "bytes" || param.type_hint == "list_bytes";
                 let wants_list = param.type_hint.starts_with("list_");
                 let alias_name = param.alias.as_deref().unwrap_or(&param.name);
-                let fields = multipart_fields
-                    .as_mut()
-                    .and_then(|m| m.remove(alias_name));
+                let fields = multipart_fields.as_mut().and_then(|m| m.remove(alias_name));
                 match fields {
                     Some(mut fs) if !fs.is_empty() => {
                         if !wants_list && fs.len() == 1 {
@@ -2332,7 +2588,11 @@ fn extract_params_to_pydict_full<'py>(
                                 extraction_errors.push(missing_error_detail("body", alias_name));
                                 continue;
                             }
-                            return Err(validation_error_response("body", alias_name, "field required"));
+                            return Err(validation_error_response(
+                                "body",
+                                alias_name,
+                                "field required",
+                            ));
                         }
                     }
                 }
@@ -2344,9 +2604,7 @@ fn extract_params_to_pydict_full<'py>(
                 // alias to the field name; Form(alias=...) users also rely
                 // on alias being honoured on the wire).
                 let alias_name = param.alias.as_deref().unwrap_or(&param.name);
-                let fields = multipart_fields
-                    .as_mut()
-                    .and_then(|m| m.remove(alias_name));
+                let fields = multipart_fields.as_mut().and_then(|m| m.remove(alias_name));
                 let wants_list = param.type_hint.starts_with("list_");
                 match fields {
                     Some(mut fs) if !fs.is_empty() => {
@@ -2375,7 +2633,9 @@ fn extract_params_to_pydict_full<'py>(
                                     let text = String::from_utf8_lossy(&f.data).into_owned();
                                     if coerce_inner {
                                         match try_coerce_str_to_py(py, &text, inner) {
-                                            Some(v) => { let _ = list.append(v.bind(py)); }
+                                            Some(v) => {
+                                                let _ = list.append(v.bind(py));
+                                            }
                                             None => {
                                                 extraction_errors.push(
                                                     coercion_error_detail_indexed(
@@ -2386,9 +2646,7 @@ fn extract_params_to_pydict_full<'py>(
                                             }
                                         }
                                     } else {
-                                        let _ = list.append(
-                                            pyo3::types::PyString::new(py, &text),
-                                        );
+                                        let _ = list.append(pyo3::types::PyString::new(py, &text));
                                     }
                                 }
                             }
@@ -2409,13 +2667,16 @@ fn extract_params_to_pydict_full<'py>(
                                 // default (usually None). Without this,
                                 // ``age=Form(None)`` + ``age=`` fails to
                                 // parse as int and returns 422.
-                                if text.is_empty() && !param.required
-                                    && apply_default(py, &kwargs, param) {
-                                        continue;
-                                    }
+                                if text.is_empty()
+                                    && !param.required
+                                    && apply_default(py, &kwargs, param)
+                                {
+                                    continue;
+                                }
                                 if param.scalar_validator.is_some() {
                                     let raw_py = pyo3::types::PyString::new(py, &text).into_any();
-                                    let validated = run_scalar_validator(py, param, "body", &raw_py)?;
+                                    let validated =
+                                        run_scalar_validator(py, param, "body", &raw_py)?;
                                     let _ = kwargs.set_item(&param.name, validated);
                                 } else {
                                     match try_coerce_str_to_py(py, &text, &param.type_hint) {
@@ -2424,7 +2685,10 @@ fn extract_params_to_pydict_full<'py>(
                                         }
                                         None => {
                                             return Err(coercion_error_response(
-                                                "body", alias_name, &text, &param.type_hint,
+                                                "body",
+                                                alias_name,
+                                                &text,
+                                                &param.type_hint,
                                             ));
                                         }
                                     }
@@ -2605,7 +2869,10 @@ fn extract_single_param(
     match param.kind.as_str() {
         "path" => {
             if let Some(raw) = path_map.get(&param.name) {
-                resolved.insert(param.name.clone(), coerce_str_to_py(py, raw, &param.type_hint));
+                resolved.insert(
+                    param.name.clone(),
+                    coerce_str_to_py(py, raw, &param.type_hint),
+                );
             } else if param.has_default {
                 let v = match &param.default_value {
                     Some(d) => d.clone_ref(py),
@@ -2613,13 +2880,20 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response("path", &param.name, "field required"));
+                return Err(validation_error_response(
+                    "path",
+                    &param.name,
+                    "field required",
+                ));
             }
         }
         "query" => {
             let q_lookup: &str = param.alias.as_deref().unwrap_or(&param.name);
             if let Some(raw) = query_params.get(q_lookup) {
-                resolved.insert(param.name.clone(), coerce_str_to_py(py, raw, &param.type_hint));
+                resolved.insert(
+                    param.name.clone(),
+                    coerce_str_to_py(py, raw, &param.type_hint),
+                );
             } else if param.has_default {
                 let v = match &param.default_value {
                     Some(d) => d.clone_ref(py),
@@ -2627,15 +2901,22 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response("query", &param.name, "field required"));
+                return Err(validation_error_response(
+                    "query",
+                    &param.name,
+                    "field required",
+                ));
             }
         }
         "body" => {
             if let Some(ref json_val) = body_json {
                 let raw_dict = serde_to_pyobj(py, json_val);
                 let val = if let Some(ref model_cls) = param.model_class {
-                    model_cls.call_method1(py, "model_validate", (raw_dict.bind(py),))
-                        .map_err(|e| validation_error_response("body", &param.name, &format!("{e}")))?
+                    model_cls
+                        .call_method1(py, "model_validate", (raw_dict.bind(py),))
+                        .map_err(|e| {
+                            validation_error_response("body", &param.name, &format!("{e}"))
+                        })?
                 } else {
                     raw_dict
                 };
@@ -2647,16 +2928,24 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response("body", &param.name, "field required"));
+                return Err(validation_error_response(
+                    "body",
+                    &param.name,
+                    "field required",
+                ));
             }
         }
         "header" => {
             let lookup = param.alias.as_deref().unwrap_or(&param.name).to_lowercase();
-            let header_val = headers.as_ref()
+            let header_val = headers
+                .as_ref()
                 .and_then(|h| h.get(lookup.as_str()))
                 .and_then(|v| v.to_str().ok());
             if let Some(raw) = header_val {
-                resolved.insert(param.name.clone(), coerce_str_to_py(py, raw, &param.type_hint));
+                resolved.insert(
+                    param.name.clone(),
+                    coerce_str_to_py(py, raw, &param.type_hint),
+                );
             } else if param.has_default {
                 let v = match &param.default_value {
                     Some(d) => d.clone_ref(py),
@@ -2664,16 +2953,24 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response("header", &param.name, "field required"));
+                return Err(validation_error_response(
+                    "header",
+                    &param.name,
+                    "field required",
+                ));
             }
         }
         "cookie" => {
-            let cookie_val = headers.as_ref()
+            let cookie_val = headers
+                .as_ref()
                 .and_then(|h| h.get("cookie"))
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| parse_cookie_value(s, &param.name));
             if let Some(raw) = cookie_val {
-                resolved.insert(param.name.clone(), coerce_str_to_py(py, &raw, &param.type_hint));
+                resolved.insert(
+                    param.name.clone(),
+                    coerce_str_to_py(py, &raw, &param.type_hint),
+                );
             } else if param.has_default {
                 let v = match &param.default_value {
                     Some(d) => d.clone_ref(py),
@@ -2681,7 +2978,11 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response("cookie", &param.name, "field required"));
+                return Err(validation_error_response(
+                    "cookie",
+                    &param.name,
+                    "field required",
+                ));
             }
         }
         _ => {}
@@ -2750,8 +3051,7 @@ pub fn dispatch_validation_error(detail_json: serde_json::Value) -> Response {
             Ok((status, body_bytes, ct))
         });
         if let Ok((status, body_bytes, ct)) = result {
-            let status =
-                StatusCode::from_u16(status).unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
             return Response::builder()
                 .status(status)
                 .header("content-type", ct)
@@ -2790,16 +3090,20 @@ fn missing_error_detail(loc: &str, name: &str) -> serde_json::Value {
 }
 
 /// Return a single error-detail object for a str→type coercion failure.
-fn coercion_error_detail(
-    loc: &str,
-    name: &str,
-    raw: &str,
-    type_hint: &str,
-) -> serde_json::Value {
+fn coercion_error_detail(loc: &str, name: &str, raw: &str, type_hint: &str) -> serde_json::Value {
     let (err_type, msg) = match type_hint {
-        "int" => ("int_parsing", "Input should be a valid integer, unable to parse string as an integer"),
-        "float" => ("float_parsing", "Input should be a valid number, unable to parse string as a number"),
-        "bool" => ("bool_parsing", "Input should be a valid boolean, unable to interpret input"),
+        "int" => (
+            "int_parsing",
+            "Input should be a valid integer, unable to parse string as an integer",
+        ),
+        "float" => (
+            "float_parsing",
+            "Input should be a valid number, unable to parse string as a number",
+        ),
+        "bool" => (
+            "bool_parsing",
+            "Input should be a valid boolean, unable to interpret input",
+        ),
         _ => ("value_error", "Value error"),
     };
     serde_json::json!({
@@ -2820,9 +3124,18 @@ fn coercion_error_detail_indexed(
     type_hint: &str,
 ) -> serde_json::Value {
     let (err_type, msg) = match type_hint {
-        "int" => ("int_parsing", "Input should be a valid integer, unable to parse string as an integer"),
-        "float" => ("float_parsing", "Input should be a valid number, unable to parse string as a number"),
-        "bool" => ("bool_parsing", "Input should be a valid boolean, unable to interpret input"),
+        "int" => (
+            "int_parsing",
+            "Input should be a valid integer, unable to parse string as an integer",
+        ),
+        "float" => (
+            "float_parsing",
+            "Input should be a valid number, unable to parse string as a number",
+        ),
+        "bool" => (
+            "bool_parsing",
+            "Input should be a valid boolean, unable to interpret input",
+        ),
         _ => ("value_error", "Value error"),
     };
     serde_json::json!({
@@ -2844,9 +3157,18 @@ fn coercion_error_response_indexed(
     type_hint: &str,
 ) -> Response {
     let (err_type, msg) = match type_hint {
-        "int" => ("int_parsing", "Input should be a valid integer, unable to parse string as an integer"),
-        "float" => ("float_parsing", "Input should be a valid number, unable to parse string as a number"),
-        "bool" => ("bool_parsing", "Input should be a valid boolean, unable to interpret input"),
+        "int" => (
+            "int_parsing",
+            "Input should be a valid integer, unable to parse string as an integer",
+        ),
+        "float" => (
+            "float_parsing",
+            "Input should be a valid number, unable to parse string as a number",
+        ),
+        "bool" => (
+            "bool_parsing",
+            "Input should be a valid boolean, unable to interpret input",
+        ),
         _ => ("value_error", "Value error"),
     };
     let body = serde_json::json!({
@@ -2864,9 +3186,18 @@ fn coercion_error_response_indexed(
 /// in Pydantic-v2 format.
 fn coercion_error_response(loc: &str, name: &str, raw: &str, type_hint: &str) -> Response {
     let (err_type, msg) = match type_hint {
-        "int" => ("int_parsing", "Input should be a valid integer, unable to parse string as an integer"),
-        "float" => ("float_parsing", "Input should be a valid number, unable to parse string as a number"),
-        "bool" => ("bool_parsing", "Input should be a valid boolean, unable to interpret input"),
+        "int" => (
+            "int_parsing",
+            "Input should be a valid integer, unable to parse string as an integer",
+        ),
+        "float" => (
+            "float_parsing",
+            "Input should be a valid number, unable to parse string as a number",
+        ),
+        "bool" => (
+            "bool_parsing",
+            "Input should be a valid boolean, unable to interpret input",
+        ),
         _ => ("value_error", "Value error"),
     };
     let body = serde_json::json!({
@@ -3009,7 +3340,12 @@ fn pydantic_error_response_with_loc_ext(
                     }
                 }
                 obj.insert("loc".into(), serde_json::Value::Array(loc));
-                if let Some(m) = d.get_item("msg").ok().flatten().and_then(|v| v.extract::<String>().ok()) {
+                if let Some(m) = d
+                    .get_item("msg")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract::<String>().ok())
+                {
                     // FastAPI post-processes a handful of Pydantic-v2
                     // wordings to match its historical error strings
                     // (array→list, object→dictionary, duration→timedelta,
@@ -3022,11 +3358,13 @@ fn pydantic_error_response_with_loc_ext(
                 // fields only (``loc.len() <= 2``). For nested missing
                 // errors (``["body","item","price"]``), preserve the
                 // partial input Pydantic provided.
-                let is_missing_err = obj.get("type")
+                let is_missing_err = obj
+                    .get("type")
                     .and_then(|v| v.as_str())
                     .map(|s| s == "missing")
                     .unwrap_or(false);
-                let loc_len_2 = obj.get("loc")
+                let loc_len_2 = obj
+                    .get("loc")
                     .and_then(|v| v.as_array())
                     .map(|a| a.len())
                     .unwrap_or(0);
@@ -3132,10 +3470,7 @@ fn parse_cookie_value(cookie_header: &str, name: &str) -> Option<String> {
         if let Some((key, value)) = pair.split_once('=') {
             if key.trim() == name {
                 let raw = value.trim();
-                let unquoted = if raw.len() >= 2
-                    && raw.starts_with('"')
-                    && raw.ends_with('"')
-                {
+                let unquoted = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
                     &raw[1..raw.len() - 1]
                 } else {
                     raw
@@ -3158,10 +3493,14 @@ fn coerce_str_to_py(py: Python<'_>, raw: &str, type_hint: &str) -> Py<PyAny> {
 /// target type (rather than silently returning the raw string).
 fn try_coerce_str_to_py(py: Python<'_>, raw: &str, type_hint: &str) -> Option<Py<PyAny>> {
     match type_hint {
-        "int" => raw.trim().parse::<i64>()
+        "int" => raw
+            .trim()
+            .parse::<i64>()
             .ok()
             .map(|i| i.into_pyobject(py).expect("int").into_any().unbind()),
-        "float" => raw.trim().parse::<f64>()
+        "float" => raw
+            .trim()
+            .parse::<f64>()
             .ok()
             .map(|f| f.into_pyobject(py).expect("float").into_any().unbind()),
         "bool" => {
@@ -3171,10 +3510,16 @@ fn try_coerce_str_to_py(py: Python<'_>, raw: &str, type_hint: &str) -> Option<Py
             let lower = raw.to_ascii_lowercase();
             match lower.as_str() {
                 "true" | "t" | "1" | "yes" | "y" | "on" => Some(
-                    pyo3::types::PyBool::new(py, true).to_owned().into_any().unbind(),
+                    pyo3::types::PyBool::new(py, true)
+                        .to_owned()
+                        .into_any()
+                        .unbind(),
                 ),
                 "false" | "f" | "0" | "no" | "n" | "off" => Some(
-                    pyo3::types::PyBool::new(py, false).to_owned().into_any().unbind(),
+                    pyo3::types::PyBool::new(py, false)
+                        .to_owned()
+                        .into_any()
+                        .unbind(),
                 ),
                 _ => None,
             }
@@ -3194,12 +3539,18 @@ mod tests {
 
     #[test]
     fn test_convert_multiple_params() {
-        assert_eq!(convert_path("/users/{user_id}/posts/{post_id}"), "/users/{user_id}/posts/{post_id}");
+        assert_eq!(
+            convert_path("/users/{user_id}/posts/{post_id}"),
+            "/users/{user_id}/posts/{post_id}"
+        );
     }
 
     #[test]
     fn test_convert_catch_all() {
-        assert_eq!(convert_path("/files/{file_path:path}"), "/files/{*file_path}");
+        assert_eq!(
+            convert_path("/files/{file_path:path}"),
+            "/files/{*file_path}"
+        );
     }
 
     #[test]
