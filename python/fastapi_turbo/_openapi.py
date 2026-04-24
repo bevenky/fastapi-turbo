@@ -2059,7 +2059,17 @@ def _build_request_body(param: dict[str, Any]) -> dict[str, Any]:
                 if title_from is None:
                     title_from = arm_type
             else:
-                frag = _type_hint_to_schema(_get_type_name(arm_type))
+                # Non-BaseModel arm (int / str / list[...] / ...): map the
+                # bare class name to a primitive JSON-Schema fragment.
+                # Prefer the richer ``_schema_for_annotation`` path for
+                # types like ``UUID`` / ``datetime`` so we get their
+                # ``format`` alongside ``type: string``.
+                rich = _schema_for_annotation(arm_type)
+                if rich is not None and rich != {"type": "object"}:
+                    any_of.append(rich)
+                    continue
+                type_name = getattr(arm_type, "__name__", None) or "str"
+                frag = _type_hint_to_schema(type_name, inner_annotation=arm_type)
                 if frag and frag != {"type": "object"}:
                     any_of.append(frag)
                 else:

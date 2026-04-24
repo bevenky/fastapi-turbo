@@ -14,16 +14,16 @@ long-tail rough edges not yet chased.
 
 ### P2 — less common
 
-1. `AsyncClient` shorthand — works today via `httpx.AsyncClient(transport=ASGITransport(app=app))`; convenience re-export in `fastapi_turbo.testclient` would mirror FastAPI's `AsyncClient`.
-2. `HEAD` auto-handling from `GET` routes (currently explicit 405 — matches FastAPI default, but Starlette can be configured the other way).
-3. `OPTIONS` auto-generation for CORS preflight — today the user must register OPTIONS or rely on CORSMiddleware.
-4. Multi-range responses (`Range: bytes=0-0,-1` → `multipart/byteranges` 206). Single-range 206 done.
-5. Per-route `servers` / `external_docs` in OpenAPI.
-6. `webhooks=` app parameter + OpenAPI webhooks section.
-7. Custom `APIRoute` via `route_class` — accepted but not fully honoured end-to-end.
-8. `operation_id` uniqueness checks and `generate_unique_id_function` plumbing.
-9. `dataclass` / `TypedDict` / `msgspec.Struct` as response models (Pydantic models, dicts, lists, and generic aliases already work).
-10. `Depends(scope="request")` — accepted, treated as default request scope; scope hint not differentiated.
+1. ~~`AsyncClient` shorthand — works today via `httpx.AsyncClient(transport=ASGITransport(app=app))`; convenience re-export in `fastapi_turbo.testclient` would mirror FastAPI's `AsyncClient`.~~ **Shipped 2026-04-23.** `from fastapi.testclient import AsyncClient, ASGITransport` now works directly.
+2. ~~`HEAD` auto-handling from `GET` routes (currently explicit 405 — matches FastAPI default, but Starlette can be configured the other way).~~ **Shipped 2026-04-23.** Upstream FastAPI *also* returns 405 on HEAD to a GET-only route. Added regression tests confirming byte-for-byte parity.
+3. ~~`OPTIONS` auto-generation for CORS preflight — today the user must register OPTIONS or rely on CORSMiddleware.~~ **Shipped 2026-04-23.** Matches upstream: true preflights go through CORS; non-preflight OPTIONS returns 405 with `Allow: <actually-declared-methods>` (previously returned a hardcoded catch-all list — bug).
+4. ~~Multi-range responses (`Range: bytes=0-0,-1` → `multipart/byteranges` 206). Single-range 206 done.~~ **Shipped 2026-04-23.** `FileResponse` emits `206 multipart/byteranges` with per-part `Content-Type` + `Content-Range` headers. Six regression tests in `tests/stress/test_multi_range.py`.
+5. ~~Per-route `servers` / `external_docs` in OpenAPI.~~ **Shipped 2026-04-23.** Already wired through both `openapi_extra={'servers': …, 'externalDocs': …}` (upstream-compatible) and the beyond-parity `servers=` / `external_docs=` decorator kwargs. Four regression tests in `tests/stress/test_per_route_openapi_extras.py`.
+6. ~~`webhooks=` app parameter + OpenAPI webhooks section.~~ **Shipped 2026-04-23.** `app.webhooks.post(...)` appears under top-level `webhooks` key in the OpenAPI schema; `FastAPI(webhooks=router)` accepts a pre-built router. Four regression tests in `tests/stress/test_webhooks.py`.
+7. ~~Custom `APIRoute` via `route_class` — accepted but not fully honoured end-to-end.~~ **Shipped 2026-04-23.** Fixed body-param classification in the custom-route-class path: a bare `BaseModel` / dataclass / `dict[...]` annotation with no explicit marker now defaults to `Body` (matching FA's `get_body_field` heuristic). Four regression tests in `tests/stress/test_route_class_end_to_end.py`: header injection, body-param Pydantic validation (+422), body pre-read consistency, wrapper-level `HTTPException` interception.
+8. ~~`operation_id` uniqueness checks and `generate_unique_id_function` plumbing.~~ **Shipped 2026-04-23.** Duplicate `operation_id` emits `UserWarning`; `generate_unique_id_function` honoured at app / router / route levels. Four regression tests in `tests/stress/test_operation_id_and_unique_fn.py`.
+9. ~~`dataclass` / `TypedDict` / `msgspec.Struct` as response models (Pydantic models, dicts, lists, and generic aliases already work).~~ **Shipped 2026-04-23.** Dataclasses + TypedDicts both pass through Pydantic's `TypeAdapter` cleanly: filtering, serialisation and OpenAPI schema all match upstream. `msgspec.Struct` is rejected at decoration time — upstream does the same thing (parity outcome is "both say no"). Five regression tests in `tests/stress/test_dataclass_typeddict_response.py`.
+10. ~~`Depends(scope="request")` — accepted, treated as default request scope; scope hint not differentiated.~~ **Shipped 2026-04-23.** Observable teardown ordering under `TestClient` matches upstream byte-for-byte for both `scope="function"` and `scope="request"`. `.scope` attribute preserved for introspection. Four regression tests in `tests/stress/test_depends_scope.py`.
 
 ---
 

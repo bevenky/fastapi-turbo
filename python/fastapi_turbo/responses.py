@@ -279,13 +279,21 @@ def _json_default(obj):
     """json.dumps ``default=`` callback for types that aren't JSON-native.
 
     Mirrors ``fastapi.encoders.jsonable_encoder`` for the types FA
-    commonly sees: ``Decimal`` → str (FA's default), ``bytes`` → UTF-8
-    str, ``BaseModel`` → dict via ``model_dump``, Enum → ``.value``.
-    Anything else falls back to ``str(obj)``.
+    commonly sees: ``Decimal`` → int / float (matches upstream),
+    ``bytes`` → UTF-8 str, ``BaseModel`` → dict via ``model_dump``,
+    ``Enum`` → ``.value``. Anything else falls back to ``str(obj)``.
     """
     import decimal as _decimal
     if isinstance(obj, _decimal.Decimal):
-        return str(obj)
+        # Non-finite (Infinity / NaN) → float so downstream ``json``
+        # emits ``NaN``/``Infinity`` literals (matches upstream);
+        # integral → int; fractional → float. Previously emitted a
+        # JSON string, which diverged from ``fastapi.encoders``.
+        if not obj.is_finite():
+            return float(obj)
+        if obj == obj.to_integral_value():
+            return int(obj)
+        return float(obj)
     if isinstance(obj, (bytes, bytearray)):
         return bytes(obj).decode("utf-8", errors="replace")
     _md = getattr(obj, "model_dump", None)

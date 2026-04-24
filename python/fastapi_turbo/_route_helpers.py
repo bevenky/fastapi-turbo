@@ -435,6 +435,86 @@ def _has_overridden_get_route_handler(route) -> bool:
         return False
 
 
+def _looks_like_body(annotation) -> bool:
+    """Loose 'is this a Body param by default?' check for the custom-
+    route-class path. Mirrors FA's default-body heuristic (scalars →
+    query, anything structurally richer → body):
+
+      * ``BaseModel`` subclass
+      * ``@dataclass`` class
+      * ``TypedDict`` subclass (detected via ``__total__`` + dict base)
+      * bare ``dict`` / typed ``dict[...]`` / generic ``Mapping[...]``
+      * ``list[T]`` / ``set[T]`` / ``frozenset[T]`` / ``tuple[T, ...]``
+        where ``T`` is itself body-typed (e.g. ``list[Item]``)
+      * ``Annotated[T, ...]`` — unwrap and recurse
+      * ``T | None`` / ``Optional[T]`` / ``Union[T, …]`` — body if any
+        non-None arm is body-typed
+    """
+    try:
+        import typing as _tp
+        from pydantic import BaseModel as _BM
+
+        if annotation is None:
+            return False
+
+        # Unwrap ``Annotated[T, ...]`` — the metadata doesn't change
+        # body-ness; the real type is the first arg.
+        origin = _tp.get_origin(annotation)
+        if origin is _tp.Annotated:
+            inner = _tp.get_args(annotation)
+            if inner:
+                return _looks_like_body(inner[0])
+
+        # Union / Optional: recurse into non-None arms.
+        if origin is _tp.Union:
+            non_none = [a for a in _tp.get_args(annotation) if a is not type(None)]
+            return any(_looks_like_body(a) for a in non_none)
+
+        if isinstance(annotation, type) and issubclass(annotation, _BM):
+            return True
+
+        # TypedDict: subclasses expose ``__required_keys__`` /
+        # ``__total__`` and inherit from ``dict``. The stable marker
+        # across 3.9 → 3.13 is ``__total__`` + being a subclass of
+        # ``dict`` without being ``dict`` itself.
+        if (
+            isinstance(annotation, type)
+            and annotation is not dict
+            and issubclass(annotation, dict)
+            and hasattr(annotation, "__total__")
+        ):
+            return True
+
+        import dataclasses as _dc
+        if isinstance(annotation, type) and _dc.is_dataclass(annotation):
+            return True
+
+        # Bare ``dict`` / ``list`` / ``set`` / ``frozenset`` / ``tuple``
+        # without a parameter type — FA treats these as body (arbitrary
+        # structures aren't parseable from a query string).
+        if annotation in (dict, list, set, frozenset, tuple):
+            return True
+
+        import collections.abc as _cabc
+        if origin in (dict, _cabc.Mapping, _cabc.MutableMapping):
+            return True
+
+        # list[T] / set[T] / frozenset[T] / tuple[T, ...] where T is
+        # itself body-typed. Scalar containers like ``list[int]`` /
+        # ``list[str]`` stay query (matches FA).
+        if origin in (list, set, frozenset, tuple):
+            args = _tp.get_args(annotation)
+            if not args:
+                # Bare ``list`` / ``set`` without item type — FA treats
+                # these as body (unparseable from query string).
+                return True
+            return any(_looks_like_body(a) for a in args if a is not Ellipsis)
+
+        return False
+    except Exception:
+        return False
+
+
 def _build_default_route_handler(route, app):
     """Return an ``async (request) -> Response`` callable that runs
     the route's full pipeline (body parsing, param validation, endpoint
@@ -510,6 +590,11 @@ def _build_default_route_handler(route, app):
                 kind = getattr(marker, "_kind", "query") or "query"
             elif isinstance(inner_ann, type) and issubclass(inner_ann, (_Req, _HC)):
                 kind = "request"
+            elif pname not in getattr(route, "path_params", set()) and _looks_like_body(inner_ann):
+                # FA parity: a Pydantic model / dataclass / generic-mapping
+                # annotation without an explicit marker is a Body param.
+                # Path params are excluded since ``/{x}`` wins.
+                kind = "body"
             param_plan.append({
                 "name": pname,
                 "kind": kind,

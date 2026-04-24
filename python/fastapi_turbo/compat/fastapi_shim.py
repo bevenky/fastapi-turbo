@@ -424,6 +424,16 @@ def _build() -> dict[str, types.ModuleType]:
         fastapi_testclient.AsyncTestClient = _ATC  # type: ignore[attr-defined]
     except ImportError:
         pass
+    # ``AsyncClient`` / ``ASGITransport`` — FastAPI docs tell users to
+    # use ``httpx.AsyncClient(transport=ASGITransport(app=app))`` for
+    # async tests. Mirror the shorthand so ``from fastapi.testclient
+    # import AsyncClient`` works.
+    try:
+        from fastapi_turbo.testclient import AsyncClient as _AC, ASGITransport as _AT
+        fastapi_testclient.AsyncClient = _AC  # type: ignore[attr-defined]
+        fastapi_testclient.ASGITransport = _AT  # type: ignore[attr-defined]
+    except ImportError:
+        pass
     modules["fastapi.testclient"] = fastapi_testclient
 
     # ── fastapi.requests ──────────────────────────────────────────

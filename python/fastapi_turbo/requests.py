@@ -3,8 +3,12 @@
 Wraps a dict-based scope. Many plugins and middleware check
 ``isinstance(request, Request)`` so this must exist.
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from fastapi_turbo.datastructures import FormData
 
 import json as _json
 from http.cookies import SimpleCookie
