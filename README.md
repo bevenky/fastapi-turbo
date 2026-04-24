@@ -29,9 +29,26 @@ app.run()
 
 ## Performance
 
-Measured with a compiled Rust HTTP client, 20K requests, keep-alive, Apple Silicon.
+### Methodology
 
-### HTTP (p50 latency, lower is better)
+All numbers below come from the custom `fastapi-turbo-bench` Rust HTTP
+client. To keep the comparison honest, the published table uses the
+following configuration — **re-run locally before relying on any
+claim here**:
+
+- **Load shape**: `--connections 1`, 20K requests, keep-alive. This
+  measures per-request overhead in a single-flight flight pattern.
+  Real traffic is concurrent; see the "Concurrent" table below for
+  multi-connection numbers (these change the picture).
+- **Hardware**: Apple Silicon M-series, local loopback. Linux numbers
+  differ — epoll / kqueue overhead, NUMA effects, and distro scheduler
+  defaults all shift the results. CI publishes a Linux x86_64 run
+  per release; those are the numbers users should rely on.
+- **Cross-check**: every row in the single-connection table has been
+  re-run with `wrk -c1 -t1` / `oha -c 1` and the deltas noted when
+  they disagree by more than 2 μs.
+
+### HTTP (p50 latency, single connection, lower is better)
 
 | Endpoint | FastAPI | **fastapi-turbo** | Go Gin | Go Echo | Fastify | Speedup vs FastAPI |
 |----------|---------|---------------|--------|---------|---------|-------------------|
@@ -41,7 +58,12 @@ Measured with a compiled Rust HTTP client, 20K requests, keep-alive, Apple Silic
 | DELETE | — | **23 us** | — | — | — | — |
 | PATCH | — | **23 us** | — | — | — | — |
 
-fastapi-turbo **ties Go and Fastify on GET** and **beats Fastify on POST** (29 us vs 30 us) thanks to Pydantic's Rust-backed validation being faster than Ajv.
+These are **single-connection loopback** numbers — good for
+measuring per-request overhead, not a production workload. For
+concurrent load (c=32, c=256) and Linux measurements, see
+[benchmarks.md](benchmarks.md). The ordering against Go/Fastify
+shifts at higher concurrency because our worker loop model is
+different from their per-core thread pools.
 
 ### WebSocket (p50 latency per echo round-trip, 10K messages)
 
@@ -380,9 +402,9 @@ python benchmarks/bench_hello.py
 
 ## Architecture
 
-- **Rust core** (~8K lines): Axum 0.8, hyper, tokio, Tower, PyO3 0.25, crossbeam; HTTP, WebSocket, multipart, streaming, DB pool, HTTP client
+- **Rust core** (~8K lines): Axum 0.8, hyper, tokio, Tower, PyO3 0.28, crossbeam; HTTP, WebSocket, multipart, streaming, DB pool, HTTP client
 - **Python layer** (~22K lines): FastAPI-compatible API, introspection, OpenAPI 3.1 generator, Starlette/FastAPI `sys.modules` compat shims
-- **Tests** (~45K lines): 510 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
+- **Tests** (~45K lines): 748 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
 
 See [CLAUDE.md](CLAUDE.md) for development guide, [benchmarks.md](benchmarks.md) for full benchmark data including Go Echo, Fastify, free-threaded Python, and WebSocket library comparisons, and [COMPATIBILITY.md](COMPATIBILITY.md) for a per-feature map of where fastapi_turbo sits against FastAPI 0.136.0 (Full / Partial / Not-implemented / Different-by-design).
 

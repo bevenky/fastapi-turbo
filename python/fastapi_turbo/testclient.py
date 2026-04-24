@@ -56,6 +56,7 @@ class _ASGISyncClientShim:
         follow_redirects: bool,
         headers=None,
         cookies=None,
+        raise_app_exceptions: bool = True,
     ):
         self._app = app
         self._base_url = base_url
@@ -73,7 +74,14 @@ class _ASGISyncClientShim:
         )
         self._thread.start()
 
-        transport = httpx.ASGITransport(app=app)
+        # ``raise_app_exceptions=True`` (httpx default): unhandled
+        # exceptions propagate as-is. ``=False``: httpx converts them
+        # to synthetic 500 responses so the test can assert on them.
+        # Starlette's TestClient threads this via
+        # ``raise_server_exceptions``; we match that semantic.
+        transport = httpx.ASGITransport(
+            app=app, raise_app_exceptions=raise_app_exceptions,
+        )
 
         async def _mk_client():
             return httpx.AsyncClient(
@@ -194,12 +202,22 @@ class TestClient:
         self._raise_server_exceptions = raise_server_exceptions
         self._started = False
 
+        # Three-state flag:
+        #   ``in_process=None`` (default): auto-fallback allowed. If the
+        #     loopback bind fails we transparently switch to ASGI.
+        #   ``in_process=True``: force ASGI path now.
+        #   ``in_process=False``: force real-HTTP path. Bind failures
+        #     must SURFACE (user is testing the Rust/Tower path).
+        # ``_auto_fallback`` captures the "didn't explicitly opt out"
+        # bit so ``_ensure_started`` can honour it.
         if in_process is None:
             import os as _os
             env = _os.environ.get("FASTAPI_TURBO_TESTCLIENT_IN_PROCESS")
             self._in_process = env is not None and env.lower() in ("1", "true", "yes")
+            self._auto_fallback = True
         else:
             self._in_process = bool(in_process)
+            self._auto_fallback = False
         # Optional defaults to seed into the httpx client once it's lazy-
         # created — matches Starlette's TestClient kwargs surface.
         self._seed_cookies = cookies
@@ -245,6 +263,7 @@ class TestClient:
             follow_redirects=self._follow_redirects,
             headers=dict(self._seed_headers or {}) or None,
             cookies=self._seed_cookies,
+            raise_app_exceptions=self._raise_server_exceptions,
         )
         self._started = True
         self._port = None
@@ -276,19 +295,18 @@ class TestClient:
             self._switch_to_in_process()
             return
         # Auto-fallback: if bind() fails (sandboxed env, serverless,
-        # CAP_NET_BIND_SERVICE missing), flip to in-process rather
-        # than forcing the user to rewrite every call site. Starlette's
-        # TestClient never needs a socket, so this restores drop-in
-        # behaviour for the common sandboxed case.
+        # CAP_NET_BIND_SERVICE missing), flip to in-process — BUT only
+        # when ``in_process=None`` was used (default path). An explicit
+        # ``in_process=False`` means the user is specifically testing
+        # the real-HTTP path; surface the bind error instead of
+        # silently degrading.
         try:
             _probe_port = self._find_free_port()
-        except (OSError, PermissionError) as _bind_exc:
-            _log_tc = getattr(threading, "_dummy_log", None)
-            # Silent fallback — users who need real-HTTP specifically
-            # opt in via FASTAPI_TURBO_TESTCLIENT_IN_PROCESS=0 (forces
-            # real HTTP and surfaces the bind error).
-            self._switch_to_in_process()
-            return
+        except (OSError, PermissionError):
+            if self._auto_fallback:
+                self._switch_to_in_process()
+                return
+            raise
         key = id(self.app)
         with TestClient._app_lock:
             cached = TestClient._app_servers.get(key)

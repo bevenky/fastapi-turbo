@@ -1757,7 +1757,107 @@ async def _asgi_emit_exception(app, scope, send, exc):
     raise exc
 
 
+async def _send_file_response_asgi(send, response) -> None:
+    """Serialize a ``FileResponse`` over ASGI.
+
+    ``FileResponse`` stores ``content=b""`` and relies on the Rust
+    server to read ``self.path`` from disk at serve-time. Over the
+    in-process ASGI path that never runs, so we must open the file
+    here, stamp Content-Length/Content-Type if the user didn't set
+    them, and stream the body via multiple ``http.response.body``
+    frames."""
+    import os
+    from fastapi_turbo.responses import JSONResponse as _JR_file
+
+    path = getattr(response, "path", None)
+    if path is None:
+        await _send_asgi_response(send, _JR_file(
+            content={"detail": "FileResponse has no path"},
+            status_code=500,
+        ))
+        return
+
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        await _send_asgi_response(send, _JR_file(
+            content={"detail": f"File not found: {path}"},
+            status_code=404,
+        ))
+        return
+    except OSError as e:
+        await _send_asgi_response(send, _JR_file(
+            content={"detail": f"File stat error: {e}"},
+            status_code=500,
+        ))
+        return
+
+    # Stamp Content-Length from stat if the caller didn't set it.
+    if "content-length" not in response.headers:
+        response.headers["content-length"] = str(stat.st_size)
+    if "content-type" not in response.headers:
+        media = getattr(response, "media_type", None) or "application/octet-stream"
+        response.headers["content-type"] = media
+
+    # Build the start message using the same header-pack logic as
+    # the generic path below.
+    status_code = int(getattr(response, "status_code", 200) or 200)
+    hdrs = response.headers
+    raw_headers = getattr(response, "raw_headers", None) or []
+    norm_headers: list[tuple[bytes, bytes]] = []
+    seen_exact: set[tuple[str, str]] = set()
+    if hdrs is not None and hasattr(hdrs, "items"):
+        for k, v in hdrs.items():
+            kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
+            vs = v if isinstance(v, str) else v.decode("latin-1")
+            seen_exact.add((kl, vs))
+            norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
+    for k, v in raw_headers:
+        kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
+        vs = v if isinstance(v, str) else v.decode("latin-1")
+        if (kl, vs) in seen_exact:
+            continue
+        seen_exact.add((kl, vs))
+        norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
+
+    await send({
+        "type": "http.response.start",
+        "status": status_code,
+        "headers": norm_headers,
+    })
+
+    # Stream 64 KiB chunks. We open with sync I/O and yield the GIL
+    # between chunks — keeps this simple without an async fs dep.
+    CHUNK = 64 * 1024
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(CHUNK)
+            if not chunk:
+                break
+            await send({
+                "type": "http.response.body",
+                "body": chunk,
+                "more_body": True,
+            })
+    await send({
+        "type": "http.response.body",
+        "body": b"",
+        "more_body": False,
+    })
+
+
 async def _send_asgi_response(send, response) -> None:
+    # ``FileResponse`` stores ``content=b""`` because the Rust server
+    # reads ``response.path`` from disk at serve time. Over the in-
+    # process ASGI path no Rust runs, so we must open + stream the
+    # file ourselves.
+    try:
+        from fastapi_turbo.responses import FileResponse as _FR
+        if isinstance(response, _FR):
+            await _send_file_response_asgi(send, response)
+            return
+    except Exception:  # noqa: BLE001
+        pass
     """Serialize a fastapi-turbo ``Response`` (or Starlette-compatible
     response with ``status_code`` / ``headers`` / ``body``) into ASGI
     ``http.response.start`` + ``http.response.body`` messages.

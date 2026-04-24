@@ -1188,21 +1188,23 @@ pub fn file_response_with_range(
 ) -> Response {
     let path = Path::new(path_str);
 
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
+    // Stat first — we need total_len for range parsing / Content-Range
+    // headers, and this is where ENOENT / permission errors surface
+    // early (before we commit to any body).
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return (StatusCode::NOT_FOUND, format!("File not found: {path_str}")).into_response();
         }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("File read error: {e}"),
+                format!("File stat error: {e}"),
             )
                 .into_response();
         }
     };
-
-    let total_len = data.len() as u64;
+    let total_len = meta.len();
     let mut ct = media_type.unwrap_or_else(|| "application/octet-stream".to_string());
     if (ct.starts_with("text/") || ct == "application/javascript" || ct == "application/json")
         && !ct.to_lowercase().contains("charset=")
@@ -1226,9 +1228,24 @@ pub fn file_response_with_range(
         None => None,
     };
 
-    // Multi-range → multipart/byteranges. Matches Starlette's FileResponse.
+    // Multi-range → multipart/byteranges (matches Starlette). Kept
+    // buffered because the DoS cap bounds the total body at ≤ 2× file
+    // size with ≤ 16 ranges — the multipart wrapper is small and
+    // streaming multipart gains little. Large files only appear here
+    // when a client requests many small ranges, which is already
+    // capped above.
     if let Some(rs) = &ranges {
         if rs.len() > 1 {
+            let data = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("File read error: {e}"),
+                    )
+                        .into_response();
+                }
+            };
             let boundary = make_byteranges_boundary();
             let mut body: Vec<u8> = Vec::new();
             for (start, end) in rs {
@@ -1278,32 +1295,89 @@ pub fn file_response_with_range(
         }
     }
 
-    let (status, slice, content_range) = if let Some(rs) = ranges {
+    // Single-range OR no-range: open the file and stream (or buffer
+    // if small). Threshold mirrors ``file_response`` — ≤ 256 KiB uses
+    // the fast buffered path; larger reads seek + stream via
+    // ``ReaderStream`` so memory is one chunk per concurrent request.
+    let (status, content_range, start_off, slice_len) = if let Some(rs) = ranges {
         let (start, end) = rs[0];
-        let s = start as usize;
-        let e = (end as usize) + 1; // end-inclusive → exclusive slice
-        let slice = data[s..e].to_vec();
         (
             StatusCode::PARTIAL_CONTENT,
-            slice,
             Some(format!("bytes {start}-{end}/{total_len}")),
+            start,
+            end - start + 1,
         )
     } else {
-        (StatusCode::OK, data, None)
+        (StatusCode::OK, None, 0u64, total_len)
     };
 
-    let body_len = slice.len() as u64;
+    const STREAM_THRESHOLD: u64 = 256 * 1024;
+    let body = if slice_len <= STREAM_THRESHOLD {
+        // Small: read just the slice we need into memory.
+        match std::fs::read(path) {
+            Ok(all) => {
+                let s = start_off as usize;
+                let e = (start_off + slice_len) as usize;
+                Body::from(all[s..e].to_vec())
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("File read error: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        // Large: seek + take + stream. ``tokio::fs::File::from_std``
+        // is sync; we build the async stream without needing an
+        // async context.
+        match std::fs::File::open(path) {
+            Ok(std_file) => {
+                let tokio_file = tokio::fs::File::from_std(std_file);
+                // Seek runs synchronously via the underlying fd —
+                // ``set_len`` isn't appropriate here; we use an
+                // async-seeking wrapper that reads from ``start_off``.
+                use std::io::Seek;
+                // Pull the std handle back out to seek sync, then
+                // re-wrap for streaming the slice.
+                let std_handle = tokio_file
+                    .try_into_std()
+                    .unwrap_or_else(|_| std::fs::File::open(path).expect("reopen"));
+                let mut std_handle = std_handle;
+                if start_off > 0 {
+                    if let Err(e) = std_handle.seek(std::io::SeekFrom::Start(start_off)) {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("File seek error: {e}"),
+                        )
+                            .into_response();
+                    }
+                }
+                let tokio_file = tokio::fs::File::from_std(std_handle);
+                let limited = tokio::io::AsyncReadExt::take(tokio_file, slice_len);
+                let stream = tokio_util::io::ReaderStream::new(limited);
+                Body::from_stream(stream)
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("File open error: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    };
+
     let mut builder = Response::builder()
         .status(status)
         .header("content-type", &ct)
-        .header("content-length", body_len)
+        .header("content-length", slice_len)
         .header("accept-ranges", "bytes");
     if let Some(ref cr) = content_range {
         builder = builder.header("content-range", cr);
     }
-    let mut resp = builder
-        .body(Body::from(slice))
-        .expect("build file response");
+    let mut resp = builder.body(body).expect("build file response");
 
     for (k, v) in extra_headers {
         let k_lower = k.to_ascii_lowercase();
