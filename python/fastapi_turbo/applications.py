@@ -1733,13 +1733,51 @@ async def _send_asgi_response(send, response) -> None:
             continue
         seen_exact.add((kl, vs))
         norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
+    # StreamingResponse / SSE: iterate ``body_iterator`` and emit
+    # multiple ``http.response.body`` frames with ``more_body=True``.
+    # Handles both sync and async iterables.
+    body_iter = getattr(response, "body_iterator", None)
+    if body_iter is not None:
+        await send({
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": norm_headers,
+        })
+        import inspect as _insp_send
+        if hasattr(body_iter, "__anext__") or _insp_send.isasyncgen(body_iter):
+            async for chunk in body_iter:
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                await send({
+                    "type": "http.response.body",
+                    "body": bytes(chunk),
+                    "more_body": True,
+                })
+        else:
+            for chunk in body_iter:
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                await send({
+                    "type": "http.response.body",
+                    "body": bytes(chunk),
+                    "more_body": True,
+                })
+        await send({
+            "type": "http.response.body",
+            "body": b"",
+            "more_body": False,
+        })
+        return
+
     body = getattr(response, "body", b"") or b""
     if not isinstance(body, (bytes, bytearray)):
-        # StreamingResponse / FileResponse need a richer path — defer
-        # to the proxy caller by raising; the outer handler catches it.
-        raise NotImplementedError(
-            "in-process ASGI: streaming response serialization not implemented yet"
-        )
+        # Unknown body shape — try a str fallback or bail.
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        else:
+            raise NotImplementedError(
+                f"in-process ASGI: cannot serialise body of type {type(body).__name__}"
+            )
     await send({
         "type": "http.response.start",
         "status": status_code,
@@ -4039,14 +4077,23 @@ class FastAPI:
                     endpoint = compiled
                     is_async = False
 
-            # Final safety net: a pure-async endpoint that wasn't
-            # wrapped above would be handed to Rust as ``is_async=True``,
-            # and Rust's ``submit_to_async_worker(coro)`` call has no
-            # way to thread ``app=`` into the Python-side ``submit()``.
-            # Always wrap async endpoints in a thin sync caller so per-
-            # app ``worker_timeout`` isolation survives the Rust hot
-            # path (audit R2 #3 fix).
-            if is_async and inspect.iscoroutinefunction(endpoint) and not inspect.isasyncgenfunction(endpoint):
+            # Per-app ``worker_timeout`` plumbing for pure-async
+            # endpoints: when the user has actually set a timeout AND
+            # ``_raw_asgi_middlewares`` isn't carrying a shim that
+            # already wrapped the handler, wrap in a thin sync caller
+            # so ``submit(coro, app=app)`` is called with the owning
+            # app. For the common case (no ``worker_timeout`` set),
+            # skip the wrap — Rust's ``submit_to_async_worker`` then
+            # handles the coro directly via its existing APP_INSTANCE
+            # plumbing, saving a Python hop per request.
+            needs_app_plumb = (
+                is_async
+                and inspect.iscoroutinefunction(endpoint)
+                and not inspect.isasyncgenfunction(endpoint)
+                and getattr(self, "worker_timeout", None) is not None
+                and os.environ.get("FASTAPI_TURBO_WORKER_TIMEOUT") is None
+            )
+            if needs_app_plumb:
                 from fastapi_turbo._resolution import _make_sync_wrapper
                 endpoint = _make_sync_wrapper(endpoint, for_handler=True, app=self)
                 is_async = False
@@ -5750,12 +5797,17 @@ class FastAPI:
                 survey_plan.append((pname, "skip", None))
                 continue
             ann = resolved_hints.get(pname, p.annotation)
-            # Depends(...) default — resolve recursively before invoking
-            # the endpoint.
+            # Depends(...) / Security(...) default — resolve before
+            # invoking the endpoint. We pass the MARKER (not just the
+            # dep fn) so Security's ``scopes=`` contribute to the
+            # accumulated scopes seen by inner SecurityScopes params.
             from fastapi_turbo.dependencies import Depends as _Dep_check
             if isinstance(p.default, _Dep_check):
-                dep_fn = p.default.dependency or ann
-                survey_plan.append((pname, "depends", dep_fn))
+                if p.default.dependency is None and ann is not _insp.Parameter.empty:
+                    # Attach fallback callable from the annotation.
+                    # We keep the marker intact for scopes.
+                    pass
+                survey_plan.append((pname, "depends", p.default))
                 continue
             # Form(...) / File(...) markers — defer kwarg assembly to
             # the form-parser block below (which knows how to read
@@ -5862,22 +5914,47 @@ class FastAPI:
                 _log.debug("in-process form parse: %r", _exc)
                 return False
 
-        # ── Depends resolution ──
-        # Resolve any ``= Depends(fn)`` params (including nested deps,
-        # async deps, yield-deps, dependency_overrides) before we build
-        # kwargs. Teardowns are collected and run after the response.
+        # ── Depends / Security resolution ──
+        # Resolve any ``= Depends(fn)`` or ``= Security(fn, scopes=...)``
+        # params (including nested deps, async deps, yield-deps,
+        # dependency_overrides) before we build kwargs. Teardowns are
+        # collected and run after the response. ``Security`` scopes
+        # accumulate along the resolution path so an inner dep that
+        # asks for ``ss: SecurityScopes`` sees the full scope list.
         from fastapi_turbo.dependencies import Depends as _Dep_marker
+        from fastapi_turbo.dependencies import Security as _Sec_marker
+        from fastapi_turbo.security import SecurityScopes as _SS_cls
 
         dep_teardowns: list = []  # (gen, is_async) pairs
 
-        async def _resolve_dep(dep_fn, cache):
-            """Resolve ``dep_fn`` recursively. ``cache`` dedups calls
-            for the same dep within one request (FA caching semantics)."""
+        async def _resolve_dep(marker_or_fn, cache, accumulated_scopes):
+            """Resolve ``marker_or_fn`` recursively. ``cache`` dedups
+            calls for the same dep within one request (FA caching).
+            ``accumulated_scopes`` is the list of OAuth2 scopes
+            collected along the resolution path (consumed by any
+            ``SecurityScopes`` param deeper in the chain).
+            """
+            # Unwrap Security marker → extend scopes + resolve its callable.
+            if isinstance(marker_or_fn, _Sec_marker):
+                next_scopes = list(accumulated_scopes) + list(
+                    getattr(marker_or_fn, "scopes", []) or []
+                )
+                dep_fn = marker_or_fn.dependency
+                if dep_fn is None:
+                    return None
+                return await _resolve_dep(dep_fn, cache, next_scopes)
+            if isinstance(marker_or_fn, _Dep_marker):
+                dep_fn = marker_or_fn.dependency
+                if dep_fn is None:
+                    return None
+                return await _resolve_dep(dep_fn, cache, accumulated_scopes)
+            dep_fn = marker_or_fn
             # Honour dependency_overrides.
             override = (getattr(self, "dependency_overrides", None) or {}).get(dep_fn)
             actual_fn = override if override is not None else dep_fn
-            if actual_fn in cache:
-                return cache[actual_fn]
+            cache_key = (actual_fn, tuple(sorted(accumulated_scopes)))
+            if cache_key in cache:
+                return cache[cache_key]
             try:
                 sub_sig = _insp.signature(actual_fn)
             except (TypeError, ValueError):
@@ -5891,9 +5968,26 @@ class FastAPI:
             if sub_sig is not None:
                 for sname, sp in sub_sig.parameters.items():
                     sdefault = sp.default
-                    if isinstance(sdefault, _Dep_marker):
-                        inner = sdefault.dependency or sub_hints.get(sname, sp.annotation)
-                        sub_kwargs[sname] = await _resolve_dep(inner, cache)
+                    sann = sub_hints.get(sname, sp.annotation)
+                    # SecurityScopes injection — inner dep asks for
+                    # the accumulated scopes.
+                    if isinstance(sann, type) and issubclass(sann, _SS_cls):
+                        sub_kwargs[sname] = _SS_cls(scopes=list(accumulated_scopes))
+                        continue
+                    if isinstance(sdefault, _Sec_marker):
+                        # Nested Security — extend scopes before recursing.
+                        next_scopes = list(accumulated_scopes) + list(
+                            getattr(sdefault, "scopes", []) or []
+                        )
+                        inner = sdefault.dependency or sann
+                        sub_kwargs[sname] = await _resolve_dep(
+                            inner, cache, next_scopes
+                        )
+                    elif isinstance(sdefault, _Dep_marker):
+                        inner = sdefault.dependency or sann
+                        sub_kwargs[sname] = await _resolve_dep(
+                            inner, cache, accumulated_scopes
+                        )
             if _insp.isasyncgenfunction(actual_fn):
                 gen = actual_fn(**sub_kwargs)
                 val = await gen.__anext__()
@@ -5906,7 +6000,7 @@ class FastAPI:
                 val = await actual_fn(**sub_kwargs)
             else:
                 val = actual_fn(**sub_kwargs)
-            cache[actual_fn] = val
+            cache[cache_key] = val
             return val
 
         import typing as _tp
@@ -5925,7 +6019,7 @@ class FastAPI:
                 continue
             if kind == "depends":
                 try:
-                    kwargs[pname] = await _resolve_dep(ann_or_info, dep_cache)
+                    kwargs[pname] = await _resolve_dep(ann_or_info, dep_cache, [])
                 except _HE as he:
                     await _send_asgi_response(
                         send,
@@ -6063,7 +6157,24 @@ class FastAPI:
             if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
         ]
 
+        # Pull response_model + options off the matched route so we
+        # filter + alias the return value the same way the Rust hot
+        # path does. The route object carries everything _try_compile_
+        # handler would normally honour.
+        _route = matched_route
+        _resp_model = getattr(_route, "response_model", None)
+        _rm_opts = {
+            "include": getattr(_route, "response_model_include", None),
+            "exclude": getattr(_route, "response_model_exclude", None),
+            "exclude_unset": getattr(_route, "response_model_exclude_unset", False),
+            "exclude_defaults": getattr(_route, "response_model_exclude_defaults", False),
+            "exclude_none": getattr(_route, "response_model_exclude_none", False),
+            "by_alias": getattr(_route, "response_model_by_alias", True),
+        }
+        _status_code = getattr(_route, "status_code", None)
+
         async def _call_endpoint(_request):
+            from fastapi_turbo._route_helpers import _apply_response_model
             try:
                 if _insp.iscoroutinefunction(endpoint):
                     r = await endpoint(**kwargs)
@@ -6079,7 +6190,16 @@ class FastAPI:
                 return _JR(content={"detail": rve.errors()}, status_code=422)
             if isinstance(r, _Resp):
                 return r
-            out = _JR(content=_je(r))
+            # Apply response_model filtering / aliasing / exclude-unset
+            # (matches Rust hot-path semantics). Falls through as-is
+            # when ``response_model`` is None.
+            if _resp_model is not None:
+                try:
+                    r = _apply_response_model(r, _resp_model, **_rm_opts)
+                except Exception as _exc:  # noqa: BLE001
+                    _log.debug("in-process response_model filter: %r", _exc)
+            status_code = _status_code or 200
+            out = _JR(content=_je(r), status_code=status_code)
             if response_injected is not None:
                 for k, v in getattr(response_injected, "raw_headers", []) or []:
                     out.raw_headers.append((k, v))
