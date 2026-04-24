@@ -1694,6 +1694,68 @@ def _collect_dependencies_from_markers(dependencies):
     return result
 
 
+def _find_exception_handler(app, exc):
+    """Locate a custom exception handler for ``exc`` walking
+    ``app.exception_handlers`` by MRO. Returns ``None`` when no
+    user-registered handler matches — caller falls back to the
+    framework default."""
+    handlers = getattr(app, "exception_handlers", {}) or {}
+    for cls in type(exc).__mro__:
+        h = handlers.get(cls)
+        if h is not None:
+            return h
+    return None
+
+
+async def _asgi_emit_exception(app, scope, send, exc):
+    """Turn an exception raised during in-process dispatch into an
+    ASGI response by (a) consulting ``app.exception_handlers`` for a
+    user-registered handler, (b) falling back to FA-compatible
+    defaults for HTTPException / RequestValidationError / other."""
+    from fastapi_turbo.requests import Request as _Req
+    from fastapi_turbo.responses import JSONResponse as _JR
+    from fastapi_turbo.exceptions import (
+        HTTPException as _HE,
+        RequestValidationError as _RVE,
+    )
+
+    handler = _find_exception_handler(app, exc)
+    if handler is not None:
+        request = _Req(dict(scope))
+        try:
+            import inspect as _insp
+            if _insp.iscoroutinefunction(handler):
+                resp = await handler(request, exc)
+            else:
+                resp = handler(request, exc)
+                if _insp.iscoroutine(resp):
+                    resp = await resp
+            await _send_asgi_response(send, resp)
+            return
+        except Exception:  # noqa: BLE001
+            # Handler itself blew up — fall through to default.
+            pass
+
+    if isinstance(exc, _HE):
+        headers = getattr(exc, "headers", None) or {}
+        resp = _JR(content={"detail": exc.detail}, status_code=exc.status_code)
+        for k, v in headers.items():
+            resp.headers[k] = v
+        await _send_asgi_response(send, resp)
+        return
+    if isinstance(exc, _RVE):
+        await _send_asgi_response(
+            send, _JR(content={"detail": exc.errors()}, status_code=422)
+        )
+        return
+    # Anything else → 500. Include the message in dev only; upstream
+    # just emits "Internal Server Error".
+    await _send_asgi_response(
+        send,
+        _JR(content={"detail": "Internal Server Error"}, status_code=500),
+    )
+
+
 async def _send_asgi_response(send, response) -> None:
     """Serialize a fastapi-turbo ``Response`` (or Starlette-compatible
     response with ``status_code`` / ``headers`` / ``body``) into ASGI
@@ -5726,12 +5788,16 @@ class FastAPI:
             # Else fall through — we're inside the chain recursion
             # and should dispatch the actual endpoint.
 
+        # Two-phase route match: first find a method-matching route;
+        # if none, collect the set of methods declared for the same
+        # path so we can emit 405 + Allow (FA parity) instead of
+        # falling through to 404 or the proxy.
         matched_route = None
         path_params: dict = {}
+        methods_for_path: set[str] = set()
         for route in self.router.routes:
             r_path = getattr(route, "path", None)
-            r_methods = {m.upper() for m in (getattr(route, "methods", None) or ())}
-            if not r_path or method not in r_methods:
+            if not r_path:
                 continue
             regex = getattr(route, "_fastapi_turbo_asgi_regex", None)
             if regex is None:
@@ -5754,14 +5820,33 @@ class FastAPI:
             match = regex.match(path)
             if match is None:
                 continue
-            matched_route = route
-            path_params = match.groupdict()
-            break
+            r_methods = {m.upper() for m in (getattr(route, "methods", None) or ())}
+            methods_for_path |= r_methods
+            if method in r_methods:
+                matched_route = route
+                path_params = match.groupdict()
+                break
 
         if matched_route is None:
-            # Bail BEFORE consuming the receive channel so the proxy
-            # path (if we fall back there) can still read the body.
-            return False
+            # Path matched but method didn't → 405 with Allow; else 404.
+            # Emitted IN-PROCESS so sandboxed envs don't fall through to
+            # the loopback proxy for normal FA behaviour.
+            if methods_for_path:
+                from fastapi_turbo.responses import JSONResponse as _JR_err
+                allow = ", ".join(sorted(methods_for_path))
+                resp = _JR_err(
+                    content={"detail": "Method Not Allowed"}, status_code=405
+                )
+                resp.headers["allow"] = allow
+                await _send_asgi_response(send, resp)
+            else:
+                # Build a 404 via the app's exception_handlers so custom
+                # handlers fire — fall back to {"detail": "Not Found"} 404.
+                from fastapi_turbo.exceptions import HTTPException as _HE404
+                await _asgi_emit_exception(
+                    self, scope, send, _HE404(status_code=404, detail="Not Found")
+                )
+            return True
 
         # Confirm we can handle every param on this endpoint. If the
         # signature uses a feature we don't cover (Form, File, Depends,
@@ -5777,9 +5862,9 @@ class FastAPI:
             return False
 
         # Resolve forward-ref annotations once up front.
+        import typing as _tp_sig
         try:
-            import typing as _tp
-            resolved_hints = _tp.get_type_hints(endpoint)
+            resolved_hints = _tp_sig.get_type_hints(endpoint, include_extras=True)
         except Exception:  # noqa: BLE001
             resolved_hints = {}
 
@@ -5809,15 +5894,31 @@ class FastAPI:
                     pass
                 survey_plan.append((pname, "depends", p.default))
                 continue
-            # Form(...) / File(...) markers — defer kwarg assembly to
-            # the form-parser block below (which knows how to read
-            # multipart / urlencoded bodies).
+            # Param markers: Form / File / Header / Cookie / Query / Path / Body.
             from fastapi_turbo.param_functions import _ParamMarker as _PM_check
-            if isinstance(p.default, _PM_check):
-                _pm_kind = getattr(p.default, "_kind", None)
+            marker = p.default if isinstance(p.default, _PM_check) else None
+            # ``Annotated[T, Query()]`` carries marker in metadata —
+            # sniff that too.
+            if marker is None:
+                try:
+                    origin = _tp_sig.get_origin(ann)
+                    if origin is _tp_sig.Annotated:
+                        for meta in _tp_sig.get_args(ann)[1:]:
+                            if isinstance(meta, _PM_check):
+                                marker = meta
+                                break
+                except Exception:  # noqa: BLE001
+                    pass
+            if marker is not None:
+                _pm_kind = getattr(marker, "_kind", None)
                 if _pm_kind in ("form", "file"):
-                    survey_plan.append((pname, _pm_kind, (ann, p.default)))
+                    survey_plan.append((pname, _pm_kind, (ann, marker)))
                     survey_needs_body = True
+                    continue
+                if _pm_kind in ("header", "cookie", "query", "path", "body"):
+                    survey_plan.append((pname, _pm_kind, (ann, marker)))
+                    if _pm_kind == "body":
+                        survey_needs_body = True
                     continue
             if pname in path_params:
                 survey_plan.append((pname, "path", ann))
@@ -5914,6 +6015,72 @@ class FastAPI:
                 _log.debug("in-process form parse: %r", _exc)
                 return False
 
+        # ── Shared helpers used by dep resolution + kwarg assembly ──
+        from fastapi_turbo.exceptions import RequestValidationError as _RVE_err
+
+        def _missing(loc, pname):
+            return {
+                "type": "missing",
+                "loc": [loc, pname],
+                "msg": "Field required",
+                "input": None,
+            }
+
+        def _bad_type(loc, pname, expected, raw):
+            return {
+                "type": f"{expected}_parsing",
+                "loc": [loc, pname],
+                "msg": f"Input should be a valid {expected}",
+                "input": raw,
+            }
+
+        def _coerce(raw, target_ann):
+            if target_ann is int:
+                return int(raw)
+            if target_ann is float:
+                return float(raw)
+            if target_ann is bool:
+                if isinstance(raw, bool):
+                    return raw
+                rs = str(raw).lower()
+                if rs in ("true", "1", "yes", "on"):
+                    return True
+                if rs in ("false", "0", "no", "off"):
+                    return False
+                raise ValueError(f"not a bool: {raw!r}")
+            return raw
+
+        def _is_required_default(default):
+            """True when a ``Query(...) / Header(...) / Cookie(...)``
+            marker signals "required". Pydantic v2 uses
+            ``PydanticUndefined`` as the sentinel; older FA also
+            treated ``...`` as required; we accept both."""
+            if default is ...:
+                return True
+            # Pydantic v2 sentinel — avoid importing at module load.
+            _type_name = type(default).__name__
+            return _type_name == "PydanticUndefinedType"
+
+        # Parse query string once so deps + params share the same view.
+        qp: dict = {}
+        _qs_bytes = scope.get("query_string", b"")
+        if _qs_bytes:
+            from urllib.parse import parse_qsl
+            qp = dict(parse_qsl(_qs_bytes.decode("latin-1")))
+
+        # Parse request headers/cookies once so deps can read them.
+        from fastapi_turbo.datastructures import Headers as _Hdrs_cls
+        _scope_headers = _Hdrs_cls(scope.get("headers", []))
+        _scope_cookies: dict[str, str] = {}
+        for _ck_name, _ck_val in [
+            (k, v) for k, v in _scope_headers.items() if k.lower() == "cookie"
+        ]:
+            for pair in _ck_val.split(";"):
+                pair = pair.strip()
+                if "=" in pair:
+                    ck_k, ck_v = pair.split("=", 1)
+                    _scope_cookies[ck_k.strip()] = ck_v.strip()
+
         # ── Depends / Security resolution ──
         # Resolve any ``= Depends(fn)`` or ``= Security(fn, scopes=...)``
         # params (including nested deps, async deps, yield-deps,
@@ -5966,16 +6133,15 @@ class FastAPI:
                 pass
             sub_kwargs = {}
             if sub_sig is not None:
+                from fastapi_turbo.param_functions import _ParamMarker as _PM_dep
                 for sname, sp in sub_sig.parameters.items():
                     sdefault = sp.default
                     sann = sub_hints.get(sname, sp.annotation)
-                    # SecurityScopes injection — inner dep asks for
-                    # the accumulated scopes.
+                    # SecurityScopes injection.
                     if isinstance(sann, type) and issubclass(sann, _SS_cls):
                         sub_kwargs[sname] = _SS_cls(scopes=list(accumulated_scopes))
                         continue
                     if isinstance(sdefault, _Sec_marker):
-                        # Nested Security — extend scopes before recursing.
                         next_scopes = list(accumulated_scopes) + list(
                             getattr(sdefault, "scopes", []) or []
                         )
@@ -5983,11 +6149,60 @@ class FastAPI:
                         sub_kwargs[sname] = await _resolve_dep(
                             inner, cache, next_scopes
                         )
-                    elif isinstance(sdefault, _Dep_marker):
+                        continue
+                    if isinstance(sdefault, _Dep_marker):
                         inner = sdefault.dependency or sann
                         sub_kwargs[sname] = await _resolve_dep(
                             inner, cache, accumulated_scopes
                         )
+                        continue
+                    # Query/Header/Cookie markers inside a dep signature.
+                    sdefault_marker = None
+                    if isinstance(sdefault, _PM_dep):
+                        sdefault_marker = sdefault
+                    if sdefault_marker is not None:
+                        _pm_kind_sub = getattr(sdefault_marker, "_kind", None)
+                        alias = getattr(sdefault_marker, "alias", None) or sname
+                        raw = None
+                        if _pm_kind_sub == "query":
+                            raw = qp.get(alias)
+                        elif _pm_kind_sub == "header":
+                            raw = _scope_headers.get(alias.replace("_", "-"))
+                        elif _pm_kind_sub == "cookie":
+                            raw = _scope_cookies.get(alias)
+                        if raw is None:
+                            default = getattr(sdefault_marker, "default", ...)
+                            if default is ...:
+                                raise _RVE_err([_missing(_pm_kind_sub, alias)])
+                            sub_kwargs[sname] = default
+                        else:
+                            try:
+                                sub_kwargs[sname] = _coerce(raw, sann)
+                            except (ValueError, TypeError):
+                                raise _RVE_err(
+                                    [_bad_type(
+                                        _pm_kind_sub, alias,
+                                        getattr(sann, "__name__", "str"), raw
+                                    )]
+                                ) from None
+                        continue
+                    # Fallback: query by name with type coercion /
+                    # default value from the parameter itself.
+                    if sname in qp:
+                        try:
+                            sub_kwargs[sname] = _coerce(qp[sname], sann)
+                        except (ValueError, TypeError):
+                            raise _RVE_err(
+                                [_bad_type(
+                                    "query", sname,
+                                    getattr(sann, "__name__", "str"), qp[sname]
+                                )]
+                            ) from None
+                    elif sdefault is not _insp.Parameter.empty:
+                        sub_kwargs[sname] = sdefault
+                    elif isinstance(sann, type) and issubclass(sann, (_Req, _HC)):
+                        sub_kwargs[sname] = _Req(req_scope)
+                    # else: leave unset; the dep may have **kwargs etc.
             if _insp.isasyncgenfunction(actual_fn):
                 gen = actual_fn(**sub_kwargs)
                 val = await gen.__anext__()
@@ -6008,109 +6223,186 @@ class FastAPI:
         kwargs: dict = {}
         response_injected = None  # Track so we can fold its cookies back.
         bg_injected = None
-        qp: dict = {}
-        qs = scope.get("query_string", b"")
-        if qs:
-            from urllib.parse import parse_qsl
-            qp = dict(parse_qsl(qs.decode("latin-1")))
         dep_cache: dict = {}
-        for pname, kind, ann_or_info in survey_plan:
-            if kind == "skip":
-                continue
-            if kind == "depends":
-                try:
+
+        # Everything below may raise — wrap once so RequestValidationError /
+        # HTTPException / generic exceptions all route through the app's
+        # exception_handlers (matches upstream FA's dispatch envelope).
+        try:
+            for pname, kind, ann_or_info in survey_plan:
+                if kind == "skip":
+                    continue
+                if kind == "depends":
                     kwargs[pname] = await _resolve_dep(ann_or_info, dep_cache, [])
-                except _HE as he:
-                    await _send_asgi_response(
-                        send,
-                        _JR(content={"detail": he.detail}, status_code=he.status_code),
-                    )
-                    return True
-                except Exception as _exc:  # noqa: BLE001
-                    _log.debug("in-process dep resolution: %r", _exc)
-                    return False
-                continue
-            if kind in ("form", "file"):
-                val = form_fields.get(pname)
-                if val is None:
+                    continue
+                if kind in ("form", "file"):
+                    val = form_fields.get(pname)
+                    if val is None:
+                        ann_tuple = ann_or_info
+                        marker = ann_tuple[1]  # type: ignore[index]
+                        if getattr(marker, "default", ...) is ...:
+                            raise _RVE_err([_missing("form", pname)])
+                        kwargs[pname] = getattr(marker, "default", None)
+                    else:
+                        kwargs[pname] = val
+                    continue
+                if kind == "path":
+                    # Legacy survey path: annotation-only (no marker)
+                    val = path_params.get(pname, "")
+                    ann = ann_or_info
+                    try:
+                        kwargs[pname] = _coerce(val, ann)
+                    except (ValueError, TypeError):
+                        raise _RVE_err(
+                            [_bad_type("path", pname, getattr(ann, "__name__", "int"), val)]
+                        ) from None
+                    continue
+                if kind == "header":
                     ann_tuple = ann_or_info
-                    marker = ann_tuple[1]  # type: ignore[index]
-                    # Field required? (``Form(...)`` / ``File(...)``)
-                    if getattr(marker, "default", ...) is ...:
-                        await _send_asgi_response(
-                            send,
-                            _JR(
-                                content={"detail": [{
-                                    "loc": ["form", pname],
-                                    "msg": "field required",
-                                }]},
-                                status_code=422,
-                            ),
-                        )
-                        return True
-                    kwargs[pname] = getattr(marker, "default", None)
-                else:
-                    kwargs[pname] = val
-                continue
-            if kind == "path":
-                val = path_params.get(pname, "")
-                ann = ann_or_info
-                if ann is int:
+                    ann, marker = ann_tuple  # type: ignore[misc]
+                    alias = getattr(marker, "alias", None) or pname.replace("_", "-")
+                    raw = _scope_headers.get(alias)
+                    if raw is None:
+                        default = getattr(marker, "default", ...)
+                        if _is_required_default(default):
+                            raise _RVE_err([_missing("header", alias)])
+                        kwargs[pname] = default
+                    else:
+                        try:
+                            kwargs[pname] = _coerce(raw, ann)
+                        except (ValueError, TypeError):
+                            raise _RVE_err(
+                                [_bad_type("header", alias, getattr(ann, "__name__", "str"), raw)]
+                            ) from None
+                    continue
+                if kind == "cookie":
+                    ann_tuple = ann_or_info
+                    ann, marker = ann_tuple  # type: ignore[misc]
+                    alias = getattr(marker, "alias", None) or pname
+                    raw = _scope_cookies.get(alias)
+                    if raw is None:
+                        default = getattr(marker, "default", ...)
+                        if _is_required_default(default):
+                            raise _RVE_err([_missing("cookie", alias)])
+                        kwargs[pname] = default
+                    else:
+                        try:
+                            kwargs[pname] = _coerce(raw, ann)
+                        except (ValueError, TypeError):
+                            raise _RVE_err(
+                                [_bad_type("cookie", alias, getattr(ann, "__name__", "str"), raw)]
+                            ) from None
+                    continue
+                if kind == "query":
+                    ann_tuple = ann_or_info
+                    ann, marker = ann_tuple  # type: ignore[misc]
+                    alias = getattr(marker, "alias", None) or pname
+                    raw = qp.get(alias)
+                    if raw is None:
+                        default = getattr(marker, "default", ...)
+                        if _is_required_default(default):
+                            raise _RVE_err([_missing("query", alias)])
+                        kwargs[pname] = default
+                    else:
+                        try:
+                            kwargs[pname] = _coerce(raw, ann)
+                        except (ValueError, TypeError):
+                            raise _RVE_err(
+                                [_bad_type("query", alias, getattr(ann, "__name__", "str"), raw)]
+                            ) from None
+                    continue
+                if kind == "request":
+                    kwargs[pname] = _Req(req_scope)
+                    continue
+                if kind == "response":
+                    ann = ann_or_info
+                    resp_inst = ann() if callable(ann) else _Resp_cls()
+                    response_injected = resp_inst
+                    kwargs[pname] = resp_inst
+                    continue
+                if kind == "background":
+                    ann = ann_or_info
+                    bg_inst = ann()
+                    bg_inst._app = self
+                    bg_injected = bg_inst
+                    kwargs[pname] = bg_inst
+                    continue
+                if kind == "body":
+                    ann = ann_or_info
+                    # ann here is either the bare annotation or (ann, marker)
+                    # depending on survey branch taken.
+                    if isinstance(ann, tuple):
+                        ann = ann[0]
+                    import json as _json
+                    from pydantic import BaseModel as _BM, ValidationError as _PyVE
+                    if not body_bytes:
+                        raise _RVE_err([_missing("body", pname)])
                     try:
-                        val = int(val)
-                    except (ValueError, TypeError):
-                        pass
-                elif ann is float:
+                        parsed = _json.loads(body_bytes)
+                    except _json.JSONDecodeError as jde:
+                        raise _RVE_err([{
+                            "type": "json_invalid",
+                            "loc": ["body", jde.pos],
+                            "msg": f"JSON decode error: {jde.msg}",
+                            "input": {},
+                        }]) from None
                     try:
-                        val = float(val)
-                    except (ValueError, TypeError):
-                        pass
-                kwargs[pname] = val
-                continue
-            if kind == "request":
-                kwargs[pname] = _Req(req_scope)
-                continue
-            if kind == "response":
-                # Injected Response: endpoint mutates it (cookies, headers,
-                # status). After the call we fold its state into the
-                # returned value (FA parity).
-                ann = ann_or_info
-                resp_inst = ann() if callable(ann) else _Resp_cls()
-                response_injected = resp_inst
-                kwargs[pname] = resp_inst
-                continue
-            if kind == "background":
-                ann = ann_or_info
-                bg_inst = ann()
-                bg_inst._app = self
-                bg_injected = bg_inst
-                kwargs[pname] = bg_inst
-                continue
-            if kind == "body":
-                ann = ann_or_info
-                import json as _json
+                        if (
+                            isinstance(ann, type)
+                            and issubclass(ann, _BM)
+                            and isinstance(parsed, dict)
+                        ):
+                            kwargs[pname] = ann.model_validate(parsed)
+                            continue
+                    except _PyVE as pve:
+                        errs = []
+                        for e in pve.errors():
+                            new = {
+                                k: v for k, v in e.items()
+                                if k not in ("url", "ctx")
+                            }
+                            loc = list(new.get("loc", ()))
+                            new["loc"] = ["body", *loc] if loc else ["body"]
+                            errs.append(new)
+                        raise _RVE_err(errs, body=parsed) from None
+                    kwargs[pname] = parsed
+                    continue
+                if kind == "query_or_default":
+                    ann, default = ann_or_info  # type: ignore[misc]
+                    if pname in qp:
+                        raw = qp[pname]
+                        try:
+                            kwargs[pname] = _coerce(raw, ann)
+                        except (ValueError, TypeError):
+                            raise _RVE_err(
+                                [_bad_type("query", pname, getattr(ann, "__name__", "str"), raw)]
+                            ) from None
+                    elif default is not _insp.Parameter.empty:
+                        kwargs[pname] = default
+                    else:
+                        raise _RVE_err([_missing("query", pname)])
+                    continue
+        except Exception as exc:
+            # Any param-resolution failure → route through the app's
+            # exception handlers. This includes RequestValidationError
+            # (→ 422) and HTTPException from a dep (→ its status).
+            await _asgi_emit_exception(self, scope, send, exc)
+            # Teardown any deps already committed.
+            for gen, is_async in reversed(dep_teardowns):
                 try:
-                    parsed = _json.loads(body_bytes) if body_bytes else None
-                except _json.JSONDecodeError:
-                    await _send_asgi_response(
-                        send,
-                        _JR(content={"detail": "invalid JSON"}, status_code=422),
-                    )
-                    return True
-                try:
-                    from pydantic import BaseModel as _BM
-                    if (
-                        isinstance(ann, type)
-                        and issubclass(ann, _BM)
-                        and isinstance(parsed, dict)
-                    ):
-                        kwargs[pname] = ann.model_validate(parsed)
-                        continue
-                except Exception as _exc:  # noqa: BLE001
-                    _log.debug("in-process pydantic validate: %r", _exc)
-                    return False
-                kwargs[pname] = parsed
-                continue
+                    if is_async:
+                        try:
+                            await gen.__anext__()
+                        except StopAsyncIteration:
+                            pass
+                    else:
+                        try:
+                            next(gen)
+                        except StopIteration:
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
+            return True
             if kind == "query_or_default":
                 ann, default = ann_or_info  # type: ignore[misc]
                 if pname in qp:
@@ -6174,30 +6466,26 @@ class FastAPI:
         _status_code = getattr(_route, "status_code", None)
 
         async def _call_endpoint(_request):
+            """Invoke the endpoint + apply response_model. Exceptions
+            propagate — the outer envelope routes them through the
+            app's exception_handlers."""
             from fastapi_turbo._route_helpers import _apply_response_model
-            try:
-                if _insp.iscoroutinefunction(endpoint):
-                    r = await endpoint(**kwargs)
-                else:
-                    r = endpoint(**kwargs)
-                    if _insp.iscoroutine(r):
-                        r = await r
-            except _HE as he:
-                return _JR(
-                    content={"detail": he.detail}, status_code=he.status_code
-                )
-            except _RVE as rve:
-                return _JR(content={"detail": rve.errors()}, status_code=422)
+
+            if _insp.iscoroutinefunction(endpoint):
+                r = await endpoint(**kwargs)
+            else:
+                r = endpoint(**kwargs)
+                if _insp.iscoroutine(r):
+                    r = await r
             if isinstance(r, _Resp):
                 return r
-            # Apply response_model filtering / aliasing / exclude-unset
-            # (matches Rust hot-path semantics). Falls through as-is
-            # when ``response_model`` is None.
+            # Apply response_model filtering / aliasing / exclude-unset.
+            # Errors from this path must propagate — FA surfaces
+            # ResponseValidationError as a 500; silently returning the
+            # unvalidated payload is a security hole (we'd leak fields
+            # the schema intended to strip).
             if _resp_model is not None:
-                try:
-                    r = _apply_response_model(r, _resp_model, **_rm_opts)
-                except Exception as _exc:  # noqa: BLE001
-                    _log.debug("in-process response_model filter: %r", _exc)
+                r = _apply_response_model(r, _resp_model, **_rm_opts)
             status_code = _status_code or 200
             out = _JR(content=_je(r), status_code=status_code)
             if response_injected is not None:
@@ -6227,19 +6515,28 @@ class FastAPI:
         req_obj = _Req(req_scope)
         try:
             result = await current_call(req_obj)
-        except _HE as he:
-            await _send_asgi_response(
-                send, _JR(content={"detail": he.detail}, status_code=he.status_code)
-            )
+        except Exception as exc:
+            # Endpoint / middleware / response_model raised. Route
+            # through the app's exception_handlers — this honours a
+            # user's `@app.exception_handler(HTTPException)` override
+            # and surfaces ResponseValidationError / RequestValidationError
+            # with FA-shaped bodies.
+            await _asgi_emit_exception(self, scope, send, exc)
+            for gen, is_async in reversed(dep_teardowns):
+                try:
+                    if is_async:
+                        try:
+                            await gen.__anext__()
+                        except StopAsyncIteration:
+                            pass
+                    else:
+                        try:
+                            next(gen)
+                        except StopIteration:
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
             return True
-        except _RVE as rve:
-            await _send_asgi_response(
-                send, _JR(content={"detail": rve.errors()}, status_code=422)
-            )
-            return True
-        except Exception as _exc:  # noqa: BLE001
-            _log.debug("in-process endpoint raised: %r", _exc)
-            return False
 
         # ``result`` is already a Response (either the MW-wrapped or
         # the raw endpoint return converted by ``_call_endpoint``).

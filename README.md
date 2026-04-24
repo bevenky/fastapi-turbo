@@ -129,7 +129,7 @@ To disable this and use both FastAPI and fastapi-turbo side by side, set `FASTAP
 
 - HTTP/3 + QUIC not yet exposed (Axum stack is HTTP/1.1 + HTTP/2)
 - Free-threaded Python (3.13t/3.14t) works but hasn't been perf-tuned
-- `AsyncClient(transport=ASGITransport(app=app))` routes through a background loopback Rust server — requires localhost socket access (in-process ASGI is tracked future work)
+- `AsyncClient(transport=ASGITransport(app=app))` dispatches fully in-process (no loopback socket). Verified parity with upstream FastAPI across 404/405/HEAD/OPTIONS, `Header(...)`/`Cookie(...)`/`Query(...)`, path param type coercion → 422, invalid Pydantic body → 422, nested `Depends`/`Security` with inner params, `response_model` validation failures, and custom `@app.exception_handler` routing.
 
 ### ⚠️ Public-internet checklist
 

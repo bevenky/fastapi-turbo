@@ -2,7 +2,7 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 699 tests (410 general + 22 WebSocket + 160 stress + 107 parity snapshots).
+Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 712 tests (410 general + 22 WebSocket + 173 stress + 107 parity snapshots).
 
 ## Routing
 
@@ -121,7 +121,7 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | `TestClient.websocket_connect(...)` | Full | |
 | `TestClient(raise_server_exceptions=True/False)` | Full | Non-HTTP exceptions captured server-side and re-raised in the test thread. |
 | ASGI transport fallback (wrap with `SentryAsgiMiddleware(app)`, etc.) | Full | Detected via absence of `.run()` — falls back to an `httpx.AsyncClient` + `ASGITransport` with a sync facade. |
-| `AsyncClient` re-export | Full | `from fastapi.testclient import AsyncClient, ASGITransport` works. Dispatch runs **entirely in-process** — no loopback socket needed — covering: path match (+ `{name:path}` converter), query + JSON body + Pydantic validation, `Request` / `Response` / `BackgroundTasks` injection, `Depends(...)` (simple, nested, async, yield-with-teardown, `dependency_overrides`), `Security(...)` with `SecurityScopes` accumulation across the chain, `Form(...)` / `File(...)` / `UploadFile`, `StreamingResponse` / SSE (sync + async body iterators chunked via `more_body=True`), `response_model` filtering / `exclude_unset` / `by_alias` / `include` / `exclude`, `app.mount("/sub", subapp)` recursion, raw-ASGI `add_middleware(MW)` chains (LIFO composition), `@app.middleware("http")` functions, and WebSocket endpoints (`@app.websocket("/ws")` with path params). Duplicate request/response headers survive round-trip. |
+| `AsyncClient` re-export | Full | `from fastapi.testclient import AsyncClient, ASGITransport` works fully in-process — no loopback socket. A 13-case parity contract test (`tests/stress/test_asgi_in_process_parity_contract.py`) runs both upstream FastAPI and fastapi-turbo on the same endpoint and asserts equal status/body/headers, covering: 404 on unknown path, 405 + `Allow` on wrong method, HEAD on GET-only, OPTIONS non-preflight, `Header(...)` / `Cookie(...)` markers, missing-required `Query(...)` → 422, invalid Pydantic body → 422, bad path-param type coercion → 422, `Depends(...)` with inner query/header/cookie params, `response_model` validation failure (non-200), custom `@app.exception_handler(HTTPException)` override, custom user exception types. Additional coverage for `Request` / `Response` / `BackgroundTasks` injection, `Security(...)` + `SecurityScopes`, `Form(...)` / `File(...)` / `UploadFile`, `StreamingResponse` / SSE, `app.mount(...)` recursion, raw-ASGI middleware chains (LIFO), `@app.middleware("http")`, and WebSocket endpoints — each with its own test file. |
 
 ## Database / HTTP client helpers
 
