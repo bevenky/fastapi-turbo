@@ -118,7 +118,7 @@ pub fn parse_multipart_sync(
 
         result
             .entry(name.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(ParsedField { name, filename, content_type, data, headers });
 
         pos = data_end + 2; // position of the next `--boundary`

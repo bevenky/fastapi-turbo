@@ -1,3 +1,18 @@
+#![allow(
+    // Trade-offs we've made intentionally:
+    clippy::too_many_arguments,       // request handlers wrap many bits of context
+    clippy::result_large_err,         // pyo3::PyErr is the project-wide error type
+    clippy::type_complexity,          // FnMut closure types are unavoidable
+    clippy::unnecessary_cast,         // clippy confuses f64-as-f64 in percentile math
+    clippy::manual_strip,             // a few paths use starts_with + &s[n..] for clarity
+    clippy::needless_return,          // `return` in early-exit arms reads more clearly
+    clippy::only_used_in_recursion,   // recursive helpers use their own params
+    // PyO3 API transition: `downcast` → `cast` rename landed late in
+    // PyO3 0.28. Migration is mechanical but large; silence until we
+    // do a dedicated bump (tracked in todos.md).
+    deprecated,
+)]
+
 use pyo3::prelude::*;
 
 mod config;

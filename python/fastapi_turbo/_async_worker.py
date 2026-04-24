@@ -32,12 +32,18 @@ all async I/O runs on ONE event loop, matching uvicorn's architecture.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from collections import deque
 
 _loop: asyncio.AbstractEventLoop | None = None
 _thread: threading.Thread | None = None
 _ready = threading.Event()
+
+# Distinct sentinel so ``submit(coro, timeout=None)`` can mean "no
+# timeout" distinctly from "caller didn't pass a timeout, use the
+# default from env / app config".
+_SENTINEL = object()
 
 # Lock-free-ish pool of reusable threading.Event objects. ``deque``'s
 # ``.append`` / ``.pop`` are atomic under the GIL for single-element ops,
@@ -87,17 +93,58 @@ def _release_event(ev: threading.Event) -> None:
         _event_pool.append(ev)
 
 
-def submit(coro) -> object:
+def _default_timeout() -> float | None:
+    """Resolve the default worker-loop submit timeout.
+
+    Priority: ``FASTAPI_TURBO_WORKER_TIMEOUT`` env var, then the app's
+    ``worker_timeout`` attribute (set via ``FastAPI(worker_timeout=...)``
+    if any app is installed), then ``None`` (no timeout — matches
+    FastAPI's default).
+    """
+    env = os.environ.get("FASTAPI_TURBO_WORKER_TIMEOUT")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    # Look up the currently-installed FastAPI app, if any, without
+    # importing applications.py at module load (circular).
+    try:
+        from fastapi_turbo.applications import FastAPI as _FA  # noqa: PLC0415
+        app = getattr(_FA, "_fastapi_turbo_current_instance", None)
+        if app is not None:
+            t = getattr(app, "worker_timeout", None)
+            if t is not None:
+                return float(t)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def submit(coro, *, timeout: float | None = _SENTINEL) -> object:  # type: ignore[valid-type]
     """Schedule coro on the worker's loop and block until done.
 
-    Returns the coroutine's result. Raises if the coroutine raised.
-    ~25 μs overhead on Apple silicon (see module docstring).
+    ``timeout`` (seconds) controls how long we wait before giving up.
+    When the timeout elapses, the background coroutine is **cancelled**
+    via ``task.cancel()`` (scheduled on the worker loop thread-safely)
+    so it doesn't keep running in the background. A ``TimeoutError`` is
+    then raised in the caller.
+
+    ``None`` means wait indefinitely — matching FastAPI/Starlette
+    behaviour where long-running async handlers simply take as long
+    as they need.
+
+    The sentinel default lets callers distinguish "I didn't pass a
+    timeout" (use ``_default_timeout()``) from "I want no timeout"
+    (pass ``None`` explicitly).
     """
+    if timeout is _SENTINEL:  # type: ignore[comparison-overlap]
+        timeout = _default_timeout()
     if _loop is None:
         init()
     ev = _acquire_event()
-    # [0] = result, [1] = exception. Closure avoids per-call object alloc.
-    box: list = [None, None]
+    # [0] = result, [1] = exception, [2] = task handle (for cancellation).
+    box: list = [None, None, None]
     loop = _loop
 
     async def _runner():
@@ -108,10 +155,21 @@ def submit(coro) -> object:
         finally:
             ev.set()
 
-    loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_runner(), loop=loop))
+    def _kickoff():
+        box[2] = asyncio.ensure_future(_runner(), loop=loop)
+
+    loop.call_soon_threadsafe(_kickoff)
     # Interruptible wait — honors signals, unlike a bare Condition.wait().
-    if not ev.wait(timeout=30):
-        raise TimeoutError("fastapi-turbo worker-loop submit timed out after 30s")
+    if not ev.wait(timeout=timeout):
+        # Cancel the underlying task on the worker loop so it doesn't
+        # keep running and consuming resources. Cancellation is
+        # thread-safe via call_soon_threadsafe.
+        task = box[2]
+        if task is not None:
+            loop.call_soon_threadsafe(task.cancel)
+        raise TimeoutError(
+            f"fastapi-turbo worker-loop submit timed out after {timeout}s"
+        )
     exc = box[1]
     if exc is not None:
         # Don't pool events that held a failure — conservative.

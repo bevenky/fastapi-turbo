@@ -175,9 +175,9 @@ pub fn py_to_response_with_request(
 
     // JSONResponse / PlainTextResponse / HTMLResponse: body is already
     // rendered bytes; skip the path + body_iterator probes entirely.
-    let is_plain_response = JSON_RESPONSE_CLS.get().map_or(false, |c| ty.is(c.bind(py)))
-        || PLAIN_RESPONSE_CLS.get().map_or(false, |c| ty.is(c.bind(py)))
-        || HTML_RESPONSE_CLS.get().map_or(false, |c| ty.is(c.bind(py)));
+    let is_plain_response = JSON_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py)))
+        || PLAIN_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py)))
+        || HTML_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py)));
     if is_plain_response {
         if let Ok(status_attr) = obj.getattr("status_code") {
             return response_object_to_response(py, obj, &status_attr);
@@ -188,14 +188,14 @@ pub fn py_to_response_with_request(
     // chat/completions request, so its dispatch sits on the TTFB hot path.
     // Exact-class check avoids the generic getattr("status_code") →
     // getattr("path") → getattr("body_iterator") probe below.
-    if STREAMING_RESPONSE_CLS.get().map_or(false, |c| ty.is(c.bind(py))) {
+    if STREAMING_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py))) {
         return crate::streaming::create_streaming_response(py, obj);
     }
 
     // FileResponse: skip path/media_type/headers getattr-chain if we can
     // confirm the exact class. Fall back to the generic attr-probe path
     // for unknown subclasses.
-    if FILE_RESPONSE_CLS.get().map_or(false, |c| ty.is(c.bind(py))) {
+    if FILE_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py))) {
         if let Ok(path_attr) = obj.getattr("path") {
             if let Ok(path_str) = path_attr.extract::<String>() {
                 let media_type = obj.getattr("media_type")
@@ -680,12 +680,10 @@ fn write_any_json(py: Python<'_>, obj: &Bound<'_, PyAny>, buf: &mut String) {
         buf.push('[');
         let mut first = true;
         if let Ok(iter) = obj.try_iter() {
-            for item in iter {
-                if let Ok(item) = item {
-                    if !first { buf.push(','); }
-                    first = false;
-                    write_any_json(py, &item, buf);
-                }
+            for item in iter.flatten() {
+                if !first { buf.push(','); }
+                first = false;
+                write_any_json(py, &item, buf);
             }
         }
         buf.push(']');
@@ -951,11 +949,10 @@ pub fn file_response(
     let total_len = data.len() as u64;
     let mut ct = media_type.unwrap_or_else(|| "application/octet-stream".to_string());
     // FastAPI/Starlette append `; charset=utf-8` to textual types if absent.
-    if ct.starts_with("text/") || ct == "application/javascript" || ct == "application/json" {
-        if !ct.to_lowercase().contains("charset=") {
+    if (ct.starts_with("text/") || ct == "application/javascript" || ct == "application/json")
+        && !ct.to_lowercase().contains("charset=") {
             ct.push_str("; charset=utf-8");
         }
-    }
 
     let mut resp = Response::builder()
         .status(StatusCode::OK)
@@ -1074,11 +1071,10 @@ pub fn file_response_with_range(
 
     let total_len = data.len() as u64;
     let mut ct = media_type.unwrap_or_else(|| "application/octet-stream".to_string());
-    if ct.starts_with("text/") || ct == "application/javascript" || ct == "application/json" {
-        if !ct.to_lowercase().contains("charset=") {
+    if (ct.starts_with("text/") || ct == "application/javascript" || ct == "application/json")
+        && !ct.to_lowercase().contains("charset=") {
             ct.push_str("; charset=utf-8");
         }
-    }
 
     // Parse Range (if any). Malformed → full body. Unsatisfiable → 416.
     let range = match range_header {

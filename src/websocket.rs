@@ -12,7 +12,6 @@ use bytes::Bytes;
 use crossbeam_channel as cb;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
@@ -795,7 +794,7 @@ pub async fn handle_ws_upgrade(
                             Message::Binary(b) => WsMessage::Binary(b),
                             Message::Close(frame) => {
                                 let (code, reason) = frame
-                                    .map(|f| (f.code.into(), f.reason.to_string()))
+                                    .map(|f| (f.code, f.reason.to_string()))
                                     .unwrap_or((1000u16, String::new()));
                                 let _ = cb_tx.send(WsMessage::Close { code, reason });
                                 state_r.store(STATE_DISCONNECTED, Ordering::Release);

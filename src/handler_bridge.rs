@@ -9,6 +9,7 @@ use std::sync::{Mutex, OnceLock};
 /// Uses `block_in_place` instead of `spawn_blocking` to avoid thread pool
 /// scheduling overhead (~3μs saved). The tokio runtime migrates other tasks
 /// off this worker thread while we hold the GIL.
+#[allow(dead_code)]  // Historical entry point — keep for binary stability.
 pub async fn call_sync_handler(
     handler: Py<PyAny>,
     kwargs: HashMap<String, Py<PyAny>>,
@@ -27,6 +28,7 @@ pub async fn call_sync_handler(
 // ── Async worker: crossbeam + run_until_complete (15x faster than run_coroutine_threadsafe) ──
 
 /// A request to execute an async Python coroutine.
+#[allow(dead_code)]  // Retained for future inter-thread request protocol.
 struct AsyncRequest {
     coro: Py<PyAny>,
     response_tx: crossbeam_channel::Sender<PyResult<Py<PyAny>>>,
@@ -241,7 +243,7 @@ pub fn call_async_on_local_loop(
     // Fall through: route to async worker
     init_async_worker();
     let coro = handler.call(py, (), Some(kwargs))?;
-    return submit_to_async_worker(py, coro);
+    submit_to_async_worker(py, coro)
 }
 
 
@@ -253,6 +255,7 @@ pub fn call_async_on_local_loop(
 static EVENT_LOOP: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Public accessor for the persistent event loop.
+#[allow(dead_code)]  // Exposed for future external callers.
 pub fn get_event_loop_pub(py: Python<'_>) -> PyResult<Py<PyAny>> {
     get_event_loop(py)
 }
@@ -367,6 +370,7 @@ pub async fn call_async_handler(
 /// in an async wrapper running ON the event loop thread — this ensures
 /// `asyncio.get_event_loop()` works inside the handler.
 /// Public wrapper for WebSocket handlers that must always use the event loop.
+#[allow(dead_code)]  // Historical entry point.
 pub async fn call_async_via_event_loop_pub(
     handler: Py<PyAny>,
     kwargs: HashMap<String, Py<PyAny>>,

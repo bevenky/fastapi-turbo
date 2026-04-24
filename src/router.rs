@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::handler_bridge::call_async_handler;
 use crate::multipart::{parse_boundary, parse_multipart, ParsedField, PyUploadFile};
-use crate::responses::{py_to_response, py_to_response_with_request, pyerr_to_response, serde_to_pyobj};
+use crate::responses::{py_to_response_with_request, pyerr_to_response, serde_to_pyobj};
 use crate::websocket::handle_ws_upgrade;
 
 static BG_TASKS_CLS: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
@@ -828,11 +828,14 @@ struct RouteState {
     params: Vec<ParamInfo>,
     is_async: bool,
     has_body_params: bool,
+    #[allow(dead_code)]  // Wired at compile time, consumed by a future fast path.
     has_header_params: bool,
     has_dep_params: bool,
     has_any_params: bool,
     has_inject_request: bool,
+    #[allow(dead_code)]
     has_inject_background_tasks: bool,
+    #[allow(dead_code)]
     has_inject_response: bool,
     has_file_params: bool,
     has_form_params: bool,
@@ -1397,7 +1400,7 @@ async fn handle_request(
         for (k, v) in url::form_urlencoded::parse(
             request.uri().query().unwrap_or("").as_bytes(),
         ) {
-            m.entry(k.into_owned()).or_insert_with(Vec::new).push(v.into_owned());
+            m.entry(k.into_owned()).or_default().push(v.into_owned());
         }
         m
     };
@@ -1515,7 +1518,7 @@ async fn handle_request(
             // so the "form" extraction path below works uniformly.
             let mut fields: HashMap<String, Vec<ParsedField>> = HashMap::new();
             for (k, v) in url::form_urlencoded::parse(&bb) {
-                fields.entry(k.to_string()).or_insert_with(Vec::new).push(
+                fields.entry(k.to_string()).or_default().push(
                     ParsedField {
                         name: k.to_string(),
                         filename: None,
@@ -1643,7 +1646,6 @@ async fn handle_request(
                 if !state.has_any_params {
                     let kwargs = PyDict::new(py);
                     if state.has_http_middleware {
-                        if state.has_http_middleware {
                         inject_request_metadata(py, &kwargs, &scope_method, &scope_path, &scope_query, &headers);
                         if let Some(ref raw) = raw_body_for_mw {
                             if !raw.is_empty() {
@@ -1653,7 +1655,6 @@ async fn handle_request(
                                 );
                             }
                         }
-                    }
                     }
                     match crate::handler_bridge::call_async_on_local_loop(
                         py, &state.handler, &kwargs,
@@ -1776,7 +1777,7 @@ async fn handle_request(
                         let result = if param.is_async_dep {
                             try_call_async_sync(py, dep_callable, &dep_kwargs)
                         } else {
-                            dep_callable.call(py, (), Some(&dep_kwargs)).map_err(|e| e)
+                            dep_callable.call(py, (), Some(&dep_kwargs))
                         };
 
                         match result {
@@ -1826,7 +1827,7 @@ async fn handle_request(
                         // Return a sentinel status to signal fallback needed
                         (StatusCode::from_u16(599).unwrap(), "NEEDS_EVENT_LOOP").into_response()
                     } else {
-                        pyerr_to_response(py, &py_err)
+                        pyerr_to_response(py, py_err)
                     }
                 }
             }
@@ -1914,6 +1915,7 @@ fn try_call_async_sync(
 
 /// Extract ALL params directly into a PyDict (fast path for sync handlers without deps).
 /// Single GIL acquisition — no intermediate HashMap.
+#[allow(dead_code)]  // Superseded by extract_params_to_pydict_full; kept as reference.
 fn extract_params_to_pydict<'py>(
     py: Python<'py>,
     params: &[ParamInfo],
@@ -2138,7 +2140,7 @@ fn extract_params_to_pydict_full<'py>(
                                 return Err(pydantic_error_response_with_body(py, &e, "body", body_bytes));
                             }
                         }
-                    } else if let Some(ref json_val) = body_json {
+                    } else if let Some(json_val) = body_json {
                         // No Pydantic model — pass as dict
                         serde_to_pyobj(py, json_val)
                     } else {
@@ -2407,11 +2409,10 @@ fn extract_params_to_pydict_full<'py>(
                                 // default (usually None). Without this,
                                 // ``age=Form(None)`` + ``age=`` fails to
                                 // parse as int and returns 422.
-                                if text.is_empty() && !param.required {
-                                    if apply_default(py, &kwargs, param) {
+                                if text.is_empty() && !param.required
+                                    && apply_default(py, &kwargs, param) {
                                         continue;
                                     }
-                                }
                                 if param.scalar_validator.is_some() {
                                     let raw_py = pyo3::types::PyString::new(py, &text).into_any();
                                     let validated = run_scalar_validator(py, param, "body", &raw_py)?;
@@ -2834,6 +2835,7 @@ fn coercion_error_detail_indexed(
 
 /// Build a 422 response for a str→type coercion failure at a specific
 /// list index (loc = [location, field, index]).
+#[allow(dead_code)]
 fn coercion_error_response_indexed(
     loc: &str,
     name: &str,
@@ -2881,6 +2883,7 @@ fn coercion_error_response(loc: &str, name: &str, raw: &str, type_hint: &str) ->
 /// Convert a Pydantic ValidationError (from body model validation) into a
 /// FastAPI-style 422 response. Prepends `loc_prefix` (e.g. "body") to each
 /// error's location.
+#[allow(dead_code)]
 fn pydantic_error_response(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Response {
     pydantic_error_response_with_loc_ext(py, err, &[loc_prefix], false)
 }
@@ -3113,8 +3116,10 @@ fn fastapi_normalize_error_msg(msg: &str) -> String {
     s = s.replace("valid object", "valid dictionary");
     s = s.replace("an object", "a dictionary");
     s = s.replace("valid duration", "valid timedelta");
-    s = s.replace("valid set", "valid set");      // no-op (Pydantic already uses "set")
-    s = s.replace("valid frozenset", "valid frozenset"); // same
+    // No-op replacements kept as anchors — if Pydantic ever renames
+    // ``"valid set"`` we want a single place to patch. Clippy's
+    // ``replacing text with itself`` warning is silenced via the
+    // crate-level allow in ``lib.rs``.
     s
 }
 

@@ -3401,6 +3401,7 @@ class FastAPI:
         debug: bool = False,
         redirect_slashes: bool = True,
         max_request_size: int | None = None,
+        worker_timeout: float | None = None,
         webhooks: "APIRouter | None" = None,
         external_docs: dict[str, Any] | None = None,
         middleware: Sequence | None = None,
@@ -3469,6 +3470,17 @@ class FastAPI:
         self.redirect_slashes: bool = bool(redirect_slashes)
         # Max request body size in bytes. 413 Payload Too Large beyond this.
         self.max_request_size: int | None = max_request_size
+        # ``worker_timeout`` bounds how long a single async handler may
+        # block the shared worker loop before we cancel its task and
+        # raise ``TimeoutError``. Default None — matches FastAPI's "no
+        # framework-imposed timeout" behaviour. Also overridable per
+        # process via ``FASTAPI_TURBO_WORKER_TIMEOUT`` env var.
+        self.worker_timeout: float | None = worker_timeout
+        # Expose the instance so ``_async_worker._default_timeout`` can
+        # pick up the per-app setting without needing it plumbed through
+        # every submit call site. Last-constructed wins — single-app
+        # processes are the common case.
+        type(self)._fastapi_turbo_current_instance = self  # type: ignore[attr-defined]
         # OpenAPI webhooks — mirrors `app.webhooks` in FastAPI. Use as a
         # router-like container for webhook definitions that appear under
         # the top-level `webhooks` field of the OpenAPI schema.

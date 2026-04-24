@@ -6,7 +6,6 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use reqwest;
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 

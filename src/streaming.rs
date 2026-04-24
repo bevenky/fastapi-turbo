@@ -155,6 +155,7 @@ fn drain_one_sync_chunk(iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
 /// continue from chunk 2 without duplicating chunk 1. If the coroutine
 /// suspends we return None WITHOUT closing the coro — closing would propagate
 /// GeneratorExit to the async generator, destroying it.
+#[allow(dead_code)]  // Unused fast-path — kept for a future TTFB optimization.
 fn drain_one_async_chunk_sync(py: Python<'_>, iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
     let anext_name = pyo3::intern!(py, "__anext__");
     if !iter_bound.hasattr(anext_name).unwrap_or(false) {
