@@ -365,7 +365,7 @@ python benchmarks/bench_hello.py
 - **Python layer** (~22K lines): FastAPI-compatible API, introspection, OpenAPI 3.1 generator, Starlette/FastAPI `sys.modules` compat shims
 - **Tests** (~45K lines): 510 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
 
-See [CLAUDE.md](CLAUDE.md) for development guide and [benchmarks.md](benchmarks.md) for full benchmark data including Go Echo, Fastify, free-threaded Python, and WebSocket library comparisons.
+See [CLAUDE.md](CLAUDE.md) for development guide, [benchmarks.md](benchmarks.md) for full benchmark data including Go Echo, Fastify, free-threaded Python, and WebSocket library comparisons, and [COMPATIBILITY.md](COMPATIBILITY.md) for a per-feature map of where fastapi_turbo sits against FastAPI 0.136.0 (Full / Partial / Not-implemented / Different-by-design).
 
 ## License
 
