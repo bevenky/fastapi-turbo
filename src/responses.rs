@@ -1081,143 +1081,134 @@ pub fn file_response(
     resp
 }
 
-/// Parse an RFC 7233 `Range: bytes=…` header for a resource of `total_len` bytes.
+/// Result of parsing an RFC 7233 `Range:` header against a known file
+/// size. Mirrors Starlette 1.0's branching: ``Malformed`` → 400,
+/// ``Unsatisfiable`` → 416, ``Full`` → 200 (no ranges OR DoS-cap
+/// exceeded), ``Single`` → 206 single-range, ``Multi`` → 206
+/// multipart/byteranges.
+pub enum RangeOutcome {
+    /// Serve 200 with the full body. Used when the header is absent, OR
+    /// when the post-coalesce range count exceeds ``MAX_RANGES``
+    /// (different-by-design DoS guard, documented in COMPATIBILITY.md).
+    Full,
+    /// Serve 206 with a single ``Content-Range`` header.
+    Single(u64, u64),
+    /// Serve 206 ``multipart/byteranges`` covering these ranges.
+    Multi(Vec<(u64, u64)>),
+    /// Serve 416 ``Range Not Satisfiable``.
+    Unsatisfiable,
+    /// Serve 400 ``Bad Request``. Carries a short reason for the body.
+    Malformed(&'static str),
+}
+
+/// Parse an RFC 7233 `Range: bytes=…` header for a resource of
+/// `total_len` bytes.
 ///
-/// Supports all four forms FastAPI users hit in practice:
+/// Supports all forms FastAPI users hit in practice:
 ///   * `bytes=N-M`          — absolute window
 ///   * `bytes=N-`           — from N through end
 ///   * `bytes=-N`           — last N bytes (suffix)
-///   * `bytes=N-M,X-Y,...`  — multiple ranges (→ `multipart/byteranges` 206)
+///   * `bytes=N-M,X-Y,...`  — multiple ranges
 ///
-/// Returns `Ok(Some(ranges))` when at least one range parses and is
-/// satisfiable. Returns `Ok(None)` when the header is absent/malformed
-/// (caller should serve 200). Returns `Err(())` when the header parsed
-/// cleanly but every range is unsatisfiable (caller should return 416).
-pub fn parse_byte_ranges(header: &str, total_len: u64) -> Result<Option<Vec<(u64, u64)>>, ()> {
-    // DoS protection:
-    //   * ``MAX_RANGES`` caps how many satisfiable parts we'll honour
-    //     (a hostile ``Range: bytes=0-0,0-0,0-0,...`` could otherwise
-    //     allocate an unbounded multipart body).
-    //   * ``max_total_bytes`` ensures the *sum* of range lengths stays
-    //     bounded by ``2 * total_len`` — prevents a single client from
-    //     forcing us to materialise many duplicate copies of the file
-    //     in memory.
-    // Both mirror Starlette's ``FileResponse`` conservative posture.
+/// Logic mirrors Starlette 1.0's ``_parse_range_header`` /
+/// ``_parse_ranges`` exactly:
+///   * Unit must be ``bytes`` (case-insensitive token).
+///   * Non-bytes unit, missing ``=``, no parseable sub-ranges → 400.
+///   * Any sub-range start outside ``[0, total_len)`` → 416.
+///   * Any reversed sub-range (``start > end``) → 400.
+///   * Overlapping/adjacent sub-ranges are coalesced before deciding
+///     single vs multipart.
+///
+/// DoS guard (different-by-design): post-coalesce range count > 16
+/// returns ``RangeOutcome::Full`` rather than amplifying the response.
+pub fn parse_byte_ranges(header: &str, total_len: u64) -> RangeOutcome {
     const MAX_RANGES: usize = 16;
-    let max_total_bytes: u64 = total_len.saturating_mul(2).max(1);
 
-    // Unit parse: split on '=', lower-case unit token, compare to
-    // ``bytes`` (Starlette-parity — ``Bytes=`` / ``items=`` fall through
-    // to 200 full body).
+    // Error-message strings match Starlette 1.0 byte-for-byte so
+    // error-body comparisons against upstream pass.
     let trimmed = header.trim();
     let (unit, rest) = match trimmed.split_once('=') {
         Some((u, r)) => (u.trim(), r.trim()),
-        None => return Ok(None),
+        None => return RangeOutcome::Malformed("Malformed range header."),
     };
     if !unit.eq_ignore_ascii_case("bytes") {
-        return Ok(None);
+        return RangeOutcome::Malformed("Only support bytes range");
     }
     if total_len == 0 {
-        // Any well-formed range against an empty resource is
-        // unsatisfiable per RFC 7233.
-        return Err(());
+        return RangeOutcome::Unsatisfiable;
     }
-    // Early-reject headers with too many comma-separated parts BEFORE
-    // parsing — even ``split(',').count()`` is O(n) but bounded by the
-    // header-size limit the HTTP layer already enforces.
-    if rest.split(',').count() > MAX_RANGES {
-        // Too many ranges — fall back to full body (matches Starlette).
-        return Ok(None);
-    }
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    let mut running_total: u64 = 0;
-    let mut saw_any_parseable = false;
+
+    // Parse sub-ranges in Starlette's half-open ``[start, end)`` form.
+    // ``start`` may be negative (``bytes=-N`` with N > total_len) which
+    // the bounds check below catches.
+    let mut raw: Vec<(i128, u64)> = Vec::new();
     for part in rest.split(',') {
         let part = part.trim();
-        // Drop empty spec and bare "-" (syntactic no-op per Starlette).
         if part.is_empty() || part == "-" {
             continue;
         }
         let (a, b) = match part.split_once('-') {
             Some(pair) => pair,
-            None => {
-                // Malformed sub-range → bail whole header (matches Starlette).
-                return Ok(None);
-            }
+            None => continue,
         };
         let a = a.trim();
         let b = b.trim();
-        let (start, end) = if a.is_empty() {
-            // Suffix ``-N``: last N bytes.
+
+        // Mirror Starlette's ``_parse_ranges`` per-sub-range parsing.
+        // Per-sub-range ValueErrors are dropped (continue), not bailed.
+        let start: i128 = if a.is_empty() {
             match b.parse::<u64>() {
-                Ok(0) => {
-                    // Zero-length suffix is a syntactic no-op — skip,
-                    // don't bail the whole header (matches Starlette).
-                    continue;
-                }
-                Ok(n) => {
-                    saw_any_parseable = true;
-                    let n = n.min(total_len);
-                    (total_len - n, total_len - 1)
-                }
-                Err(_) => return Ok(None),
+                Ok(n) => total_len as i128 - n as i128,
+                Err(_) => continue,
             }
-        } else if b.is_empty() {
-            let s: u64 = match a.parse() {
-                Ok(s) => s,
-                Err(_) => return Ok(None),
-            };
-            saw_any_parseable = true;
-            if s >= total_len {
-                continue; // unsatisfiable sub-range: skip, try next
-            }
-            (s, total_len - 1)
         } else {
-            let s: u64 = match a.parse() {
-                Ok(s) => s,
-                Err(_) => return Ok(None),
-            };
-            let e: u64 = match b.parse() {
-                Ok(e) => e,
-                Err(_) => return Ok(None),
-            };
-            if s > e {
-                // Reversed sub-range is malformed per Starlette — bail
-                // the whole header to full body.
-                return Ok(None);
+            match a.parse::<u64>() {
+                Ok(s) => s as i128,
+                Err(_) => continue,
             }
-            saw_any_parseable = true;
-            if s >= total_len {
-                continue;
-            }
-            (s, e.min(total_len - 1))
         };
-        let part_len = end - start + 1;
-        if running_total.saturating_add(part_len) > max_total_bytes {
-            // Sum of range sizes exceeds our cap → fall back to full
-            // body rather than build a multi-GB multipart response.
-            return Ok(None);
-        }
-        running_total = running_total.saturating_add(part_len);
-        out.push((start, end));
-    }
-    if out.is_empty() {
-        if saw_any_parseable {
-            // Every sub-range unsatisfiable → 416.
-            return Err(());
-        }
-        return Ok(None);
+        let end: u64 = if !a.is_empty() && !b.is_empty() {
+            match b.parse::<u64>() {
+                Ok(e) if e < total_len => e + 1,
+                Ok(_) => total_len,
+                Err(_) => continue,
+            }
+        } else {
+            total_len
+        };
+        raw.push((start, end));
     }
 
-    // Coalesce overlapping/adjacent ranges (Starlette parity). A
-    // request like ``0-19,0-19`` collapses to a single ``0-19`` so the
-    // caller emits a single-range 206 instead of multipart with two
-    // copies of the same body. ``0-9,10-19`` (touching) also merges.
-    out.sort_unstable();
-    let mut coalesced: Vec<(u64, u64)> = Vec::with_capacity(out.len());
-    for (s, e) in out {
+    if raw.is_empty() {
+        // Empty range value (``bytes=``) and unparseable subranges
+        // (``bytes=abc-def``) both surface here in Starlette.
+        return RangeOutcome::Malformed("Range header: range must be requested");
+    }
+
+    // Bounds check (BEFORE the reversed check — matches Starlette
+    // order). Any start outside [0, total_len) → 416.
+    if raw
+        .iter()
+        .any(|&(s, _)| s < 0 || (s as u128) >= total_len as u128)
+    {
+        return RangeOutcome::Unsatisfiable;
+    }
+
+    // Now safe to drop to u64.
+    let mut ranges: Vec<(u64, u64)> = raw.iter().map(|&(s, e)| (s as u64, e)).collect();
+
+    // Reversed in half-open form means input had start > end.
+    if ranges.iter().any(|&(s, e)| s > e) {
+        return RangeOutcome::Malformed("Range header: start must be less than end");
+    }
+
+    // Coalesce in half-open form. Touching: ``next.start <= prev.end``
+    // (since prev.end is exclusive, touching means equal).
+    ranges.sort_unstable();
+    let mut coalesced: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
         if let Some(prev) = coalesced.last_mut() {
-            if s <= prev.1.saturating_add(1) {
+            if s <= prev.1 {
                 prev.1 = prev.1.max(e);
                 continue;
             }
@@ -1225,18 +1216,20 @@ pub fn parse_byte_ranges(header: &str, total_len: u64) -> Result<Option<Vec<(u64
         coalesced.push((s, e));
     }
 
-    // Re-check the byte-sum cap AFTER coalescing — pre-coalesce the
-    // running total may have been inflated by hostile duplicates that
-    // collapse to legitimate small ranges. Conversely, a coalesced sum
-    // exceeding 2× file size still indicates an attempted amplification.
-    let coalesced_total: u64 = coalesced
-        .iter()
-        .map(|(s, e)| e - s + 1)
-        .fold(0u64, |a, b| a.saturating_add(b));
-    if coalesced_total > max_total_bytes {
-        return Ok(None);
+    if coalesced.len() > MAX_RANGES {
+        // Different-by-design DoS guard. Coalesce-first ensures
+        // legitimate duplicate/overlapping inputs never trip this.
+        return RangeOutcome::Full;
     }
-    Ok(Some(coalesced))
+
+    // Convert half-open back to inclusive ``[start, end]`` for the
+    // caller (which builds Content-Range / wire bytes).
+    let inclusive: Vec<(u64, u64)> = coalesced.into_iter().map(|(s, e)| (s, e - 1)).collect();
+    if inclusive.len() == 1 {
+        let (s, e) = inclusive[0];
+        return RangeOutcome::Single(s, e);
+    }
+    RangeOutcome::Multi(inclusive)
 }
 
 /// Compute the Last-Modified and ETag pair for a file, based on its
@@ -1503,19 +1496,40 @@ pub fn file_response_with_range(
         _ => range_header,
     };
 
-    // Parse Range (if any). Malformed → full body. Unsatisfiable → 416.
-    let ranges = match effective_range {
+    // Parse Range (if any). Branches:
+    //   * Malformed   → 400 (Starlette MalformedRangeHeader parity)
+    //   * Unsatisfiable → 416
+    //   * Full        → fall through to no-range path
+    //   * Single/Multi → emit partial content
+    let ranges: Option<Vec<(u64, u64)>> = match effective_range {
         Some(h) => match parse_byte_ranges(h, total_len) {
-            Ok(r) => r,
-            Err(()) => {
+            RangeOutcome::Full => None,
+            RangeOutcome::Single(s, e) => Some(vec![(s, e)]),
+            RangeOutcome::Multi(rs) => Some(rs),
+            RangeOutcome::Unsatisfiable => {
+                // 416 header shape mirrors Starlette 1.0 exactly:
+                // Content-Range, Content-Length: 0, Content-Type:
+                // text/plain; charset=utf-8. No file stat headers
+                // (Last-Modified / ETag) — those are entity-validators
+                // and Starlette omits them for the error response.
+                // No accept-ranges either.
                 return Response::builder()
                     .status(StatusCode::RANGE_NOT_SATISFIABLE)
                     .header("content-range", format!("bytes */{total_len}"))
-                    .header("content-type", &ct)
-                    .header("last-modified", &last_modified)
-                    .header("etag", &etag)
+                    .header("content-length", "0")
+                    .header("content-type", "text/plain; charset=utf-8")
                     .body(Body::empty())
                     .expect("build 416");
+            }
+            RangeOutcome::Malformed(reason) => {
+                // 400 mirrors Starlette: Content-Type + Content-Length
+                // only. No Last-Modified / ETag / accept-ranges.
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .header("content-length", reason.len().to_string())
+                    .body(Body::from(reason))
+                    .expect("build 400");
             }
         },
         None => None,
@@ -1538,21 +1552,24 @@ pub fn file_response_with_range(
             let boundary = make_byteranges_boundary();
 
             // Precompute every preamble + closing + total body length.
-            // Wire format mirrors Starlette: LF separators, no leading
-            // CRLF, ``\n`` between body and next part, ``\n--…--\n``
-            // closing. The first preamble has no leading separator; the
-            // rest start with ``\n`` to terminate the prior body.
+            // Wire format mirrors Starlette 1.0 byte-for-byte: CRLF
+            // separators, no leading CRLF on the first preamble,
+            // ``\r\n`` between body and next part, ``\r\n--…--``
+            // closing (no trailing CRLF). ``ct`` already carries
+            // ``; charset=utf-8`` for textual types thanks to the
+            // augmentation block above, so the per-part Content-Type
+            // matches what Starlette emits for the same file.
             let mut preambles: Vec<bytes::Bytes> = Vec::with_capacity(rs.len());
             let mut body_len: u64 = 0;
             for (idx, (start, end)) in rs.iter().enumerate() {
-                let sep = if idx == 0 { "" } else { "\n" };
+                let sep = if idx == 0 { "" } else { "\r\n" };
                 let pre = format!(
-                    "{sep}--{boundary}\nContent-Type: {ct}\nContent-Range: bytes {start}-{end}/{total_len}\n\n"
+                    "{sep}--{boundary}\r\nContent-Type: {ct}\r\nContent-Range: bytes {start}-{end}/{total_len}\r\n\r\n"
                 );
                 body_len += pre.len() as u64 + (end - start + 1);
                 preambles.push(bytes::Bytes::from(pre));
             }
-            let closing = bytes::Bytes::from(format!("\n--{boundary}--\n"));
+            let closing = bytes::Bytes::from(format!("\r\n--{boundary}--"));
             body_len += closing.len() as u64;
 
             // Spawn producer. The axum handler context already runs

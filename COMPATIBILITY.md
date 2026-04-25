@@ -2,7 +2,7 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 783 tests (410 general + 22 WebSocket + 244 stress + 107 parity snapshots).
+Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 790 tests (410 general + 22 WebSocket + 251 stress + 107 parity snapshots).
 
 ## Routing
 
@@ -41,8 +41,9 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | Pydantic v2 body validation | Full | Uses `__pydantic_validator__.validate_json(bytes)` directly. |
 | `Form`, `File`, `UploadFile`, multipart | Full | Rust multipart parser; `UploadFile.read/seek/write/close`. |
 | `Response`, `JSONResponse`, `HTMLResponse`, `PlainTextResponse`, `RedirectResponse`, `StreamingResponse`, `FileResponse` | Full | |
-| `FileResponse` with `Range: bytes=N-M` / `N-` / `-N` | Full | Returns 206 Partial Content with `Content-Range`; 416 on unsatisfiable; 200 on malformed. |
-| Multi-range responses (`bytes=0-0,-1` → `multipart/byteranges`) | Full | 206 with `multipart/byteranges; boundary=…`; per-part `Content-Type` + `Content-Range`; closing boundary; `Content-Length` set. DoS-capped: ≤ 16 ranges and sum-of-lengths ≤ 2× file size; hostile headers fall back to the full body rather than amplify. |
+| `FileResponse` with `Range: bytes=N-M` / `N-` / `-N` | Full | 206 Partial Content with `Content-Range`; 416 on out-of-bounds; 400 on malformed (non-`bytes` unit, reversed `5-3`, no parseable sub-ranges). Validation order matches Starlette 1.0 (bounds check before reversed check). |
+| Multi-range responses (`bytes=0-0,-1` → `multipart/byteranges`) | Full | 206 with `multipart/byteranges; boundary=…`; CRLF wire framing; per-part `Content-Type` + `Content-Range` (Content-Type echoes the response's content-type, including `; charset=utf-8` for textual files); closing `--{boundary}--`; `Content-Length` precomputed. Overlapping/adjacent sub-ranges coalesce before deciding single vs multipart, matching Starlette. |
+| `FileResponse` Range count cap | Different-by-design | Post-coalesce range count > 16 falls back to a 200 full-body response. Starlette has no such cap. Coalesce-first means duplicate / overlapping inputs (e.g. 100×`bytes=0-1023`) collapse to a single range and never hit the cap; only genuinely disjoint requests with > 16 sub-ranges differ from upstream. Documented for clients that need to know. |
 | `ORJSONResponse`, `UJSONResponse` | Full | When the optional dep is installed. |
 | SSE: `EventSourceResponse`, `ServerSentEvent`, `format_sse_event` | Full | |
 | `BackgroundTasks` single-task and multi-task | Full | |

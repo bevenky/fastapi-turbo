@@ -85,15 +85,14 @@ def test_multi_range_unsatisfiable_returns_416(file20):
     assert r.headers["content-range"] == "bytes */20"
 
 
-def test_multi_range_skips_unsatisfiable_subrange(file20):
-    """One good sub-range + one past-EOF sub-range → serve the good one."""
+def test_multi_range_any_unsatisfiable_returns_416(file20):
+    """One good sub-range + one past-EOF sub-range → 416 (not a
+    partial 206). Starlette rejects the whole header when any
+    sub-range's start is out of bounds, and we match that."""
     c = TestClient(_app(file20))
     r = c.get("/f", headers={"Range": "bytes=0-4,100-200"})
-    assert r.status_code == 206
-    # Only the satisfiable sub-range is delivered. Since it's the sole
-    # range, it's a plain single-range 206 (not multipart).
-    assert r.headers["content-range"] == "bytes 0-4/20"
-    assert r.content == b"01234"
+    assert r.status_code == 416
+    assert r.headers["content-range"] == "bytes */20"
 
 
 def test_unique_boundary_across_responses(file20):
