@@ -1208,7 +1208,35 @@ pub fn parse_byte_ranges(header: &str, total_len: u64) -> Result<Option<Vec<(u64
         }
         return Ok(None);
     }
-    Ok(Some(out))
+
+    // Coalesce overlapping/adjacent ranges (Starlette parity). A
+    // request like ``0-19,0-19`` collapses to a single ``0-19`` so the
+    // caller emits a single-range 206 instead of multipart with two
+    // copies of the same body. ``0-9,10-19`` (touching) also merges.
+    out.sort_unstable();
+    let mut coalesced: Vec<(u64, u64)> = Vec::with_capacity(out.len());
+    for (s, e) in out {
+        if let Some(prev) = coalesced.last_mut() {
+            if s <= prev.1.saturating_add(1) {
+                prev.1 = prev.1.max(e);
+                continue;
+            }
+        }
+        coalesced.push((s, e));
+    }
+
+    // Re-check the byte-sum cap AFTER coalescing — pre-coalesce the
+    // running total may have been inflated by hostile duplicates that
+    // collapse to legitimate small ranges. Conversely, a coalesced sum
+    // exceeding 2× file size still indicates an attempted amplification.
+    let coalesced_total: u64 = coalesced
+        .iter()
+        .map(|(s, e)| e - s + 1)
+        .fold(0u64, |a, b| a.saturating_add(b));
+    if coalesced_total > max_total_bytes {
+        return Ok(None);
+    }
+    Ok(Some(coalesced))
 }
 
 /// Compute the Last-Modified and ETag pair for a file, based on its
@@ -1377,16 +1405,18 @@ fn format_http_date(secs: u64) -> String {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ][(month - 1) as usize];
 
-    format!(
-        "{dow}, {day:02} {month_name} {year:04} {hour:02}:{minute:02}:{second:02} GMT"
-    )
+    format!("{dow}, {day:02} {month_name} {year:04} {hour:02}:{minute:02}:{second:02} GMT")
 }
 
 /// Civil date from days-since-epoch. Howard Hinnant's algorithm
 /// (``chrono::days_from_civil`` inverse). Returns (year, month, day).
 fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = (z - era * 146_097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe as i64 + era * 400;
@@ -1508,16 +1538,21 @@ pub fn file_response_with_range(
             let boundary = make_byteranges_boundary();
 
             // Precompute every preamble + closing + total body length.
+            // Wire format mirrors Starlette: LF separators, no leading
+            // CRLF, ``\n`` between body and next part, ``\n--…--\n``
+            // closing. The first preamble has no leading separator; the
+            // rest start with ``\n`` to terminate the prior body.
             let mut preambles: Vec<bytes::Bytes> = Vec::with_capacity(rs.len());
             let mut body_len: u64 = 0;
-            for (start, end) in rs {
+            for (idx, (start, end)) in rs.iter().enumerate() {
+                let sep = if idx == 0 { "" } else { "\n" };
                 let pre = format!(
-                    "\r\n--{boundary}\r\nContent-Type: {ct}\r\nContent-Range: bytes {start}-{end}/{total_len}\r\n\r\n"
+                    "{sep}--{boundary}\nContent-Type: {ct}\nContent-Range: bytes {start}-{end}/{total_len}\n\n"
                 );
                 body_len += pre.len() as u64 + (end - start + 1);
                 preambles.push(bytes::Bytes::from(pre));
             }
-            let closing = bytes::Bytes::from(format!("\r\n--{boundary}--\r\n"));
+            let closing = bytes::Bytes::from(format!("\n--{boundary}--\n"));
             body_len += closing.len() as u64;
 
             // Spawn producer. The axum handler context already runs

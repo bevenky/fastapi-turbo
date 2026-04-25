@@ -1656,7 +1656,8 @@ async fn handle_request(
                         Ok(py_result) => py_to_response_with_request(
                             py,
                             py_result.bind(py),
-                            range_header.as_deref(), if_range_header.as_deref(),
+                            range_header.as_deref(),
+                            if_range_header.as_deref(),
                         ),
                         Err(py_err) => pyerr_to_response(py, &py_err),
                     }
@@ -1666,9 +1667,12 @@ async fn handle_request(
             return Python::attach(|py| {
                 set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
                 match state.handler.call0(py) {
-                    Ok(py_result) => {
-                        py_to_response_with_request(py, py_result.bind(py), range_header.as_deref(), if_range_header.as_deref())
-                    }
+                    Ok(py_result) => py_to_response_with_request(
+                        py,
+                        py_result.bind(py),
+                        range_header.as_deref(),
+                        if_range_header.as_deref(),
+                    ),
                     Err(py_err) => pyerr_to_response(py, &py_err),
                 }
             });
@@ -1740,7 +1744,8 @@ async fn handle_request(
                         let mut resp = py_to_response_with_request(
                             py,
                             py_result.bind(py),
-                            range_header.as_deref(), if_range_header.as_deref(),
+                            range_header.as_deref(),
+                            if_range_header.as_deref(),
                         );
                         apply_injected_response(py, &kwargs, &state.params, &mut resp);
                         resp
@@ -1796,9 +1801,12 @@ async fn handle_request(
                         &kwargs,
                         app_for_submit.as_ref(),
                     ) {
-                        Ok(r) => {
-                            py_to_response_with_request(py, r.bind(py), range_header.as_deref(), if_range_header.as_deref())
-                        }
+                        Ok(r) => py_to_response_with_request(
+                            py,
+                            r.bind(py),
+                            range_header.as_deref(),
+                            if_range_header.as_deref(),
+                        ),
                         Err(e) => pyerr_to_response(py, &e),
                     }
                 } else if !state.has_dep_params {
@@ -1866,7 +1874,8 @@ async fn handle_request(
                             let mut resp = py_to_response_with_request(
                                 py,
                                 r.bind(py),
-                                range_header.as_deref(), if_range_header.as_deref(),
+                                range_header.as_deref(),
+                                if_range_header.as_deref(),
                             );
                             apply_injected_response(py, &kwargs, &state.params, &mut resp);
                             resp
@@ -1926,7 +1935,12 @@ async fn handle_request(
                     match state.handler.call(py, (), Some(&kwargs)) {
                         Ok(r) => {
                             drain_background_tasks(py, &kwargs, &state.params);
-                            py_to_response_with_request(py, r.bind(py), range_header.as_deref(), if_range_header.as_deref())
+                            py_to_response_with_request(
+                                py,
+                                r.bind(py),
+                                range_header.as_deref(),
+                                if_range_header.as_deref(),
+                            )
                         }
                         Err(e) => pyerr_to_response(py, &e),
                     }
@@ -2019,9 +2033,12 @@ async fn handle_request(
             };
 
             match result {
-                Ok(py_result) => {
-                    py_to_response_with_request(py, py_result.bind(py), range_header.as_deref(), if_range_header.as_deref())
-                }
+                Ok(py_result) => py_to_response_with_request(
+                    py,
+                    py_result.bind(py),
+                    range_header.as_deref(),
+                    if_range_header.as_deref(),
+                ),
                 Err(ref py_err) => {
                     // Check if this is "needs event loop" — signal for fallback
                     let msg = py_err
@@ -2076,7 +2093,12 @@ async fn handle_request(
         let handler = Python::attach(|py| state.handler.clone_ref(py));
         return match call_async_handler(handler, handler_kwargs).await {
             Ok(py_result) => Python::attach(|py| {
-                py_to_response_with_request(py, py_result.bind(py), range_header.as_deref(), if_range_header.as_deref())
+                py_to_response_with_request(
+                    py,
+                    py_result.bind(py),
+                    range_header.as_deref(),
+                    if_range_header.as_deref(),
+                )
             }),
             Err(py_err) => Python::attach(|py| pyerr_to_response(py, &py_err)),
         };

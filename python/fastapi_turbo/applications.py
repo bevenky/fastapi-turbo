@@ -1761,25 +1761,40 @@ def _parse_range_header(header_val: str, total_len: int):
     """Parse an RFC 7233 ``Range:`` header against a known file length.
 
     Returns one of:
-      * ``('full',)`` — header absent/unparseable, wrong unit, or all
-        sub-ranges were syntactic no-ops (e.g. ``bytes=-0``). Caller
-        serves 200 full body.
+      * ``('full',)`` — header absent/unparseable, wrong unit, all
+        sub-ranges were syntactic no-ops (e.g. ``bytes=-0``), OR the
+        DoS caps were violated (>16 sub-ranges, or coalesced byte
+        sum > 2× file size). Caller serves 200 full body.
       * ``('range', start, end_inclusive)`` — exactly one satisfiable
-        sub-range after dropping unsatisfiable ones.
+        range after coalescing overlapping/adjacent sub-ranges.
       * ``('multi', [(s0, e0), (s1, e1), ...])`` — two or more
-        satisfiable sub-ranges. Caller emits 206 multipart/byteranges.
+        coalesced satisfiable ranges. Caller emits 206
+        multipart/byteranges.
       * ``('unsatisfiable',)`` — at least one sub-range parsed cleanly
         but every one was out of bounds. Caller returns 416.
 
     Edge-case handling mirrors Starlette/upstream FastAPI:
-      * Unit must be exactly ``bytes=`` (case-insensitive token, but
-        the spec on-the-wire is lowercase — ``Bytes=`` falls through).
+      * Unit must be exactly ``bytes=`` (case-insensitive token —
+        ``Bytes=`` is accepted, ``items=`` is not).
       * ``-0`` (zero-length suffix) is a syntactic no-op.
       * Reversed ranges (``5-3``) bail the whole header to full body —
         Starlette treats these as malformed.
       * Mixed satisfiable + past-EOF sub-ranges: serve only the
         satisfiable ones.
+      * Overlapping or adjacent sub-ranges are merged before deciding
+        single-range vs multipart (a request like ``0-19,0-19`` is
+        served as a single 206, not multipart).
+
+    DoS caps (mirror src/responses.rs):
+      * MAX_RANGES = 16: more sub-ranges than this → bail to full
+        body. Bounded check happens BEFORE parsing.
+      * max_total_bytes = 2 × total_len: post-coalesce sum of range
+        sizes must not exceed this. Otherwise bail to full body —
+        prevents ``Range: bytes=0-N,0-N,...`` from amplifying the
+        response (each duplicate is a fresh body copy in a multipart
+        envelope).
     """
+    MAX_RANGES = 16
     if not header_val:
         return ("full",)
     v = header_val.strip()
@@ -1800,6 +1815,11 @@ def _parse_range_header(header_val: str, total_len: int):
     # Drop truly empty specs and single-dash placeholders.
     specs = [p for p in specs if p and p != "-"]
     if not specs:
+        return ("full",)
+    # Early-reject: more sub-ranges than MAX_RANGES → bail to full body.
+    # Bounded BEFORE the parse loop so a hostile 1000-range header
+    # doesn't even get parsed.
+    if len(specs) > MAX_RANGES:
         return ("full",)
 
     satisfiable: list[tuple[int, int]] = []
@@ -1851,10 +1871,34 @@ def _parse_range_header(header_val: str, total_len: int):
         return ("full",)
     if not satisfiable:
         return ("unsatisfiable",)
-    if len(satisfiable) == 1:
-        s, e = satisfiable[0]
+
+    # Coalesce overlapping/adjacent ranges so a request like
+    # ``0-19,0-19`` collapses to a single 0-19, and ``0-9,10-19``
+    # (adjacent) merges into 0-19. Matches Starlette behaviour. Sort
+    # by start, then sweep — touching ranges (next.start <= prev.end+1)
+    # combine into one.
+    satisfiable.sort()
+    coalesced: list[tuple[int, int]] = []
+    for s, e in satisfiable:
+        if coalesced and s <= coalesced[-1][1] + 1:
+            ps, pe = coalesced[-1]
+            coalesced[-1] = (ps, max(pe, e))
+        else:
+            coalesced.append((s, e))
+
+    # DoS cap on post-coalesce byte sum: must not exceed 2× file size.
+    # If a hostile client sends 16 disjoint full-file ranges, that's
+    # 16× total_len; this check catches it. Coalesce-first ensures
+    # legitimate adjacent ranges aren't penalised.
+    max_total_bytes = max(2 * total_len, 1)
+    running = sum((e - s + 1) for s, e in coalesced)
+    if running > max_total_bytes:
+        return ("full",)
+
+    if len(coalesced) == 1:
+        s, e = coalesced[0]
         return ("range", s, e)
-    return ("multi", satisfiable)
+    return ("multi", coalesced)
 
 
 def _make_byteranges_boundary() -> str:
@@ -1960,25 +2004,41 @@ async def _send_file_response_asgi(send, response, scope=None) -> None:
         return
 
     # Multi-range: emit 206 multipart/byteranges, streaming each part.
+    # Wire format mirrors Starlette's ``generate_multipart`` exactly
+    # (LF separators, no leading CRLF, ``\n`` between body and next
+    # part, closing prefixed with ``\n``):
+    #
+    #   --{boundary}\n
+    #   Content-Type: {media}\n
+    #   Content-Range: bytes {start}-{end}/{total}\n
+    #   \n
+    #   <body bytes>
+    #   \n--{boundary}\n
+    #   Content-Type: {media}\n
+    #   ...
+    #   \n--{boundary}--\n
     if parsed[0] == "multi":
         ranges: list[tuple[int, int]] = parsed[1]
         media = getattr(response, "media_type", None) or "application/octet-stream"
         boundary = _make_byteranges_boundary()
 
-        # Precompute each part's preamble and the total body length so
-        # we can stamp Content-Length without buffering the whole body.
+        # Precompute each part's preamble and the total body length.
+        # First preamble has no leading separator (matches Starlette);
+        # subsequent preambles are prefixed with ``\n`` to act as the
+        # inter-part separator (the previous part's body ends raw).
         preambles: list[bytes] = []
         body_len = 0
-        for start, end in ranges:
+        for idx, (start, end) in enumerate(ranges):
+            sep = "" if idx == 0 else "\n"
             pre = (
-                f"\r\n--{boundary}\r\n"
-                f"Content-Type: {media}\r\n"
-                f"Content-Range: bytes {start}-{end}/{total_len}\r\n"
-                f"\r\n"
+                f"{sep}--{boundary}\n"
+                f"Content-Type: {media}\n"
+                f"Content-Range: bytes {start}-{end}/{total_len}\n"
+                f"\n"
             ).encode("latin-1")
             preambles.append(pre)
             body_len += len(pre) + (end - start + 1)
-        closing = f"\r\n--{boundary}--\r\n".encode("latin-1")
+        closing = f"\n--{boundary}--\n".encode("latin-1")
         body_len += len(closing)
 
         # Override headers for multipart response. We drop the upstream
