@@ -16,48 +16,6 @@ import time
 import pytest
 
 
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture()
-def server_app(tmp_path):
-    procs = []
-
-    def _start(code: str):
-        port = _free_port()
-        code = code.replace("__PORT__", str(port))
-        app_file = tmp_path / "app.py"
-        app_file.write_text(textwrap.dedent(code))
-        proc = subprocess.Popen(
-            [sys.executable, str(app_file)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        procs.append(proc)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                    break
-            except (ConnectionRefusedError, OSError):
-                time.sleep(0.1)
-                if proc.poll() is not None:
-                    out = proc.stdout.read().decode()
-                    err = proc.stderr.read().decode()
-                    pytest.fail(f"Server died.\nstdout: {out}\nstderr: {err}")
-        else:
-            proc.kill()
-            pytest.fail("Server did not start")
-        return f"http://127.0.0.1:{port}"
-
-    yield _start
-
-    for p in procs:
-        p.kill()
-        p.wait()
 
 
 # ── File uploads (multipart) ─────────────────────────────────────────
@@ -101,6 +59,8 @@ def test_upload_single_file(server_app):
 
 
 def test_upload_multiple_files(server_app):
+    # Multipart parser path through Tower differs from the in-process
+    # python multipart parser; sandbox parity isn't 100% yet.
     import httpx
 
     url = server_app("""
@@ -288,6 +248,8 @@ def test_parse_range_header():
 
 
 def test_static_files_serves_file(server_app, tmp_path):
+    # StaticFiles is mounted via Rust ServeDir — in-process
+    # fallback's ASGI dispatcher doesn't intercept that mount yet.
     import httpx
 
     static_dir = tmp_path / "static"

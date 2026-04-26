@@ -173,5 +173,8 @@ works identically; they get faster after `pip install --upgrade`.
   is real, useful for some patterns, but doesn't resolve the pool-
   affinity vs multi-core-parallelism dilemma for our target workloads.
 - Single-session delivery of multi-week phases above. Each needs
-  dedicated work with proper regression testing across the 510 project
-  + 3131 upstream + 14 parity-runner matrices.
+  dedicated work with proper regression testing across the
+  fastapi-turbo own suite (see COMPATIBILITY.md for the canonical
+  breakdown — pinned to a specific count there rather than
+  duplicated in every doc), the upstream FastAPI suite, and the
+  parity-runner matrices.

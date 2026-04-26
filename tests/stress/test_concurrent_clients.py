@@ -11,11 +11,17 @@ import concurrent.futures
 import threading
 
 import httpx
+import pytest
 
 import fastapi_turbo  # noqa: F401
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+# Tests in this module hit the loopback Rust server explicitly
+# (``cli._port`` is asserted). Skip cleanly when the environment
+# denies loopback binds.
+pytestmark = pytest.mark.requires_loopback
 
 
 def test_hundred_concurrent_clients_each_get_correct_response():

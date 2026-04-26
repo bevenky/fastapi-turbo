@@ -2,7 +2,24 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 790 tests (410 general + 22 WebSocket + 251 stress + 107 parity snapshots).
+Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 867 tests (410 general + 22 WebSocket + 328 stress + 107 parity snapshots).
+
+**Test suite under different environments:**
+
+* **Normal dev box / CI** (loopback bind allowed): all 867 tests run, 0 skipped, 0 failed.
+* **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError`): `tests/conftest.py` detects this and switches mode. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`. Expected totals: 718 pass, 149 skipped, **0 failed, 0 errors**.
+
+**Per the audit's process risk note: a real-loopback CI run is REQUIRED before shipping** — the sandbox-mode pass set covers ASGI / Python-side parity but does NOT exercise the Rust + Tower + socket pipeline (subprocess parity matrix, WebSocket protocol negotiation, `cli._port` lifecycle, public-bind warning, `fastapi-turbo-bench` against a live server, concurrent socket stress). Those are exactly the tests sandbox skips, and they're the ones that catch real-server regressions.
+
+The skip breakdown under sandbox mode (149 total):
+
+* 107 — parity-runner tests under `tests/parity/` (spawn dual subprocess servers for upstream FastAPI + turbo on real ports; whole directory skipped via `parity/conftest.py`).
+* 22 — `test_websocket.py` (uses `websockets.sync.client.connect` against a real subprocess WS server; functional in-process WS coverage in `tests/stress/test_r12_regressions.py` + `test_r15_regressions.py`).
+* 9 — bench-CLI tests (`test_bench_cli_correctness.py` × 5, `test_bench_cli_compat.py` × 3, `test_bench_runner_parser.py` × 1) drive the `fastapi-turbo-bench` Rust binary against a live server.
+* 4 — `test_public_bind_warning.py` exercises the public-bind DoS warning, which only fires when the server actually starts.
+* 4 — `test_testclient_lifecycle.py` asserts on `cli._port` and `TestClient._app_servers` cache state (real-server-only invariants).
+* 2 — `test_middleware.py` (`test_trustedhost_middleware_allowed` hard-codes `allowed_hosts=["127.0.0.1"]` — doesn't match the synthetic sandbox URL host; `test_httpsredirect_middleware` relies on the Rust HTTPSRedirect's `X-Forwarded-Proto` handling, which Starlette's HTTPSRedirectMiddleware doesn't replicate).
+* 1 — `test_concurrent_clients.py` needs real concurrent socket connections.
 
 ## Routing
 
@@ -21,6 +38,7 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | HEAD auto-handling from GET | Full | 405 + `Allow: <declared>` — matches upstream FastAPI byte-for-byte. |
 | OPTIONS auto-generation for CORS | Full | True preflights (`Origin` + `Access-Control-Request-Method`) are handled by `CORSMiddleware`; bare OPTIONS on undeclared method returns 405 + `Allow: <declared>` — matches upstream. |
 | 405 Method Not Allowed on wrong method | Full | |
+| 405 `Allow` header on overlapping routes (literal vs param) | Different-by-design (Rust path) / Full (in-process) | When ``@app.get('/items/{id}')`` and ``@app.post('/items/special')`` are both registered, OPTIONS /items/special on upstream FastAPI returns ``Allow: GET`` (first matched route's methods). The in-process / TestClient ASGI fallback path mirrors that. The Rust server's matcher (matchit + axum) returns ``Allow: POST`` (literal template wins over parameterised) — divergent. Real-server users who depend on first-match semantics should document this; the in-process path is parity-correct. |
 
 ## Dependencies
 
@@ -41,9 +59,8 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | Pydantic v2 body validation | Full | Uses `__pydantic_validator__.validate_json(bytes)` directly. |
 | `Form`, `File`, `UploadFile`, multipart | Full | Rust multipart parser; `UploadFile.read/seek/write/close`. |
 | `Response`, `JSONResponse`, `HTMLResponse`, `PlainTextResponse`, `RedirectResponse`, `StreamingResponse`, `FileResponse` | Full | |
-| `FileResponse` with `Range: bytes=N-M` / `N-` / `-N` | Full | 206 Partial Content with `Content-Range`; 416 on out-of-bounds; 400 on malformed (non-`bytes` unit, reversed `5-3`, no parseable sub-ranges). Validation order matches Starlette 1.0 (bounds check before reversed check). |
-| Multi-range responses (`bytes=0-0,-1` → `multipart/byteranges`) | Full | 206 with `multipart/byteranges; boundary=…`; CRLF wire framing; per-part `Content-Type` + `Content-Range` (Content-Type echoes the response's content-type, including `; charset=utf-8` for textual files); closing `--{boundary}--`; `Content-Length` precomputed. Overlapping/adjacent sub-ranges coalesce before deciding single vs multipart, matching Starlette. |
-| `FileResponse` Range count cap | Different-by-design | Post-coalesce range count > 16 falls back to a 200 full-body response. Starlette has no such cap. Coalesce-first means duplicate / overlapping inputs (e.g. 100×`bytes=0-1023`) collapse to a single range and never hit the cap; only genuinely disjoint requests with > 16 sub-ranges differ from upstream. Documented for clients that need to know. |
+| `FileResponse` with `Range: bytes=N-M` / `N-` / `-N` | Full | 206 Partial Content with `Content-Range`; 416 on out-of-bounds; 400 on malformed (non-`bytes` unit, reversed `5-3`, no parseable sub-ranges). Validation order matches Starlette 1.0 (bounds check before reversed check). 400 / 416 bodies + headers match upstream byte-for-byte. |
+| Multi-range responses (`bytes=0-0,-1` → `multipart/byteranges`) | Full | 206 with `multipart/byteranges; boundary=…`; CRLF wire framing; per-part `Content-Type` + `Content-Range` (Content-Type echoes the response's content-type, including `; charset=utf-8` for textual files); closing `--{boundary}--`; `Content-Length` precomputed. Overlapping/adjacent sub-ranges coalesce before deciding single vs multipart, matching Starlette. No range-count cap — matches upstream's behaviour for download accelerators / media segmenters. |
 | `ORJSONResponse`, `UJSONResponse` | Full | When the optional dep is installed. |
 | SSE: `EventSourceResponse`, `ServerSentEvent`, `format_sse_event` | Full | |
 | `BackgroundTasks` single-task and multi-task | Full | |

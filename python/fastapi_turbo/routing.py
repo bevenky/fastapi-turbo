@@ -1094,20 +1094,82 @@ class APIRouter:
             joined = pfx.rstrip("/") + "/" + child.lstrip("/")
             return joined or "/"
 
-        def _mirror(src_router, pfx: str) -> None:
+        # Resolve the response_class cascade ONCE per included route
+        # so the in-process dispatcher doesn't have to walk the
+        # router/include tree at request time. Cascade matches
+        # upstream: route own → child include_router default →
+        # child router default → … → outermost include
+        # default_response_class → outermost router default. The
+        # walker threads ``parent_default`` through recursion so a
+        # nested router with no default still inherits the
+        # outermost ancestor's default.
+        outer_default = (
+            default_response_class
+            if default_response_class is not None
+            else getattr(router, "default_response_class", None)
+        )
+
+        def _mirror(
+            src_router, pfx: str, parent_default, parent_deps
+        ) -> None:
+            own_default = getattr(src_router, "default_response_class", None)
+            eff_default = own_default if own_default is not None else parent_default
+            # ``parent_deps`` is the dep chain accumulated from the
+            # outermost include down to (but not including) this
+            # router's own deps. Append this router's own deps so
+            # routes registered directly on it get the full chain.
+            eff_extra_deps = list(parent_deps)
+            eff_extra_deps.extend(
+                getattr(src_router, "dependencies", []) or []
+            )
             for r in getattr(src_router, "routes", []):
                 if getattr(r, "_is_included_shadow", False):
                     continue
                 clone = _copy.copy(r)
                 clone.path = _stack_path(pfx, getattr(r, "path", ""))
                 clone._is_included_shadow = True
+                if (
+                    eff_default is not None
+                    and getattr(clone, "response_class", None) is None
+                    and getattr(clone, "_fastapi_turbo_effective_response_class", None)
+                    is None
+                ):
+                    clone._fastapi_turbo_effective_response_class = eff_default
+                if eff_extra_deps:
+                    clone._fastapi_turbo_include_deps = list(eff_extra_deps)
                 self.routes.append(clone)
             for entry in getattr(src_router, "_included_routers", []):
                 child_router, child_prefix = entry[0], entry[1]
+                # Per-include kwarg (entry[3]['default_response_class'])
+                # also overrides for that subtree only.
+                child_meta = entry[3] if len(entry) >= 4 else {}
+                child_include_default = (
+                    child_meta.get("default_response_class")
+                    if isinstance(child_meta, dict)
+                    else None
+                )
+                nested_default = (
+                    child_include_default
+                    if child_include_default is not None
+                    else eff_default
+                )
+                child_include_deps = (
+                    list(child_meta.get("dependencies", []) or [])
+                    if isinstance(child_meta, dict)
+                    else []
+                )
+                nested_parent_deps = (
+                    list(eff_extra_deps) + child_include_deps
+                )
                 nested_prefix = _stack_path(
                     _stack_path(pfx, child_prefix or ""),
                     getattr(child_router, "prefix", "") or "",
                 )
-                _mirror(child_router, nested_prefix)
+                _mirror(
+                    child_router,
+                    nested_prefix,
+                    nested_default,
+                    nested_parent_deps,
+                )
 
-        _mirror(router, full_prefix)
+        _mirror(router, full_prefix, outer_default, list(dependencies or []))

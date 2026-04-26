@@ -36,34 +36,70 @@ def test_rust_path_emits_decimal_as_json_number():
     assert r.content == b'{"whole":5,"frac":1.23,"neg":-100}'
 
 
-def test_rust_path_nonfinite_decimal_becomes_null():
-    # Upstream crashes on NaN Decimal (json.dumps ValueError); we
-    # emit JSON null to keep the response valid.
+def test_nonfinite_decimal_response_does_not_emit_invalid_json():
+    """Returning ``{"v": Decimal("NaN")}`` from a handler must NOT
+    surface as a 200 response with the invalid literal ``NaN`` /
+    ``Infinity`` token in the body. Both the Rust hot path and the
+    Python ``JSONResponse.render`` (with ``allow_nan=False``) reject
+    non-finite floats — the response is either a 5xx error (matches
+    upstream FastAPI's ``json.dumps`` ValueError → 500) OR valid
+    JSON without the literal token (e.g. quoted ``"NaN"`` for paths
+    that coerce non-finite Decimals to strings).
+
+    The earlier assertion ``r.content == b'{"v":null}'`` baked in
+    the Rust path's specific null-coercion as a contract; that's
+    not parity with upstream and creates an inconsistency with the
+    Python path, which raises. Drop the literal-bytes assertion in
+    favour of the semantic guarantee."""
     app = FastAPI()
 
     @app.get("/n")
     def _n():
         return {"v": decimal.Decimal("NaN")}
 
-    c = TestClient(app)
+    # ``raise_server_exceptions=False`` so a server-side ValueError
+    # surfaces as a 500 to the client (Starlette TestClient parity).
+    # Without it, the exception escapes the TestClient and the test
+    # crashes instead of asserting on the response.
+    c = TestClient(app, raise_server_exceptions=False)
     r = c.get("/n")
-    assert r.status_code == 200
-    assert r.content == b'{"v":null}'
+    if r.status_code == 200:
+        assert b"NaN" not in r.content, (
+            f"emitted invalid JSON with NaN literal: {r.content!r}"
+        )
+        assert b"Infinity" not in r.content, (
+            f"emitted invalid JSON with Infinity literal: {r.content!r}"
+        )
+        # If the path emitted a successful 200, the body must be valid JSON.
+        import json
+        json.loads(r.content)
+    else:
+        # Non-200 (typically 500) is the upstream-parity outcome.
+        assert r.status_code >= 500, (
+            f"non-finite Decimal expected 200-with-coercion or "
+            f"5xx error; got {r.status_code} {r.content!r}"
+        )
 
 
-def test_python_jsonresponse_path_emits_decimal_as_number():
-    """``JSONResponse(content=...)`` uses our Python fallback
-    ``_json_default`` — must agree with the Rust path."""
-    app = FastAPI()
+def test_python_jsonresponse_path_with_decimal_raises_typeerror():
+    """Explicit ``fastapi_turbo.responses.JSONResponse({...Decimal...})``
+    raises ``TypeError`` on construction — matching upstream
+    ``starlette.responses.JSONResponse`` exactly. Users who want
+    Decimal coercion should return the dict from a handler (so
+    ``jsonable_encoder`` runs) rather than constructing the
+    JSONResponse directly with raw Decimal values.
 
-    @app.get("/p")
-    def _p():
-        return JSONResponse({"amount": decimal.Decimal("12.99")})
+    The previous behavior (silent coercion via ``_json_default``)
+    was a drop-in parity break — upstream wraps stdlib
+    ``json.dumps`` with no ``default=``, so any non-serializable
+    type raises."""
+    import pytest as _pytest
 
-    c = TestClient(app)
-    r = c.get("/p")
-    assert r.status_code == 200
-    assert r.content == b'{"amount":12.99}'
+    with _pytest.raises(TypeError, match="Decimal"):
+        JSONResponse({"amount": decimal.Decimal("12.99")})
+
+    with _pytest.raises(TypeError, match="Decimal"):
+        JSONResponse({"v": decimal.Decimal("NaN")})
 
 
 def test_nested_decimal_in_list_and_dict():

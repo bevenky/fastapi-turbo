@@ -278,22 +278,35 @@ class Response:
 def _json_default(obj):
     """json.dumps ``default=`` callback for types that aren't JSON-native.
 
-    Mirrors ``fastapi.encoders.jsonable_encoder`` for the types FA
-    commonly sees: ``Decimal`` → int / float (matches upstream),
-    ``bytes`` → UTF-8 str, ``BaseModel`` → dict via ``model_dump``,
-    ``Enum`` → ``.value``. Anything else falls back to ``str(obj)``.
+    Type handling — chosen for ``starlette.responses.JSONResponse``
+    parity, NOT for ``fastapi.encoders.jsonable_encoder`` parity:
+
+      * ``Decimal``: RAISES ``TypeError``. Upstream's
+        ``starlette.responses.JSONResponse`` doesn't pass any
+        ``default=`` to ``json.dumps``, so any Decimal hits the
+        same TypeError. Handlers that return a dict containing
+        Decimals go through ``jsonable_encoder`` (which converts
+        Decimal to int/float) BEFORE reaching this default.
+      * ``bytes`` / ``bytearray``: UTF-8 str.
+      * ``BaseModel``: dict via ``model_dump(by_alias=True)``.
+      * ``Enum``: ``.value``.
+      * Anything else: ``str(obj)`` fallback.
+
+    ``JSONResponse.render`` also passes ``allow_nan=False`` so a
+    raw ``float('nan')`` raises ``ValueError`` rather than emitting
+    invalid ``NaN`` JSON.
     """
     import decimal as _decimal
     if isinstance(obj, _decimal.Decimal):
-        # Non-finite (Infinity / NaN) → float so downstream ``json``
-        # emits ``NaN``/``Infinity`` literals (matches upstream);
-        # integral → int; fractional → float. Previously emitted a
-        # JSON string, which diverged from ``fastapi.encoders``.
-        if not obj.is_finite():
-            return float(obj)
-        if obj == obj.to_integral_value():
-            return int(obj)
-        return float(obj)
+        # Match upstream ``starlette.responses.JSONResponse`` exactly:
+        # explicit ``JSONResponse({"v": Decimal(...)})`` raises
+        # ``TypeError("Object of type Decimal is not JSON
+        # serializable")`` because stdlib ``json.dumps`` doesn't
+        # natively handle Decimal. The default endpoint return path
+        # goes through ``jsonable_encoder`` which converts Decimal
+        # to int/float BEFORE reaching this fallback, so the
+        # encoder-driven path stays working.
+        raise TypeError("Object of type Decimal is not JSON serializable")
     if isinstance(obj, (bytes, bytearray)):
         return bytes(obj).decode("utf-8", errors="replace")
     _md = getattr(obj, "model_dump", None)
@@ -320,11 +333,18 @@ class JSONResponse(Response):
 
     def render(self, content) -> bytes:
         import json
+        # ``allow_nan=False`` so a raw ``float('nan')`` / ``float
+        # ('inf')`` raises ``ValueError`` rather than emitting invalid
+        # ``NaN`` / ``Infinity`` JSON. Decimals (finite OR non-finite)
+        # raise via ``_json_default`` to match upstream
+        # ``starlette.responses.JSONResponse``, which doesn't pass any
+        # ``default=`` to ``json.dumps`` at all.
         return json.dumps(
             content,
             separators=(",", ":"),
             ensure_ascii=False,
             default=_json_default,
+            allow_nan=False,
         ).encode("utf-8")
 
 

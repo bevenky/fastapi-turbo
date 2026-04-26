@@ -1,4 +1,12 @@
-"""Shared fixtures for parity tests: start FastAPI + fastapi-turbo once per session."""
+"""Shared fixtures for parity tests: start FastAPI + fastapi-turbo once per session.
+
+The parity matrix spawns SUBPROCESS servers for both upstream
+FastAPI and turbo on real loopback ports — those processes need
+``socket.bind(('127.0.0.1', 0))`` to succeed. In sandboxed
+environments where loopback bind is denied, every parity test
+would fail with ``PermissionError`` instead of a useful skip.
+The collection hook below skips the entire parity directory in
+that mode."""
 import os
 import socket
 import subprocess
@@ -7,6 +15,33 @@ import time
 
 import httpx
 import pytest
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items):
+    """Skip every parity test when loopback bind is denied —
+    they all spawn subprocess servers that need real ports."""
+    try:
+        from tests.conftest import LOOPBACK_DENIED
+    except ImportError:
+        # Older test trees without the suite-level conftest still
+        # import this directly; fall back to a fresh probe.
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+            return
+        except (PermissionError, OSError):
+            LOOPBACK_DENIED = True
+    if not LOOPBACK_DENIED:
+        return
+    skipper = pytest.mark.skip(
+        reason="parity tests need real loopback ports for subprocess "
+        "servers (FastAPI + turbo); sandbox denies bind."
+    )
+    for item in items:
+        # Only apply to items collected under tests/parity/.
+        if "tests/parity" in str(item.fspath).replace("\\", "/"):
+            item.add_marker(skipper)
+
 
 PYTHON = sys.executable
 TEST_DIR = os.path.dirname(os.path.abspath(__file__))

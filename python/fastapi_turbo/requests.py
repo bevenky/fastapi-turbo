@@ -40,7 +40,6 @@ class HTTPConnection:
         self._receive = receive
         self._send = send
         self._cookies: dict[str, str] | None = None
-        self._state: State | None = None
         # Starlette/FastAPI: scope["root_path"] carries the app mount/prefix
         # (set by reverse-proxy ASGI middleware or TestClient(root_path=...)).
         # Our Rust-built scope doesn't populate it; mirror it from app.root_path
@@ -142,20 +141,30 @@ class HTTPConnection:
 
     @property
     def state(self) -> State:
-        if self._state is None:
-            s = State()
-            # Seed with lifespan-yielded state from scope["state"] or the
-            # owning app's ``_app_state`` so handlers can do
-            # ``request.state.<key>`` after a lifespan yielded a dict.
-            seed = self._scope.get("state")
-            if not seed:
-                app = self._scope.get("app")
-                seed = getattr(app, "_app_state", None) if app is not None else None
+        # State must be SHARED across every Request/HTTPConnection
+        # built from the same scope so middleware mutations
+        # (``request.state.user = X``) propagate to the endpoint that
+        # injects ``request: Request`` and reads ``request.state.user``
+        # downstream. Storing per-instance (the previous
+        # ``self._state``) made each builder produce its own state
+        # object, breaking BaseHTTPMiddleware semantics.
+        existing = self._scope.get("state")
+        if isinstance(existing, State):
+            return existing
+        s = State()
+        if existing:
+            # Seed with lifespan-yielded state (a dict from a lifespan
+            # context manager) or the owning app's ``_app_state``.
+            for k, v in existing.items():
+                setattr(s, k, v)
+        else:
+            app = self._scope.get("app")
+            seed = getattr(app, "_app_state", None) if app is not None else None
             if seed:
                 for k, v in seed.items():
                     setattr(s, k, v)
-            self._state = s
-        return self._state
+        self._scope["state"] = s
+        return s
 
 
 class Request(HTTPConnection):
@@ -185,21 +194,27 @@ class Request(HTTPConnection):
 
     @property
     def state(self) -> State:
-        if self._state is None:
-            s = State()
-            seed = self._scope.get("state")
-            if not seed:
-                app = self._scope.get("app")
-                seed = getattr(app, "_app_state", None) if app is not None else None
+        # See ``HTTPConnection.state`` — state lives in scope, not on
+        # the Request instance, so middleware mutations propagate.
+        existing = self._scope.get("state")
+        if isinstance(existing, State):
+            return existing
+        s = State()
+        if existing:
+            for k, v in existing.items():
+                setattr(s, k, v)
+        else:
+            app = self._scope.get("app")
+            seed = getattr(app, "_app_state", None) if app is not None else None
             if seed:
                 for k, v in seed.items():
                     setattr(s, k, v)
-            self._state = s
-        return self._state
+        self._scope["state"] = s
+        return s
 
     @state.setter
     def state(self, value: State) -> None:
-        self._state = value
+        self._scope["state"] = value
 
     @property
     def user(self):

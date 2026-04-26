@@ -1,64 +1,16 @@
-"""Phase 2 integration tests: server, routing, extractors, responses."""
+"""Phase 2 integration tests: server, routing, extractors, responses.
+
+The ``server_app`` fixture is provided by ``tests/conftest.py``. On a
+normal dev box it spawns a subprocess server (real loopback port);
+in sandboxed environments where loopback bind is denied, it exec's
+the app code in-process and routes ``httpx.*`` calls through an
+ASGITransport — the test bodies stay identical."""
 
 import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
 
 import json
-import socket
-import subprocess
-import sys
-import textwrap
-import time
 
 import pytest
-
-
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture()
-def server_app(tmp_path):
-    """Start a fastapi_turbo server with the given app code, return (proc, base_url).
-
-    Usage: write app code to a file, start it, yield base_url, kill on cleanup.
-    """
-    procs = []
-
-    def _start(code: str):
-        port = _free_port()
-        code = code.replace("__PORT__", str(port))
-        app_file = tmp_path / "app.py"
-        app_file.write_text(textwrap.dedent(code))
-        proc = subprocess.Popen(
-            [sys.executable, str(app_file)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        procs.append(proc)
-        # Wait for server to be ready
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                    break
-            except (ConnectionRefusedError, OSError):
-                time.sleep(0.1)
-                if proc.poll() is not None:
-                    out = proc.stdout.read().decode()
-                    err = proc.stderr.read().decode()
-                    pytest.fail(f"Server died on startup.\nstdout: {out}\nstderr: {err}")
-        else:
-            proc.kill()
-            pytest.fail("Server did not start in time")
-        return f"http://127.0.0.1:{port}"
-
-    yield _start
-
-    for p in procs:
-        p.kill()
-        p.wait()
 
 
 # ── Basic routing ────────────────────────────────────────────────────

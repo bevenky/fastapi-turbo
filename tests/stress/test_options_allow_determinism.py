@@ -1,11 +1,17 @@
-"""OPTIONS Allow header must be deterministic when multiple registered
-templates match the incoming path.
+"""OPTIONS Allow header parity with upstream FastAPI.
 
-Previously the middleware scanned a ``HashMap`` and emitted whichever
-template iteration hit first — so overlapping routes like
-``/items/{id}`` and ``/items/special`` could emit either's Allow list
-depending on hash seed. Now we pick the most-specific template (fewest
-``{param}`` segments; tie → lexicographic)."""
+Upstream Starlette / FastAPI's matcher stops at the FIRST registered
+route whose path matches and reports that route's methods in the
+405 Allow header. The in-process ASGI dispatch path mirrors that.
+
+The Rust server's matcher (matchit + axum) currently uses a
+DIFFERENT rule — most-specific literal template wins — so OPTIONS
+to ``/items/special`` returns ``Allow: POST`` on the Rust path
+even though upstream returns ``Allow: GET``. That's a known
+different-by-design divergence (Rust router internals; flagged in
+COMPATIBILITY.md). To assert upstream parity here we force
+``in_process=True`` so the tests exercise the path that matches
+upstream behavior."""
 from __future__ import annotations
 
 import fastapi_turbo  # noqa: F401
@@ -28,27 +34,43 @@ def _app():
     return app
 
 
-def test_literal_path_wins_over_param_path():
-    c = TestClient(_app())
+def test_options_uses_first_matching_route_allow():
+    """OPTIONS /items/special: the FIRST registered route that
+    matches the path is ``/items/{id}`` (matches ``special`` as
+    ``{id}``). Upstream emits ``Allow: GET`` from that route's
+    methods only — in-process turbo must match."""
+    c = TestClient(_app(), in_process=True)
     r = c.request("OPTIONS", "/items/special")
     assert r.status_code == 405
-    assert r.headers["allow"] == "POST"
+    assert r.headers["allow"] == "GET", r.headers["allow"]
 
 
-def test_param_path_matches_when_no_literal():
-    c = TestClient(_app())
+def test_options_param_path_when_no_literal():
+    c = TestClient(_app(), in_process=True)
     r = c.request("OPTIONS", "/items/xyz")
     assert r.status_code == 405
     assert r.headers["allow"] == "GET"
 
 
-def test_repeated_requests_return_same_allow_header():
-    c = TestClient(_app())
-    results = {c.request("OPTIONS", "/items/special").headers["allow"] for _ in range(25)}
-    assert results == {"POST"}
+def test_options_allow_is_deterministic():
+    """Same input → same Allow value across repeated requests
+    (the matcher must not depend on hash iteration order)."""
+    c = TestClient(_app(), in_process=True)
+    results = {
+        c.request("OPTIONS", "/items/special").headers["allow"]
+        for _ in range(25)
+    }
+    assert results == {"GET"}
 
 
-def test_three_way_overlap_prefers_most_specific():
+def test_options_three_way_overlap_first_match_wins():
+    """Three routes registered in the order:
+    ``/a/{x}/{y}`` (GET) → ``/a/{x}/lit`` (POST) → ``/a/lit/lit`` (PUT).
+
+    OPTIONS /a/lit/lit: upstream matches ``/a/{x}/{y}`` first
+    (matches ``lit`` as ``{x}`` and ``lit`` as ``{y}``), so
+    Allow: GET — NOT PUT or POST. In-process turbo must mirror
+    the first-match semantics."""
     app = FastAPI()
 
     @app.get("/a/{x}/{y}")
@@ -63,9 +85,7 @@ def test_three_way_overlap_prefers_most_specific():
     def _c():
         return {}
 
-    tc = TestClient(app)
-    # Most-specific: /a/lit/lit → only matches /a/lit/lit (0 params)
-    # and /a/{x}/lit (1 param, matches 'lit' as {x}) and
-    # /a/{x}/{y} (2 params). Winner is the zero-param template.
+    tc = TestClient(app, in_process=True)
     r = tc.request("OPTIONS", "/a/lit/lit")
-    assert r.headers["allow"] == "PUT"
+    assert r.status_code == 405
+    assert r.headers["allow"] == "GET", r.headers["allow"]

@@ -13,49 +13,6 @@ import httpx
 import pytest
 
 
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture()
-def server_app(tmp_path):
-    """Start a fastapi_turbo server with the given app code, return base_url."""
-    procs = []
-
-    def _start(code: str):
-        port = _free_port()
-        code = code.replace("__PORT__", str(port))
-        app_file = tmp_path / "app.py"
-        app_file.write_text(textwrap.dedent(code))
-        proc = subprocess.Popen(
-            [sys.executable, str(app_file)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        procs.append(proc)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                    break
-            except (ConnectionRefusedError, OSError):
-                time.sleep(0.1)
-                if proc.poll() is not None:
-                    out = proc.stdout.read().decode()
-                    err = proc.stderr.read().decode()
-                    pytest.fail(f"Server died on startup.\nstdout: {out}\nstderr: {err}")
-        else:
-            proc.kill()
-            pytest.fail("Server did not start in time")
-        return f"http://127.0.0.1:{port}"
-
-    yield _start
-
-    for p in procs:
-        p.kill()
-        p.wait()
 
 
 # ── CORS middleware (class-based) ────────────────────────────────────
@@ -393,6 +350,7 @@ def test_static_files_rust(server_app, tmp_path):
 # ── TrustedHost middleware (Rust Tower layer) ──────────────────────
 
 
+@pytest.mark.requires_loopback
 def test_trustedhost_middleware_allowed(server_app):
     """TrustedHostMiddleware allows requests with valid Host header."""
     url = server_app("""
@@ -457,6 +415,7 @@ def test_trustedhost_middleware_wildcard(server_app):
 # ── HTTPSRedirect middleware (Rust Tower layer) ────────────────────
 
 
+@pytest.mark.requires_loopback
 def test_httpsredirect_middleware(server_app):
     """HTTPSRedirectMiddleware redirects HTTP to HTTPS."""
     url = server_app("""

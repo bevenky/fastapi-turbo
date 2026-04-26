@@ -123,6 +123,320 @@ class _ASGISyncClientShim:
     def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         return self._run(self._client.request(method, url, **kwargs))
 
+    def stream(self, method: str, url: str, **kwargs: Any):
+        """Sync streaming-response context manager (httpx parity).
+
+        Drives the underlying ASGI app DIRECTLY (bypassing
+        ``httpx.ASGITransport``, which buffers all body parts before
+        returning the response — see httpx ``_transports/asgi.py``
+        ``body_parts.append(body)`` followed by
+        ``ASGIResponseStream(body_parts)`` only after the app fully
+        completes). The custom driver here pushes each
+        ``http.response.body`` frame into a thread-safe queue as it
+        arrives, so ``iter_bytes()`` yields chunk-by-chunk in real
+        time.
+
+        Suitable for SSE, long-poll, and infinite streams. First
+        chunk arrives as soon as the handler ``yields`` it, not
+        when the whole response completes.
+
+        Honours ``follow_redirects`` — when True (or the session
+        default is True), 301/302/303/307/308 responses with a
+        ``Location`` header trigger an automatic re-issue at the
+        new target. Capped at 10 redirects to mirror httpx."""
+        # Pull redirect / timeout knobs out of kwargs BEFORE we
+        # forward to the per-request driver — the rest stay as
+        # httpx Request kwargs.
+        follow_redirects = kwargs.pop(
+            "follow_redirects", self._follow_redirects
+        )
+        # ``timeout`` isn't enforced strictly here (the in-process
+        # path is bounded by the user's handler, not by network
+        # latency); we accept and discard for kwarg parity so
+        # ``c.stream(..., timeout=...)`` doesn't TypeError.
+        kwargs.pop("timeout", None)
+
+        max_redirects = 10
+        for _hop in range(max_redirects + 1):
+            facade = self._stream_one_shot(method, url, **kwargs)
+            if not (
+                follow_redirects
+                and facade.status_code in (301, 302, 303, 307, 308)
+                and facade.headers.get("location")
+            ):
+                return facade
+            # Close the current stream cleanly before re-issuing.
+            location = facade.headers["location"]
+            facade.__exit__(None, None, None)
+            # Per RFC 7231 §6.4.4: 303 always becomes GET; other
+            # 3xx preserve the method. Body / json are dropped on
+            # redirect to avoid replaying potentially-large bodies.
+            if facade.status_code == 303:
+                method = "GET"
+            kwargs.pop("content", None)
+            kwargs.pop("json", None)
+            kwargs.pop("data", None)
+            kwargs.pop("files", None)
+            url = location
+        # Too many redirects — raise so the caller sees the loop.
+        raise RuntimeError(
+            f"too many redirects (>{max_redirects}) starting from {url!r}"
+        )
+
+    def _stream_one_shot(self, method: str, url: str, **kwargs: Any):
+        """Drive a single non-redirected request through the in-process
+        ASGI app. Returns the streaming facade. ``stream()`` wraps
+        this with the follow-redirects loop."""
+        from urllib.parse import urlsplit, urlencode
+        import queue as _queue
+
+        # Capture loop reference up-front for ``__exit__`` cancellation.
+        loop = self._loop
+
+        # Honour httpx-style request kwargs by building an
+        # ``httpx.Request`` first — that handles ``params``, ``data``,
+        # ``files``, ``json``, ``content``, ``headers``, ``cookies``,
+        # auth, and url joining the same way ``httpx.AsyncClient.
+        # request`` would. The constructed request is then translated
+        # into an ASGI scope + body. This gives us drop-in httpx
+        # parity for the kwargs surface without re-implementing each
+        # encoder by hand.
+        full_url = url
+        if "://" not in full_url:
+            full_url = self._base_url.rstrip("/") + "/" + full_url.lstrip("/")
+        merged_headers = dict(self._headers or {})
+        for k, v in (kwargs.pop("headers", None) or {}).items():
+            merged_headers[k] = v
+        # Per-call cookies stack on top of the session jar; httpx
+        # merges them into the Cookie header for us.
+        merged_cookies = httpx.Cookies()
+        if self._cookies is not None:
+            try:
+                merged_cookies.update(self._cookies)
+            except Exception:  # noqa: BLE001
+                pass
+        for k, v in (kwargs.pop("cookies", None) or {}).items():
+            merged_cookies.set(k, v)
+        # ``httpx.Request`` accepts these kwargs natively; pass them
+        # through verbatim. Unknown kwargs (extensions / auth /
+        # follow_redirects) are dropped silently — TestClient.stream
+        # callers in the test suite don't exercise them.
+        req = httpx.Request(
+            method=method.upper(),
+            url=full_url,
+            params=kwargs.pop("params", None),
+            content=kwargs.pop("content", None),
+            data=kwargs.pop("data", None),
+            files=kwargs.pop("files", None),
+            json=kwargs.pop("json", None),
+            headers=merged_headers,
+            cookies=merged_cookies if merged_cookies else None,
+        )
+        parts = urlsplit(str(req.url))
+        path = parts.path or "/"
+        query = parts.query.encode("latin-1") if parts.query else b""
+        host = parts.hostname or "testserver"
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        # ``httpx.Request`` already serialised the body and built
+        # the final header list (Content-Type, Content-Length,
+        # Cookie, etc.) — translate directly.
+        req_body = req.read() or b""
+        raw_headers: list[tuple[bytes, bytes]] = []
+        for k, v in req.headers.raw:
+            raw_headers.append(
+                (k.lower() if isinstance(k, bytes) else k.lower().encode("latin-1"),
+                 v if isinstance(v, bytes) else v.encode("latin-1"))
+            )
+        if not any(k == b"host" for k, _ in raw_headers):
+            raw_headers.append(
+                (b"host", (
+                    f"{host}:{port}" if port not in (80, 443) else host
+                ).encode("latin-1"))
+            )
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": method.upper(),
+            "scheme": parts.scheme or "http",
+            "server": (host, port),
+            "client": ("testclient", 50000),
+            "root_path": "",
+            "path": path,
+            "raw_path": path.encode("latin-1"),
+            "query_string": query,
+            "headers": raw_headers,
+            "app": self._app,
+        }
+
+        # Thread-safe queue for body chunks. Status + headers
+        # captured separately and signalled via an Event. Early
+        # client exit is signalled via ``client_disconnected`` —
+        # the next ``receive()`` call will return an
+        # ``http.disconnect`` message so the app's generator can
+        # observe ``CancelledError`` / ``GeneratorExit`` and unwind
+        # cleanly. Without this, an infinite stream would keep
+        # producing chunks after the test exited the ``with`` block
+        # and pytest would warn ``Task was destroyed but it is
+        # pending``.
+        chunk_q: _queue.Queue = _queue.Queue()
+        SENTINEL = object()
+        status_holder: dict = {}
+        ready = threading.Event()
+        done = threading.Event()
+        client_disconnected = threading.Event()
+        request_consumed = threading.Event()
+        # ``app_task_holder`` lets ``__exit__`` cancel the running
+        # asyncio task — necessary for infinite generators that
+        # don't observe ``http.disconnect`` (they ignore receive).
+        app_task_holder: dict = {}
+
+        async def _receive():
+            # First call delivers the request body; subsequent calls
+            # block until the client disconnects. Returning
+            # ``http.disconnect`` lets the app's body generator
+            # observe ``GeneratorExit`` via ASGI semantics.
+            if not request_consumed.is_set():
+                request_consumed.set()
+                return {
+                    "type": "http.request",
+                    "body": req_body,
+                    "more_body": False,
+                }
+            # Wait for client disconnect.
+            while not client_disconnected.is_set():
+                await asyncio.sleep(0.01)
+            return {"type": "http.disconnect"}
+
+        async def _send(message):
+            mtype = message["type"]
+            if mtype == "http.response.start":
+                status_holder["status"] = message["status"]
+                status_holder["headers"] = message.get("headers", [])
+                ready.set()
+            elif mtype == "http.response.body":
+                body = message.get("body", b"")
+                more = message.get("more_body", False)
+                if body:
+                    chunk_q.put(body)
+                if not more:
+                    chunk_q.put(SENTINEL)
+                    done.set()
+
+        async def _run_app():
+            try:
+                # Capture the running task so ``__exit__`` can
+                # cancel it explicitly when the client exits early.
+                app_task_holder["task"] = asyncio.current_task()
+                await self._app(scope, _receive, _send)
+            except asyncio.CancelledError:
+                # Client cancelled — propagate so the loop unwinds.
+                raise
+            finally:
+                if not done.is_set():
+                    chunk_q.put(SENTINEL)
+                    done.set()
+
+        # Schedule the app on the background loop.
+        future = asyncio.run_coroutine_threadsafe(_run_app(), self._loop)
+
+        # Wait for headers (or completion if the app errored).
+        if not ready.wait(timeout=10):
+            future.cancel()
+            raise RuntimeError("ASGI app did not send response headers within 10s")
+
+        status_code = status_holder["status"]
+        # Build httpx-style Headers from raw list.
+        from httpx import Headers as _Hdr
+        decoded = [
+            (
+                k.decode("latin-1") if isinstance(k, bytes) else str(k),
+                v.decode("latin-1") if isinstance(v, bytes) else str(v),
+            )
+            for k, v in status_holder["headers"]
+        ]
+        response_headers = _Hdr(decoded)
+
+        class _StreamFacade:
+            status_code = None  # set below
+            headers = None
+            url = full_url
+
+            def __enter__(_self):
+                return _self
+
+            def __exit__(_self, *exc):
+                # Signal the receive loop that the client has gone.
+                # The next ``await receive()`` returns
+                # ``http.disconnect`` so the app's body generator
+                # observes ``GeneratorExit`` and unwinds.
+                client_disconnected.set()
+                # Do NOT drain ``chunk_q`` here — with an unbounded
+                # queue the producer never blocks on ``put``, so
+                # there's no deadlock to break. A drain loop would
+                # spin forever against a no-sleep infinite generator
+                # because new chunks land as fast as we pull them,
+                # and we'd never reach the cancellation code below.
+                # Give the app a brief beat to honour the disconnect
+                # naturally (handlers that ``await ws.receive()``
+                # observe the ``http.disconnect`` reply); then
+                # cancel explicitly for handlers that ignore
+                # ``receive()`` entirely (the common
+                # ``async for chunk in source: yield chunk`` shape).
+                try:
+                    future.result(timeout=0.1)
+                except Exception:  # noqa: BLE001
+                    pass
+                if not future.done():
+                    task = app_task_holder.get("task")
+                    if task is not None:
+                        loop.call_soon_threadsafe(task.cancel)
+                    try:
+                        future.result(timeout=2)
+                    except Exception:  # noqa: BLE001
+                        pass
+                return None
+
+            def iter_bytes(_self, chunk_size: int | None = None):
+                while True:
+                    item = chunk_q.get()
+                    if item is SENTINEL:
+                        return
+                    if chunk_size is None or len(item) <= chunk_size:
+                        yield item
+                    else:
+                        for i in range(0, len(item), chunk_size):
+                            yield item[i : i + chunk_size]
+
+            def _charset(_self) -> str:
+                ct = response_headers.get("content-type", "")
+                if "charset=" in ct:
+                    return (
+                        ct.split("charset=", 1)[1].strip().split(";", 1)[0]
+                    )
+                return "utf-8"
+
+            def iter_text(_self, chunk_size: int | None = None):
+                charset = _self._charset()
+                for c in _self.iter_bytes(chunk_size):
+                    yield c.decode(charset, errors="replace")
+
+            def read(_self) -> bytes:
+                return b"".join(_self.iter_bytes())
+
+            @property
+            def text(_self) -> str:
+                return _self.read().decode(_self._charset(), errors="replace")
+
+            @property
+            def content(_self) -> bytes:
+                return _self.read()
+
+        _StreamFacade.status_code = status_code
+        _StreamFacade.headers = response_headers
+        return _StreamFacade()
+
     @property
     def headers(self):
         return self._client.headers
@@ -637,6 +951,20 @@ class TestClient:
         self._check_raised()
         return r
 
+    def stream(self, method: str, url: str, **kwargs: Any):
+        """Streaming-response context manager (httpx parity).
+
+        Routes through ``self._client.stream`` which exists on both
+        backing clients: real ``httpx.Client`` (when bound to a real
+        loopback server) and ``_ASGISyncClientShim`` (in-process
+        fallback). Both return a context manager that yields a
+        response with ``status_code`` / ``headers`` /
+        ``iter_bytes`` / ``iter_text`` etc.
+        """
+        self._ensure_started()
+        self._track_follow(kwargs)
+        return self._client.stream(method, url, **kwargs)
+
     def put(self, url: str, **kwargs: Any) -> httpx.Response:
         self._ensure_started()
         self._track_follow(kwargs)
@@ -706,6 +1034,48 @@ class TestClient:
         # (without ``with TestClient(...)``) works — matches Starlette's
         # TestClient, which FA's tests use.
         self._ensure_started()
+
+        # In-process / fallback path: there is no real loopback port,
+        # so build an ASGI WebSocket scope and drive ``self.app`` via
+        # asyncio queues. Without this we'd construct
+        # ``ws://127.0.0.1:None{url}`` and ``websockets.sync.client``
+        # would crash with ``ValueError: Port could not be cast to
+        # integer value as 'None'``.
+        if getattr(self, "_in_process", False) or self._port is None:
+            cookie_jar: dict[str, str] = {}
+            if self._client is not None:
+                try:
+                    for c in self._client.cookies.jar:
+                        cookie_jar[c.name] = c.value
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._seed_cookies:
+                cookie_jar.update(dict(self._seed_cookies))
+            if cookies:
+                cookie_jar.update(cookies)
+            hdrs_list: list[tuple[str, str]] = []
+            if headers:
+                for k, v in dict(headers).items():
+                    hdrs_list.append((k, v))
+            ws_path = url
+            if not ws_path.startswith("/"):
+                # Allow callers to pass a full ``ws://host/path`` URL.
+                from urllib.parse import urlparse as _up
+                parsed = _up(url)
+                ws_path = parsed.path + (
+                    f"?{parsed.query}" if parsed.query else ""
+                )
+            if not ws_path.startswith("/"):
+                ws_path = "/" + ws_path
+            inproc_url = f"ws://testserver{ws_path}"
+            return _InProcessWebSocketSession(
+                app=self.app,
+                url=inproc_url,
+                subprotocols=subprotocols,
+                headers=hdrs_list,
+                cookies=cookie_jar,
+            )
+
         ws_url = f"ws://127.0.0.1:{self._port}{url}"
         # Carry forward cookies set on the client (``client.cookies``
         # or ``cookies=`` in the TestClient ctor) as a ``Cookie``
@@ -764,6 +1134,195 @@ class TestClient:
             app=self.app,
             **kwargs,
         )
+
+
+class _InProcessWebSocketSession:
+    """ASGI-driven WebSocket session for the in-process / fallback
+    ``TestClient`` path.
+
+    No real socket — drives the app's ``websocket`` scope through
+    asyncio queues so ``ws://127.0.0.1:None`` (the broken loopback
+    URL when ``_port=None``) is never built. Implements the same
+    surface as ``_WebSocketTestSession`` for the methods Starlette
+    tests commonly use: ``send_text`` / ``send_bytes`` /
+    ``send_json``, the matching ``receive_*``, ``close``,
+    ``accepted_subprotocol``."""
+
+    def __init__(
+        self,
+        app: Any,
+        url: str,
+        subprotocols: list[str] | None = None,
+        headers: list[tuple[str, str]] | None = None,
+        cookies: dict[str, str] | None = None,
+    ):
+        self._app = app
+        self._url = url
+        self._subprotocols = subprotocols or []
+        self._headers = list(headers or [])
+        self._cookies = dict(cookies or {})
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever,
+            daemon=True,
+            name="fastapi-turbo-ws-inproc",
+        )
+        self._thread.start()
+        self._client_to_server: Any = None
+        self._server_to_client: Any = None
+        self._app_task: Any = None
+        self._accepted = False
+        self._accepted_subprotocol: str | None = None
+        self._closed = False
+
+    def _run(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def __enter__(self) -> "_InProcessWebSocketSession":
+        from urllib.parse import urlparse
+
+        u = urlparse(self._url)
+        path = u.path or "/"
+        query = u.query.encode("latin-1") if u.query else b""
+
+        hdrs: list[tuple[bytes, bytes]] = []
+        for k, v in self._headers:
+            hdrs.append(
+                (
+                    k.lower().encode("latin-1"),
+                    v.encode("latin-1"),
+                )
+            )
+        if self._cookies:
+            cookie = "; ".join(f"{k}={v}" for k, v in self._cookies.items())
+            hdrs.append((b"cookie", cookie.encode("latin-1")))
+        if not any(h[0] == b"host" for h in hdrs):
+            hdrs.append((b"host", b"testserver"))
+
+        scope = {
+            "type": "websocket",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "scheme": "ws",
+            "server": ("testserver", 80),
+            "client": ("testclient", 50000),
+            "root_path": "",
+            "path": path,
+            "raw_path": path.encode("latin-1"),
+            "query_string": query,
+            "headers": hdrs,
+            "subprotocols": list(self._subprotocols),
+            "app": self._app,
+        }
+
+        async def _setup():
+            self._client_to_server = asyncio.Queue()
+            self._server_to_client = asyncio.Queue()
+            await self._client_to_server.put({"type": "websocket.connect"})
+
+            async def _receive():
+                return await self._client_to_server.get()
+
+            async def _send(msg):
+                await self._server_to_client.put(msg)
+
+            self._app_task = asyncio.create_task(
+                self._app(scope, _receive, _send)
+            )
+            return await self._server_to_client.get()
+
+        first_msg = self._run(_setup())
+        if first_msg["type"] == "websocket.accept":
+            self._accepted = True
+            self._accepted_subprotocol = first_msg.get("subprotocol")
+        elif first_msg["type"] == "websocket.close":
+            from fastapi_turbo.exceptions import WebSocketDisconnect
+            raise WebSocketDisconnect(code=first_msg.get("code", 1000))
+        else:
+            raise RuntimeError(
+                f"unexpected first WS server message: {first_msg!r}"
+            )
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+        self._loop.call_soon_threadsafe(self._loop.stop)
+
+    @property
+    def accepted_subprotocol(self) -> str | None:
+        return self._accepted_subprotocol
+
+    def send_text(self, text: str) -> None:
+        async def _put():
+            await self._client_to_server.put(
+                {"type": "websocket.receive", "text": text}
+            )
+        self._run(_put())
+
+    def send_bytes(self, data: bytes) -> None:
+        async def _put():
+            await self._client_to_server.put(
+                {"type": "websocket.receive", "bytes": bytes(data)}
+            )
+        self._run(_put())
+
+    def send_json(self, data: Any, mode: str = "text") -> None:
+        import json
+        encoded = json.dumps(data)
+        if mode == "binary":
+            self.send_bytes(encoded.encode("utf-8"))
+        else:
+            self.send_text(encoded)
+
+    def _next_message(self) -> dict[str, Any]:
+        async def _get():
+            return await self._server_to_client.get()
+        msg = self._run(_get())
+        if msg["type"] == "websocket.close":
+            self._closed = True
+            from fastapi_turbo.exceptions import WebSocketDisconnect
+            raise WebSocketDisconnect(
+                code=msg.get("code", 1000),
+                reason=msg.get("reason", "") or "",
+            )
+        return msg
+
+    def receive_text(self) -> str:
+        msg = self._next_message()
+        return msg.get("text", "")
+
+    def receive_bytes(self) -> bytes:
+        msg = self._next_message()
+        return msg.get("bytes", b"")
+
+    def receive_json(self, mode: str = "text") -> Any:
+        import json
+        if mode == "binary":
+            return json.loads(self.receive_bytes())
+        return json.loads(self.receive_text())
+
+    def close(self, code: int = 1000) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        async def _disconnect():
+            try:
+                await self._client_to_server.put(
+                    {"type": "websocket.disconnect", "code": code}
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            if self._app_task is not None:
+                try:
+                    await asyncio.wait_for(self._app_task, timeout=1.0)
+                except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                    pass
+
+        try:
+            self._run(_disconnect())
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class _WebSocketTestSession:

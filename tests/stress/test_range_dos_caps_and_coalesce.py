@@ -164,9 +164,15 @@ def test_disjoint_ranges_remain_multipart(tmp_path):
     _run(go())
 
 
-def test_too_many_ranges_falls_back_to_full(tmp_path):
-    """A header with > MAX_RANGES (16) sub-ranges falls back to 200
-    full body — matches Rust path's existing cap."""
+def test_many_disjoint_ranges_serve_multipart(tmp_path):
+    """20 disjoint 4-byte sub-ranges → 206 multipart/byteranges with
+    all 20 parts (matches upstream Starlette — no range-count cap).
+
+    Earlier revisions capped to 16 and bailed to 200; that diverged
+    from upstream behaviour for download accelerators / segmenters
+    that send many ranges. The post-coalesce byte sum is bounded by
+    ``total_len`` so the cap was never needed for DoS protection.
+    Multipart envelope overhead is ~150 bytes per part."""
     payload = b"x" * 1024
     f = _write(tmp_path, "s.bin", payload)
     app = FastAPI()
@@ -175,18 +181,25 @@ def test_too_many_ranges_falls_back_to_full(tmp_path):
     def _f():
         return FileResponse(str(f))
 
-    # 20 distinct sub-ranges — over the 16 cap. Tightly packed so they
-    # don't all coalesce into one big range (gap of 4 bytes between
-    # each).
     parts = [f"{i*8}-{i*8+3}" for i in range(20)]
     range_value = "bytes=" + ",".join(parts)
+
     async def go():
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://t"
         ) as cli:
             r = await cli.get("/f", headers={"Range": range_value})
-            # Either coalesced, capped to <=16, or bailed to 200.
-            assert r.status_code in (200, 206)
-            assert len(r.content) <= 2 * len(payload)
+            assert r.status_code == 206
+            assert r.headers["content-type"].startswith(
+                "multipart/byteranges;"
+            )
+            # Each of the 20 ranges has its own Content-Range header.
+            for i in range(20):
+                start = i * 8
+                end = start + 3
+                expected = f"Content-Range: bytes {start}-{end}/1024"
+                assert expected.encode() in r.content, (
+                    f"missing per-part header for range {i}: {expected!r}"
+                )
 
     _run(go())

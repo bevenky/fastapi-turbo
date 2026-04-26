@@ -1083,14 +1083,15 @@ pub fn file_response(
 
 /// Result of parsing an RFC 7233 `Range:` header against a known file
 /// size. Mirrors Starlette 1.0's branching: ``Malformed`` → 400,
-/// ``Unsatisfiable`` → 416, ``Full`` → 200 (no ranges OR DoS-cap
-/// exceeded), ``Single`` → 206 single-range, ``Multi`` → 206
-/// multipart/byteranges.
+/// ``Unsatisfiable`` → 416, ``Single`` → 206 single-range, ``Multi`` →
+/// 206 multipart/byteranges.
+///
+/// Note: there's no "fall through to 200 full body" variant — the
+/// header-absent case never reaches this fn (the caller short-circuits
+/// to the no-range path) and there's no DoS cap that would silently
+/// bail to a full body, so every reachable path produces one of the
+/// four variants below.
 pub enum RangeOutcome {
-    /// Serve 200 with the full body. Used when the header is absent, OR
-    /// when the post-coalesce range count exceeds ``MAX_RANGES``
-    /// (different-by-design DoS guard, documented in COMPATIBILITY.md).
-    Full,
     /// Serve 206 with a single ``Content-Range`` header.
     Single(u64, u64),
     /// Serve 206 ``multipart/byteranges`` covering these ranges.
@@ -1119,11 +1120,11 @@ pub enum RangeOutcome {
 ///   * Overlapping/adjacent sub-ranges are coalesced before deciding
 ///     single vs multipart.
 ///
-/// DoS guard (different-by-design): post-coalesce range count > 16
-/// returns ``RangeOutcome::Full`` rather than amplifying the response.
+/// No range-count cap: post-coalesce the byte sum is bounded by
+/// ``total_len`` (non-overlapping within the file), so the only
+/// amplification is multipart-envelope overhead (~150 bytes per
+/// range). Matches upstream's lack of cap.
 pub fn parse_byte_ranges(header: &str, total_len: u64) -> RangeOutcome {
-    const MAX_RANGES: usize = 16;
-
     // Error-message strings match Starlette 1.0 byte-for-byte so
     // error-body comparisons against upstream pass.
     let trimmed = header.trim();
@@ -1214,12 +1215,6 @@ pub fn parse_byte_ranges(header: &str, total_len: u64) -> RangeOutcome {
             }
         }
         coalesced.push((s, e));
-    }
-
-    if coalesced.len() > MAX_RANGES {
-        // Different-by-design DoS guard. Coalesce-first ensures
-        // legitimate duplicate/overlapping inputs never trip this.
-        return RangeOutcome::Full;
     }
 
     // Convert half-open back to inclusive ``[start, end]`` for the
@@ -1503,7 +1498,6 @@ pub fn file_response_with_range(
     //   * Single/Multi → emit partial content
     let ranges: Option<Vec<(u64, u64)>> = match effective_range {
         Some(h) => match parse_byte_ranges(h, total_len) {
-            RangeOutcome::Full => None,
             RangeOutcome::Single(s, e) => Some(vec![(s, e)]),
             RangeOutcome::Multi(rs) => Some(rs),
             RangeOutcome::Unsatisfiable => {

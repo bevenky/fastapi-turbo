@@ -14,10 +14,17 @@ import gc
 import socket
 import weakref
 
+import pytest
+
 import fastapi_turbo  # noqa: F401
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+# Lifecycle assertions read ``TestClient._app_servers`` and
+# ``cli._port`` directly — those are populated only on the
+# real-server path. Skip cleanly when loopback binds are denied.
+pytestmark = pytest.mark.requires_loopback
 
 
 def _port_bound(port: int) -> bool:

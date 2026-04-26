@@ -22,6 +22,11 @@ import time
 from pathlib import Path
 
 import pytest
+# Spawns subprocess servers / runs the ``fastapi-turbo-bench`` binary
+# against a live loopback port — needs ``socket.bind('127.0.0.1', 0)``
+# to succeed. Skip cleanly in sandboxes that deny bind.
+pytestmark = pytest.mark.requires_loopback
+
 
 BENCH_BIN = Path(__file__).resolve().parents[2] / "target" / "release" / "fastapi-turbo-bench"
 
