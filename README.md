@@ -1,6 +1,6 @@
 # fastapi-turbo
 
-Drop-in replacement for FastAPI, powered by Rust + Axum. Hello-world throughput on loopback at `c=1` is competitive with Fastify (Node.js), Go Gin, and Go Echo. CRUD-style workloads (Pydantic body validation + JSON encode + ORM hops) land at roughly 65–85% of Go on the same hardware. See [benchmarks.md](benchmarks.md) and [benchmarks/latest_bench.md](benchmarks/latest_bench.md) for the full breakdown across `c=1 / 32 / 256` and CRUD/echo/redis/sql/sse workloads.
+Drop-in replacement for FastAPI, powered by Rust + Axum. **Hello-world throughput on macOS loopback at `c=1` only** is competitive with Fastify (Node.js), Go Gin, and Go Echo — at higher concurrencies (`c=32+`) Go's per-core goroutine model pulls ahead. CRUD-style workloads (Pydantic body validation + JSON encode + ORM hops) land at roughly 65–85% of Go on the same hardware. See [benchmarks.md](benchmarks.md) and [benchmarks/latest_bench.md](benchmarks/latest_bench.md) for the full breakdown across `c=1 / 32 / 256` and CRUD/echo/redis/sql/sse workloads, and the documented caveats (Linux-x86_64 numbers pending, `wrk`/`bombardier` cross-checks pending).
 
 ```python
 # Change one import — everything else stays the same
@@ -404,7 +404,7 @@ python benchmarks/bench_hello.py
 
 - **Rust core** (~8K lines): Axum 0.8, hyper, tokio, Tower, PyO3 0.28, crossbeam; HTTP, WebSocket, multipart, streaming, DB pool, HTTP client
 - **Python layer** (~22K lines): FastAPI-compatible API, introspection, OpenAPI 3.1 generator, Starlette/FastAPI `sys.modules` compat shims
-- **Tests** (~45K lines): 877 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
+- **Tests** (~45K lines): 888 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
 
 See [CLAUDE.md](CLAUDE.md) for development guide, [benchmarks.md](benchmarks.md) for full benchmark data including Go Echo, Fastify, free-threaded Python, and WebSocket library comparisons, and [COMPATIBILITY.md](COMPATIBILITY.md) for a per-feature map of where fastapi_turbo sits against FastAPI 0.136.0 (Full / Partial / Not-implemented / Different-by-design).
 

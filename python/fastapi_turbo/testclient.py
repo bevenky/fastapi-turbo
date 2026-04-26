@@ -42,6 +42,64 @@ AsyncClient = httpx.AsyncClient
 ASGITransport = httpx.ASGITransport
 
 
+class _BufferedStreamFacade:
+    """Stream-facade backed by a fully-buffered body. Returned by
+    ``_ASGISyncClientShim.stream()`` when an auth challenge-response
+    loop forced us to drain intermediate responses to feed back into
+    ``flow.send(resp)``. The user-facing surface (``iter_bytes`` /
+    ``iter_text`` / ``read`` / ``content`` / ``text`` / ``status_code``
+    / ``headers`` / ``url`` / context-manager protocol) is identical
+    to the live-streaming facade — only the chunking is lost (the
+    body comes out as a single chunk, since by the time we know it's
+    the final response we've already consumed it). For Basic auth the
+    flow terminates after one ``StopIteration`` so this still wraps a
+    correct response; for Digest auth the same applies after the
+    second round."""
+
+    def __init__(self, *, status_code: int, headers, body: bytes, url: str):
+        self.status_code = status_code
+        self.headers = headers
+        self._body = body
+        self.url = url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+    def iter_bytes(self, chunk_size: int | None = None):
+        if not self._body:
+            return
+        if chunk_size is None or len(self._body) <= chunk_size:
+            yield self._body
+            return
+        for i in range(0, len(self._body), chunk_size):
+            yield self._body[i : i + chunk_size]
+
+    def _charset(self) -> str:
+        ct = self.headers.get("content-type", "")
+        if "charset=" in ct:
+            return ct.split("charset=", 1)[1].strip().split(";", 1)[0]
+        return "utf-8"
+
+    def iter_text(self, chunk_size: int | None = None):
+        charset = self._charset()
+        for c in self.iter_bytes(chunk_size):
+            yield c.decode(charset, errors="replace")
+
+    def read(self) -> bytes:
+        return self._body
+
+    @property
+    def text(self) -> str:
+        return self._body.decode(self._charset(), errors="replace")
+
+    @property
+    def content(self) -> bytes:
+        return self._body
+
+
 class _ASGISyncClientShim:
     """Sync httpx-like facade over an async ``httpx.AsyncClient`` backed
     by ``ASGITransport``. Used when the wrapped app is a bare ASGI
@@ -143,9 +201,20 @@ class _ASGISyncClientShim:
         Honours ``follow_redirects`` — when True (or the session
         default is True), 301/302/303/307/308 responses with a
         ``Location`` header trigger an automatic re-issue at the
-        new target. Capped at 10 redirects to mirror httpx."""
-        # Pull redirect / timeout knobs out of kwargs BEFORE we
-        # forward to the per-request driver — the rest stay as
+        new target. Capped at 10 redirects to mirror httpx.
+
+        Honours ``auth`` — accepts ``(user, pass)`` (treated as
+        ``httpx.BasicAuth``) or any ``httpx.Auth`` instance. The
+        full challenge-response loop runs: each yielded request goes
+        through the in-process app, the resulting response is fed
+        back via ``flow.send(resp)``, and the loop terminates on
+        ``StopIteration``. This makes ``httpx.DigestAuth`` work
+        end-to-end (initial 401 → server's nonce parsed by the auth
+        flow → second request stamped with ``Authorization: Digest …``
+        → 200 returned to the caller). Earlier code only used the
+        first yielded request, so digest auth always returned 401."""
+        # Pull redirect / timeout / auth knobs out of kwargs BEFORE
+        # we forward to the per-request driver — the rest stay as
         # httpx Request kwargs.
         follow_redirects = kwargs.pop(
             "follow_redirects", self._follow_redirects
@@ -156,6 +225,105 @@ class _ASGISyncClientShim:
         # ``c.stream(..., timeout=...)`` doesn't TypeError.
         kwargs.pop("timeout", None)
 
+        auth = kwargs.pop("auth", None)
+        auth_inst = self._normalise_auth(auth)
+
+        if auth_inst is None:
+            return self._stream_with_redirects(
+                method, url, follow_redirects, **kwargs
+            )
+
+        # Auth challenge-response loop. Build a fresh ``httpx.Request``
+        # to seed the flow, then for each yielded request run the
+        # in-process app, materialise an ``httpx.Response``, and feed
+        # it back. ``StopIteration`` means the last request/response
+        # pair is the final answer.
+        from urllib.parse import urlsplit
+        full_url = url
+        if "://" not in full_url:
+            full_url = self._base_url.rstrip("/") + "/" + full_url.lstrip("/")
+        merged_headers = dict(self._headers or {})
+        for k, v in (kwargs.get("headers") or {}).items():
+            merged_headers[k] = v
+        seed_req = httpx.Request(
+            method=method.upper(),
+            url=full_url,
+            params=kwargs.get("params"),
+            content=kwargs.get("content"),
+            data=kwargs.get("data"),
+            files=kwargs.get("files"),
+            json=kwargs.get("json"),
+            headers=merged_headers,
+            cookies=kwargs.get("cookies"),
+        )
+        flow = auth_inst.sync_auth_flow(seed_req)
+        try:
+            cur_req = next(flow)
+        except StopIteration:
+            return self._stream_with_redirects(
+                method, url, follow_redirects, **kwargs
+            )
+
+        from httpx import Response as _Resp
+        max_auth_rounds = 4  # mirrors httpx's auth-loop guard
+        for _round in range(max_auth_rounds + 1):
+            # Translate the auth-flow's ``httpx.Request`` back into
+            # kwargs for ``_stream_with_redirects``. The flow may have
+            # mutated headers (e.g. added ``Authorization``) — pass
+            # the request's headers + URL + body wholesale; drop
+            # original encoder kwargs (``json`` / ``files`` / ``data``
+            # / ``params``) since the body is already serialised.
+            round_kwargs: dict[str, Any] = {}
+            round_kwargs["headers"] = dict(cur_req.headers)
+            round_kwargs["content"] = cur_req.read() or b""
+            facade = self._stream_with_redirects(
+                cur_req.method, str(cur_req.url), follow_redirects,
+                **round_kwargs,
+            )
+            body = facade.read()
+            facade.__exit__(None, None, None)
+            resp = _Resp(
+                status_code=facade.status_code,
+                headers=facade.headers,
+                content=body,
+                request=cur_req,
+            )
+            try:
+                cur_req = flow.send(resp)
+            except StopIteration:
+                return _BufferedStreamFacade(
+                    status_code=facade.status_code,
+                    headers=facade.headers,
+                    body=body,
+                    url=str(cur_req.url),
+                )
+        raise RuntimeError(
+            f"auth flow did not terminate after {max_auth_rounds} rounds"
+        )
+
+    def _normalise_auth(self, auth: Any) -> Any:
+        """Normalise ``auth=`` kwarg into an ``httpx.Auth`` instance,
+        or ``None`` if not provided / unsupported."""
+        if auth is None:
+            return None
+        from httpx import Auth as _Auth, BasicAuth as _BasicAuth
+        if isinstance(auth, _Auth):
+            return auth
+        if isinstance(auth, tuple) and len(auth) == 2:
+            return _BasicAuth(auth[0], auth[1])
+        return None
+
+    def _stream_with_redirects(
+        self,
+        method: str,
+        url: str,
+        follow_redirects: bool,
+        **kwargs: Any,
+    ):
+        """Per-request driver wrapped with the follow-redirects loop.
+        Auth is handled one level up in ``stream()``; this just runs
+        the request, and on a 3xx with a Location header re-issues at
+        the new target up to ``max_redirects`` times."""
         max_redirects = 10
         for _hop in range(max_redirects + 1):
             facade = self._stream_one_shot(method, url, **kwargs)
@@ -180,10 +348,6 @@ class _ASGISyncClientShim:
             #     always rewrote — httpx mirrors that). Other
             #     methods are preserved.
             #   * 307 / 308: method is preserved (RFC mandate).
-            #
-            # Earlier code only rewrote 303, so a POST → 301 / 302
-            # chain re-POSTed to the redirect target; upstream
-            # FastAPI's httpx-backed TestClient GETs it.
             method_upper = method.upper()
             if status == 303 and method_upper not in ("GET", "HEAD"):
                 method = "GET"
@@ -238,13 +402,10 @@ class _ASGISyncClientShim:
         for k, v in (kwargs.pop("cookies", None) or {}).items():
             merged_cookies.set(k, v)
         # ``httpx.Request`` accepts the per-request kwargs natively.
-        # ``auth=`` isn't a Request constructor kwarg — it's an
-        # httpx.Auth instance applied via ``next(auth.sync_auth_flow
-        # (request))`` (the auth flow can mutate the request, e.g.
-        # add ``Authorization: Basic …``). We invoke that here so
-        # ``c.stream(..., auth=("u", "p"))`` produces the same
-        # Authorization header upstream's TestClient would.
-        auth = kwargs.pop("auth", None)
+        # ``auth=`` is handled at the ``stream()`` level above (full
+        # challenge-response loop), not here — by this point the
+        # auth-flow's mutations (added ``Authorization`` header etc.)
+        # have already landed in ``kwargs["headers"]``.
         req = httpx.Request(
             method=method.upper(),
             url=full_url,
@@ -256,29 +417,6 @@ class _ASGISyncClientShim:
             headers=merged_headers,
             cookies=merged_cookies if merged_cookies else None,
         )
-        if auth is not None:
-            # Normalise tuple shorthand to ``BasicAuth`` exactly as
-            # ``httpx.Client`` does internally.
-            from httpx import BasicAuth as _BasicAuth
-            from httpx import Auth as _Auth
-            if isinstance(auth, tuple) and len(auth) == 2:
-                auth_inst = _BasicAuth(auth[0], auth[1])
-            elif isinstance(auth, _Auth):
-                auth_inst = auth
-            else:
-                auth_inst = None
-            if auth_inst is not None:
-                # ``sync_auth_flow`` is a generator that yields the
-                # request after stamping auth headers. We only need
-                # the first yielded request (no challenge / retry).
-                try:
-                    flow = auth_inst.sync_auth_flow(req)
-                    req = next(flow)
-                    flow.close()
-                except StopIteration:
-                    pass
-                except Exception:  # noqa: BLE001
-                    pass
         parts = urlsplit(str(req.url))
         path = parts.path or "/"
         query = parts.query.encode("latin-1") if parts.query else b""

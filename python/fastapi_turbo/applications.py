@@ -7043,6 +7043,13 @@ class FastAPI:
                             break
                     if boundary is not None:
                         from fastapi_turbo.param_functions import UploadFile as _UF
+                        # Starlette's MultiPartParser defaults — exceeding
+                        # either bounds the request to a 400, defending the
+                        # endpoint against unbounded form expansion.
+                        _max_files = 1000
+                        _max_fields = 1000
+                        _files_seen = 0
+                        _fields_seen = 0
                         raw = (
                             f"Content-Type: multipart/form-data; boundary={boundary}\r\n\r\n"
                         ).encode("utf-8") + body_bytes
@@ -7063,6 +7070,15 @@ class FastAPI:
                             if fname is None:
                                 continue
                             if "filename" in params:
+                                _files_seen += 1
+                                if _files_seen > _max_files:
+                                    from fastapi_turbo.exceptions import (
+                                        MultiPartException as _MPE,
+                                    )
+                                    raise _MPE(
+                                        "Too many files. Maximum number of "
+                                        f"files is {_max_files}."
+                                    )
                                 payload = part_msg.get_payload(decode=True) or b""
                                 _new_uf = _UF(
                                     filename=params["filename"],
@@ -7077,6 +7093,15 @@ class FastAPI:
                                 else:
                                     form_fields[fname] = [_existing, _new_uf]
                             else:
+                                _fields_seen += 1
+                                if _fields_seen > _max_fields:
+                                    from fastapi_turbo.exceptions import (
+                                        MultiPartException as _MPE,
+                                    )
+                                    raise _MPE(
+                                        "Too many fields. Maximum number of "
+                                        f"fields is {_max_fields}."
+                                    )
                                 val = part_msg.get_payload(decode=True) or b""
                                 if isinstance(val, bytes):
                                     val = val.decode("utf-8", errors="replace")
@@ -7095,8 +7120,26 @@ class FastAPI:
                 # against a stripped payload.
                 _log.debug("in-process form parse: %r", _exc)
                 from fastapi_turbo.exceptions import (
+                    MultiPartException as _MPE_check,
                     RequestValidationError as _RVE_form,
                 )
+                if isinstance(_exc, _MPE_check):
+                    # Starlette/FastAPI map MultiPartException to a
+                    # plain 400 with ``{"detail": <msg>}`` — not the
+                    # 422 RequestValidationError envelope. Match that
+                    # so over-limit uploads get the same response.
+                    import json as _j
+                    _payload = _j.dumps({"detail": _exc.message}).encode("utf-8")
+                    await send({
+                        "type": "http.response.start",
+                        "status": 400,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(_payload)).encode("ascii")),
+                        ],
+                    })
+                    await send({"type": "http.response.body", "body": _payload})
+                    return True
                 await _asgi_emit_exception(
                     self, scope, send,
                     _RVE_form([{

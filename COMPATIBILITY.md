@@ -2,12 +2,12 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 877 tests (410 general + 22 WebSocket + 338 stress + 107 parity snapshots).
+Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 888 tests (410 general + 22 WebSocket + 349 stress + 107 parity snapshots).
 
 **Test suite under different environments:**
 
-* **Normal dev box / CI** (loopback bind allowed): all 877 tests run, 0 skipped, 0 failed.
-* **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError`): `tests/conftest.py` detects this and switches mode. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`. Expected totals: 728 pass, 149 skipped, **0 failed, 0 errors**.
+* **Normal dev box / CI** (loopback bind allowed): all 888 tests run, 0 skipped, 0 failed.
+* **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError`): `tests/conftest.py` detects this and switches mode. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`. Expected totals: 739 pass, 149 skipped, **0 failed, 0 errors**.
 
 > ### Release readiness — **a real-loopback CI run is REQUIRED before shipping**
 >

@@ -14,7 +14,7 @@ use pyo3::exceptions::{PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// A single parsed multipart field — either a file (has filename) or a
 /// plain form field (just name + value bytes). `data` is a zero-copy slice
@@ -221,25 +221,97 @@ impl ImmediateNone {
     }
 }
 
-/// Awaitable that resolves to an integer immediately. Used by
-/// ``UploadFile.write`` so ``await upload.write(data)`` returns the
-/// number of bytes written (matches Starlette).
+/// Sync file-like exposing the same shared buffer as ``PyUploadFile``.
+/// Returned from ``PyUploadFile.file`` so callers that hand the file
+/// to a sync consumer (``shutil.copyfileobj(upload.file, dest)``,
+/// ``image_lib.open(upload.file)``) get the bytes/int return shapes
+/// they expect — Starlette backs ``.file`` with ``SpooledTemporaryFile``,
+/// whose methods return raw values, not awaitables. Earlier the
+/// getter returned ``self``, so ``upload.file.read()`` produced an
+/// awaitable wrapper instead of bytes and broke any sync consumer.
 #[pyclass]
-pub struct ImmediateInt {
-    value: Option<i64>,
+pub struct PySyncFile {
+    data: Arc<Mutex<Vec<u8>>>,
+    cursor: Arc<Mutex<usize>>,
+    closed: Arc<Mutex<bool>>,
 }
 
 #[pymethods]
-impl ImmediateInt {
-    fn __await__(slf: Py<Self>) -> Py<Self> {
-        slf
+impl PySyncFile {
+    /// Sync read returning bytes. ``size = -1`` reads to EOF.
+    #[pyo3(signature = (size=-1))]
+    fn read<'py>(&self, py: Python<'py>, size: isize) -> PyResult<Py<PyBytes>> {
+        let data = self.data.lock().unwrap();
+        let mut cursor = self.cursor.lock().unwrap();
+        let remaining = data.len().saturating_sub(*cursor);
+        let take = if size < 0 {
+            remaining
+        } else {
+            std::cmp::min(remaining, size as usize)
+        };
+        let slice = &data[*cursor..*cursor + take];
+        let py_bytes = PyBytes::new(py, slice).unbind();
+        *cursor += take;
+        Ok(py_bytes)
     }
-    fn __iter__(slf: Py<Self>) -> Py<Self> {
-        slf
+
+    /// Sync write returning the integer byte count (matches
+    /// ``io.BufferedIOBase.write`` / ``SpooledTemporaryFile.write``).
+    fn write<'py>(&self, _py: Python<'py>, data: Bound<'py, PyAny>) -> PyResult<usize> {
+        let buf: Vec<u8> = if let Ok(b) = data.cast::<PyBytes>() {
+            b.as_bytes().to_vec()
+        } else {
+            data.extract::<Vec<u8>>().map_err(|e| {
+                PyValueError::new_err(format!(
+                    "UploadFile.file.write expects bytes-like, got error: {e}"
+                ))
+            })?
+        };
+        let mut storage = self.data.lock().unwrap();
+        let mut cursor = self.cursor.lock().unwrap();
+        let pos = *cursor;
+        let new_end = pos + buf.len();
+        if new_end > storage.len() {
+            storage.resize(new_end, 0);
+        }
+        storage[pos..new_end].copy_from_slice(&buf);
+        *cursor = new_end;
+        Ok(buf.len())
     }
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<()> {
-        let v = slf.value.take();
-        Err(PyStopIteration::new_err(v))
+
+    /// Sync seek; returns the new cursor position to mirror
+    /// ``io.IOBase.seek`` (which returns the absolute position).
+    #[pyo3(signature = (offset, whence=0))]
+    fn seek(&self, offset: isize, whence: i32) -> PyResult<usize> {
+        let data_len = self.data.lock().unwrap().len();
+        let mut cursor = self.cursor.lock().unwrap();
+        let target: isize = match whence {
+            0 => offset,
+            1 => *cursor as isize + offset,
+            2 => data_len as isize + offset,
+            _ => return Err(PyValueError::new_err("invalid whence")),
+        };
+        let clamped = if target < 0 {
+            0
+        } else {
+            std::cmp::min(target as usize, data_len)
+        };
+        *cursor = clamped;
+        Ok(clamped)
+    }
+
+    fn tell(&self) -> PyResult<usize> {
+        Ok(*self.cursor.lock().unwrap())
+    }
+
+    fn close(&self) -> PyResult<()> {
+        *self.closed.lock().unwrap() = true;
+        Ok(())
+    }
+
+    #[getter]
+    fn closed(&self) -> bool {
+        *self.closed.lock().unwrap()
     }
 }
 
@@ -258,16 +330,19 @@ pub struct PyUploadFile {
     #[pyo3(get)]
     content_type: Option<String>,
     /// Mutable buffer — supports both reads (cursor-based slicing) and
-    /// writes (cursor-positioned overwrite + extend).
-    data: Mutex<Vec<u8>>,
+    /// writes (cursor-positioned overwrite + extend). Held behind an
+    /// ``Arc<Mutex>`` so the sync ``.file`` view (``PySyncFile``) can
+    /// share the same backing buffer — Starlette's ``UploadFile`` and
+    /// ``UploadFile.file`` mutate the same bytes.
+    data: Arc<Mutex<Vec<u8>>>,
     /// Read / write cursor — advances on read() and write(), reset by
-    /// seek(). Held in its own lock so reads aren't blocked by the
-    /// (rarer) write path.
-    cursor: Mutex<usize>,
+    /// seek(). Shared with ``PySyncFile`` for the same reason as
+    /// ``data``: a sync seek on ``.file`` must move the async cursor too.
+    cursor: Arc<Mutex<usize>>,
     /// Headers from the multipart part.
     header_list: Vec<(String, String)>,
     /// Starlette-parity: ``file.closed`` flips to ``True`` after ``close()``.
-    closed: Mutex<bool>,
+    closed: Arc<Mutex<bool>>,
 }
 
 #[pymethods]
@@ -335,15 +410,16 @@ impl PyUploadFile {
 
     /// Async write — extends or overwrites the buffer at the cursor.
     /// Matches Starlette's ``UploadFile.write(b)``: bytes-like input,
-    /// extends past EOF, advances cursor by the number of bytes
-    /// written. Returns the byte count (not None) — ``await
-    /// upload.write(data)`` gives an int the caller can sum.
+    /// extends past EOF, advances cursor. Returns ``None`` (the
+    /// awaitable resolves to ``None``) to match Starlette's signature
+    /// — callers that need the byte count should use the sync
+    /// ``upload.file.write(b)`` path which returns an int per the
+    /// ``io.IOBase`` contract.
     ///
-    /// Earlier impl was a no-op that ignored its argument and returned
-    /// None. That diverged from Starlette and broke handlers that
-    /// stage uploads for later processing
-    /// (``await upload.seek(0); await upload.write(transformed)``).
-    fn write<'py>(&self, py: Python<'py>, data: Bound<'py, PyAny>) -> PyResult<Py<ImmediateInt>> {
+    /// Earlier impl was a no-op that ignored its argument. The R19
+    /// fix added real write semantics but returned an int, which
+    /// diverged from Starlette's ``async def write(...) -> None``.
+    fn write<'py>(&self, py: Python<'py>, data: Bound<'py, PyAny>) -> PyResult<Py<ImmediateNone>> {
         // Accept any bytes-like (bytes, bytearray, memoryview).
         let buf: Vec<u8> = if let Ok(b) = data.cast::<PyBytes>() {
             b.as_bytes().to_vec()
@@ -364,21 +440,28 @@ impl PyUploadFile {
         }
         storage[pos..new_end].copy_from_slice(&buf);
         *cursor = new_end;
-        let written = buf.len();
-        Py::new(
-            py,
-            ImmediateInt {
-                value: Some(written as i64),
-            },
-        )
+        Py::new(py, ImmediateNone)
     }
 
-    /// Starlette-compat: UploadFile.file exposes a SpooledTemporaryFile-like.
-    /// We return self — our own .read/.seek/.write methods cover the
-    /// important calls and operate on the same shared buffer.
+    /// Starlette-compat: ``UploadFile.file`` exposes a sync
+    /// SpooledTemporaryFile-like object. We hand back a fresh
+    /// ``PySyncFile`` that shares the underlying buffer / cursor /
+    /// closed flag via ``Arc<Mutex<…>>`` — sync reads/writes/seeks
+    /// on ``.file`` are immediately visible to the async API on
+    /// ``UploadFile`` and vice-versa. ``.file.read()`` returns
+    /// ``bytes`` directly (not an awaitable wrapper) so libraries
+    /// that pass ``upload.file`` to a sync consumer
+    /// (``shutil.copyfileobj(upload.file, dest)`` etc.) work.
     #[getter]
-    fn file<'py>(slf: PyRef<'py, Self>) -> PyRef<'py, Self> {
-        slf
+    fn file(&self, py: Python<'_>) -> PyResult<Py<PySyncFile>> {
+        Py::new(
+            py,
+            PySyncFile {
+                data: self.data.clone(),
+                cursor: self.cursor.clone(),
+                closed: self.closed.clone(),
+            },
+        )
     }
 
     #[getter]
@@ -396,10 +479,10 @@ impl PyUploadFile {
         Self {
             filename: field.filename,
             content_type: field.content_type,
-            data: Mutex::new(field.data.to_vec()),
-            cursor: Mutex::new(0),
+            data: Arc::new(Mutex::new(field.data.to_vec())),
+            cursor: Arc::new(Mutex::new(0)),
             header_list: field.headers,
-            closed: Mutex::new(false),
+            closed: Arc::new(Mutex::new(false)),
         }
     }
 }

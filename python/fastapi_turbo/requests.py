@@ -408,6 +408,11 @@ class Request(HTTPConnection):
             = Form(...)`` / ``UploadFile`` endpoints).
           * Anything else → empty ``FormData``.
 
+        ``max_files`` / ``max_fields`` cap the number of file and
+        text parts respectively; exceeding either raises
+        ``MultiPartException`` (becomes HTTP 400 in handlers), matching
+        Starlette. Defaults match Starlette's 1000/1000.
+
         Earlier code unconditionally ran ``parse_qsl`` on the raw
         body, so ``await request.form()`` against a multipart
         upload returned the raw boundary text as a single garbled
@@ -416,11 +421,18 @@ class Request(HTTPConnection):
             return self._form
         from fastapi_turbo.datastructures import FormData
 
-        ct = (self.headers.get("content-type") or "").lower()
+        # Don't lowercase the whole header — RFC 7578 boundaries are
+        # case-sensitive (``boundary=AaB03x`` ≠ ``boundary=aab03x``).
+        # Normalise only the media-type prefix for the dispatch check;
+        # pass the original to the parser so it sees the real boundary.
+        ct = self.headers.get("content-type") or ""
+        ct_lower = ct.lower()
         raw = await self.body()
-        if ct.startswith("multipart/form-data"):
-            self._form = self._parse_multipart_form(ct, raw)
-        elif ct.startswith("application/x-www-form-urlencoded") or not ct:
+        if ct_lower.startswith("multipart/form-data"):
+            self._form = self._parse_multipart_form(
+                ct, raw, max_files=max_files, max_fields=max_fields
+            )
+        elif ct_lower.startswith("application/x-www-form-urlencoded") or not ct_lower:
             from urllib.parse import parse_qsl
             items = parse_qsl(raw.decode("utf-8"), keep_blank_values=True)
             self._form = FormData(items)
@@ -428,12 +440,21 @@ class Request(HTTPConnection):
             self._form = FormData([])
         return self._form
 
-    def _parse_multipart_form(self, content_type: str, raw_body: bytes):
+    def _parse_multipart_form(
+        self,
+        content_type: str,
+        raw_body: bytes,
+        *,
+        max_files: int = 1000,
+        max_fields: int = 1000,
+    ):
         """Parse a multipart body into a ``FormData`` with file parts
         materialised as ``UploadFile``. Mirrors the in-process ASGI
         dispatcher's parser so ``await request.form()`` and
         ``Form(...)`` / ``UploadFile`` injection see the same
-        structure."""
+        structure. ``max_files`` / ``max_fields`` cap the part counts —
+        exceeding either raises ``MultiPartException`` (handled by
+        FastAPI as a 400)."""
         import io
         import email.parser
         from fastapi_turbo.datastructures import FormData
@@ -458,6 +479,8 @@ class Request(HTTPConnection):
             return FormData([])
 
         items: list[tuple[str, Any]] = []
+        files_seen = 0
+        fields_seen = 0
         for part_msg in msg.walk():
             if part_msg.is_multipart():
                 continue
@@ -474,6 +497,12 @@ class Request(HTTPConnection):
             if fname is None:
                 continue
             if "filename" in params:
+                files_seen += 1
+                if files_seen > max_files:
+                    from fastapi_turbo.exceptions import MultiPartException
+                    raise MultiPartException(
+                        f"Too many files. Maximum number of files is {max_files}."
+                    )
                 payload = part_msg.get_payload(decode=True) or b""
                 upload = UploadFile(
                     filename=params["filename"],
@@ -482,6 +511,12 @@ class Request(HTTPConnection):
                 )
                 items.append((fname, upload))
             else:
+                fields_seen += 1
+                if fields_seen > max_fields:
+                    from fastapi_turbo.exceptions import MultiPartException
+                    raise MultiPartException(
+                        f"Too many fields. Maximum number of fields is {max_fields}."
+                    )
                 val = part_msg.get_payload(decode=True) or b""
                 if isinstance(val, bytes):
                     val = val.decode("utf-8", errors="replace")

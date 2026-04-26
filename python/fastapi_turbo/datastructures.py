@@ -370,19 +370,30 @@ class FormData:
             self._items = list(items._items)
 
     def __getitem__(self, key: str):
+        # Mapping semantics — last value wins on duplicates, matching
+        # Starlette's ``FormData`` (``form["x"]`` for ``x=1&x=2`` is
+        # ``"2"``). Earlier code returned the first value, so a form
+        # with ``a=1&a=2`` reported ``form["a"] == "1"`` and any
+        # handler that expected the latest value silently took the
+        # earliest one — same shape mismatch upstream test suites
+        # caught.
+        last = _MISSING = object()
         for k, v in self._items:
             if k == key:
-                return v
-        raise KeyError(key)
+                last = v
+        if last is _MISSING:
+            raise KeyError(key)
+        return last
 
     def __contains__(self, key: object) -> bool:
         return any(k == key for k, _ in self._items)
 
     def get(self, key: str, default=None):
+        last = _MISSING = object()
         for k, v in self._items:
             if k == key:
-                return v
-        return default
+                last = v
+        return default if last is _MISSING else last
 
     def getlist(self, key: str) -> list:
         return [v for k, v in self._items if k == key]
@@ -395,11 +406,23 @@ class FormData:
                 yield k
 
     def values(self):
-        for _, v in self._items:
-            yield v
+        # One value per unique key — last wins. Matches Starlette's
+        # ``MultiDict.values()`` (which delegates to the collapsed
+        # mapping view).
+        for k in self.keys():
+            yield self[k]
 
     def items(self):
-        return iter(self._items)
+        # Collapsed mapping items — one ``(key, last_value)`` pair per
+        # unique key. ``multi_items()`` returns the full list of pairs
+        # including duplicates (mirrors Starlette's
+        # ``ImmutableMultiDict``). Earlier ``items()`` returned all
+        # pairs, which broke ``dict(form)`` for forms with repeated
+        # keys (it would emit duplicate keys to ``dict.__setitem__``,
+        # last write winning by accident — but the *iteration* order
+        # is not what an upstream-aware caller expects).
+        for k in self.keys():
+            yield (k, self[k])
 
     def multi_items(self):
         return iter(self._items)
@@ -408,7 +431,9 @@ class FormData:
         return self.keys()
 
     def __len__(self) -> int:
-        return len(self._items)
+        # Number of unique keys (collapsed-mapping length), matching
+        # Starlette. ``len(form)`` for ``a=1&a=2`` is 1, not 2.
+        return sum(1 for _ in self.keys())
 
 
 class Secret:

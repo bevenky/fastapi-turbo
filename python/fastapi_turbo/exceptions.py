@@ -1,6 +1,20 @@
 """Exception classes matching FastAPI's interface."""
 
 
+class MultiPartException(Exception):
+    """Raised when multipart parsing exceeds a configured limit
+    (``max_files`` / ``max_fields``) or hits a parser-level error.
+
+    Matches ``starlette.formparsers.MultiPartException``. FastAPI's
+    request handler converts this into an HTTP 400 response so
+    over-limit uploads don't propagate as 500s.
+    """
+
+    def __init__(self, message: str = "") -> None:
+        self.message = message
+        super().__init__(message)
+
+
 class HTTPException(Exception):
     """HTTP exception that results in an error response."""
 

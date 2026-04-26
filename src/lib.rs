@@ -53,6 +53,7 @@ fn _fastapi_turbo_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<http_client::RustTransport>()?;
     m.add_class::<http_client::RawResponse>()?;
     m.add_class::<multipart::PyUploadFile>()?;
+    m.add_class::<multipart::PySyncFile>()?;
     m.add_class::<multipart::ImmediateBytes>()?;
     m.add_class::<multipart::ImmediateNone>()?;
     Ok(())
