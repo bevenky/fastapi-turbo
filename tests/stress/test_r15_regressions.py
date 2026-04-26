@@ -505,6 +505,59 @@ def test_testclient_stream_follow_redirects():
 
 
 # ────────────────────────────────────────────────────────────────────
+# R18 #1: redirect method rewrite parity (RFC 7231 + httpx semantics)
+# ────────────────────────────────────────────────────────────────────
+
+def test_testclient_stream_redirect_method_rewrite_parity():
+    """Per httpx's redirect rules (RFC 7231 §6.4 + historical
+    browser behaviour):
+
+      * 301 / 302: POST → GET, others preserve method.
+      * 303:       any non-GET/HEAD → GET (mandatory).
+      * 307 / 308: method preserved (mandatory).
+
+    Earlier turbo only rewrote 303, so a POST that hit a 301 or
+    302 redirected as POST — diverging from upstream FastAPI's
+    httpx-backed TestClient and from real browsers."""
+    from fastapi_turbo import FastAPI, Request
+    from fastapi_turbo.responses import RedirectResponse, JSONResponse
+    from fastapi_turbo.testclient import TestClient
+
+    app = FastAPI()
+
+    for code in (301, 302, 303, 307, 308):
+        @app.api_route(f"/r{code}", methods=["GET", "POST"])
+        def _r(request: Request, _code=code):
+            return RedirectResponse(url="/landing", status_code=_code)
+
+    @app.api_route("/landing", methods=["GET", "POST"])
+    def _landing(request: Request):
+        return JSONResponse({"method": request.method})
+
+    expectations = {
+        301: "GET",   # POST → GET
+        302: "GET",   # POST → GET
+        303: "GET",   # any non-GET/HEAD → GET
+        307: "POST",  # preserved
+        308: "POST",  # preserved
+    }
+
+    with TestClient(app, in_process=True) as c:
+        for code, want_method in expectations.items():
+            with c.stream(
+                "POST", f"/r{code}", follow_redirects=True
+            ) as r:
+                body = b"".join(r.iter_bytes())
+                assert r.status_code == 200, (code, r.status_code)
+                import json
+                got = json.loads(body)["method"]
+                assert got == want_method, (
+                    f"redirect {code}: POST → expected method "
+                    f"{want_method!r} on landing, got {got!r}"
+                )
+
+
+# ────────────────────────────────────────────────────────────────────
 # #5 TestClient.stream is lazy
 # ────────────────────────────────────────────────────────────────────
 

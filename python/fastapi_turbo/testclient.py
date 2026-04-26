@@ -167,16 +167,36 @@ class _ASGISyncClientShim:
                 return facade
             # Close the current stream cleanly before re-issuing.
             location = facade.headers["location"]
+            status = facade.status_code
             facade.__exit__(None, None, None)
-            # Per RFC 7231 §6.4.4: 303 always becomes GET; other
-            # 3xx preserve the method. Body / json are dropped on
-            # redirect to avoid replaying potentially-large bodies.
-            if facade.status_code == 303:
+            # Method-rewrite rules — match httpx (and historical
+            # browser behaviour, which RFC 7231 §6.4 acknowledges
+            # via the §6.4.2 / §6.4.3 "should not change ... but
+            # historical clients did" notes):
+            #
+            #   * 303: any non-GET/HEAD method becomes GET (mandatory
+            #     per RFC).
+            #   * 301 / 302: POST becomes GET (historical browsers
+            #     always rewrote — httpx mirrors that). Other
+            #     methods are preserved.
+            #   * 307 / 308: method is preserved (RFC mandate).
+            #
+            # Earlier code only rewrote 303, so a POST → 301 / 302
+            # chain re-POSTed to the redirect target; upstream
+            # FastAPI's httpx-backed TestClient GETs it.
+            method_upper = method.upper()
+            if status == 303 and method_upper not in ("GET", "HEAD"):
                 method = "GET"
-            kwargs.pop("content", None)
-            kwargs.pop("json", None)
-            kwargs.pop("data", None)
-            kwargs.pop("files", None)
+            elif status in (301, 302) and method_upper == "POST":
+                method = "GET"
+            # Body / json / form / files are dropped whenever the
+            # method changes — preserving them across a method
+            # rewrite would replay a POST body as a GET.
+            if method != method_upper:
+                kwargs.pop("content", None)
+                kwargs.pop("json", None)
+                kwargs.pop("data", None)
+                kwargs.pop("files", None)
             url = location
         # Too many redirects — raise so the caller sees the loop.
         raise RuntimeError(

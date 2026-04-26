@@ -2,24 +2,26 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 867 tests (410 general + 22 WebSocket + 328 stress + 107 parity snapshots).
+Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 868 tests (410 general + 22 WebSocket + 329 stress + 107 parity snapshots).
 
 **Test suite under different environments:**
 
-* **Normal dev box / CI** (loopback bind allowed): all 867 tests run, 0 skipped, 0 failed.
-* **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError`): `tests/conftest.py` detects this and switches mode. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`. Expected totals: 718 pass, 149 skipped, **0 failed, 0 errors**.
+* **Normal dev box / CI** (loopback bind allowed): all 868 tests run, 0 skipped, 0 failed.
+* **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError`): `tests/conftest.py` detects this and switches mode. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`. Expected totals: 719 pass, 149 skipped, **0 failed, 0 errors**.
 
-**Per the audit's process risk note: a real-loopback CI run is REQUIRED before shipping** — the sandbox-mode pass set covers ASGI / Python-side parity but does NOT exercise the Rust + Tower + socket pipeline (subprocess parity matrix, WebSocket protocol negotiation, `cli._port` lifecycle, public-bind warning, `fastapi-turbo-bench` against a live server, concurrent socket stress). Those are exactly the tests sandbox skips, and they're the ones that catch real-server regressions.
-
-The skip breakdown under sandbox mode (149 total):
-
-* 107 — parity-runner tests under `tests/parity/` (spawn dual subprocess servers for upstream FastAPI + turbo on real ports; whole directory skipped via `parity/conftest.py`).
-* 22 — `test_websocket.py` (uses `websockets.sync.client.connect` against a real subprocess WS server; functional in-process WS coverage in `tests/stress/test_r12_regressions.py` + `test_r15_regressions.py`).
-* 9 — bench-CLI tests (`test_bench_cli_correctness.py` × 5, `test_bench_cli_compat.py` × 3, `test_bench_runner_parser.py` × 1) drive the `fastapi-turbo-bench` Rust binary against a live server.
-* 4 — `test_public_bind_warning.py` exercises the public-bind DoS warning, which only fires when the server actually starts.
-* 4 — `test_testclient_lifecycle.py` asserts on `cli._port` and `TestClient._app_servers` cache state (real-server-only invariants).
-* 2 — `test_middleware.py` (`test_trustedhost_middleware_allowed` hard-codes `allowed_hosts=["127.0.0.1"]` — doesn't match the synthetic sandbox URL host; `test_httpsredirect_middleware` relies on the Rust HTTPSRedirect's `X-Forwarded-Proto` handling, which Starlette's HTTPSRedirectMiddleware doesn't replicate).
-* 1 — `test_concurrent_clients.py` needs real concurrent socket connections.
+> ### Release readiness — **a real-loopback CI run is REQUIRED before shipping**
+>
+> Sandbox mode is "valid run, partial coverage" — it validates the ASGI / Python dispatch path and the in-process parity surface, but the 149 skipped tests are precisely the ones that exercise the parts of the system most likely to regress on real hardware:
+>
+> 1. **107 parity-runner tests** (`tests/parity/`) — drive both upstream FastAPI AND turbo as subprocess servers on real loopback ports and diff the responses. The whole compatibility claim against FastAPI 0.136.0 hangs off these.
+> 2. **22 `test_websocket.py`** — drive `websockets.sync.client.connect` against a real subprocess WS server. Catches real-WS-protocol regressions (handshake, ping/pong, close codes over the wire) that the in-process WS path can't reproduce.
+> 3. **9 bench-CLI tests** — exercise the `fastapi-turbo-bench` Rust binary against a live server. Catches regressions in the Rust `bench-app` integration and CLI argument compatibility shim.
+> 4. **4 `test_public_bind_warning.py`** — verify the public-bind DoS warning fires only when the server actually starts on a public address.
+> 5. **4 `test_testclient_lifecycle.py`** — assert on `cli._port` / `TestClient._app_servers` cache state (real-server-only invariants).
+> 6. **2 `test_middleware.py`** — Tower-bound HTTPSRedirect's `X-Forwarded-Proto` handling, TrustedHost with hard-coded `127.0.0.1` host.
+> 7. **1 `test_concurrent_clients.py`** — 100 actual concurrent socket connections to validate the request-pipeline doesn't deadlock under load.
+>
+> These cover the Rust + Tower + socket pipeline. Sandbox green is necessary but not sufficient. **Always run the full suite on a normal CI runner (loopback unrestricted) before tagging a release.**
 
 ## Routing
 
