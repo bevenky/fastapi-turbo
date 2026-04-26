@@ -163,9 +163,16 @@ def _build() -> dict[str, types.ModuleType]:
             self.endpoint = endpoint
             self.name = name or endpoint.__name__
     fastapi_routing.APIWebSocketRoute = APIWebSocketRoute  # type: ignore[attr-defined]
-    # request_response — stac-fastapi, fastapi-pagination use this
-    async def request_response(func):
-        """Stub wrapping an endpoint into an ASGI handler."""
+    # request_response — stac-fastapi, fastapi-pagination use this.
+    # Upstream is a SYNC function returning an ASGI callable (the
+    # callable itself is async). Earlier shim was ``async def``,
+    # so calling ``request_response(handler)`` returned a coroutine
+    # instead of the ASGI app — ``app(scope, ...)`` then raised
+    # ``TypeError: 'coroutine' object is not callable``.
+    def request_response(func):
+        """Stub wrapping an endpoint into an ASGI handler. Matches
+        upstream FastAPI's ``request_response``: sync wrapper,
+        returns an async ASGI callable."""
         async def app(scope, receive, send):
             pass
         return app

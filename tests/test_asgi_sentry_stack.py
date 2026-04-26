@@ -249,24 +249,37 @@ def test_sentry_captures_error_and_transactions(sentry_capture):
         elif (j.get("exception") or {}).get("values"):
             errors.append(j)
 
-    # Transaction names are now full URLs (SentryAsgiMiddleware default)
-    # because our ASGI scope populates scheme+server. Accept either
-    # form.
+    # Transaction names depend on ``transaction_style`` —
+    # SentryAsgiMiddleware default is ``"endpoint"``, which after
+    # the R25 scope mutation reports the endpoint function's
+    # qualified name (e.g. ``..._build_app.<locals>.health``).
+    # Earlier we didn't populate ``scope["endpoint"]`` so Sentry
+    # fell through to ``_get_url`` and we saw URLs ending in the
+    # path. Accept BOTH forms so the assertion is robust to either:
+    #   * URL ending in ``/health`` (legacy fallback path)
+    #   * endpoint qualname ending in ``.health`` (post-R25 path)
     tx_paths = {t.get("transaction") for t in transactions}
 
     def _matches(name, path):
-        return name == path or name.endswith(path)
+        suffix = path.lstrip("/")
+        return (
+            name == path
+            or name.endswith(path)
+            or name.endswith("." + suffix)
+        )
 
     assert any(_matches(n, "/health") for n in tx_paths), tx_paths
     assert any(_matches(n, "/missing") for n in tx_paths), tx_paths
     assert any(_matches(n, "/boom") for n in tx_paths), tx_paths
 
-    # Status code mapping
+    # Status code mapping — match transactions by either URL-suffix
+    # or endpoint-qualname-suffix (same dual recognition as above).
     by_path_suffix = {}
     for t in transactions:
         n = t.get("transaction") or ""
         for suf in ("/missing", "/boom", "/health"):
-            if n.endswith(suf):
+            qualname_suf = "." + suf.lstrip("/")
+            if n.endswith(suf) or n.endswith(qualname_suf):
                 by_path_suffix[suf] = t
                 break
     assert (by_path_suffix["/missing"].get("contexts") or {}).get("trace", {}).get(

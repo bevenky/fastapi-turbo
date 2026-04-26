@@ -6992,6 +6992,25 @@ class FastAPI:
         req_scope["path_params"] = path_params
         req_scope["app"] = self
         req_scope["route"] = matched_route
+        # Also mutate the OUTER scope so middleware that wraps the
+        # ASGI app (legacy ``SentryAsgiMiddleware(app)``, OTel,
+        # rate-limit) sees the matched route at response-time.
+        # Sentry's transaction name uses ``scope["route"].path`` to
+        # template the URL — without this it records the concrete
+        # path (``/message/123456``) instead of the route shape
+        # (``/message/{message_id}``). Starlette's router does the
+        # same in-place mutation; we previously only updated the
+        # copied ``req_scope`` so the outer scope stayed empty.
+        try:
+            scope["route"] = matched_route
+            scope["path_params"] = path_params
+            scope["endpoint"] = getattr(matched_route, "endpoint", None)
+        except (TypeError, AttributeError):
+            # Some upstream wrappers hand us a frozen / mapping-only
+            # scope; in that case the in-place mutation isn't possible
+            # and the legacy-Sentry shape stays untemplated. Not an
+            # error — most middleware uses ``scope`` as a plain dict.
+            pass
         try:
             body_bytes = await _drain_body()
         except _BodyTooLarge:

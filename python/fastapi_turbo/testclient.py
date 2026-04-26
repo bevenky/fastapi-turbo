@@ -119,7 +119,15 @@ class _ASGISyncClientShim:
         self._app = app
         self._base_url = base_url
         self._follow_redirects = follow_redirects
-        self._headers = dict(headers or {})
+        # Pin ``Accept-Encoding: gzip, deflate`` as a session default
+        # (matches Starlette's TestClient — see comment in
+        # ``TestClient.__init__`` for the upstream-FastAPI Tutorial
+        # snapshot mismatch this fixes). User-supplied headers
+        # override; the default fills in if absent.
+        merged_headers: dict = {"accept-encoding": "gzip, deflate"}
+        for k, v in (headers or {}).items():
+            merged_headers[str(k).lower()] = v
+        self._headers = merged_headers
         self._cookies = cookies
 
         # Persistent event loop on a background thread so sync code can
@@ -915,7 +923,20 @@ class TestClient:
                 if stripped != v:
                     request.headers[k] = stripped
 
-        default_headers = {"host": host_header, "user-agent": "testclient"}
+        # Starlette's TestClient pins ``Accept-Encoding: gzip,
+        # deflate`` as a default so request snapshots are stable
+        # regardless of which compression libraries the test
+        # environment has installed. httpx's default includes ``br``
+        # when ``brotli`` is on sys.path, which leaks into upstream
+        # FastAPI tutorial test snapshots (``test_tutorial001`` and
+        # similar) and produces a 6-test failure that has nothing to
+        # do with our code. Match Starlette by injecting the same
+        # default; user ``headers={...}`` overrides win.
+        default_headers = {
+            "host": host_header,
+            "user-agent": "testclient",
+            "accept-encoding": "gzip, deflate",
+        }
         if self._seed_headers:
             # Let user-supplied defaults win over our injected Host.
             for k, v in dict(self._seed_headers).items():

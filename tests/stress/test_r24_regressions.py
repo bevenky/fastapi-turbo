@@ -17,38 +17,29 @@ import fastapi_turbo  # noqa: F401
 
 
 def test_formdata_close_handles_pre_shim_starlette_uploadfile():
-    """If user code imported ``starlette.datastructures.UploadFile``
-    BEFORE the fastapi_turbo shim ran (or ``starlette`` got
-    re-imported after the shim was disabled), the resulting class
-    is a genuinely-different type than ``fastapi_turbo.UploadFile``.
-    Our previous strict-isinstance check missed that case and left
-    pre-shim uploads open. ``FormData.close`` now recognises both."""
-    import sys
+    """The R24 fix probed ``sys.modules`` post-facto and missed
+    pre-shim references; R25 captures the original class at install
+    time in ``compat.PRESHIM_STARLETTE_UPLOADFILE``. This test
+    simulates that capture explicitly so it doesn't depend on the
+    test process having pre-imported Starlette."""
+    from fastapi_turbo import compat
     from fastapi_turbo.datastructures import FormData
 
-    # Synthesise a "pre-shim" Starlette ``UploadFile`` — register a
-    # fake module under ``starlette.datastructures`` whose
-    # ``UploadFile`` is a separate type from our shimmed one. Restore
-    # the prior module on exit so we don't poison other tests.
-    import types
-    original_mod = sys.modules.get("starlette.datastructures")
+    original_capture = compat.PRESHIM_STARLETTE_UPLOADFILE
+    closed_log: list[bool] = []
+
+    class _StarletteUF:
+        """Stand-in for the original ``starlette.datastructures.UploadFile``."""
+
+        def __init__(self):
+            self.filename = "x.txt"
+            self.file = None
+
+        async def close(self):
+            closed_log.append(True)
+
+    compat.PRESHIM_STARLETTE_UPLOADFILE = _StarletteUF
     try:
-        fake_mod = types.ModuleType("starlette.datastructures")
-        closed_log: list[bool] = []
-
-        class _StarletteUF:
-            """Stand-in for ``starlette.datastructures.UploadFile``."""
-
-            def __init__(self):
-                self.filename = "x.txt"
-                self.file = None
-
-            async def close(self):
-                closed_log.append(True)
-
-        fake_mod.UploadFile = _StarletteUF
-        sys.modules["starlette.datastructures"] = fake_mod
-
         async def _run() -> list[bool]:
             f = FormData([("file", _StarletteUF())])
             await f.close()
@@ -57,22 +48,21 @@ def test_formdata_close_handles_pre_shim_starlette_uploadfile():
         result = asyncio.run(_run())
         assert result == [True], result
     finally:
-        if original_mod is not None:
-            sys.modules["starlette.datastructures"] = original_mod
-        else:
-            sys.modules.pop("starlette.datastructures", None)
+        compat.PRESHIM_STARLETTE_UPLOADFILE = original_capture
 
 
-def test_formdata_close_still_strict_when_starlette_module_absent():
-    """If ``starlette.datastructures`` isn't in ``sys.modules`` (or
-    its ``UploadFile`` symbol is missing), ``FormData.close`` falls
-    back to the pure ``fastapi_turbo.UploadFile`` check — no
-    ``AttributeError`` from probing a missing class. Regression
-    guard: the lookup must not crash on minimal-environment runs."""
-    import sys
+def test_formdata_close_still_strict_when_no_preshim_capture():
+    """When no Starlette pre-import happened (the common case —
+    fresh tests start with an empty import graph), the
+    ``compat.PRESHIM_STARLETTE_UPLOADFILE`` slot is ``None`` and
+    ``FormData.close`` falls back to the pure ``fastapi_turbo.
+    UploadFile`` check. Regression guard: the lookup must not
+    crash and must remain strict (dummy values aren't closed)."""
+    from fastapi_turbo import compat
     from fastapi_turbo.datastructures import FormData
 
-    saved = sys.modules.pop("starlette.datastructures", None)
+    original_capture = compat.PRESHIM_STARLETTE_UPLOADFILE
+    compat.PRESHIM_STARLETTE_UPLOADFILE = None
     try:
         async def _run() -> bool:
             f = FormData([("a", "1")])
@@ -81,8 +71,7 @@ def test_formdata_close_still_strict_when_starlette_module_absent():
 
         assert asyncio.run(_run()) is True
     finally:
-        if saved is not None:
-            sys.modules["starlette.datastructures"] = saved
+        compat.PRESHIM_STARLETTE_UPLOADFILE = original_capture
 
 
 # ────────────────────────────────────────────────────────────────────

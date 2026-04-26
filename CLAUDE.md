@@ -46,8 +46,8 @@ PATH="$HOME/.cargo/bin:$PATH" maturin develop          # debug, ~5s incremental
 PATH="$HOME/.cargo/bin:$PATH" maturin develop --release  # optimized, ~8s
 
 # Test (skip WS tests for speed — they need server startup)
-pytest tests/ -x -q --ignore=tests/test_websocket.py   # ~6s, 124 tests
-pytest tests/ -x -q                                      # ~50s, 128 tests
+pytest tests/ -x -q --ignore=tests/test_websocket.py   # ~45s
+pytest tests/ -x -q                                      # ~50s, 920 tests
 
 # Benchmark
 ./target/release/fastapi-turbo-bench 127.0.0.1 PORT /path N WARMUP [METHOD] [BODY] [CONTENT_TYPE]
@@ -55,7 +55,7 @@ pytest tests/ -x -q                                      # ~50s, 128 tests
 
 ## Key Design Decisions
 
-- **PyO3 0.25** — not 0.28, because 0.28 requires API migration (with_gil→attach, etc.) with no perf gain
+- **PyO3 0.28** — see `Cargo.toml`. The migration from 0.25 (with_gil → attach, deprecated downcast → cast) is complete; clippy clean under `--release --all-targets -- -D warnings`
 - **orjson is optional** — removed from required deps for free-threaded Python compatibility
 - **Response serialization**: Direct PyDict→JSON writer in Rust (bypasses serde_json::Value intermediate)
 - **Async deps**: Wrapped in sync callers at startup via `_make_sync_wrapper` — drives coroutines via `coro.send(None)` in Python, avoiding PyO3 coroutine protocol overhead

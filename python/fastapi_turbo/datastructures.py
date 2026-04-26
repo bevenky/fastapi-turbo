@@ -171,9 +171,20 @@ class Headers:
         k = key.lower()
         return [vv for kk, vv in self._list if kk == k]
 
+    @property
     def raw(self):
         """List of ``(name: bytes, value: bytes)`` tuples — Starlette-
-        compatible low-level view."""
+        compatible low-level view.
+
+        Property (not method) so attribute access yields the list
+        directly: matches Starlette's ``Headers.raw`` (an instance
+        attribute) and httpx's ``Headers.raw`` (a property) — both
+        let callers do ``for k, v in headers.raw: ...`` without
+        parens. Earlier impl was a method, so the same call site
+        iterated a bound-method object and raised
+        ``TypeError: 'method' object is not iterable`` (silently
+        caught in WS scope assembly, leaving raw ASGI WS middleware
+        with empty headers — risky for Sentry / auth / observability)."""
         return [(k.encode("latin-1"), v.encode("latin-1")) for k, v in self._list]
 
 
@@ -322,29 +333,59 @@ class URLPath(str):
 
 
 class MutableHeaders(Headers):
-    """Headers that support __setitem__/__delitem__/append (Starlette-compat)."""
+    """Headers that support __setitem__/__delitem__/append (Starlette-compat).
+
+    Stored as ``self._list: list[tuple[str, str]]`` (inherited from
+    ``Headers``); duplicates are preserved via ``append`` and
+    overwritten via ``__setitem__`` (last-write-wins for that key).
+
+    Earlier impl wrote ``self._dict`` even though ``Headers`` switched
+    to ``_list`` storage — every mutation raised
+    ``AttributeError: ... has no attribute '_dict'``. Probe-confirmed:
+    ``h["x"] = "1"``, ``h.append(...)``, ``h.setdefault(...)`` all
+    crashed under the shim.
+    """
 
     def __setitem__(self, key: str, value: str) -> None:
-        self._dict[key.lower()] = str(value)
+        # Replace any existing values for this key, then append the
+        # new one — matches Starlette's ``MutableHeaders.__setitem__``
+        # (set semantics: drop duplicates, leave one canonical value).
+        kl = key.lower()
+        sv = str(value)
+        existing = [(k, v) for (k, v) in self._list if k != kl]
+        existing.append((kl, sv))
+        self._list = existing
 
     def __delitem__(self, key: str) -> None:
-        del self._dict[key.lower()]
+        kl = key.lower()
+        before = len(self._list)
+        self._list = [(k, v) for (k, v) in self._list if k != kl]
+        if len(self._list) == before:
+            raise KeyError(key)
 
     def setdefault(self, key: str, value: str) -> str:
-        return self._dict.setdefault(key.lower(), str(value))
+        kl = key.lower()
+        for (k, v) in self._list:
+            if k == kl:
+                return v
+        sv = str(value)
+        self._list.append((kl, sv))
+        return sv
 
     def update(self, other) -> None:
         if isinstance(other, Headers):
             for k, v in other.items():
-                self._dict[k.lower()] = v
+                self[k] = v
         elif isinstance(other, dict):
             for k, v in other.items():
-                self._dict[k.lower()] = str(v)
+                self[k] = str(v)
 
     def append(self, key: str, value: str) -> None:
-        """Append adds (or overwrites in this single-value impl). Starlette's
-        append preserves duplicates — our simplified store collapses them."""
-        self._dict[key.lower()] = str(value)
+        """Append a new ``(key, value)`` pair without removing existing
+        ones — matches Starlette's ``MutableHeaders.append``. Multiple
+        calls with the same key produce duplicates, the canonical
+        shape for headers like ``Set-Cookie`` and ``Vary``."""
+        self._list.append((key.lower(), str(value)))
 
 
 class FormData:
@@ -460,22 +501,23 @@ class FormData:
         Idempotent at the per-file level — each ``UploadFile.close``
         is itself idempotent."""
         import inspect as _inspect
-        import sys as _sys
         from fastapi_turbo.param_functions import UploadFile as _UF
+        from fastapi_turbo import compat as _compat
 
         # Build the recognised-classes tuple. Always include our own
-        # ``UploadFile``. Add the upstream Starlette class only if
-        # it was imported BEFORE the shim ran (and is therefore a
-        # genuinely separate type). If the shim has already
-        # rewritten ``sys.modules['starlette.datastructures']`` to
-        # point at us, ``starlette.datastructures.UploadFile`` IS
-        # our ``_UF`` and we'd just be repeating ourselves.
+        # ``UploadFile``. Add the upstream Starlette class captured
+        # at shim-install time, if it was imported before us — that
+        # reference is to the ORIGINAL Starlette class, not the
+        # post-shim ``sys.modules['starlette.datastructures'].
+        # UploadFile`` (which is our ``_UF`` after the swap and would
+        # be redundant). The R24 attempt probed ``sys.modules`` post-
+        # facto and couldn't see the pre-shim original; ``compat``
+        # captures it at install time, before the module pointer
+        # gets replaced.
         upload_classes: tuple = (_UF,)
-        starlette_mod = _sys.modules.get("starlette.datastructures")
-        if starlette_mod is not None:
-            starlette_uf = getattr(starlette_mod, "UploadFile", None)
-            if starlette_uf is not None and starlette_uf is not _UF:
-                upload_classes = (_UF, starlette_uf)
+        preshim = getattr(_compat, "PRESHIM_STARLETTE_UPLOADFILE", None)
+        if preshim is not None and preshim is not _UF:
+            upload_classes = (_UF, preshim)
 
         for _, v in self._items:
             if not isinstance(v, upload_classes):
