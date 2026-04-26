@@ -42,6 +42,7 @@ fallback tests should not assert ``_port`` or ``_app_servers``."
 """
 from __future__ import annotations
 
+import os
 import socket
 
 import pytest
@@ -60,9 +61,31 @@ def _can_bind_loopback() -> bool:
         return False
 
 
+def _loopback_denied() -> bool:
+    """Determine whether to treat the env as loopback-denied.
+
+    Auditors and CI runs that want to exercise the
+    ``requires_loopback`` skip path can set
+    ``FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`` to override the probe
+    — useful when the actual ``socket.bind`` call from the test
+    process succeeds (e.g. because the auditor's parent process is
+    privileged) but a child process / subprocess server would fail.
+    The env-var override flips ``LOOPBACK_DENIED`` to ``True``
+    regardless of the probe result. The reverse override
+    (``FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED=1``) lets a sandbox env
+    that wants the full real-loopback suite to run override a
+    failing probe, on the user's promise that bind will work for
+    the actual subprocess servers."""
+    if os.environ.get("FASTAPI_TURBO_FORCE_LOOPBACK_DENIED") == "1":
+        return True
+    if os.environ.get("FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED") == "1":
+        return False
+    return not _can_bind_loopback()
+
+
 # Computed once per session — used both for module-level decisions
 # and by per-test fixtures.
-LOOPBACK_DENIED: bool = not _can_bind_loopback()
+LOOPBACK_DENIED: bool = _loopback_denied()
 
 
 def pytest_configure(config: pytest.Config) -> None:

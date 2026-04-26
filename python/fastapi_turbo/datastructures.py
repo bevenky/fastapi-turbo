@@ -444,6 +444,14 @@ class FormData:
         ``close`` attribute does NOT get closed; that's a probe the
         R22 audit caught us failing).
 
+        Recognises BOTH the shimmed ``fastapi_turbo`` ``UploadFile``
+        and any pre-shim ``starlette.datastructures.UploadFile`` that
+        was imported before ``fastapi_turbo`` installed its
+        ``sys.modules`` shim. Without this, drop-in code that did
+        ``from starlette.datastructures import UploadFile`` early
+        (before importing fastapi_turbo) would skip the close — a
+        real edge for libraries that build form data directly.
+
         Cleanup errors propagate — ``UploadFile.close`` failures are
         load-bearing: they signal a real I/O problem the caller may
         want to handle. Earlier impl swallowed everything, hiding
@@ -452,10 +460,25 @@ class FormData:
         Idempotent at the per-file level — each ``UploadFile.close``
         is itself idempotent."""
         import inspect as _inspect
+        import sys as _sys
         from fastapi_turbo.param_functions import UploadFile as _UF
 
+        # Build the recognised-classes tuple. Always include our own
+        # ``UploadFile``. Add the upstream Starlette class only if
+        # it was imported BEFORE the shim ran (and is therefore a
+        # genuinely separate type). If the shim has already
+        # rewritten ``sys.modules['starlette.datastructures']`` to
+        # point at us, ``starlette.datastructures.UploadFile`` IS
+        # our ``_UF`` and we'd just be repeating ourselves.
+        upload_classes: tuple = (_UF,)
+        starlette_mod = _sys.modules.get("starlette.datastructures")
+        if starlette_mod is not None:
+            starlette_uf = getattr(starlette_mod, "UploadFile", None)
+            if starlette_uf is not None and starlette_uf is not _UF:
+                upload_classes = (_UF, starlette_uf)
+
         for _, v in self._items:
-            if not isinstance(v, _UF):
+            if not isinstance(v, upload_classes):
                 continue
             result = v.close()
             if _inspect.isawaitable(result):

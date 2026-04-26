@@ -144,23 +144,43 @@ _rust_seek = _PyUploadFile.seek
 _rust_close = _PyUploadFile.close
 
 
-async def _async_upload_read(self, size: int = -1):
+async def read(self, size: int = -1) -> bytes:  # noqa: D401
+    """Read and return up to ``size`` bytes from the upload."""
     return await _rust_read(self, size)
 
 
-async def _async_upload_write(self, data) -> None:
+async def write(self, data: bytes) -> None:  # noqa: D401
+    """Write ``data`` to the upload at the current cursor."""
     return await _rust_write(self, data)
 
 
-async def _async_upload_seek(self, offset: int) -> None:
+async def seek(self, offset: int) -> None:  # noqa: D401
+    """Move the cursor to ``offset`` bytes from the start."""
     return await _rust_seek(self, offset)
 
 
-async def _async_upload_close(self) -> None:
+async def close(self) -> None:  # noqa: D401
+    """Close the upload and release the underlying buffer's handle."""
     return await _rust_close(self)
 
 
-_PyUploadFile.read = _async_upload_read
-_PyUploadFile.write = _async_upload_write
-_PyUploadFile.seek = _async_upload_seek
-_PyUploadFile.close = _async_upload_close
+# Stamp ``__qualname__`` so introspection tools that show
+# ``Class.method`` (debuggers, schema generators, OpenAPI tooling
+# that reads ``inspect.signature`` via ``__qualname__``) report
+# ``UploadFile.read`` / ``.write`` / ``.seek`` / ``.close`` instead
+# of the module-level helper names. ``__name__`` is already the
+# bare verb because we named the helpers that way; setting
+# ``__qualname__`` makes the joined form match Starlette.
+read.__qualname__ = "UploadFile.read"
+write.__qualname__ = "UploadFile.write"
+seek.__qualname__ = "UploadFile.seek"
+close.__qualname__ = "UploadFile.close"
+
+_PyUploadFile.read = read
+_PyUploadFile.write = write
+_PyUploadFile.seek = seek
+_PyUploadFile.close = close
+
+# Don't leak the wrappers into ``fastapi_turbo``'s public namespace —
+# they're not part of the public API surface.
+del read, write, seek, close
