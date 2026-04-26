@@ -1,5 +1,15 @@
 # fastapi-turbo Benchmarks
 
+> **Reading order:** the most recent runs (concurrent load,
+> external-tool cross-checks, c=1/32/256 sweeps) are at the top of
+> this file. Sections below the first `---` are **historical**:
+> earlier single-connection-sequential runs that were superseded
+> by the concurrent-load methodology. Treat the historical numbers
+> as data points, not release messaging — they don't reflect
+> behaviour under realistic concurrency, and the only release-claim
+> wording lives in [README.md](README.md) and the topmost dated
+> section here.
+
 ## Test Environment
 
 - **Machine**: Apple Silicon (ARM64)

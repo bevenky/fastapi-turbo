@@ -339,6 +339,15 @@ pub struct PyUploadFile {
     /// seek(). Shared with ``PySyncFile`` for the same reason as
     /// ``data``: a sync seek on ``.file`` must move the async cursor too.
     cursor: Arc<Mutex<usize>>,
+    /// Logical size — separate from ``data.len()``. Async
+    /// ``await upload.write(b)`` increments this by ``len(b)``
+    /// regardless of cursor position (matches Starlette's
+    /// ``UploadFile.write`` semantics: ``self.size += len(data)``).
+    /// Sync ``upload.file.write(b)`` mutates ``data`` / ``cursor`` but
+    /// does NOT touch ``size`` — Starlette's underlying
+    /// ``SpooledTemporaryFile.write`` is opaque to ``UploadFile.size``.
+    /// Initialised to the parsed multipart slice length.
+    size: Arc<Mutex<usize>>,
     /// Headers from the multipart part.
     header_list: Vec<(String, String)>,
     /// Starlette-parity: ``file.closed`` flips to ``True`` after ``close()``.
@@ -347,11 +356,16 @@ pub struct PyUploadFile {
 
 #[pymethods]
 impl PyUploadFile {
-    /// Current logical length — reflects writes that extended the buffer.
-    /// Matches Starlette's ``UploadFile.size`` after writes.
+    /// Logical size, tracked separately from the backing buffer.
+    /// Async ``await upload.write(b)`` increments this; sync
+    /// ``upload.file.write(b)`` does not — same divergence Starlette
+    /// has between ``UploadFile.size`` and the underlying
+    /// ``SpooledTemporaryFile``. Initialised to the parsed multipart
+    /// slice length (so a freshly-uploaded file reports its on-the-wire
+    /// size before any writes happen).
     #[getter]
     fn size(&self) -> usize {
-        self.data.lock().unwrap().len()
+        *self.size.lock().unwrap()
     }
 
     /// Async read: returns an awaitable that resolves to bytes. Matches
@@ -431,15 +445,25 @@ impl PyUploadFile {
                 ))
             })?
         };
-        let mut storage = self.data.lock().unwrap();
-        let mut cursor = self.cursor.lock().unwrap();
-        let pos = *cursor;
-        let new_end = pos + buf.len();
-        if new_end > storage.len() {
-            storage.resize(new_end, 0);
+        let written = buf.len();
+        {
+            let mut storage = self.data.lock().unwrap();
+            let mut cursor = self.cursor.lock().unwrap();
+            let pos = *cursor;
+            let new_end = pos + written;
+            if new_end > storage.len() {
+                storage.resize(new_end, 0);
+            }
+            storage[pos..new_end].copy_from_slice(&buf);
+            *cursor = new_end;
         }
-        storage[pos..new_end].copy_from_slice(&buf);
-        *cursor = new_end;
+        // Starlette's ``UploadFile.write`` does ``self.size += len
+        // (data)`` unconditionally — the size accumulates across
+        // every async write, even when the write overlays existing
+        // bytes (so ``size`` doesn't necessarily equal the buffer
+        // length). Mirror that here so probes that compare
+        // ``upstream.size`` to ``turbo.size`` agree on the count.
+        *self.size.lock().unwrap() += written;
         Py::new(py, ImmediateNone)
     }
 
@@ -476,11 +500,13 @@ impl PyUploadFile {
 
 impl PyUploadFile {
     pub fn from_field(field: ParsedField) -> Self {
+        let initial_len = field.data.len();
         Self {
             filename: field.filename,
             content_type: field.content_type,
             data: Arc::new(Mutex::new(field.data.to_vec())),
             cursor: Arc::new(Mutex::new(0)),
+            size: Arc::new(Mutex::new(initial_len)),
             header_list: field.headers,
             closed: Arc::new(Mutex::new(false)),
         }

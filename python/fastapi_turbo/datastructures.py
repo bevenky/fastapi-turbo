@@ -435,6 +435,34 @@ class FormData:
         # Starlette. ``len(form)`` for ``a=1&a=2`` is 1, not 2.
         return sum(1 for _ in self.keys())
 
+    async def close(self) -> None:
+        """Close every ``UploadFile`` value held in this ``FormData``,
+        matching ``starlette.datastructures.FormData.close``. Text
+        fields are passed through; values exposing an ``async def
+        close()`` (UploadFile) are awaited so the underlying
+        ``SpooledTemporaryFile`` releases its handle. Safe to call
+        multiple times — each ``UploadFile.close`` is idempotent.
+
+        Required for parity with the upstream Starlette / FastAPI
+        ``Request.close`` cleanup path: handlers that explicitly call
+        ``await form.close()`` (e.g. inside a ``finally`` block to
+        guarantee buffered uploads release before the response goes
+        out) silently no-op'd before this fix."""
+        import inspect as _inspect
+        for _, v in self._items:
+            close = getattr(v, "close", None)
+            if close is None:
+                continue
+            try:
+                result = close()
+            except Exception:  # noqa: BLE001
+                continue
+            if _inspect.isawaitable(result):
+                try:
+                    await result
+                except Exception:  # noqa: BLE001
+                    pass
+
 
 class Secret:
     """Wrapper that hides its value in repr(). For env-var secrets.

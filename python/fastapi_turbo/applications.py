@@ -7035,12 +7035,17 @@ class FastAPI:
                         form_fields[k] = v
                 elif ct_lower.startswith("multipart/form-data"):
                     import email.parser as _email_parser
+                    # RFC 2045 §5.1: param names case-insensitive,
+                    # values case-sensitive — ``Boundary=AaB03x`` is
+                    # valid. Lowercase the lookup key, preserve value.
                     boundary = None
                     for part in content_type.split(";"):
                         part = part.strip()
-                        if part.startswith("boundary="):
-                            boundary = part[len("boundary="):].strip('"')
-                            break
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            if k.strip().lower() == "boundary":
+                                boundary = v.strip().strip('"')
+                                break
                     if boundary is not None:
                         from fastapi_turbo.param_functions import UploadFile as _UF
                         # Starlette's MultiPartParser defaults — exceeding
@@ -7060,12 +7065,17 @@ class FastAPI:
                             cd = part_msg.get("content-disposition", "")
                             if not cd:
                                 continue
+                            # Param NAMES case-insensitive (RFC 2045
+                            # §5.1) — lowercase keys, preserve values.
+                            # ``Content-Disposition: form-data;
+                            # Name="x"; FileName="y.txt"`` parses to
+                            # the same fields as the canonical case.
                             params: dict[str, str] = {}
                             for seg in cd.split(";"):
                                 seg = seg.strip()
                                 if "=" in seg:
                                     k, v = seg.split("=", 1)
-                                    params[k.strip()] = v.strip().strip('"')
+                                    params[k.strip().lower()] = v.strip().strip('"')
                             fname = params.get("name")
                             if fname is None:
                                 continue
@@ -7084,6 +7094,13 @@ class FastAPI:
                                     filename=params["filename"],
                                     file=io.BytesIO(payload),
                                     content_type=part_msg.get_content_type(),
+                                    # Match Starlette's MultiPartParser:
+                                    # initialise ``size`` so subsequent
+                                    # ``await file.write(b)`` increments
+                                    # it (otherwise size stays None and
+                                    # ``UploadFile.size`` reports None
+                                    # forever — diverges from upstream).
+                                    size=len(payload),
                                 )
                                 _existing = form_fields.get(fname)
                                 if _existing is None:

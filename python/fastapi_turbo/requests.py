@@ -432,11 +432,16 @@ class Request(HTTPConnection):
             self._form = self._parse_multipart_form(
                 ct, raw, max_files=max_files, max_fields=max_fields
             )
-        elif ct_lower.startswith("application/x-www-form-urlencoded") or not ct_lower:
+        elif ct_lower.startswith("application/x-www-form-urlencoded"):
             from urllib.parse import parse_qsl
             items = parse_qsl(raw.decode("utf-8"), keep_blank_values=True)
             self._form = FormData(items)
         else:
+            # Starlette parity: a body with no ``Content-Type`` header
+            # is NOT a form — return an empty ``FormData`` rather than
+            # speculatively running ``parse_qsl`` on the raw bytes
+            # (which would surface an arbitrary binary body as fake
+            # ``(key, value)`` pairs).
             self._form = FormData([])
         return self._form
 
@@ -460,12 +465,18 @@ class Request(HTTPConnection):
         from fastapi_turbo.datastructures import FormData
         from fastapi_turbo.param_functions import UploadFile
 
+        # RFC 2045 §5.1: parameter names are case-insensitive,
+        # parameter values are case-sensitive. ``Content-Type:
+        # multipart/form-data; Boundary=AaB03x`` is valid; lowercase
+        # the param name when looking it up but preserve the value.
         boundary = None
         for part in content_type.split(";"):
             part = part.strip()
-            if part.startswith("boundary="):
-                boundary = part[len("boundary="):].strip().strip('"')
-                break
+            if "=" in part:
+                k, v = part.split("=", 1)
+                if k.strip().lower() == "boundary":
+                    boundary = v.strip().strip('"')
+                    break
         if boundary is None:
             return FormData([])
 
@@ -487,12 +498,15 @@ class Request(HTTPConnection):
             cd = part_msg.get("content-disposition", "")
             if not cd:
                 continue
+            # Parameter NAMES are case-insensitive (RFC 2045 §5.1) —
+            # lowercase the key, preserve the value verbatim.
+            # ``Content-Disposition: form-data; Name="x"`` is valid.
             params: dict[str, str] = {}
             for seg in cd.split(";"):
                 seg = seg.strip()
                 if "=" in seg:
                     k, v = seg.split("=", 1)
-                    params[k.strip()] = v.strip().strip('"')
+                    params[k.strip().lower()] = v.strip().strip('"')
             fname = params.get("name")
             if fname is None:
                 continue

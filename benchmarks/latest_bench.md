@@ -184,12 +184,19 @@ No code changes required.
 
 ## 7. Raw TSVs
 
-All numbers rendered above come from these files (retained for reproducibility):
+All numbers rendered above come from these files. Authoritative copies
+live in this repo (under `benchmarks/`); the `/tmp/...` paths are the
+runners' default scratch outputs and are NOT what reproducers should
+link to:
 
-- `/tmp/v3.tsv` — HTTP CRUD + WS
-- `/tmp/dbm.tsv` — Postgres driver × mode
-- `/tmp/rm.tsv` — Redis sync vs async
-- `/tmp/sqla.tsv` — SQLA driver × mode (partial; see §4 gap)
+- [`benchmarks/v3.tsv`](v3.tsv) — HTTP CRUD + WS
+  (runner default: `/tmp/v3.tsv`)
+- [`benchmarks/dbm.tsv`](dbm.tsv) — Postgres driver × mode
+  (runner default: `/tmp/dbm.tsv`)
+- [`benchmarks/rm.tsv`](rm.tsv) — Redis sync vs async
+  (runner default: `/tmp/rm.tsv`)
+- [`benchmarks/sqla.tsv`](sqla.tsv) — SQLA driver × mode (partial; see §4 gap)
+  (runner default: `/tmp/sqla.tsv`)
 
 ### Runner scripts
 
