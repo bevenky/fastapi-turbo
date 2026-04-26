@@ -544,25 +544,19 @@ class Request(HTTPConnection):
         ``await request.close()`` in a ``finally`` to guarantee
         upload buffers release before the response goes out.
 
-        Earlier impl was a bare ``pass``, so ``request.close``
+        Cleanup errors propagate. Starlette's ``Request.close`` is
+        a thin pass-through to ``self._form.close()`` — if an
+        underlying ``UploadFile.close`` raises, the caller sees it.
+        Earlier impl wrapped in ``try/except Exception: pass``, which
+        hid broken cleanup behind silent success and diverged from
+        upstream (probe: upstream raised ``OSError("boom")``; we
+        returned normally).
+
+        Earlier-earlier impl was a bare ``pass``, so ``request.close``
         silently no-op'd — a parsed multipart form's ``UploadFile``
-        objects stayed open until garbage-collected. Probe-confirmed
-        upstream toggles ``upload.file.closed`` to ``True`` after
-        ``await request.close()``."""
+        objects stayed open until garbage-collected."""
         if self._form is not None:
-            close = getattr(self._form, "close", None)
-            if close is not None:
-                try:
-                    result = close()
-                    import inspect as _inspect
-                    if _inspect.isawaitable(result):
-                        await result
-                except Exception:  # noqa: BLE001
-                    # Swallow only at the request boundary — individual
-                    # ``UploadFile.close`` failures shouldn't abort the
-                    # response. Per-file errors propagate inside
-                    # ``FormData.close`` (see datastructures.py).
-                    pass
+            await self._form.close()
 
     def __getitem__(self, key: str) -> Any:
         return self._scope[key]

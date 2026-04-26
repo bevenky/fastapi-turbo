@@ -118,3 +118,49 @@ import os as _os
 if not _os.environ.get("FASTAPI_TURBO_NO_SHIM"):
     from fastapi_turbo.compat import install as _install_shims
     _install_shims()
+
+
+# ── Coroutine-function parity for the Rust ``PyUploadFile`` ──────────
+#
+# Starlette's ``UploadFile.read`` / ``write`` / ``seek`` / ``close``
+# are real ``async def`` methods, so ``inspect.iscoroutinefunction
+# (file.read)`` returns ``True``. The Rust-bound methods on
+# ``PyUploadFile`` return immediate awaitables (``ImmediateBytes`` /
+# ``ImmediateNone``) — ``await file.read()`` works, but the FUNCTION
+# itself isn't a coroutine function (no ``CO_COROUTINE`` flag), so
+# libraries that introspect with ``inspect.iscoroutinefunction``
+# (or pre-build the awaitable then await it later) saw different
+# behaviour from upstream.
+#
+# Wrap each method with an ``async def`` shim so introspection
+# matches Starlette. The body still drives the original immediate
+# awaitable (``await rust_method(self, ...)``) — no extra scheduler
+# hop, just a Python-level coroutine wrapper.
+from fastapi_turbo._fastapi_turbo_core import PyUploadFile as _PyUploadFile
+
+_rust_read = _PyUploadFile.read
+_rust_write = _PyUploadFile.write
+_rust_seek = _PyUploadFile.seek
+_rust_close = _PyUploadFile.close
+
+
+async def _async_upload_read(self, size: int = -1):
+    return await _rust_read(self, size)
+
+
+async def _async_upload_write(self, data) -> None:
+    return await _rust_write(self, data)
+
+
+async def _async_upload_seek(self, offset: int) -> None:
+    return await _rust_seek(self, offset)
+
+
+async def _async_upload_close(self) -> None:
+    return await _rust_close(self)
+
+
+_PyUploadFile.read = _async_upload_read
+_PyUploadFile.write = _async_upload_write
+_PyUploadFile.seek = _async_upload_seek
+_PyUploadFile.close = _async_upload_close
