@@ -155,15 +155,18 @@ class AuthenticationMiddleware:
 
     async def __call__(self, request, call_next):
         if self.backend is None:
+            request.scope.setdefault("auth", AuthCredentials())
+            request.scope.setdefault("user", UnauthenticatedUser())
             return await call_next(request)
         try:
             result = await self.backend.authenticate(request)
         except AuthenticationError as exc:
             return self.on_error(request, exc)
-        if result is not None:
-            creds, user = result
-            request.scope["auth"] = creds
-            request.scope["user"] = user
+        if result is None:
+            result = AuthCredentials(), UnauthenticatedUser()
+        creds, user = result
+        request.scope["auth"] = creds
+        request.scope["user"] = user
         return await call_next(request)
 
 

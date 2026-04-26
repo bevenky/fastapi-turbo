@@ -218,36 +218,47 @@ class Request(HTTPConnection):
 
     @property
     def user(self):
-        """Authenticated user (populated by AuthenticationMiddleware).
+        """Authenticated user — populated by ``AuthenticationMiddleware``.
 
-        Matches Starlette's Request.user: returns None until an auth backend
-        sets scope['user']. When no user is authenticated, returns an
-        UnauthenticatedUser-like sentinel that evaluates falsy.
-        """
-        from fastapi_turbo.authentication import UnauthenticatedUser
-
-        return self._scope.get("user") or UnauthenticatedUser()
+        Matches Starlette: ``request.user`` raises ``AssertionError``
+        ("AuthenticationMiddleware must be installed to access
+        request.user") when no auth middleware has set
+        ``scope['user']``. The previous permissive fallback (return
+        an ``UnauthenticatedUser`` sentinel) silently let auth-aware
+        endpoints succeed without auth wired in — a real shipping
+        risk for handlers that gate on ``if not request.user``."""
+        if "user" not in self._scope:
+            raise AssertionError(
+                "AuthenticationMiddleware must be installed to access "
+                "request.user"
+            )
+        return self._scope["user"]
 
     @property
     def auth(self):
-        """AuthCredentials (populated by AuthenticationMiddleware).
+        """AuthCredentials — populated by ``AuthenticationMiddleware``.
 
-        Matches Starlette's Request.auth: returns an object exposing .scopes
-        (list[str]). Returns empty AuthCredentials when no auth middleware ran.
-        """
-        from fastapi_turbo.authentication import AuthCredentials
-
-        return self._scope.get("auth") or AuthCredentials()
+        Matches Starlette: raises ``AssertionError`` when the
+        middleware hasn't run."""
+        if "auth" not in self._scope:
+            raise AssertionError(
+                "AuthenticationMiddleware must be installed to access "
+                "request.auth"
+            )
+        return self._scope["auth"]
 
     @property
     def session(self):
-        """Session dict (populated by SessionMiddleware).
+        """Session dict — populated by ``SessionMiddleware``.
 
-        Returns {} if SessionMiddleware isn't installed — matches Starlette
-        if session cookie missing; real Starlette raises AssertionError if
-        SessionMiddleware is fully absent. We're permissive.
-        """
-        return self._scope.setdefault("session", {})
+        Matches Starlette: raises ``AssertionError`` when the
+        middleware hasn't run."""
+        if "session" not in self._scope:
+            raise AssertionError(
+                "SessionMiddleware must be installed to access "
+                "request.session"
+            )
+        return self._scope["session"]
 
     @property
     def receive(self):
@@ -255,11 +266,56 @@ class Request(HTTPConnection):
         return self._receive
 
     async def is_disconnected(self) -> bool:
-        """Check if the client has disconnected.
+        """Probe whether the client has disconnected.
 
-        Cannot reliably detect in our Rust-bridged architecture, so
-        this always returns False. Matches the Starlette API surface.
-        """
+        Schedules a single ``receive()`` task, lets the loop run
+        one tick (``await asyncio.sleep(0)``), then either reads
+        the result if it completed synchronously or cancels.
+        ``asyncio.wait_for(receive(), 0)`` would NOT work — it
+        cancels the task before it ever runs, so a receive that
+        could return synchronously (e.g. a pre-stashed
+        ``http.disconnect``) never gets a chance.
+
+        Caveat (matches Starlette): if you call ``is_disconnected
+        ()`` BEFORE draining the request body, a pending body
+        chunk may be silently consumed by this peek. The standard
+        advice is to call it inside long-running streaming
+        handlers (SSE / long-poll) where the body is already
+        drained.
+
+        Idempotent — once a disconnect is observed, stays ``True``
+        for the rest of the request lifetime so polling loops can
+        check it cheaply each iteration. Returns ``False`` when no
+        ``receive`` channel is available (Rust-bridged path with
+        no Python receive bound)."""
+        if getattr(self, "_disconnected", False):
+            return True
+        recv = self._receive
+        if recv is None:
+            return False
+        import asyncio
+        try:
+            task = asyncio.ensure_future(recv())
+        except Exception:  # noqa: BLE001
+            return False
+        # Yield one tick so the receive task can run. If receive
+        # returns synchronously (no internal await), task.done()
+        # will be True after the yield.
+        await asyncio.sleep(0)
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            return False
+        try:
+            msg = task.result()
+        except Exception:  # noqa: BLE001
+            return False
+        if isinstance(msg, dict) and msg.get("type") == "http.disconnect":
+            self._disconnected = True
+            return True
         return False
 
     def url_for(self, name: str, /, **path_params: Any) -> URL:
@@ -338,17 +394,99 @@ class Request(HTTPConnection):
         return self._json
 
     async def form(self, *, max_files: int = 1000, max_fields: int = 1000) -> "FormData":
+        """Parse the request body as form data.
+
+        Dispatches on ``Content-Type``:
+
+          * ``application/x-www-form-urlencoded`` → ``parse_qsl``,
+            multi-values preserved (``form.getlist("tag")`` works).
+          * ``multipart/form-data`` → ``email.parser.BytesParser``
+            applied to a synthetic ``Content-Type`` envelope, with
+            file parts surfaced as ``UploadFile`` objects and text
+            parts as plain strings. Same parser the in-process ASGI
+            dispatcher uses (matches FastAPI parity for ``form: …
+            = Form(...)`` / ``UploadFile`` endpoints).
+          * Anything else → empty ``FormData``.
+
+        Earlier code unconditionally ran ``parse_qsl`` on the raw
+        body, so ``await request.form()`` against a multipart
+        upload returned the raw boundary text as a single garbled
+        ``(key, value)`` pair instead of fields + ``UploadFile``."""
         if self._form is not None:
             return self._form
-        # Basic form parsing — assumes application/x-www-form-urlencoded.
-        # Preserve multi-values as separate `(key, value)` entries so
-        # `form.getlist("tag")` surfaces each occurrence individually.
-        raw = await self.body()
-        from urllib.parse import parse_qsl
         from fastapi_turbo.datastructures import FormData
-        items = parse_qsl(raw.decode("utf-8"), keep_blank_values=True)
-        self._form = FormData(items)
+
+        ct = (self.headers.get("content-type") or "").lower()
+        raw = await self.body()
+        if ct.startswith("multipart/form-data"):
+            self._form = self._parse_multipart_form(ct, raw)
+        elif ct.startswith("application/x-www-form-urlencoded") or not ct:
+            from urllib.parse import parse_qsl
+            items = parse_qsl(raw.decode("utf-8"), keep_blank_values=True)
+            self._form = FormData(items)
+        else:
+            self._form = FormData([])
         return self._form
+
+    def _parse_multipart_form(self, content_type: str, raw_body: bytes):
+        """Parse a multipart body into a ``FormData`` with file parts
+        materialised as ``UploadFile``. Mirrors the in-process ASGI
+        dispatcher's parser so ``await request.form()`` and
+        ``Form(...)`` / ``UploadFile`` injection see the same
+        structure."""
+        import io
+        import email.parser
+        from fastapi_turbo.datastructures import FormData
+        from fastapi_turbo.param_functions import UploadFile
+
+        boundary = None
+        for part in content_type.split(";"):
+            part = part.strip()
+            if part.startswith("boundary="):
+                boundary = part[len("boundary="):].strip().strip('"')
+                break
+        if boundary is None:
+            return FormData([])
+
+        envelope = (
+            f"Content-Type: multipart/form-data; boundary={boundary}\r\n\r\n"
+        ).encode("latin-1") + raw_body
+        parser = email.parser.BytesParser()
+        try:
+            msg = parser.parsebytes(envelope)
+        except Exception:  # noqa: BLE001
+            return FormData([])
+
+        items: list[tuple[str, Any]] = []
+        for part_msg in msg.walk():
+            if part_msg.is_multipart():
+                continue
+            cd = part_msg.get("content-disposition", "")
+            if not cd:
+                continue
+            params: dict[str, str] = {}
+            for seg in cd.split(";"):
+                seg = seg.strip()
+                if "=" in seg:
+                    k, v = seg.split("=", 1)
+                    params[k.strip()] = v.strip().strip('"')
+            fname = params.get("name")
+            if fname is None:
+                continue
+            if "filename" in params:
+                payload = part_msg.get_payload(decode=True) or b""
+                upload = UploadFile(
+                    filename=params["filename"],
+                    file=io.BytesIO(payload),
+                    content_type=part_msg.get_content_type(),
+                )
+                items.append((fname, upload))
+            else:
+                val = part_msg.get_payload(decode=True) or b""
+                if isinstance(val, bytes):
+                    val = val.decode("utf-8", errors="replace")
+                items.append((fname, val))
+        return FormData(items)
 
     async def close(self) -> None:
         pass

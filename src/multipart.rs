@@ -10,7 +10,7 @@
 //! The file contents are kept in memory (axum's body is already buffered).
 //! A spool-to-disk variant could be added later for huge uploads.
 
-use pyo3::exceptions::PyStopIteration;
+use pyo3::exceptions::{PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use std::collections::HashMap;
@@ -221,20 +221,48 @@ impl ImmediateNone {
     }
 }
 
+/// Awaitable that resolves to an integer immediately. Used by
+/// ``UploadFile.write`` so ``await upload.write(data)`` returns the
+/// number of bytes written (matches Starlette).
+#[pyclass]
+pub struct ImmediateInt {
+    value: Option<i64>,
+}
+
+#[pymethods]
+impl ImmediateInt {
+    fn __await__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<()> {
+        let v = slf.value.take();
+        Err(PyStopIteration::new_err(v))
+    }
+}
+
 /// Python-exposed UploadFile — wraps the parsed bytes with a file-like API
-/// matching Starlette's `UploadFile` exactly (async read/seek/close).
+/// matching Starlette's `UploadFile` exactly (async read/seek/write/close).
 ///
-/// `data` is a zero-copy `bytes::Bytes` slice into the original request body.
+/// `data` starts as a copy of the multipart slice and is mutable so
+/// ``write()`` can extend or overwrite at the cursor (like Starlette's
+/// `SpooledTemporaryFile`-backed `UploadFile.file`). The original
+/// `bytes::Bytes` is unchanged — handlers that mutate the upload don't
+/// affect the request body.
 #[pyclass]
 pub struct PyUploadFile {
     #[pyo3(get)]
     filename: Option<String>,
     #[pyo3(get)]
     content_type: Option<String>,
-    #[pyo3(get)]
-    size: usize,
-    data: bytes::Bytes,
-    /// Read cursor — advances on read(), reset by seek().
+    /// Mutable buffer — supports both reads (cursor-based slicing) and
+    /// writes (cursor-positioned overwrite + extend).
+    data: Mutex<Vec<u8>>,
+    /// Read / write cursor — advances on read() and write(), reset by
+    /// seek(). Held in its own lock so reads aren't blocked by the
+    /// (rarer) write path.
     cursor: Mutex<usize>,
     /// Headers from the multipart part.
     header_list: Vec<(String, String)>,
@@ -244,21 +272,29 @@ pub struct PyUploadFile {
 
 #[pymethods]
 impl PyUploadFile {
+    /// Current logical length — reflects writes that extended the buffer.
+    /// Matches Starlette's ``UploadFile.size`` after writes.
+    #[getter]
+    fn size(&self) -> usize {
+        self.data.lock().unwrap().len()
+    }
+
     /// Async read: returns an awaitable that resolves to bytes. Matches
     /// Starlette's UploadFile.read signature. Because we have the data in
     /// memory, the awaitable resolves immediately (no scheduling hop).
     #[pyo3(signature = (size=-1))]
     fn read<'py>(&self, py: Python<'py>, size: isize) -> PyResult<Py<ImmediateBytes>> {
+        let data = self.data.lock().unwrap();
         let mut cursor = self.cursor.lock().unwrap();
-        let remaining = self.data.len().saturating_sub(*cursor);
+        let remaining = data.len().saturating_sub(*cursor);
         let take = if size < 0 {
             remaining
         } else {
             std::cmp::min(remaining, size as usize)
         };
-        let slice = &self.data[*cursor..*cursor + take];
-        *cursor += take;
+        let slice = &data[*cursor..*cursor + take];
         let py_bytes = PyBytes::new(py, slice).unbind();
+        *cursor += take;
         Py::new(
             py,
             ImmediateBytes {
@@ -269,11 +305,12 @@ impl PyUploadFile {
 
     /// Async seek.
     fn seek(&self, py: Python<'_>, offset: isize) -> PyResult<Py<ImmediateNone>> {
+        let data_len = self.data.lock().unwrap().len();
         let mut cursor = self.cursor.lock().unwrap();
         let clamped = if offset < 0 {
             0
         } else {
-            std::cmp::min(offset as usize, self.data.len())
+            std::cmp::min(offset as usize, data_len)
         };
         *cursor = clamped;
         Py::new(py, ImmediateNone)
@@ -283,7 +320,9 @@ impl PyUploadFile {
         Ok(*self.cursor.lock().unwrap())
     }
 
-    /// Async close — no-op for in-memory uploads, but flips ``closed``.
+    /// Async close — flips ``closed``. Buffer is retained so subsequent
+    /// reads after close return what was written (matches Starlette's
+    /// SpooledTemporaryFile behaviour).
     fn close(&self, py: Python<'_>) -> PyResult<Py<ImmediateNone>> {
         *self.closed.lock().unwrap() = true;
         Py::new(py, ImmediateNone)
@@ -294,13 +333,49 @@ impl PyUploadFile {
         *self.closed.lock().unwrap()
     }
 
-    /// Async write — not really writable, but matches signature.
-    fn write<'py>(&self, py: Python<'py>, _data: Bound<'py, PyAny>) -> PyResult<Py<ImmediateNone>> {
-        Py::new(py, ImmediateNone)
+    /// Async write — extends or overwrites the buffer at the cursor.
+    /// Matches Starlette's ``UploadFile.write(b)``: bytes-like input,
+    /// extends past EOF, advances cursor by the number of bytes
+    /// written. Returns the byte count (not None) — ``await
+    /// upload.write(data)`` gives an int the caller can sum.
+    ///
+    /// Earlier impl was a no-op that ignored its argument and returned
+    /// None. That diverged from Starlette and broke handlers that
+    /// stage uploads for later processing
+    /// (``await upload.seek(0); await upload.write(transformed)``).
+    fn write<'py>(&self, py: Python<'py>, data: Bound<'py, PyAny>) -> PyResult<Py<ImmediateInt>> {
+        // Accept any bytes-like (bytes, bytearray, memoryview).
+        let buf: Vec<u8> = if let Ok(b) = data.cast::<PyBytes>() {
+            b.as_bytes().to_vec()
+        } else {
+            // Fallback: try to extract via the buffer protocol.
+            data.extract::<Vec<u8>>().map_err(|e| {
+                PyValueError::new_err(format!(
+                    "UploadFile.write expects bytes-like, got error: {e}"
+                ))
+            })?
+        };
+        let mut storage = self.data.lock().unwrap();
+        let mut cursor = self.cursor.lock().unwrap();
+        let pos = *cursor;
+        let new_end = pos + buf.len();
+        if new_end > storage.len() {
+            storage.resize(new_end, 0);
+        }
+        storage[pos..new_end].copy_from_slice(&buf);
+        *cursor = new_end;
+        let written = buf.len();
+        Py::new(
+            py,
+            ImmediateInt {
+                value: Some(written as i64),
+            },
+        )
     }
 
     /// Starlette-compat: UploadFile.file exposes a SpooledTemporaryFile-like.
-    /// We return self — our own .read/.seek methods cover the important calls.
+    /// We return self — our own .read/.seek/.write methods cover the
+    /// important calls and operate on the same shared buffer.
     #[getter]
     fn file<'py>(slf: PyRef<'py, Self>) -> PyRef<'py, Self> {
         slf
@@ -318,12 +393,10 @@ impl PyUploadFile {
 
 impl PyUploadFile {
     pub fn from_field(field: ParsedField) -> Self {
-        let size = field.data.len();
         Self {
             filename: field.filename,
             content_type: field.content_type,
-            size,
-            data: field.data,
+            data: Mutex::new(field.data.to_vec()),
             cursor: Mutex::new(0),
             header_list: field.headers,
             closed: Mutex::new(false),

@@ -7793,7 +7793,12 @@ class FastAPI:
                     continue
 
                 if kind in ("inject_request",):
-                    kwargs[name] = _Req(req_scope)
+                    # Pass ``receive`` so ``request.is_disconnected()``
+                    # can peek the ASGI channel for ``http.disconnect``
+                    # messages. Without this, every Request injected
+                    # as a kwarg has ``_receive=None`` and
+                    # ``is_disconnected`` is unconditionally ``False``.
+                    kwargs[name] = _Req(req_scope, receive=receive)
                     continue
                 if kind in ("inject_response",):
                     resp_inst = _Resp_cls()
@@ -7926,7 +7931,17 @@ class FastAPI:
 
                 current_call = _wrapped
 
-        req_obj = _Req(req_scope)
+        # Wrap ``receive`` so the body bytes the dispatcher already
+        # drained aren't redelivered (the handler reads them via
+        # ``request.body()`` / ``request._body`` from
+        # ``_fastapi_turbo_prebuffered_body``). Subsequent ``receive``
+        # calls (e.g. from ``request.is_disconnected()``) pass through
+        # to the real ASGI receive, surfacing
+        # ``{"type": "http.disconnect"}`` when the client drops.
+        async def _ws_aware_receive():
+            return await receive()
+
+        req_obj = _Req(req_scope, receive=_ws_aware_receive)
         try:
             # Honour ``FastAPI(worker_timeout=…)`` for the in-process
             # dispatch path. Without this the dispatcher just awaited

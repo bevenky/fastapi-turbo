@@ -237,10 +237,14 @@ class _ASGISyncClientShim:
                 pass
         for k, v in (kwargs.pop("cookies", None) or {}).items():
             merged_cookies.set(k, v)
-        # ``httpx.Request`` accepts these kwargs natively; pass them
-        # through verbatim. Unknown kwargs (extensions / auth /
-        # follow_redirects) are dropped silently — TestClient.stream
-        # callers in the test suite don't exercise them.
+        # ``httpx.Request`` accepts the per-request kwargs natively.
+        # ``auth=`` isn't a Request constructor kwarg — it's an
+        # httpx.Auth instance applied via ``next(auth.sync_auth_flow
+        # (request))`` (the auth flow can mutate the request, e.g.
+        # add ``Authorization: Basic …``). We invoke that here so
+        # ``c.stream(..., auth=("u", "p"))`` produces the same
+        # Authorization header upstream's TestClient would.
+        auth = kwargs.pop("auth", None)
         req = httpx.Request(
             method=method.upper(),
             url=full_url,
@@ -252,6 +256,29 @@ class _ASGISyncClientShim:
             headers=merged_headers,
             cookies=merged_cookies if merged_cookies else None,
         )
+        if auth is not None:
+            # Normalise tuple shorthand to ``BasicAuth`` exactly as
+            # ``httpx.Client`` does internally.
+            from httpx import BasicAuth as _BasicAuth
+            from httpx import Auth as _Auth
+            if isinstance(auth, tuple) and len(auth) == 2:
+                auth_inst = _BasicAuth(auth[0], auth[1])
+            elif isinstance(auth, _Auth):
+                auth_inst = auth
+            else:
+                auth_inst = None
+            if auth_inst is not None:
+                # ``sync_auth_flow`` is a generator that yields the
+                # request after stamping auth headers. We only need
+                # the first yielded request (no challenge / retry).
+                try:
+                    flow = auth_inst.sync_auth_flow(req)
+                    req = next(flow)
+                    flow.close()
+                except StopIteration:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
         parts = urlsplit(str(req.url))
         path = parts.path or "/"
         query = parts.query.encode("latin-1") if parts.query else b""
@@ -313,10 +340,16 @@ class _ASGISyncClientShim:
         app_task_holder: dict = {}
 
         async def _receive():
-            # First call delivers the request body; subsequent calls
-            # block until the client disconnects. Returning
-            # ``http.disconnect`` lets the app's body generator
-            # observe ``GeneratorExit`` via ASGI semantics.
+            # First call delivers the request body. Subsequent calls
+            # are non-blocking probes used by ``request.is_disconnected
+            # ()`` (which wraps receive in ``wait_for(..., timeout=0)``)
+            # AND by handlers that ``await receive()`` directly. The
+            # short-circuit before any ``await`` matters: it makes
+            # disconnect-detection deterministic under
+            # ``wait_for(0)`` — if we awaited even
+            # ``asyncio.sleep(0.01)`` first, ``wait_for`` would
+            # cancel the await before we ever reached the disconnect
+            # check.
             if not request_consumed.is_set():
                 request_consumed.set()
                 return {
@@ -324,7 +357,11 @@ class _ASGISyncClientShim:
                     "body": req_body,
                     "more_body": False,
                 }
-            # Wait for client disconnect.
+            if client_disconnected.is_set():
+                return {"type": "http.disconnect"}
+            # Not disconnected yet — block until it happens (long-
+            # poll-style) so handlers that ``await receive()``
+            # directly stay parked.
             while not client_disconnected.is_set():
                 await asyncio.sleep(0.01)
             return {"type": "http.disconnect"}

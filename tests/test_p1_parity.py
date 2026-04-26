@@ -138,22 +138,22 @@ class TestRequestStream:
 
 
 class TestRequestAuthUser:
-    def test_unauthenticated_by_default(self):
-        from starlette.authentication import UnauthenticatedUser
+    def test_user_requires_authentication_middleware(self):
+        # Parity with Starlette: accessing ``request.user`` without
+        # AuthenticationMiddleware installed must raise — silently
+        # returning UnauthenticatedUser hides misconfigured auth.
         from starlette.requests import Request
 
         req = Request(scope={"type": "http"})
-        assert isinstance(req.user, UnauthenticatedUser)
-        assert not req.user.is_authenticated
-        assert bool(req.user) is False
+        with pytest.raises(AssertionError):
+            _ = req.user
 
-    def test_auth_scopes_empty_by_default(self):
-        from starlette.authentication import AuthCredentials
+    def test_auth_requires_authentication_middleware(self):
         from starlette.requests import Request
 
         req = Request(scope={"type": "http"})
-        assert isinstance(req.auth, AuthCredentials)
-        assert req.auth.scopes == []
+        with pytest.raises(AssertionError):
+            _ = req.auth
 
     def test_authenticated_user_reachable(self):
         from starlette.authentication import AuthCredentials, SimpleUser
