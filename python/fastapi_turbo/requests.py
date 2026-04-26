@@ -538,7 +538,31 @@ class Request(HTTPConnection):
         return FormData(items)
 
     async def close(self) -> None:
-        pass
+        """Close the request's parsed form, releasing any
+        ``UploadFile`` handles it holds. Matches Starlette's
+        ``Request.close``: parity for handlers that explicitly
+        ``await request.close()`` in a ``finally`` to guarantee
+        upload buffers release before the response goes out.
+
+        Earlier impl was a bare ``pass``, so ``request.close``
+        silently no-op'd — a parsed multipart form's ``UploadFile``
+        objects stayed open until garbage-collected. Probe-confirmed
+        upstream toggles ``upload.file.closed`` to ``True`` after
+        ``await request.close()``."""
+        if self._form is not None:
+            close = getattr(self._form, "close", None)
+            if close is not None:
+                try:
+                    result = close()
+                    import inspect as _inspect
+                    if _inspect.isawaitable(result):
+                        await result
+                except Exception:  # noqa: BLE001
+                    # Swallow only at the request boundary — individual
+                    # ``UploadFile.close`` failures shouldn't abort the
+                    # response. Per-file errors propagate inside
+                    # ``FormData.close`` (see datastructures.py).
+                    pass
 
     def __getitem__(self, key: str) -> Any:
         return self._scope[key]

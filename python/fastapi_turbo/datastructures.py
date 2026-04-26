@@ -438,30 +438,28 @@ class FormData:
     async def close(self) -> None:
         """Close every ``UploadFile`` value held in this ``FormData``,
         matching ``starlette.datastructures.FormData.close``. Text
-        fields are passed through; values exposing an ``async def
-        close()`` (UploadFile) are awaited so the underlying
-        ``SpooledTemporaryFile`` releases its handle. Safe to call
-        multiple times — each ``UploadFile.close`` is idempotent.
+        fields and any other non-``UploadFile`` values are skipped —
+        upstream is strict: it only calls ``close()`` on
+        ``UploadFile`` instances (so a dummy value with a
+        ``close`` attribute does NOT get closed; that's a probe the
+        R22 audit caught us failing).
 
-        Required for parity with the upstream Starlette / FastAPI
-        ``Request.close`` cleanup path: handlers that explicitly call
-        ``await form.close()`` (e.g. inside a ``finally`` block to
-        guarantee buffered uploads release before the response goes
-        out) silently no-op'd before this fix."""
+        Cleanup errors propagate — ``UploadFile.close`` failures are
+        load-bearing: they signal a real I/O problem the caller may
+        want to handle. Earlier impl swallowed everything, hiding
+        broken cleanup behind a silent pass.
+
+        Idempotent at the per-file level — each ``UploadFile.close``
+        is itself idempotent."""
         import inspect as _inspect
+        from fastapi_turbo.param_functions import UploadFile as _UF
+
         for _, v in self._items:
-            close = getattr(v, "close", None)
-            if close is None:
+            if not isinstance(v, _UF):
                 continue
-            try:
-                result = close()
-            except Exception:  # noqa: BLE001
-                continue
+            result = v.close()
             if _inspect.isawaitable(result):
-                try:
-                    await result
-                except Exception:  # noqa: BLE001
-                    pass
+                await result
 
 
 class Secret:

@@ -44,9 +44,12 @@ claim here**:
   differ — epoll / kqueue overhead, NUMA effects, and distro scheduler
   defaults all shift the results. CI publishes a Linux x86_64 run
   per release; those are the numbers users should rely on.
-- **Cross-check**: every row in the single-connection table has been
-  re-run with `wrk -c1 -t1` / `oha -c 1` and the deltas noted when
-  they disagree by more than 2 μs.
+- **Cross-check**: rows in the single-connection table have been
+  re-run with `oha -c 1` and the deltas noted when they disagree
+  by more than 2 μs. `wrk` and `bombardier` cross-checks are still
+  TODO — see [benchmarks.md](benchmarks.md) "What we have NOT yet
+  published" for the gap list. Until those run, treat `oha` as the
+  single independent confirmation, not a multi-tool consensus.
 
 ### HTTP (p50 latency, single connection, lower is better)
 
@@ -404,7 +407,7 @@ python benchmarks/bench_hello.py
 
 - **Rust core** (~8K lines): Axum 0.8, hyper, tokio, Tower, PyO3 0.28, crossbeam; HTTP, WebSocket, multipart, streaming, DB pool, HTTP client
 - **Python layer** (~22K lines): FastAPI-compatible API, introspection, OpenAPI 3.1 generator, Starlette/FastAPI `sys.modules` compat shims
-- **Tests** (~45K lines): 896 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
+- **Tests** (~45K lines): 906 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
 
 See [CLAUDE.md](CLAUDE.md) for development guide, [benchmarks.md](benchmarks.md) for full benchmark data including Go Echo, Fastify, free-threaded Python, and WebSocket library comparisons, and [COMPATIBILITY.md](COMPATIBILITY.md) for a per-feature map of where fastapi_turbo sits against FastAPI 0.136.0 (Full / Partial / Not-implemented / Different-by-design).
 

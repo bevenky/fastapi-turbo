@@ -236,11 +236,29 @@ pub struct PySyncFile {
     closed: Arc<Mutex<bool>>,
 }
 
+/// Helper: raise ``ValueError("I/O operation on closed file.")`` if
+/// the shared ``closed`` flag is set. Mirrors Python's
+/// ``io.BytesIO`` / ``SpooledTemporaryFile`` contract — Starlette's
+/// ``UploadFile.read/write/seek`` inherits these from the underlying
+/// ``SpooledTemporaryFile``, so callers that read after ``await
+/// file.close()`` see ``ValueError``, not stale bytes. Earlier
+/// impl flipped ``closed`` but never checked it on the I/O paths,
+/// so closed files happily kept serving reads/writes — a parity
+/// gap the audit surfaced.
+fn ensure_open(closed: &Arc<Mutex<bool>>) -> PyResult<()> {
+    if *closed.lock().unwrap() {
+        Err(PyValueError::new_err("I/O operation on closed file."))
+    } else {
+        Ok(())
+    }
+}
+
 #[pymethods]
 impl PySyncFile {
     /// Sync read returning bytes. ``size = -1`` reads to EOF.
     #[pyo3(signature = (size=-1))]
     fn read<'py>(&self, py: Python<'py>, size: isize) -> PyResult<Py<PyBytes>> {
+        ensure_open(&self.closed)?;
         let data = self.data.lock().unwrap();
         let mut cursor = self.cursor.lock().unwrap();
         let remaining = data.len().saturating_sub(*cursor);
@@ -258,6 +276,7 @@ impl PySyncFile {
     /// Sync write returning the integer byte count (matches
     /// ``io.BufferedIOBase.write`` / ``SpooledTemporaryFile.write``).
     fn write<'py>(&self, _py: Python<'py>, data: Bound<'py, PyAny>) -> PyResult<usize> {
+        ensure_open(&self.closed)?;
         let buf: Vec<u8> = if let Ok(b) = data.cast::<PyBytes>() {
             b.as_bytes().to_vec()
         } else {
@@ -283,6 +302,7 @@ impl PySyncFile {
     /// ``io.IOBase.seek`` (which returns the absolute position).
     #[pyo3(signature = (offset, whence=0))]
     fn seek(&self, offset: isize, whence: i32) -> PyResult<usize> {
+        ensure_open(&self.closed)?;
         let data_len = self.data.lock().unwrap().len();
         let mut cursor = self.cursor.lock().unwrap();
         let target: isize = match whence {
@@ -301,10 +321,14 @@ impl PySyncFile {
     }
 
     fn tell(&self) -> PyResult<usize> {
+        // ``io.IOBase.tell`` raises ValueError on a closed file too.
+        ensure_open(&self.closed)?;
         Ok(*self.cursor.lock().unwrap())
     }
 
     fn close(&self) -> PyResult<()> {
+        // Idempotent — calling close on an already-closed file is a
+        // no-op, matching ``io.IOBase.close``.
         *self.closed.lock().unwrap() = true;
         Ok(())
     }
@@ -373,6 +397,7 @@ impl PyUploadFile {
     /// memory, the awaitable resolves immediately (no scheduling hop).
     #[pyo3(signature = (size=-1))]
     fn read<'py>(&self, py: Python<'py>, size: isize) -> PyResult<Py<ImmediateBytes>> {
+        ensure_open(&self.closed)?;
         let data = self.data.lock().unwrap();
         let mut cursor = self.cursor.lock().unwrap();
         let remaining = data.len().saturating_sub(*cursor);
@@ -394,6 +419,7 @@ impl PyUploadFile {
 
     /// Async seek.
     fn seek(&self, py: Python<'_>, offset: isize) -> PyResult<Py<ImmediateNone>> {
+        ensure_open(&self.closed)?;
         let data_len = self.data.lock().unwrap().len();
         let mut cursor = self.cursor.lock().unwrap();
         let clamped = if offset < 0 {
@@ -406,12 +432,15 @@ impl PyUploadFile {
     }
 
     fn tell(&self) -> PyResult<usize> {
+        ensure_open(&self.closed)?;
         Ok(*self.cursor.lock().unwrap())
     }
 
-    /// Async close — flips ``closed``. Buffer is retained so subsequent
-    /// reads after close return what was written (matches Starlette's
-    /// SpooledTemporaryFile behaviour).
+    /// Async close — flips ``closed``. The buffer is retained
+    /// (Starlette's ``SpooledTemporaryFile`` keeps its bytes around
+    /// until the underlying file's ref-count drops), but post-close
+    /// reads/writes raise ``ValueError`` on the I/O paths above.
+    /// Idempotent.
     fn close(&self, py: Python<'_>) -> PyResult<Py<ImmediateNone>> {
         *self.closed.lock().unwrap() = true;
         Py::new(py, ImmediateNone)
@@ -434,6 +463,7 @@ impl PyUploadFile {
     /// fix added real write semantics but returned an int, which
     /// diverged from Starlette's ``async def write(...) -> None``.
     fn write<'py>(&self, py: Python<'py>, data: Bound<'py, PyAny>) -> PyResult<Py<ImmediateNone>> {
+        ensure_open(&self.closed)?;
         // Accept any bytes-like (bytes, bytearray, memoryview).
         let buf: Vec<u8> = if let Ok(b) = data.cast::<PyBytes>() {
             b.as_bytes().to_vec()
