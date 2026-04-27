@@ -49,30 +49,61 @@ def test_413_oversized_body_returns_413_status_with_accepted_send_failure():
         return {"size": len(data)}
 
     body = b"z" * (2 * 1024 * 1024)  # 2 MiB — over the cap
+    # Narrow exception set: only the early-reject failure modes the
+    # audit observed (BrokenPipe / ConnectionReset surfaced as
+    # ``WriteError``, half-closed read surfaced as ``ReadError``,
+    # and the catch-all RFC-compliant ``RemoteProtocolError`` for
+    # the case where the server flushed 413 + RST before the
+    # client finished streaming). DO NOT widen back to
+    # ``httpx.HTTPError`` — that's the base class and would let
+    # genuinely unrelated httpx failures (DNS, timeout, TLS) pass
+    # through as "accepted".
+    accepted_early_reject = (
+        httpx.RemoteProtocolError,
+        httpx.WriteError,
+        httpx.ReadError,
+    )
     with TestClient(app) as cli:
         # Either the server flushes the 413 before TCP drops (httpx
         # observes the response) or the connection is dropped before
         # the response lands. Both outcomes are accepted: the SERVER
-        # behaviour is the same — early rejection. Test passes if
-        # EITHER: (a) status is 413, OR (b) httpx raised one of the
-        # early-reject family of exceptions.
+        # behaviour is the same — early rejection.
         try:
             r = cli.post(
                 "/upload",
                 content=body,
                 headers={"content-type": "application/octet-stream"},
             )
-        except (
-            httpx.RemoteProtocolError,
-            httpx.WriteError,
-            httpx.ReadError,
-            httpx.HTTPError,
-        ):
+        except accepted_early_reject as exc:
             # Documented expected outcome: server rejected before
-            # the client finished streaming. No assertion needed
-            # beyond "this exception class is in the accepted
-            # set" — getting any of these is correct early-reject
-            # behavior.
+            # the client finished streaming. The exception MUST be
+            # one of the early-reject family — anything else is a
+            # real failure (DNS, TLS, hung socket, etc).
+            #
+            # Lock that the message references the body-write half
+            # of the exchange so a post-handshake transport failure
+            # (which would also be a ``RemoteProtocolError`` /
+            # ``ReadError``) doesn't masquerade as the 413 path.
+            msg = str(exc).lower()
+            recognised_signature = any(
+                s in msg
+                for s in (
+                    "broken pipe",
+                    "connection reset",
+                    "errno 32",
+                    "errno 54",
+                    "errno 104",  # Linux ECONNRESET
+                    "send_request_body",
+                    "remote protocol",
+                    "without sending complete message body",
+                    "premature",
+                )
+            )
+            assert recognised_signature, (
+                "413 early-reject test caught an httpx exception "
+                f"that doesn't match the expected send-body-failure "
+                f"signature: {type(exc).__name__}: {exc!r}"
+            )
             return
 
         # Common case: server flushes 413 before the connection drops.
@@ -80,14 +111,23 @@ def test_413_oversized_body_returns_413_status_with_accepted_send_failure():
 
 
 @pytest.mark.requires_loopback
-def test_413_small_body_no_send_failure_at_all():
+def test_413_small_body_no_send_failure_at_all(caplog):
     """Regression guard — the 413 path is only noisy when the body
     is large enough that the client streams it across multiple
-    sendto() calls. A small over-cap body (header content-length
-    over the cap, but tiny actual body) returns 413 cleanly with
-    NO send-body failure. Locks the line: the audit's 'noisy log'
-    is specifically about the streaming-body case, not 413 in
-    general."""
+    sendto() calls. A small over-cap body (slightly over the cap,
+    well under TCP MSS) returns 413 cleanly with NO send-body
+    failure logged. Locks the line: the audit's 'noisy log' is
+    specifically about the streaming-body case, not 413 in
+    general.
+
+    Asserts:
+      * status is 413 (server rejected via Tower's
+        ``RequestBodyLimitLayer``).
+      * No httpcore / httpx ``send_request_body.failed``,
+        ``BrokenPipe``, or ``ConnectionReset`` log lines were
+        emitted during the request — the small-body path is the
+        clean reference for what "413 without noise" looks like."""
+    import logging
     from fastapi_turbo import Body, FastAPI
     from fastapi_turbo.testclient import TestClient
 
@@ -98,13 +138,30 @@ def test_413_small_body_no_send_failure_at_all():
         return {"size": len(data)}
 
     body = b"x" * 1024  # 1 KiB — over the 512 B cap, but still tiny
-    with TestClient(app) as cli:
-        r = cli.post(
-            "/upload",
-            content=body,
-            headers={"content-type": "application/octet-stream"},
-        )
-        assert r.status_code == 413, r.status_code
+    with caplog.at_level(logging.DEBUG, logger="httpcore"):
+        with caplog.at_level(logging.DEBUG, logger="httpx"):
+            with TestClient(app) as cli:
+                r = cli.post(
+                    "/upload",
+                    content=body,
+                    headers={"content-type": "application/octet-stream"},
+                )
+                assert r.status_code == 413, r.status_code
+
+    log_text = "\n".join(rec.getMessage() for rec in caplog.records)
+    forbidden = (
+        "send_request_body.failed",
+        "BrokenPipeError",
+        "ConnectionResetError",
+        "Errno 32",
+        "Errno 54",
+        "Errno 104",
+    )
+    leaks = [s for s in forbidden if s in log_text]
+    assert not leaks, (
+        f"small-body 413 path leaked send-failure log lines: {leaks}\n"
+        f"captured: {log_text[:600]}"
+    )
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -28,6 +28,14 @@ jobs:
           python -m pip install -U pip
           python -m pip install maturin pytest httpx "pydantic>=2" \
                                 python-multipart "websockets>=12" ruff
+          # Parity gate spawns a STOCK FastAPI subprocess via
+          # ``FASTAPI_TURBO_NO_SHIM=1; import uvicorn; from
+          # parity_app import app`` (see tests/parity/conftest.py).
+          # The shim-disabled subprocess needs the real upstream
+          # FastAPI + uvicorn installed alongside fastapi-turbo —
+          # without these, fresh CI runners fail at parity-process
+          # startup before any parity assertion runs.
+          python -m pip install "fastapi==0.136.0" "uvicorn[standard]>=0.30"
       - name: Build extension (release)
         run: maturin develop --release
       - name: cargo fmt --check

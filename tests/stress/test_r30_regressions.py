@@ -154,17 +154,20 @@ def test_benchmarks_md_no_longer_says_wait_for_pyo3_028():
 
 
 def test_compatibility_md_sandbox_watermark_isnt_stale_R27():
-    """The sandbox-mode breakdown must reference the current
-    R-batch (R30) rather than a stale pin from earlier audits.
-    R28 caught R26 → R27 drift; R30 catches R27 → R30 drift."""
+    """The sandbox-mode breakdown must reference a current
+    R-batch (R30+) rather than a stale pin from earlier audits.
+    R28 caught R26 → R27 drift; R30 catches R27 → R30 drift;
+    R32 generalised the anchor so future doc rewrites don't
+    trip the test."""
     compat = (
         pathlib.Path(__file__).resolve().parents[2] / "COMPATIBILITY.md"
     )
     text = compat.read_text()
-    # The R27 string must not be the active watermark anywhere in
-    # the sandbox-numbers paragraphs (anchor the search to that
-    # block via the leading sentinel).
-    sandbox_idx = text.find("Two sandbox flavours")
+    # Anchor on a phrase that has stayed stable across R26 / R27 /
+    # R30 / R32 doc rewrites. ``Probe-fails, runtime-fails`` is
+    # the bucket-#1 scenario header — present in every revision.
+    sandbox_idx = text.find("Probe-fails, runtime-fails")
     assert sandbox_idx != -1, "expected sandbox doc block missing"
-    sandbox_block = text[sandbox_idx:sandbox_idx + 2000]
-    assert "R27 watermark" not in sandbox_block, sandbox_block
+    # Inspect a wide window around the anchor.
+    block = text[max(0, sandbox_idx - 500):sandbox_idx + 2000]
+    assert "R27 watermark" not in block, block
