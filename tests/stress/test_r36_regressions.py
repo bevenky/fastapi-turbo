@@ -313,7 +313,7 @@ def test_upstream_fastapi_gate_passes_canonical_threshold():
         f"release-gate script passed {passed} tests "
         f"(failed={failed}, errors={errors}); "
         "below the 3000 threshold means a real shim regression — "
-        "investigate before shipping. (Healthy state is ~3125.)"
+        "investigate before shipping. (Healthy state is ~3119.)"
     )
     # The script's exit code must match its pytest result —
     # earlier the test could pass while the script's overall
@@ -325,4 +325,25 @@ def test_upstream_fastapi_gate_passes_canonical_threshold():
     assert proc.returncode == 0, (
         f"release-gate script returncode={proc.returncode} despite "
         f"pytest reporting {passed} passed. Script stderr: {proc.stderr[-1000:]!r}"
+    )
+    # Zero-skip / zero-xfail / zero-fail contract — R37 user
+    # explicitly required these. Upstream's own skip / xfail
+    # decisions (benchmark, py3.14-incompat, fastapi#12419)
+    # are deselected at the script level so the gate output
+    # is "tests we should be passing — and they all pass".
+    skipped_match = re.search(r"(\d+)\s+skipped", combined)
+    skipped = int(skipped_match.group(1)) if skipped_match else 0
+    xfail_match = re.search(r"(\d+)\s+xfail", combined)
+    xfailed = int(xfail_match.group(1)) if xfail_match else 0
+    assert skipped == 0, (
+        f"release-gate script reported {skipped} skipped — gate must "
+        "deselect upstream's skip decisions for a clean release signal"
+    )
+    assert xfailed == 0, (
+        f"release-gate script reported {xfailed} xfailed — gate must "
+        "deselect upstream's xfail decisions for a clean release signal"
+    )
+    assert failed == 0, (
+        f"release-gate script reported {failed} failed test(s) — "
+        "no failures permitted before release."
     )

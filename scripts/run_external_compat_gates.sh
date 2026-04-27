@@ -157,7 +157,27 @@ PY
 
     # cwd into the upstream root so test_tutorial cwd-relative
     # asset lookups (open("docs_src/...")) resolve.
-    (cd /tmp/fastapi_upstream && "$PYTHON_BIN" -m pytest tests/ -q --tb=no)
+    # Deselect upstream-FastAPI's own skip / xfail decisions so the
+    # gate output is purely "tests we should be passing" — no
+    # ``skipped`` / ``xfailed`` lines that aren't ours to fix:
+    #
+    #   * ``tests/benchmarks/test_general_performance.py`` —
+    #     upstream skips by default unless ``--codspeed`` is set
+    #     (its own benchmark suite).
+    #   * ``tests/test_pydantic_v1_error.py`` — upstream skips on
+    #     Python 3.14+ (Pydantic v1 doesn't support it; not an
+    #     fastapi-turbo issue).
+    #   * ``tests/test_tutorial/test_query_params_str_validations/test_tutorial006c.py`` —
+    #     upstream's own ``xfail`` per fastapi/fastapi#12419
+    #     ("Code example is not valid"); these are upstream-bug
+    #     markers, not our compat surface.
+    #
+    # ``--no-header`` keeps the output noise down. Result: a green
+    # "N passed" line with no skipped / xfailed asterisks.
+    (cd /tmp/fastapi_upstream && "$PYTHON_BIN" -m pytest tests/ -q --tb=no --no-header \
+        --ignore=tests/benchmarks/test_general_performance.py \
+        --ignore=tests/test_pydantic_v1_error.py \
+        --deselect=tests/test_tutorial/test_query_params_str_validations/test_tutorial006c.py)
 }
 
 run_sentry_gate() {

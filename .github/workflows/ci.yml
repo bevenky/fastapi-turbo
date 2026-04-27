@@ -103,7 +103,14 @@ jobs:
           # the canonical 3,125 / 3,129 claim was unenforced. Now
           # the wrapper runs from the upstream root AND the shim
           # conftest above guarantees the shim loads first.
-          cd /tmp/fastapi_upstream && pytest tests/ -q --tb=no
+          # Deselect upstream's own skip / xfail decisions (mirror
+          # of scripts/run_external_compat_gates.sh): benchmarks
+          # require --codspeed, pydantic-v1 module skipped on py3.14+,
+          # tutorial006c is upstream's own xfail per fastapi#12419.
+          cd /tmp/fastapi_upstream && pytest tests/ -q --tb=no --no-header \
+              --ignore=tests/benchmarks/test_general_performance.py \
+              --ignore=tests/test_pydantic_v1_error.py \
+              --deselect=tests/test_tutorial/test_query_params_str_validations/test_tutorial006c.py
       - name: Sentry SDK FastAPI + ASGI integration
         # Release-required gate, BLOCKING. R26 caught a
         # transaction-name regression here (legacy

@@ -104,7 +104,14 @@ jobs:
           PY
           # cwd into the upstream root so test_tutorial assets
           # resolve relative to that tree.
-          cd /tmp/fastapi_upstream && pytest tests/ -q --tb=no
+          # Deselect upstream's own skip / xfail decisions (mirror
+          # of scripts/run_external_compat_gates.sh): benchmarks
+          # require --codspeed, pydantic-v1 module skipped on py3.14+,
+          # tutorial006c is upstream's own xfail per fastapi#12419.
+          cd /tmp/fastapi_upstream && pytest tests/ -q --tb=no --no-header \
+              --ignore=tests/benchmarks/test_general_performance.py \
+              --ignore=tests/test_pydantic_v1_error.py \
+              --deselect=tests/test_tutorial/test_query_params_str_validations/test_tutorial006c.py
       - name: pytest Sentry SDK FastAPI + ASGI integration
         # Release-required: caught the R26 transaction-name
         # regression. Pinned to sentry-python 2.42.0; force-reset
