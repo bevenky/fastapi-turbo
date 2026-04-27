@@ -2,15 +2,15 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 89/89 (earlier R-batches reported a smaller subset; that count pre-dated the R23 / R25 / R26 fixes — `test_legacy_setup` and the active-thread-id tests are part of the now-green set). Own suite: 968 tests (410 general + 22 WebSocket + 429 stress + 107 parity snapshots).
+Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 89/89 (earlier R-batches reported a smaller subset; that count pre-dated the R23 / R25 / R26 fixes — `test_legacy_setup` and the active-thread-id tests are part of the now-green set). Own suite: 972 tests (410 general + 22 WebSocket + 433 stress + 107 parity snapshots).
 
 **Test suite under different environments:**
 
-* **Normal dev box / CI** (loopback bind allowed): all 968 tests run (1 conditional skip when Starlette wasn't pre-imported), 0 failed.
+* **Normal dev box / CI** (loopback bind allowed): all 972 tests run (1 conditional skip when Starlette wasn't pre-imported), 0 failed.
 * **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError` in the pytest process): `tests/conftest.py` detects this at session start via a one-shot bind probe and sets `LOOPBACK_DENIED = True`. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`.
   - **Force-override env vars** (audit / CI use): set `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` to skip `requires_loopback` tests even on a dev box that *can* bind, or `FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED=1` to run them anyway in an env where probe bind fails but the real subprocess server might still succeed.
   - **Counts depend on what specifically fails**. Two sandbox flavours produce different numbers:
-    1. *Probe-fails, runtime-fails* (true sandbox — every bind raises): `requires_loopback` tests skip AND tests that auto-fallback through `TestClient(in_process=...)` switch to ASGI. Measured at the R30 watermark: 808 pass, 160 skipped.
+    1. *Probe-fails, runtime-fails* (true sandbox — every bind raises): `requires_loopback` tests skip AND tests that auto-fallback through `TestClient(in_process=...)` switch to ASGI. Measured at the R31 watermark: 810 pass, 162 skipped.
     2. *Probe-fails, runtime-OK* (audit env where the probe fails but pytest's actual binds succeed, OR a dev box with `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` set): `requires_loopback` tests skip via the marker, but other tests that bind ad-hoc still succeed. Measured at the R30 watermark: ~903 pass, ~60 skipped.
   - Both flavours surface **0 failed, 0 errors**. The skip-count delta reflects what the env actually denies, not a regression.
 
@@ -74,7 +74,7 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | `BackgroundTasks` single-task and multi-task | Full | |
 | Request scalar / body returns (str, int, float, None, dict, list, dataclass, `BaseModel`) | Full | Top-level strings now produce RFC 8259-compliant JSON (control chars escaped). |
 | `dataclass` / `TypedDict` / `msgspec.Struct` as response model | Full | `dict` / `list` / Pydantic / generic aliases / `@dataclass` / `TypedDict` all pass through Pydantic's `TypeAdapter` — filter, serialise and OpenAPI-schema the same way upstream does. `msgspec.Struct` is rejected at decoration time (matches upstream — Pydantic can't adapt it). |
-| `max_request_size` on `FastAPI(...)` | Full | Enforced by Tower `RequestBodyLimitLayer`; the router no longer imposes a hidden 10 MiB cap. |
+| `max_request_size` on `FastAPI(...)` | Full | Enforced by Tower `RequestBodyLimitLayer`; the router no longer imposes a hidden 10 MiB cap. **Expected client-side log line:** when the client streams a body larger than the cap, the server rejects mid-stream and TCP drops while the client is still writing — httpcore logs `send_request_body.failed` with `BrokenPipeError` / `ConnectionResetError` for that iteration even though the client successfully observes the 413 response. This matches nginx / axum / most production servers that early-reject. The R31 regression in `tests/stress/test_r31_regressions.py` accepts both outcomes (413 status OR an early-reject httpx exception family) so the line is a documented part of the contract, not a regression. |
 
 ## Middleware
 
@@ -179,10 +179,20 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 source /Users/venky/tech/fastapi_turbo_env/bin/activate
 pytest tests/ -q
 
-# FastAPI 0.136.0 upstream against the shim
-cd /tmp/fastapi_upstream && pytest tests/ -q -p no:cacheprovider
+# External compat gates — same pinned tags + force-reset that
+# CI / release.yml use, so a local run is bit-identical to the
+# CI gate. Auditors should prefer this script over the manual
+# pytest invocations below: it removes the "but is /tmp/... at
+# the right tag?" question by force-resetting on every run.
+./scripts/run_external_compat_gates.sh           # both gates
+./scripts/run_external_compat_gates.sh fastapi   # upstream FastAPI 0.136.0 only
+./scripts/run_external_compat_gates.sh sentry    # Sentry 2.42.0 only
 
-# Sentry SDK integration tests (ASGI + FastAPI)
+# (Manual variant — only useful if you want to skip the force-reset
+# and run against whatever tag is currently checked out at /tmp/...)
+# FastAPI upstream against the shim:
+cd /tmp/fastapi_upstream && pytest tests/ -q -p no:cacheprovider
+# Sentry SDK integration tests (ASGI + FastAPI):
 cd /tmp/sentry-python
 pytest tests/integrations/fastapi/test_fastapi.py \
        tests/integrations/asgi/test_asgi.py \
