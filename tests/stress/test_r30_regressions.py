@@ -163,11 +163,15 @@ def test_compatibility_md_sandbox_watermark_isnt_stale_R27():
         pathlib.Path(__file__).resolve().parents[2] / "COMPATIBILITY.md"
     )
     text = compat.read_text()
-    # Anchor on a phrase that has stayed stable across R26 / R27 /
-    # R30 / R32 doc rewrites. ``Probe-fails, runtime-fails`` is
-    # the bucket-#1 scenario header — present in every revision.
-    sandbox_idx = text.find("Probe-fails, runtime-fails")
+    # Anchor on a stable phrase. R32 / R33 rewrote the bucket
+    # description; ``Counts at the R`` is now the lead-in (R33),
+    # ``Counts depend on what specifically fails`` was the R32
+    # phrasing. Accept either as a valid anchor.
+    sandbox_idx = text.find("Counts at the R")
+    if sandbox_idx == -1:
+        sandbox_idx = text.find("Counts depend on what specifically fails")
     assert sandbox_idx != -1, "expected sandbox doc block missing"
-    # Inspect a wide window around the anchor.
+    # Inspect a wide window around the anchor — the watermark
+    # pin must NOT still say "R27".
     block = text[max(0, sandbox_idx - 500):sandbox_idx + 2000]
     assert "R27 watermark" not in block, block

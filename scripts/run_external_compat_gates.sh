@@ -55,18 +55,51 @@ fi
 echo "── External compat gates ── using ${PYTHON_BIN} ──"
 "$PYTHON_BIN" -c 'import sys; print("sys.executable:", sys.executable); import fastapi_turbo; print("fastapi_turbo from:", fastapi_turbo.__file__)'
 
+# Offline mode: when ``OFFLINE=1`` is set, skip the network-fetch
+# steps and verify the existing ``/tmp/...`` checkout is already at
+# the pinned tag. R33 added this for network-restricted audit
+# environments where a hand-prepared checkout is the only option.
+OFFLINE="${OFFLINE:-0}"
+
+verify_at_tag() {
+    local tree="$1" tag="$2"
+    if [ ! -d "$tree/.git" ]; then
+        echo "OFFLINE=1 set, but $tree is not a git checkout." >&2
+        echo "Pre-clone the repo and check out tag $tag, then re-run." >&2
+        exit 2
+    fi
+    local current_tag
+    current_tag="$(git -C "$tree" describe --tags --exact-match HEAD 2>/dev/null || true)"
+    local current_sha
+    current_sha="$(git -C "$tree" rev-parse HEAD 2>/dev/null)"
+    local pinned_sha
+    pinned_sha="$(git -C "$tree" rev-parse "$tag" 2>/dev/null || true)"
+    if [ "$current_tag" = "$tag" ] || [ "$current_sha" = "$pinned_sha" ]; then
+        echo "OFFLINE: $tree already at $tag — proceeding."
+        return 0
+    fi
+    echo "OFFLINE=1 set, but $tree is at \"$current_tag\" / $current_sha," >&2
+    echo "expected tag $tag (sha $pinned_sha)." >&2
+    echo "Run \`git -C $tree fetch --tags && git -C $tree reset --hard $tag\`" >&2
+    echo "while online, or unset OFFLINE." >&2
+    exit 2
+}
+
 run_fastapi_gate() {
     echo "── Upstream FastAPI ${UPSTREAM_TAG} suite under shim ──"
-    if [ ! -d /tmp/fastapi_upstream/.git ]; then
-        rm -rf /tmp/fastapi_upstream
-        git clone https://github.com/fastapi/fastapi /tmp/fastapi_upstream
+    if [ "$OFFLINE" = "1" ]; then
+        verify_at_tag /tmp/fastapi_upstream "$UPSTREAM_TAG"
+    else
+        if [ ! -d /tmp/fastapi_upstream/.git ]; then
+            rm -rf /tmp/fastapi_upstream
+            git clone https://github.com/fastapi/fastapi /tmp/fastapi_upstream
+        fi
+        git -C /tmp/fastapi_upstream fetch --tags --force --depth 1 origin "$UPSTREAM_TAG"
+        git -C /tmp/fastapi_upstream reset --hard "$UPSTREAM_TAG"
+        git -C /tmp/fastapi_upstream clean -fdx -- ':!conftest.py'
+        "$PYTHON_BIN" -m pip install -q pytest-asyncio pyyaml dirty-equals \
+                                       "sqlmodel>=0.0.14" inline-snapshot
     fi
-    git -C /tmp/fastapi_upstream fetch --tags --force --depth 1 origin "$UPSTREAM_TAG"
-    git -C /tmp/fastapi_upstream reset --hard "$UPSTREAM_TAG"
-    git -C /tmp/fastapi_upstream clean -fdx -- ':!conftest.py'
-
-    "$PYTHON_BIN" -m pip install -q pytest-asyncio pyyaml dirty-equals \
-                                   "sqlmodel>=0.0.14" inline-snapshot
 
     cat > /tmp/fastapi_upstream/conftest.py <<'PY'
 # Auto-injected by run_external_compat_gates.sh: install the
@@ -82,17 +115,20 @@ PY
 
 run_sentry_gate() {
     echo "── Sentry SDK ${SENTRY_TAG} FastAPI + ASGI integration ──"
-    if [ ! -d /tmp/sentry-python/.git ]; then
-        rm -rf /tmp/sentry-python
-        git clone https://github.com/getsentry/sentry-python /tmp/sentry-python
+    if [ "$OFFLINE" = "1" ]; then
+        verify_at_tag /tmp/sentry-python "$SENTRY_TAG"
+    else
+        if [ ! -d /tmp/sentry-python/.git ]; then
+            rm -rf /tmp/sentry-python
+            git clone https://github.com/getsentry/sentry-python /tmp/sentry-python
+        fi
+        git -C /tmp/sentry-python fetch --tags --force --depth 1 origin "$SENTRY_TAG"
+        git -C /tmp/sentry-python reset --hard "$SENTRY_TAG"
+        git -C /tmp/sentry-python clean -fdx \
+            -- ':!tests/integrations/fastapi/conftest.py' \
+               ':!tests/integrations/asgi/conftest.py'
+        "$PYTHON_BIN" -m pip install -q "sentry-sdk[fastapi]==${SENTRY_TAG}"
     fi
-    git -C /tmp/sentry-python fetch --tags --force --depth 1 origin "$SENTRY_TAG"
-    git -C /tmp/sentry-python reset --hard "$SENTRY_TAG"
-    git -C /tmp/sentry-python clean -fdx \
-        -- ':!tests/integrations/fastapi/conftest.py' \
-           ':!tests/integrations/asgi/conftest.py'
-
-    "$PYTHON_BIN" -m pip install -q "sentry-sdk[fastapi]==${SENTRY_TAG}"
 
     for tree in fastapi asgi; do
         cat > /tmp/sentry-python/tests/integrations/$tree/conftest.py <<'PY'

@@ -19,19 +19,28 @@ import pytest
 
 def pytest_collection_modifyitems(config: pytest.Config, items):
     """Skip every parity test when loopback bind is denied —
-    they all spawn subprocess servers that need real ports."""
-    try:
-        from tests.conftest import LOOPBACK_DENIED
-    except ImportError:
-        # Older test trees without the suite-level conftest still
-        # import this directly; fall back to a fresh probe.
+    they all spawn subprocess servers that need real ports.
+
+    Honours the same env-var overrides as ``tests/conftest.py``
+    (``FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`` /
+    ``…_ALLOWED=1``) so the FORCE flag produces consistent
+    skip behaviour across the suite-level and parity-level
+    collection hooks. Without this, FORCE env on a dev box that
+    can bind would skip ``requires_loopback`` tests but still
+    run the 107 parity tests — auditors saw drift between the
+    two outcomes (R33)."""
+    if os.environ.get("FASTAPI_TURBO_FORCE_LOOPBACK_DENIED") == "1":
+        loopback_denied = True
+    elif os.environ.get("FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED") == "1":
+        loopback_denied = False
+    else:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("127.0.0.1", 0))
-            return
+            loopback_denied = False
         except (PermissionError, OSError):
-            LOOPBACK_DENIED = True
-    if not LOOPBACK_DENIED:
+            loopback_denied = True
+    if not loopback_denied:
         return
     skipper = pytest.mark.skip(
         reason="parity tests need real loopback ports for subprocess "
@@ -41,6 +50,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items):
         # Only apply to items collected under tests/parity/.
         if "tests/parity" in str(item.fspath).replace("\\", "/"):
             item.add_marker(skipper)
+    # ``socket`` was imported above for the fresh probe; reference it
+    # so static checkers / linting don't flag it as unused on the
+    # FORCE-env branches that don't call the probe.
+    _ = socket
 
 
 PYTHON = sys.executable

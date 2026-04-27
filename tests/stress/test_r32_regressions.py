@@ -175,12 +175,16 @@ def test_compatibility_sandbox_doc_doesnt_misclassify_force_env():
     text = compat.read_text()
     # The stale-by-multiple-batches "~903 pass" claim must be gone.
     assert "~903 pass" not in text, text
-    # And the doc must clarify that FORCE alone doesn't trigger
-    # bucket #1.
-    assert (
-        "FORCE env var ALONE doesn't take you to bucket #1" in text
-        or "FORCE env var alone doesn't take you to bucket #1" in text
-    ), text
+    # And the doc must call out the FORCE behaviour explicitly —
+    # either the original "doesn't take you to bucket #1" wording
+    # (from R32) or R33's clearer "IS sufficient to produce
+    # bucket #1 numbers on a dev box that can bind".
+    force_phrase_options = (
+        "FORCE env var ALONE doesn't take you to bucket #1",
+        "FORCE env var alone doesn't take you to bucket #1",
+        "FORCE env var IS sufficient to produce bucket #1 numbers",
+    )
+    assert any(p in text for p in force_phrase_options), text
 
 
 # ────────────────────────────────────────────────────────────────────
