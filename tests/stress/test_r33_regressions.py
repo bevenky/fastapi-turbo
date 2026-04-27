@@ -8,6 +8,8 @@ import pathlib
 import subprocess
 import sys
 
+import pytest
+
 import fastapi_turbo  # noqa: F401
 
 
@@ -86,6 +88,8 @@ def test_compatibility_md_force_mode_count_isnt_obviously_stale():
     # number is intentionally not pinned.
     if os.environ.get("FASTAPI_TURBO_SKIP_DOC_DRIFT_CHECK"):
         return
+    if os.environ.get("FASTAPI_TURBO_SKIP_SUBPROCESS_DRIFT"):
+        pytest.skip("subprocess-drift detector skipped under full-suite run")
     repo = pathlib.Path(__file__).resolve().parents[2]
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "tests/", "-q", "--timeout=60"],

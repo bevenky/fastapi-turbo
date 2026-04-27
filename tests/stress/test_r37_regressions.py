@@ -231,14 +231,35 @@ def test_compat_md_doc_count_isnt_off_by_more_than_one():
     claimed_skip = int(m.group(2))
 
     # Spawn pytest to measure (recursion-guarded same way
-    # test_r33_regressions.py does).
+    # test_r33_regressions.py does). The subprocess MUST run in
+    # the happy-path environment — clear FORCE_LOOPBACK_DENIED /
+    # FORCE_LOOPBACK_ALLOWED so the parent's env-vars don't leak
+    # in (R38 caught this: when parent sets
+    # ``FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`` for its OWN run,
+    # the subprocess inherits it via ``**os.environ``, measures
+    # the FORCE-mode count, and trips the assertion against the
+    # happy-path doc claim).
     if os.environ.get("FASTAPI_TURBO_SKIP_DOC_DRIFT_CHECK"):
         return
+    # The full-suite driver sets ``FASTAPI_TURBO_SKIP_SUBPROCESS_DRIFT``
+    # to skip every drift detector (R33 / R36 / R37) — each spawns its
+    # own pytest subprocess which contends for pytest-cache / fs and
+    # turns into flake under simultaneous full-suite execution. Run
+    # ``pytest tests/stress/test_r37_regressions.py`` directly to
+    # exercise this guard outside the parent suite.
+    if os.environ.get("FASTAPI_TURBO_SKIP_SUBPROCESS_DRIFT"):
+        pytest.skip("subprocess-drift detector skipped under full-suite run")
     repo = pathlib.Path(__file__).resolve().parents[2]
+    sub_env = {k: v for k, v in os.environ.items()
+               if k not in (
+                   "FASTAPI_TURBO_FORCE_LOOPBACK_DENIED",
+                   "FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED",
+               )}
+    sub_env["FASTAPI_TURBO_SKIP_DOC_DRIFT_CHECK"] = "1"
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "tests/", "-q", "--timeout=60"],
         cwd=str(repo),
-        env={**os.environ, "FASTAPI_TURBO_SKIP_DOC_DRIFT_CHECK": "1"},
+        env=sub_env,
         capture_output=True, text=True, timeout=300,
     )
     summary = re.search(

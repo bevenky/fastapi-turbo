@@ -279,6 +279,16 @@ def test_upstream_fastapi_gate_passes_canonical_threshold():
     Skipped in sandbox (subprocess pytest + script needs
     loopback) and when ``/tmp/fastapi_upstream`` isn't
     available."""
+    import os
+    # Full-suite escape hatch: this test spawns the canonical gate
+    # script which itself spawns pytest on /tmp/fastapi_upstream
+    # (~70s). Running it in parallel with the parent suite causes
+    # pytest-cache contention; the test is reliable in isolation.
+    # CI / release-pipeline runs should keep this enabled (no env
+    # var set); the dev-loop ``pytest tests/`` invocation can opt
+    # out.
+    if os.environ.get("FASTAPI_TURBO_SKIP_SUBPROCESS_DRIFT"):
+        pytest.skip("subprocess-drift detector skipped under full-suite run")
     upstream = pathlib.Path("/tmp/fastapi_upstream")
     if not (upstream / "tests").is_dir():
         pytest.skip("/tmp/fastapi_upstream not available; run "
@@ -298,13 +308,38 @@ def test_upstream_fastapi_gate_passes_canonical_threshold():
     )
     import re
     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    m = re.search(r"(\d+)\s+passed", combined)
-    assert m is not None, (
-        "release-gate script produced no pytest summary line "
+
+    # Defensive parse #1: returncode is the simplest, most reliable
+    # signal. Check it BEFORE doing any text parsing — earlier the
+    # test asserted ``passed >= 3000`` first which could mask a
+    # real returncode failure if the regex picked up an earlier
+    # ``X passed`` from script log lines (R38 audit reported the
+    # test passing under pytest while the gate's underlying
+    # subprocess clearly exited non-zero).
+    if proc.returncode != 0:
+        # Surface the gate's actual output — failed/error counts
+        # if findable, but also raw tail so the auditor can
+        # diagnose.
+        failed_m = re.search(r"(\d+)\s+failed", combined)
+        error_m = re.search(r"(\d+)\s+errors?", combined)
+        raise AssertionError(
+            f"release-gate script returncode={proc.returncode}; "
+            f"failed={failed_m.group(1) if failed_m else 'unknown'}, "
+            f"errors={error_m.group(1) if error_m else 'unknown'}.\n"
+            f"stdout tail: {proc.stdout[-1500:]!r}\n"
+            f"stderr tail: {proc.stderr[-1500:]!r}"
+        )
+
+    # Defensive parse #2: pytest can emit multiple summary-like
+    # lines (rerun plugins, inline-snapshot warnings, etc.); take
+    # the LAST ``X passed`` match — that's the final summary.
+    pass_matches = re.findall(r"(\d+)\s+passed", combined)
+    assert pass_matches, (
+        "release-gate script produced no pytest pass count "
         f"(returncode={proc.returncode}; stdout tail: {proc.stdout[-500:]!r}; "
         f"stderr tail: {proc.stderr[-500:]!r})"
     )
-    passed = int(m.group(1))
+    passed = int(pass_matches[-1])
     failed_match = re.search(r"(\d+)\s+failed", combined)
     failed = int(failed_match.group(1)) if failed_match else 0
     error_match = re.search(r"(\d+)\s+errors?", combined)

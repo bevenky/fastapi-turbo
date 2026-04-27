@@ -5761,21 +5761,40 @@ class FastAPI:
         _submit(_enter_all(), app=self)
 
     def _run_lifespan_shutdown(self) -> None:
-        """Exit every lifespan in reverse-start order."""
+        """Exit every lifespan context manager in reverse-start order.
+
+        Failures from ``__aexit__`` propagate — matches Starlette /
+        upstream FastAPI's contract: a lifespan ctx-manager whose
+        cleanup raises must surface that exception to the ASGI
+        server (so the supervisor sees ``lifespan.shutdown.failed``
+        and the operator gets the cleanup-error stack trace).
+        Earlier impl swallowed every exception silently, breaking
+        production observability.
+
+        Best-effort across multiple ctx-managers: we still attempt
+        every ctx's ``__aexit__`` (unwinding shouldn't stop on the
+        first failure — at-most-once cleanup per resource matters
+        more than abort-on-first-error). The first exception
+        encountered is re-raised at the end."""
         cms = getattr(self, "_lifespan_cms", None)
         if not cms:
             return
+
+        first_exc: list[Exception] = []
 
         async def _exit_all():
             for cm in reversed(cms):
                 try:
                     await cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    if not first_exc:
+                        first_exc.append(exc)
 
         from fastapi_turbo._async_worker import submit as _submit
         _submit(_exit_all(), app=self)
         self._lifespan_cms = None
+        if first_exc:
+            raise first_exc[0]
 
     # --- async variants callable from inside the worker loop ---------
     # The sync `_run_*` helpers submit to the worker loop via `submit()`,
@@ -5860,15 +5879,24 @@ class FastAPI:
             setattr(self.state, k, v)
 
     async def _async_run_lifespan_shutdown(self) -> None:
+        """Async variant of ``_run_lifespan_shutdown``. Same
+        propagation contract: best-effort across all ctx-managers,
+        first ``__aexit__`` failure re-raised at the end so the
+        ASGI lifespan dispatcher emits ``lifespan.shutdown.failed``
+        upstream. Earlier impl silently swallowed every exception."""
         cms = getattr(self, "_lifespan_cms", None)
         if not cms:
             return
+        first_exc: Exception | None = None
         for cm in reversed(cms):
             try:
                 await cm.__aexit__(None, None, None)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                if first_exc is None:
+                    first_exc = exc
         self._lifespan_cms = None
+        if first_exc is not None:
+            raise first_exc
 
     # --- lifespan dispatch through the raw ASGI middleware chain ----
     def _start_lifespan_mw_chain(self) -> bool:
