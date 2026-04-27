@@ -5526,33 +5526,93 @@ class FastAPI:
         (otherwise `asyncio.run(...)` would close the loop immediately,
         invalidating asyncpg pools / redis.asyncio clients etc.).
 
-        Idempotent — repeat calls are no-ops. Earlier R-batches had two
-        callers race to fire startup: ``_asgi_lifespan`` (driven by
-        ASGITransport / TestClient) and ``_install_in_process_dynamic_routes``
-        (lazily called on first http request). Without the guard,
-        ``@app.on_event("startup")`` ran twice — double-opening pools,
-        scheduling duplicate background jobs, or rerunning migrations.
-        Guard via ``_startup_handlers_ran`` so whichever caller wins
-        starts the app exactly once.
+        State machine via ``_startup_state``:
+
+          * ``"not_started"`` (default): handlers haven't run yet.
+            Calling this method runs them and transitions to
+            ``"started"`` on success or ``"failed"`` on the first
+            exception.
+          * ``"started"``: handlers ran successfully. Re-entry is a
+            no-op (matches Starlette / FastAPI: lifespan startup
+            fires once per app instance per lifecycle).
+          * ``"failed"``: a handler raised. Re-entry RE-RAISES a
+            ``RuntimeError`` describing the original failure. The
+            ASGI dispatcher checks this state on every request and
+            refuses to serve traffic against a poisoned app
+            (probe-confirmed bug: earlier impl set the "ran" flag
+            before the handler completed, so the failed app
+            silently served subsequent ``/ok`` requests with 200).
+          * ``"running"``: re-entrant call from inside a handler.
+            Treated as a programming bug; raises.
+
+        ``_run_shutdown_handlers`` resets the state to
+        ``"not_started"`` so a reused app instance can re-fire
+        startup on the next lifespan / request.
+
+        Earlier R-batches had two callers race to fire startup:
+        ``_asgi_lifespan`` (driven by ASGITransport / TestClient)
+        and ``_install_in_process_dynamic_routes`` (lazily called
+        on first http request). Without the state machine,
+        ``@app.on_event("startup")`` ran twice on the happy path
+        AND failed apps kept serving traffic AND reused apps never
+        re-ran startup.
         """
-        if getattr(self, "_startup_handlers_ran", False):
+        state = getattr(self, "_startup_state", "not_started")
+        if state == "started":
             return
-        self._startup_handlers_ran = True
+        if state == "failed":
+            cause = getattr(self, "_startup_failure", None)
+            raise RuntimeError(
+                "fastapi-turbo: startup handler raised earlier; the app "
+                "is in a failed state and cannot serve traffic. Re-create "
+                f"the app instance to retry. Original error: {cause!r}"
+            )
+        if state == "running":
+            raise RuntimeError(
+                "fastapi-turbo: re-entrant call to startup handlers; "
+                "a startup hook is invoking another startup-running code "
+                "path. This is a bug in the user's startup chain."
+            )
+        # state == "not_started" — fire handlers.
+        self._startup_state = "running"
         from fastapi_turbo._async_worker import submit as _submit
-        for handler in self._collect_startup_handlers():
-            if inspect.iscoroutinefunction(handler):
-                _submit(handler(), app=self)
-            else:
-                handler()
+        try:
+            for handler in self._collect_startup_handlers():
+                if inspect.iscoroutinefunction(handler):
+                    _submit(handler(), app=self)
+                else:
+                    handler()
+        except Exception as exc:
+            self._startup_state = "failed"
+            self._startup_failure = exc
+            raise
+        else:
+            self._startup_state = "started"
 
     def _run_shutdown_handlers(self) -> None:
-        """Execute all registered shutdown handlers on the worker loop."""
+        """Execute all registered shutdown handlers on the worker loop.
+
+        Resets ``_startup_state`` to ``"not_started"`` so a reused
+        app instance can re-fire startup on the next lifespan or
+        first http request — Starlette behaviour. Earlier impl
+        left the started flag pinned, so two TestClient context
+        managers on the same app produced startup=1 / shutdown=2
+        (probe-confirmed). Now both run once per ``startup ↔
+        shutdown`` cycle as upstream does."""
         from fastapi_turbo._async_worker import submit as _submit
         for handler in self._collect_shutdown_handlers():
             if inspect.iscoroutinefunction(handler):
                 _submit(handler(), app=self)
             else:
                 handler()
+        # Reset for the next lifecycle.
+        self._startup_state = "not_started"
+        self._startup_failure = None
+        # The dynamic-routes installer is also bound to this
+        # lifecycle — clear its guard so a fresh lifespan
+        # re-installs the docs routes (FastAPI 's openapi_schema
+        # cache is reset elsewhere).
+        self._in_process_dynamic_routes_installed = False
 
     def _collect_startup_handlers(self) -> list:
         """App-level startup handlers first, then every nested router's."""
@@ -6563,28 +6623,23 @@ class FastAPI:
             # ``ASGITransport``, breaking ~1273 upstream FastAPI
             # tests in the offline gate). Idempotent — guarded by
             # ``_in_process_dynamic_routes_installed``.
+            # Refuse traffic when startup previously failed —
+            # ``_run_startup_handlers`` raises with the captured
+            # original error. The ASGI transport surfaces the
+            # raise to the caller / TestClient. Earlier impl marked
+            # the install as "done" on first failure, so subsequent
+            # requests slipped past the install-once guard and
+            # served 200 against a poisoned app. Probe-confirmed:
+            # /ok #2 returned ``{"ok":true,"calls":1}`` after #1
+            # raised. Now /ok #2 raises the same RuntimeError as
+            # #1 (with the original exception in the message), so
+            # the contract is "a failed app stays failed for its
+            # lifetime, no traffic served".
+            if getattr(self, "_startup_state", "not_started") == "failed":
+                self._run_startup_handlers()  # raises
+
             if not getattr(self, "_in_process_dynamic_routes_installed", False):
-                # Startup failures must propagate. ``_install_in_process_
-                # dynamic_routes`` runs the user's ``@app.on_event
-                # ("startup")`` handlers BEFORE registering the docs
-                # routes; if those raise, the app is in a partially-
-                # initialised state and we MUST NOT serve requests
-                # against it (probe: a ``startup`` raising
-                # ``RuntimeError`` was silently dropped, then ``/ok``
-                # returned 200 against an uninitialised pool).
-                # Catch only OpenAPI-route-registration failures
-                # (which are non-fatal per the docstring) — let
-                # everything else surface so the caller / TestClient
-                # / ASGITransport sees the real exception.
-                try:
-                    self._install_in_process_dynamic_routes()
-                except Exception:
-                    # Mark as "tried" so subsequent requests don't
-                    # re-run startup; then re-raise. The transport
-                    # will turn this into a 500 (or, with
-                    # ``raise_app_exceptions=True``, propagate it).
-                    self._in_process_dynamic_routes_installed = True
-                    raise
+                self._install_in_process_dynamic_routes()
             # Honour an explicit opt-out for the (rare) cases where the
             # caller wants the proxy path (existing regression workflows,
             # tests that specifically validate the proxy code path).

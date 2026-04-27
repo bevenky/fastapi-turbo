@@ -40,19 +40,41 @@ def test_startup_runs_once_across_lifespan_then_http_request():
         return {"n": n["count"]}
 
     async def _drive() -> int:
-        # Drive ASGI lifespan startup explicitly.
-        received = []
+        # Drive ONLY ASGI lifespan startup (not shutdown). Within
+        # the same lifecycle, the first http request must NOT
+        # re-fire startup. Driving shutdown in between would
+        # legitimately reset state and cause the next http request
+        # to fire startup again — that's the correct
+        # "shutdown then reused" path validated by
+        # ``test_startup_resets_after_lifespan_shutdown_cycle``
+        # below.
+        startup_done = []
 
         async def receive():
-            if not received:
-                received.append("startup")
+            if not startup_done:
+                startup_done.append(True)
                 return {"type": "lifespan.startup"}
-            return {"type": "lifespan.shutdown"}
+            # Park so the lifespan task doesn't terminate; the
+            # outer ``asyncio.wait_for`` cancels it after the
+            # http request lands.
+            await asyncio.Event().wait()
 
-        async def send(_msg):
-            return None
+        sent = []
 
-        await app({"type": "lifespan"}, receive, send)
+        async def send(msg):
+            sent.append(msg)
+
+        # Run lifespan as a background task, drive startup, then
+        # cancel before sending shutdown.
+        lifespan_task = asyncio.create_task(
+            app({"type": "lifespan"}, receive, send)
+        )
+        # Wait for the startup ack.
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if any(m.get("type") == "lifespan.startup.complete" for m in sent):
+                break
+
         # Now drive an http request — the dynamic-routes installer
         # would re-run startup without the R35 guard.
         async def http_recv():
@@ -71,6 +93,11 @@ def test_startup_runs_once_across_lifespan_then_http_request():
             "client": ("test", 1234),
         }
         await app(scope, http_recv, http_send)
+        lifespan_task.cancel()
+        try:
+            await lifespan_task
+        except (asyncio.CancelledError, Exception):
+            pass
         return n["count"]
 
     final = asyncio.run(_drive())
