@@ -9,7 +9,8 @@ Open work only. Shipped items are deleted after completion.
 All former P0/P1 items (file uploads, FileResponse+Range, StaticFiles,
 ASGI middleware bridge, BaseHTTPMiddleware, WebSocket `accept(headers=…)`,
 TestClient `websocket_connect`, `redirect_slashes`, 405 handling) shipped
-and are covered by the 510-test suite. The items below are the
+and are covered by the own-repo test suite (currently ~950 tests; see
+COMPATIBILITY.md for the live breakdown). The items below are the
 long-tail rough edges not yet chased.
 
 ### P2 — less common
@@ -55,7 +56,7 @@ P0 / P1 items are all shipped. P2 status:
 
 ### Observability / CI
 
-- **CI pipeline.** No GitHub Actions / CI yet. Targets: `cargo test`, `cargo clippy -- -D warnings`, `pytest tests/`, FastAPI 0.136.0 upstream run, Sentry-SDK integration run, `ruff check`. Each should run on PR open + push to main.
+- ~~**CI pipeline.**~~ **Shipped.** GitHub Actions runs on every PR + push to main (`.github/workflows/ci.yml`) AND on every release tag (`.github/workflows/release.yml`). Both gates run: `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warnings`, `ruff check`, fast pytest subset, stress suite, WebSocket suite, parity (real-loopback FastAPI 0.136.0 diff), upstream FastAPI 0.136.0 suite under shim, Sentry-SDK FastAPI + ASGI integration trees. External repos pinned + force-reset every run so reused runners can't drift.
 - **Compatibility matrix freshness.** `COMPATIBILITY.md` is a snapshot. Needs an automated "does this row still match reality?" check — e.g., a pytest parameterised over the matrix rows, or a doctest-style assert per claim.
 
 ### Benchmark methodology
@@ -65,7 +66,7 @@ P0 / P1 items are all shipped. P2 status:
 
 ### Profiling gap
 
-- **Sentry active-thread-id profiling under the manual `SentryAsgiMiddleware(app)` wrap.** Requires thread-ident propagation across tokio→httpx→asyncio. 2 tests fail in `sentry-python/tests/integrations/fastapi/test_fastapi.py::test_active_thread_id`; documented in `COMPATIBILITY.md`.
+- ~~**Sentry active-thread-id profiling under the manual `SentryAsgiMiddleware(app)` wrap.**~~ **Resolved through R23–R26.** The `test_active_thread_id` cases now pass under the shim and are part of the green 89/89 Sentry-FastAPI integration count. CI gates the full Sentry FastAPI + ASGI integration trees on every PR and release tag.
 
 ---
 

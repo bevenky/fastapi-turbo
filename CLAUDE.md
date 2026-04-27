@@ -47,7 +47,7 @@ PATH="$HOME/.cargo/bin:$PATH" maturin develop --release  # optimized, ~8s
 
 # Test (skip WS tests for speed — they need server startup)
 pytest tests/ -x -q --ignore=tests/test_websocket.py   # ~45s
-pytest tests/ -x -q                                      # ~50s, 920 tests
+pytest tests/ -x -q                                      # ~50s, 950+ tests
 
 # Benchmark
 ./target/release/fastapi-turbo-bench 127.0.0.1 PORT /path N WARMUP [METHOD] [BODY] [CONTENT_TYPE]

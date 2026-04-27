@@ -88,8 +88,14 @@ jobs:
           # process so upstream tests resolve to fastapi-turbo.
           import fastapi_turbo  # noqa: F401
           PY
-          pytest /tmp/fastapi_upstream/tests/ -q --tb=no \
-                 --ignore=/tmp/fastapi_upstream/tests/test_tutorial
+          # Run from the upstream root so ``test_tutorial`` cwd-
+          # relative asset lookups (``open("docs_src/.../...")``)
+          # resolve. Earlier ``--ignore=test_tutorial`` skipped a
+          # third of the suite to avoid the cwd-mismatch failures —
+          # the canonical 3,125 / 3,129 claim was unenforced. Now
+          # the wrapper runs from the upstream root AND the shim
+          # conftest above guarantees the shim loads first.
+          cd /tmp/fastapi_upstream && pytest tests/ -q --tb=no
       - name: Sentry SDK FastAPI + ASGI integration
         # Release-required gate, BLOCKING. R26 caught a
         # transaction-name regression here (legacy

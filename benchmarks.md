@@ -515,9 +515,9 @@ Tested with `python-freethreading` (Homebrew), `#[pymodule(gil_used = false)]` d
 | WS sync echo | 57 μs | **56 μs** | **Same/faster** |
 | WS async echo | 58 μs | **57 μs** | **Same** |
 
-**Root cause found:** `Python::with_gil()` in PyO3 0.25 on free-threaded Python adds ~60μs overhead per call (biased reference counting + per-object critical sections). The pure Rust path (`/_ping`) is faster because there's no GIL overhead. WebSocket is unaffected because `py.allow_threads()` minimizes GIL hold time.
+**Historical context (preserved for transparency):** the original investigation here was on PyO3 0.25, which had a measurable per-call ``Python::with_gil()`` overhead on free-threaded Python (~60μs from biased reference counting + per-object critical sections). The pure Rust path (`/_ping`) was faster than Python-handler paths because it avoided the GIL altogether; WebSocket was unaffected because `py.allow_threads()` released the GIL.
 
-**Verdict:** Free-threaded Python's Rust layer is faster, but PyO3 0.25's `with_gil()` implementation makes Python handler calls much slower. Need PyO3 0.28+ for optimized free-threading support. WebSocket performance is already at parity — the architecture is ready.
+**Status as of R-batch refresh:** the codebase is on PyO3 0.28 (`Cargo.toml`); the migration from 0.25 (with_gil → attach, deprecated downcast → cast) is complete and clippy-clean. The free-threaded numbers above pre-date the migration and have not been re-measured on 0.28 in this document. Re-measurement under 0.28 + free-threaded Python is on the bench TODO list (alongside Linux-x86_64 numbers) — see "What we have NOT yet published" higher up in this file.
 
 ---
 

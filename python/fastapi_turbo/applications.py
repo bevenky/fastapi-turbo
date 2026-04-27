@@ -1696,22 +1696,47 @@ def _collect_dependencies_from_markers(dependencies):
 
 def _find_exception_handler(app, exc):
     """Locate a custom exception handler for ``exc`` walking
-    ``app.exception_handlers`` by MRO. Returns ``None`` when no
-    user-registered handler matches — caller falls back to the
-    framework default."""
+    ``app.exception_handlers`` by MRO. Returns ``(handler, matched_cls)``
+    where ``matched_cls`` is the class the handler was registered for
+    (so callers can distinguish a custom-subclass handler from a
+    catch-all ``Exception`` handler — only the latter re-raises after
+    running, mirroring Starlette's ServerErrorMiddleware vs
+    ExceptionMiddleware split). Returns ``(None, None)`` when no
+    user-registered handler matches."""
     handlers = getattr(app, "exception_handlers", {}) or {}
     for cls in type(exc).__mro__:
         h = handlers.get(cls)
         if h is not None:
-            return h
-    return None
+            return h, cls
+    return None, None
 
 
 async def _asgi_emit_exception(app, scope, send, exc):
     """Turn an exception raised during in-process dispatch into an
     ASGI response by (a) consulting ``app.exception_handlers`` for a
     user-registered handler, (b) falling back to FA-compatible
-    defaults for HTTPException / RequestValidationError / other."""
+    defaults for HTTPException / RequestValidationError / other.
+
+    Re-raise policy mirrors Starlette's ``ServerErrorMiddleware`` /
+    ``ExceptionMiddleware`` split:
+
+      * HTTPException, RequestValidationError, WebSocketException
+        (and their subclasses) — these ARE the intended response
+        types FastAPI uses to encode 4xx / 5xx outcomes. The handler
+        sends a response and we return; never re-raise.
+      * Generic ``Exception`` — the user may have registered a
+        catch-all ``@app.exception_handler(Exception)`` to render a
+        custom 500. Upstream Starlette runs that handler AND THEN
+        re-raises so ``httpx.ASGITransport(raise_app_exceptions=True)``
+        / ``TestClient(raise_server_exceptions=True)`` propagate the
+        original exception out of the test, instead of silently
+        masking a real failure as a successful 500. We match that
+        contract: re-raise after delivering the response.
+
+    Earlier impl returned silently after handler dispatch, so
+    catch-all-handler tests in sandbox / serverless / in-process
+    runs saw a 500 response instead of the unhandled exception —
+    upstream sees the exception. Probe-confirmed divergence."""
     from fastapi_turbo.requests import Request as _Req
     from fastapi_turbo.responses import JSONResponse as _JR
     from fastapi_turbo.exceptions import (
@@ -1719,7 +1744,7 @@ async def _asgi_emit_exception(app, scope, send, exc):
         RequestValidationError as _RVE,
     )
 
-    handler = _find_exception_handler(app, exc)
+    handler, matched_cls = _find_exception_handler(app, exc)
     if handler is not None:
         request = _Req(dict(scope))
         try:
@@ -1731,9 +1756,24 @@ async def _asgi_emit_exception(app, scope, send, exc):
                 if _insp.iscoroutine(resp):
                     resp = await resp
             await _send_asgi_response(send, resp)
+            # Re-raise rule mirrors Starlette: a handler registered
+            # for ``Exception`` itself (catch-all) sits in
+            # ``ServerErrorMiddleware``, which RE-RAISES after running
+            # so ``raise_app_exceptions=True`` test transports
+            # propagate the original exception. Handlers registered
+            # for a more specific class (HTTPException,
+            # CustomError, etc.) live in ``ExceptionMiddleware``,
+            # which sends the response and stops there. Distinguish
+            # by ``matched_cls is Exception``.
+            if matched_cls is Exception:
+                raise exc
             return
-        except Exception:  # noqa: BLE001
-            # Handler itself blew up — fall through to default.
+        except Exception as handler_exc:  # noqa: BLE001
+            if handler_exc is exc:
+                # The deliberate re-raise above; let it propagate.
+                raise
+            # Handler itself blew up — fall through to default
+            # rendering of the original exception.
             pass
 
     if isinstance(exc, _HE):

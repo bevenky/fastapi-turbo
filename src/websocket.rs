@@ -833,7 +833,24 @@ pub async fn handle_ws_upgrade(
                     maybe_cmd = rx_out.recv() => {
                         match maybe_cmd {
                             Some(WriterCmd::Send(msg)) => {
+                                // Detect a server-initiated close so we
+                                // can do a clean WS handshake termination
+                                // afterwards: send the Close frame, then
+                                // close the underlying sink so the client
+                                // sees the WebSocket close handshake
+                                // instead of a raw TCP drop. Without this
+                                // the client's reader gets a
+                                // ``ConnectionResetError`` after the
+                                // Close, which floods test debug logs
+                                // and looks like a real failure even
+                                // when the close was orderly.
+                                let is_close = matches!(msg, Message::Close(_));
                                 if ws_tx.send(msg).await.is_err() { break; }
+                                if is_close {
+                                    let _ = ws_tx.close().await;
+                                    state_r.store(STATE_DISCONNECTED, Ordering::Release);
+                                    break;
+                                }
                             }
                             Some(WriterCmd::Flush(tx)) => {
                                 let _ = tx.send(());
