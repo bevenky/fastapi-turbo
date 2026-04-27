@@ -2,15 +2,15 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 89/89 (earlier R-batches reported a smaller subset; that count pre-dated the R23 / R25 / R26 fixes — `test_legacy_setup` and the active-thread-id tests are part of the now-green set). Own suite: 948 tests (410 general + 22 WebSocket + 409 stress + 107 parity snapshots).
+Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 89/89 (earlier R-batches reported a smaller subset; that count pre-dated the R23 / R25 / R26 fixes — `test_legacy_setup` and the active-thread-id tests are part of the now-green set). Own suite: 954 tests (410 general + 22 WebSocket + 415 stress + 107 parity snapshots).
 
 **Test suite under different environments:**
 
-* **Normal dev box / CI** (loopback bind allowed): all 948 tests run (1 conditional skip when Starlette wasn't pre-imported), 0 failed.
+* **Normal dev box / CI** (loopback bind allowed): all 954 tests run (1 conditional skip when Starlette wasn't pre-imported), 0 failed.
 * **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError` in the pytest process): `tests/conftest.py` detects this at session start via a one-shot bind probe and sets `LOOPBACK_DENIED = True`. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`.
   - **Force-override env vars** (audit / CI use): set `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` to skip `requires_loopback` tests even on a dev box that *can* bind, or `FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED=1` to run them anyway in an env where probe bind fails but the real subprocess server might still succeed.
   - **Counts depend on what specifically fails**. Two sandbox flavours produce different numbers:
-    1. *Probe-fails, runtime-fails* (true sandbox — every bind raises): `requires_loopback` tests skip AND tests that auto-fallback through `TestClient(in_process=...)` switch to ASGI. Measured at the R27 watermark: 792 pass, 156 skipped.
+    1. *Probe-fails, runtime-fails* (true sandbox — every bind raises): `requires_loopback` tests skip AND tests that auto-fallback through `TestClient(in_process=...)` switch to ASGI. Measured at the R28 watermark: 798 pass, 156 skipped.
     2. *Probe-fails, runtime-OK* (audit env where the probe fails but pytest's actual binds succeed, OR a dev box with `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` set): `requires_loopback` tests skip via the marker, but other tests that bind ad-hoc still succeed. Measured at the R27 watermark: ~895 pass, ~53 skipped.
   - Both flavours surface **0 failed, 0 errors**. The skip-count delta reflects what the env actually denies, not a regression.
 
@@ -41,7 +41,7 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | `response_model=` (filtering, aliases, `model_validate(obj)`) | Full | |
 | `status_code=` / `tags=` / `summary=` / `description=` / `response_description=` | Full | |
 | `app.mount("/sub", sub_app)` for FastAPI / StaticFiles / ASGI | Full | |
-| `app.host("subdomain", sub_app)` | Full | Dispatched via a Python middleware; sub-app's routes are matched directly (no re-entry through its ASGI entry). |
+| `app.host("subdomain", sub_app)` | Full | Dispatched in-process by the ASGI entry: ``_asgi_dispatch_in_process`` checks the registered hosts BEFORE route match and recurses into the matching sub-app's ``__call__`` (R28). Works under raw ``httpx.ASGITransport(app=app)`` / serverless / sandbox runs without binding a loopback socket. Sub-app keeps its own route table, lifespan, and middleware chain. |
 | `redirect_slashes` | Full | |
 | HEAD auto-handling from GET | Full | 405 + `Allow: <declared>` — matches upstream FastAPI byte-for-byte. |
 | OPTIONS auto-generation for CORS | Full | True preflights (`Origin` + `Access-Control-Request-Method`) are handled by `CORSMiddleware`; bare OPTIONS on undeclared method returns 405 + `Allow: <declared>` — matches upstream. |

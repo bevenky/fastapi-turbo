@@ -6591,6 +6591,44 @@ class FastAPI:
         method = scope.get("method", "GET").upper()
         path = scope.get("path", "/")
 
+        # ── Host dispatch ──
+        # ``app.host("subapp", subapp)`` — when a request's Host header
+        # matches a registered host, recurse into the sub-app's
+        # ``__call__``. Done HERE (before mount dispatch and route
+        # match) because the host middleware installed via
+        # ``app.host()`` only fires inside an endpoint's wrapper
+        # chain — when no main-app route matches, the dispatcher
+        # would return False and fall back to the loopback Rust
+        # server, which can't bind under ``ASGITransport`` /
+        # serverless / sandbox runs (probe-confirmed: bare
+        # ``httpx.ASGITransport(app=app)`` raised
+        # ``PermissionError`` instead of routing to the sub-app).
+        hosts = getattr(self, "_hosts", None)
+        if hosts:
+            host_header = ""
+            for hk, hv in scope.get("headers", []) or []:
+                hkl = (hk.decode("latin-1") if isinstance(hk, bytes) else hk).lower()
+                if hkl == "host":
+                    host_header = (
+                        hv.decode("latin-1") if isinstance(hv, bytes) else hv
+                    )
+                    break
+            hs = host_header.split(":", 1)[0].lower()
+            for entry in hosts:
+                hn = entry[0].lower()
+                sub = entry[1]
+                if sub is None:
+                    continue
+                hit = (hn == hs) or ("." not in hn and hs.split(".", 1)[0] == hn)
+                if hit:
+                    # Forward the (unchanged) scope to the sub-app's
+                    # ASGI ``__call__``. Sub-app keeps its own route
+                    # table; the path on the scope is whatever the
+                    # client sent (Starlette's ``Host`` doesn't strip
+                    # a prefix — that's what ``mount`` is for).
+                    await sub(scope, receive, send)
+                    return True
+
         # ── Mount dispatch ──
         # ``app.mount("/v1", subapp)`` — if the incoming path starts
         # with a registered mount prefix AND no top-level route matches

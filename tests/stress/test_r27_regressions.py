@@ -91,9 +91,16 @@ def test_ci_workflow_injects_shim_conftest_for_external_suites():
     session-start so the shim is live during collection + teardown."""
     ci = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
     text = ci.read_text()
-    # Shim injection conftest must appear for both external trees.
+    # Shim injection conftest must appear for the upstream tree.
     assert "/tmp/fastapi_upstream/conftest.py" in text, text
-    assert "/tmp/sentry-python/tests/integrations/fastapi/conftest.py" in text, text
+    # Sentry injection covers both fastapi AND asgi trees (R28
+    # added the asgi tree). The upstream-Sentry workflow loops
+    # over both via ``for tree in fastapi asgi`` so both
+    # ``tests/integrations/<tree>/conftest.py`` paths are written.
+    assert "for tree in fastapi asgi" in text or (
+        "/tmp/sentry-python/tests/integrations/fastapi/conftest.py" in text
+        and "/tmp/sentry-python/tests/integrations/asgi/conftest.py" in text
+    ), text
     # Both written via heredoc that imports fastapi_turbo.
     assert "import fastapi_turbo" in text
 
@@ -101,26 +108,29 @@ def test_ci_workflow_injects_shim_conftest_for_external_suites():
 def test_ci_workflow_external_gates_are_blocking():
     """The previous workflow used ``|| echo "..."`` so a failing
     upstream / Sentry run printed a warning but the job still
-    succeeded. R27 removes the soft-fail and pins the external repos
-    so transient upstream churn doesn't spuriously break CI without
-    pinning."""
+    succeeded. R27 removes the soft-fail and pins the external repos.
+    R28 changes the pinning mechanism from ``git clone --branch <tag>``
+    to ``git fetch + reset --hard <tag>`` so reused runners don't
+    silently inherit a stale checkout — this test enforces the new
+    contract."""
     ci = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
     text = ci.read_text()
-    # No `|| echo` soft-fails on the upstream / sentry steps.
     upstream_idx = text.find("Upstream FastAPI test suite")
-    sentry_idx = text.find("Sentry SDK FastAPI integration")
+    sentry_idx = text.find("Sentry SDK FastAPI")
     assert upstream_idx != -1 and sentry_idx != -1, "expected blocks not found"
 
-    # Slice the steps and check no ``|| echo`` appears.
     upstream_block = text[upstream_idx:sentry_idx]
-    sentry_block = text[sentry_idx:sentry_idx + 2000]
+    sentry_block = text[sentry_idx:sentry_idx + 3000]
     assert "|| echo" not in upstream_block, upstream_block
     assert "|| echo" not in sentry_block, sentry_block
 
-    # External repos must be pinned by tag/branch (no ``--depth 1``
-    # without a pin would track moving HEAD).
-    assert "--branch 0.136.0" in upstream_block, upstream_block
-    assert "--branch 2.42.0" in sentry_block, sentry_block
+    # External repos must be pinned to a specific version. R28 uses
+    # ``UPSTREAM_TAG=…`` / ``SENTRY_TAG=…`` env vars + a hard reset
+    # so reused runners can't drift.
+    assert "UPSTREAM_TAG=0.136.0" in upstream_block, upstream_block
+    assert "SENTRY_TAG=2.42.0" in sentry_block, sentry_block
+    assert "reset --hard" in upstream_block, upstream_block
+    assert "reset --hard" in sentry_block, sentry_block
 
 
 # ────────────────────────────────────────────────────────────────────

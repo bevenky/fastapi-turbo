@@ -91,19 +91,26 @@ exhaustion.
 
 | Stack                                      | /health rps | /users/1 rps |
 |--------------------------------------------|------------:|-------------:|
-| **fastapi-turbo + SQLA + psycopg2 sync**          |   32 990    |    3 638     |
-| **fastapi-turbo + SQLA + psycopg3 sync**          |   32 256    |    3 245     |
-| **fastapi-turbo + SQLA + asyncpg (async)**        |   31 648    |    **2 641** |
-| FastAPI uvicorn + SQLA + psycopg2 sync         |    5 237    |    1 407     |
-| FastAPI uvicorn + SQLA + psycopg3 sync         |    5 232    |    1 287     |
-| FastAPI uvicorn + SQLA + asyncpg (async)       |    8 890    |    1 945     |
+| fastapi-turbo + SQLA + psycopg3 sync         |   33 772    |    3 422     |
+| fastapi-turbo + SQLA + psycopg2 sync         |   34 413    |    3 982     |
+| fastapi-turbo + SQLA + asyncpg (async)       |   31 692    |    2 831     |
+| fastapi-turbo + SQLA + psycopg3 (async)      |   31 752    |    2 826     |
+| FastAPI uvicorn + SQLA + psycopg3 sync       |    5 283    |    1 339     |
+| FastAPI uvicorn + SQLA + psycopg2 sync       |    5 103    |    1 359     |
+| FastAPI uvicorn + SQLA + asyncpg (async)     |    8 960    |    1 704     |
+| FastAPI uvicorn + SQLA + psycopg3 (async)    |    9 046    |    2 184     |
 
-p50 μs on /users/1: fastapi-turbo pg2 273 · pg3 307 · asyncpg **376** · FastAPI pg2 704 · pg3 757 · asyncpg 508.
+> Numbers above are exact from [`benchmarks/sqla.tsv`](sqla.tsv) — run order matches the TSV (sequential per stack to avoid Postgres `max_connections` exhaustion). Earlier rendered numbers in this section drifted from the authoritative TSV when the matrix runner soft-failed (R27); rendering is now reproducible from the TSV directly.
 
-**fastapi-turbo now beats FastAPI across the board, including SQLA async:**
-- psycopg2 sync: **2.6× faster** than FastAPI
-- psycopg3 sync: **2.5× faster**
-- **asyncpg async: 1.36× faster** than FastAPI (was 25% behind before this session's fix)
+p50 μs on `/users/1` (from `benchmarks/sqla.tsv`): fastapi-turbo pg3-sync 284 · pg2-sync 246 · asyncpg 339 · pg3-async 341 · FastAPI pg3-sync 722 · pg2-sync 721 · asyncpg 564 · pg3-async 447.
+
+**Per-stack speedup vs upstream FastAPI on `/users/1`** (computed from the TSV, macOS loopback at single-connection):
+- psycopg2 sync: 2.93× (3 982 vs 1 359 rps)
+- psycopg3 sync: 2.56× (3 422 vs 1 339 rps)
+- asyncpg async: 1.66× (2 831 vs 1 704 rps)
+- psycopg3 async: 1.29× (2 826 vs 2 184 rps)
+
+These are macOS-loopback numbers and don't generalise to higher concurrency — see [benchmarks.md](../benchmarks.md) "Reading order" for the cross-concurrency context.
 
 ### Bugs fixed + optimizations shipped this session
 
