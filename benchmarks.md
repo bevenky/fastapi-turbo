@@ -525,7 +525,7 @@ Tested with `python-freethreading` (Homebrew), `#[pymodule(gil_used = false)]` d
 
 | Optimization | Expected Impact | Status |
 |---|---|---|
-| Free-threaded Python 3.14t | Expected GIL → 0, actual 3x slower (PyO3 per-object locking) | **Tested — NOT ready.** Wait for PyO3 0.28+ |
+| Free-threaded Python 3.14t | Expected GIL → 0, actual 3× slower under PyO3 0.25 (per-object locking). | **Migration complete on PyO3 0.28** (`Cargo.toml`); free-threaded re-measurement under 0.28 is pending — see "What we have NOT yet published" above. |
 | Direct pydantic-core Rust FFI | Eliminate ~2μs Python boundary for POST | pydantic-core not published as Rust crate |
 | pydantic-core standalone Rust crate | Eliminate ~2μs Python boundary for POST | Confirmed NOT on crates.io — tightly coupled to PyO3. jiter (pydantic's JSON parser) IS available as a pure Rust crate. |
 | `sonic-rs` SIMD JSON | ~0.3μs faster serialization (diminishing returns on small payloads) | Evaluated, marginal gain |

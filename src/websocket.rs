@@ -834,21 +834,51 @@ pub async fn handle_ws_upgrade(
                         match maybe_cmd {
                             Some(WriterCmd::Send(msg)) => {
                                 // Detect a server-initiated close so we
-                                // can do a clean WS handshake termination
-                                // afterwards: send the Close frame, then
-                                // close the underlying sink so the client
-                                // sees the WebSocket close handshake
-                                // instead of a raw TCP drop. Without this
-                                // the client's reader gets a
-                                // ``ConnectionResetError`` after the
-                                // Close, which floods test debug logs
-                                // and looks like a real failure even
-                                // when the close was orderly.
+                                // can do a graceful WS handshake termination:
+                                // send the Close frame, then DRAIN the
+                                // read side until the client echoes Close
+                                // (or a short timeout fires) before
+                                // closing the sink. RFC 6455 §5.5.1 +
+                                // §7.1.4 — the side that sends the
+                                // first Close should drain pending
+                                // incoming frames so the peer's TCP
+                                // close lands cleanly. Without the drain,
+                                // closing the sink immediately makes the
+                                // client's reader see a TCP RST after
+                                // the Close, which surfaces as
+                                // ``ConnectionResetError`` in test debug
+                                // logs even on orderly shutdowns
+                                // (R29 saw this; R30 fixes the noise).
                                 let is_close = matches!(msg, Message::Close(_));
                                 if ws_tx.send(msg).await.is_err() { break; }
                                 if is_close {
-                                    let _ = ws_tx.close().await;
                                     state_r.store(STATE_DISCONNECTED, Ordering::Release);
+                                    // Drain incoming frames until the
+                                    // client's close echo arrives or a
+                                    // 200ms guard fires. The client side
+                                    // (``websockets`` library) sees the
+                                    // server's Close and replies in the
+                                    // same trip, so 200ms is comfortably
+                                    // above the client's reply latency
+                                    // without making test teardowns
+                                    // sluggish.
+                                    let drain_deadline = tokio::time::Instant::now()
+                                        + std::time::Duration::from_millis(200);
+                                    loop {
+                                        let remaining = drain_deadline
+                                            .saturating_duration_since(tokio::time::Instant::now());
+                                        if remaining.is_zero() {
+                                            break;
+                                        }
+                                        match tokio::time::timeout(remaining, ws_rx.next()).await {
+                                            Err(_) => break, // timeout
+                                            Ok(None) => break, // peer dropped
+                                            Ok(Some(Err(_))) => break, // read error
+                                            Ok(Some(Ok(Message::Close(_)))) => break, // got ack
+                                            Ok(Some(Ok(_))) => continue, // drop other frames
+                                        }
+                                    }
+                                    let _ = ws_tx.close().await;
                                     break;
                                 }
                             }
@@ -874,8 +904,23 @@ pub async fn handle_ws_upgrade(
                                 let (code, reason) = frame
                                     .map(|f| (f.code, f.reason.to_string()))
                                     .unwrap_or((1000u16, String::new()));
+                                let echo_reason = reason.clone();
                                 let _ = cb_tx.send(WsMessage::Close { code, reason });
                                 state_r.store(STATE_DISCONNECTED, Ordering::Release);
+                                // Client initiated close — echo a Close
+                                // frame back so the client's
+                                // ``websockets`` library treats this as
+                                // ``ConnectionClosedOK`` instead of an
+                                // abnormal shutdown, then close the sink.
+                                let _ = ws_tx
+                                    .send(Message::Close(Some(
+                                        axum::extract::ws::CloseFrame {
+                                            code,
+                                            reason: echo_reason.into(),
+                                        },
+                                    )))
+                                    .await;
+                                let _ = ws_tx.close().await;
                                 break;
                             }
                             _ => continue, // Ping/Pong handled by axum
