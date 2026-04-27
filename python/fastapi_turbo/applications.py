@@ -6002,23 +6002,45 @@ class FastAPI:
         return True
 
     def _stop_lifespan_mw_chain(self) -> bool:
+        """Drive ``lifespan.shutdown`` through the raw-ASGI middleware
+        chain. Returns True when the chain ran (caller should NOT
+        also call ``_run_shutdown_handlers`` directly).
+
+        Lifespan-shutdown FAILURES propagate. Earlier the inner
+        send-events queue recorded ``lifespan.shutdown.failed`` but
+        ``await state["task"]`` swallowed the exception silently
+        — supervisors and TestClient ``__exit__`` saw True (chain
+        ran) and never knew cleanup blew up. R39 inspects the last
+        queued event AND the task's own exception state; either
+        signal escalates to a ``RuntimeError`` with the original
+        message."""
         state = getattr(self, "_lifespan_mw_state", None)
         if not state or not state.get("task"):
             return False
-        import asyncio
         from fastapi_turbo._async_worker import submit as _submit
+
+        outcome: dict = {}
 
         async def _kickoff():
             state["send_events"].clear()
             await state["recv_q"].put({"type": "lifespan.shutdown"})
             await state["send_done"].wait()
+            last = state["send_events"][-1] if state["send_events"] else None
+            if last and last.get("type") == "lifespan.shutdown.failed":
+                outcome["failed_msg"] = last.get("message", "")
             try:
                 await state["task"]
-            except BaseException:  # noqa: BLE001
-                pass
+            except BaseException as exc:  # noqa: BLE001
+                outcome.setdefault("task_exc", exc)
 
         _submit(_kickoff(), app=self)
         self._lifespan_mw_state = None
+        if "task_exc" in outcome:
+            raise outcome["task_exc"]
+        if "failed_msg" in outcome:
+            raise RuntimeError(
+                f"Lifespan shutdown failed: {outcome['failed_msg']}"
+            )
         return True
 
     # ------------------------------------------------------------------
@@ -6160,6 +6182,49 @@ class FastAPI:
                 )
                 _redoc_route._fastapi_turbo_bypass_deps = True
                 self.router.routes.insert(0, _redoc_route)
+
+        # Swagger UI's OAuth2 redirect target — upstream FastAPI
+        # auto-registers this when ``swagger_ui_oauth2_redirect_url``
+        # is set (default ``/docs/oauth2-redirect``). Earlier the
+        # in-process installer skipped it, so the upstream
+        # ``test_swagger_ui_oauth2_redirect`` test (and any other
+        # parity surface that hits this URL) returned 404 in
+        # sandboxed / ASGITransport runs. R39 adds the same
+        # auto-registration the Rust ``run_server`` path gets.
+        if (
+            self.swagger_ui_oauth2_redirect_url is not None
+            and self.docs_url is not None
+            and _openapi_url_val is not None
+        ):
+            try:
+                import fastapi_turbo.compat as _c
+                _c.install()
+                import sys as _sys
+                _docs_mod = _sys.modules.get("fastapi.openapi.docs")
+            except Exception:  # noqa: BLE001
+                _docs_mod = None
+            if _docs_mod is not None and hasattr(
+                _docs_mod, "get_swagger_ui_oauth2_redirect_html"
+            ):
+                def _oauth2_redirect_dynamic():
+                    return _docs_mod.get_swagger_ui_oauth2_redirect_html()
+
+                _oauth2_redirect_dynamic.__name__ = "swagger_ui_redirect"
+                self.router.routes = [
+                    r for r in self.router.routes
+                    if not _is_prior_dynamic(
+                        r, "swagger_ui_redirect",
+                        self.swagger_ui_oauth2_redirect_url,
+                    )
+                ]
+                _oauth2_route = APIRoute(
+                    self.swagger_ui_oauth2_redirect_url,
+                    _oauth2_redirect_dynamic,
+                    methods=["GET"],
+                    include_in_schema=False,
+                )
+                _oauth2_route._fastapi_turbo_bypass_deps = True
+                self.router.routes.insert(0, _oauth2_route)
 
         self._in_process_dynamic_routes_installed = True
 
@@ -7840,7 +7905,13 @@ class FastAPI:
             except _PyVE as pve:
                 errs = []
                 for e in pve.errors():
-                    new = {k: v for k, v in e.items() if k not in ("url", "ctx")}
+                    # Strip ``url`` (pydantic doc-link, not in upstream
+                    # FastAPI's response shape) but PRESERVE ``ctx``
+                    # (constraint values like ``{min_length: 1}``) —
+                    # upstream FastAPI emits ctx in its 422 response
+                    # bodies. R39 audit caught us silently dropping
+                    # it across ~888 upstream tests.
+                    new = {k: v for k, v in e.items() if k != "url"}
                     loc = list(new.get("loc", ()))
                     new["loc"] = [loc_kind, loc_name, *loc] if loc else [loc_kind, loc_name]
                     errs.append(new)
@@ -8108,7 +8179,8 @@ class FastAPI:
                         except _PyVE2 as pve:
                             errs = []
                             for e in pve.errors():
-                                new = {k: v for k, v in e.items() if k not in ("url", "ctx")}
+                                # Preserve ``ctx`` (R39).
+                                new = {k: v for k, v in e.items() if k != "url"}
                                 loc = list(new.get("loc", ()))
                                 new["loc"] = ["body", *loc] if loc else ["body"]
                                 errs.append(new)
@@ -8138,7 +8210,8 @@ class FastAPI:
                         except _PyVE2 as pve:
                             errs = []
                             for e in pve.errors():
-                                new = {k: v for k, v in e.items() if k not in ("url", "ctx")}
+                                # Preserve ``ctx`` (R39).
+                                new = {k: v for k, v in e.items() if k != "url"}
                                 loc = list(new.get("loc", ()))
                                 new["loc"] = ["body", *loc] if loc else ["body"]
                                 errs.append(new)

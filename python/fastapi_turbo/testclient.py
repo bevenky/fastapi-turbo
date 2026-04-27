@@ -648,6 +648,15 @@ class _ASGISyncClientShim:
     def cookies(self):
         return self._client.cookies
 
+    @property
+    def base_url(self):
+        """Forward to the underlying ``httpx.AsyncClient.base_url`` so
+        callers can ``client.base_url`` (Starlette TestClient
+        idiom — upstream-FastAPI's
+        ``test_custom_swagger_ui_redirect`` reads this). Returns an
+        ``httpx.URL`` object."""
+        return self._client.base_url
+
     def close(self) -> None:
         try:
             self._run(self._client.aclose())
@@ -1010,10 +1019,15 @@ class TestClient:
             and self.app._collect_lifespans()
             and not getattr(self.app, "_lifespan_cms", None)
         ):
-            try:
-                self.app._run_lifespan_startup()
-            except Exception:  # noqa: BLE001
-                pass
+            # Startup failures must propagate — Starlette's TestClient
+            # raises whatever lifespan startup raised so the caller's
+            # ``with TestClient(app) as cli:`` block surfaces a real
+            # bug instead of silently entering a poisoned-app
+            # context. Earlier impl swallowed the exception, then
+            # subsequent requests against the partially-initialised
+            # app returned 200 against an uninitialised state
+            # (probe-confirmed by R39).
+            self.app._run_lifespan_startup()
         self._ensure_started()
         return self
 
@@ -1028,6 +1042,15 @@ class TestClient:
         #      launched (via ``_fastapi_turbo_core.request_server_shutdown``).
         #   3. Drop the ``_app_servers`` cache entry so the app ref is
         #      GC-eligible.
+        # Lifespan shutdown failures propagate — Starlette's TestClient
+        # raises out of ``__exit__`` so a failed cleanup doesn't slip
+        # past a green ``with`` block. We collect the first exception
+        # encountered, finish the rest of the teardown (server stop,
+        # cache eviction), then re-raise. Earlier impl wrapped the
+        # whole shutdown chain in ``try/except: pass`` (probe-confirmed
+        # by R39: a lifespan ``__aexit__`` raising RuntimeError was
+        # silently dropped, breaking parity with upstream).
+        teardown_exc: BaseException | None = None
         try:
             stop_chain = getattr(self.app, "_stop_lifespan_mw_chain", None)
             if stop_chain is not None and stop_chain():
@@ -1042,8 +1065,8 @@ class TestClient:
                     or getattr(self.app, "_lifespan_cms", None)
                 ):
                     lifespan_stop()
-        except Exception:  # noqa: BLE001
-            pass
+        except BaseException as exc:  # noqa: BLE001
+            teardown_exc = exc
         if self._client:
             self._client.close()
             self._client = None
@@ -1069,6 +1092,13 @@ class TestClient:
             if cached is not None and cached[1] == self._port:
                 TestClient._app_servers.pop(key, None)
         self._started = False
+        # Re-raise any teardown exception we captured so the
+        # ``with`` block surfaces it. Order matters: server stop
+        # / cache eviction happen FIRST (lines above) so the
+        # process leaves no zombies behind even when the user's
+        # cleanup is buggy.
+        if teardown_exc is not None:
+            raise teardown_exc
 
     # ── Lifespan state ────────────────────────────────────────────────
     @property

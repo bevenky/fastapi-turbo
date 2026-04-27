@@ -668,9 +668,13 @@ def _build_default_route_handler(route, app):
                     # ``loc: ["body", "field"]`` for field errors).
                     errs = []
                     for err in exc.errors():
+                        # Strip pydantic's doc-link ``url`` field but
+                        # preserve ``ctx`` (constraint values like
+                        # ``{min_length: 1}``) — upstream FastAPI
+                        # emits ctx in 422 response bodies (R39).
                         new_err = {
                             k: v for k, v in err.items()
-                            if k not in ("url", "ctx")
+                            if k != "url"
                         }
                         loc = list(new_err.get("loc", ()))
                         new_err["loc"] = ["body", *loc] if loc else ["body"]
