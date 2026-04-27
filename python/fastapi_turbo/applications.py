@@ -2230,6 +2230,68 @@ def _load_real_starlette_class(submodule: str, classname: str):
         return cls
 
 
+_SENTRY_FASTAPI_HOOK_CACHE: dict = {"loaded": False, "fn": None, "integration_cls": None}
+
+
+def _maybe_set_sentry_transaction_name(app, scope, matched_route) -> None:
+    """If Sentry's ``FastApiIntegration`` is loaded, set the
+    transaction name from ``scope['route'].path`` — replicating
+    what Sentry's monkey-patched ``fastapi.routing.get_request_handler``
+    would do on upstream FastAPI. Our dispatcher bypasses that
+    handler, so the patch never fires; without this call, Sentry's
+    legacy ``SentryAsgiMiddleware(app)`` setup falls back to the
+    concrete-URL transaction name and ``test_legacy_setup`` diffs
+    the URL against the expected route shape.
+
+    No-op when Sentry isn't installed or the integration isn't
+    loaded — the lookup is cached after the first call so the
+    common no-Sentry path stays at one dict read per request."""
+    cache = _SENTRY_FASTAPI_HOOK_CACHE
+    if not cache["loaded"]:
+        try:
+            import sentry_sdk
+            from sentry_sdk.integrations.fastapi import (
+                FastApiIntegration,
+                _set_transaction_name_and_source,
+            )
+            cache["sdk"] = sentry_sdk
+            cache["fn"] = _set_transaction_name_and_source
+            cache["integration_cls"] = FastApiIntegration
+        except Exception:  # noqa: BLE001
+            cache["fn"] = None
+        cache["loaded"] = True
+
+    fn = cache["fn"]
+    if fn is None:
+        return
+    try:
+        sentry_sdk = cache["sdk"]
+        client = sentry_sdk.get_client()
+        integration = client.get_integration(cache["integration_cls"])
+        if integration is None:
+            return
+        # Sentry's helper expects a request-like with a ``.scope``
+        # attribute; build a minimal shim around the live ASGI
+        # scope so the function can read ``scope['route'].path``
+        # / ``scope['endpoint']`` exactly as it would on upstream.
+        class _RequestShim:
+            __slots__ = ("scope",)
+
+            def __init__(self, asgi_scope):
+                self.scope = asgi_scope
+
+        fn(
+            sentry_sdk.get_current_scope(),
+            integration.transaction_style,
+            _RequestShim(scope),
+        )
+    except Exception:  # noqa: BLE001
+        # Defensive: any failure inside Sentry's helper must not
+        # affect the response. Sentry's own monkey-patches do the
+        # same thing.
+        pass
+
+
 def _resolve_tower_bound_to_asgi_class(mw_cls):
     """Map a Tower-bound middleware marker class to its real
     Starlette ASGI3 equivalent so the in-process dispatcher can
@@ -7011,6 +7073,19 @@ class FastAPI:
             # and the legacy-Sentry shape stays untemplated. Not an
             # error — most middleware uses ``scope`` as a plain dict.
             pass
+        # Sentry's ``FastApiIntegration`` patches
+        # ``fastapi.routing.get_request_handler`` to set the
+        # transaction name from ``scope["route"].path`` on every
+        # request. Our dispatcher doesn't go through that handler,
+        # so the patch never fires — Sentry falls back to the
+        # concrete-URL transaction name and ``test_legacy_setup``
+        # diffs ``http://testserver:None/message/123456`` against
+        # the expected ``/message/{message_id}``. Replicate the
+        # transaction-name update inline when Sentry's
+        # ``FastApiIntegration`` is loaded; cheap import probe
+        # (cached after the first run), no-op when Sentry isn't
+        # installed.
+        _maybe_set_sentry_transaction_name(self, scope, matched_route)
         try:
             body_bytes = await _drain_body()
         except _BodyTooLarge:

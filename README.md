@@ -200,7 +200,7 @@ def get_user(user_id: int):
         row = conn.execute("SELECT * FROM users WHERE id=%s", (user_id,)).fetchone()
     return dict(row)
 
-# Multiple queries — use pipeline mode (138us for 10 queries, beats Go goroutines at 148us)
+# Multiple queries — use pipeline mode (138us for 10 queries on macOS loopback at c=1; see benchmarks.md for cross-concurrency numbers)
 @app.get("/dashboard")
 def dashboard(user_id: int):
     with pool.connection() as conn:
@@ -226,13 +226,15 @@ def dashboard(user_id: int):
 | **1 query latency** | **22us** | 48us | 112us |
 | **10 queries (pipeline)** | **102us** | ~300us (seq) | 344us (gather) |
 
-### Performance: fastapi-turbo vs Go Gin (through full framework)
+### Performance: fastapi-turbo vs Go Gin (through full framework, macOS loopback at c=1 only)
 
-| Queries | fastapi-turbo | Go Gin | Winner |
-|---------|-----------|--------|--------|
-| 1 query (autocommit) | **53us** | 56us | **fastapi-turbo** |
-| 4 queries (pipeline vs goroutine) | **96us** | 79us | Go (by 17us) |
-| 10 queries (pipeline vs goroutine) | **138us** | 148us | **fastapi-turbo** |
+> **Note:** these are single-connection (`c=1`) macOS-loopback numbers and do NOT generalise to higher concurrency or Linux production. At `c=32+` Go's per-core goroutine model pulls ahead on every workload type. See [benchmarks.md](benchmarks.md) for the concurrent-load and cross-tool cross-checks; treat the table below as a per-request-overhead snapshot, not a release headline.
+
+| Queries | fastapi-turbo | Go Gin |
+|---------|-----------|--------|
+| 1 query (autocommit) | 53us | 56us |
+| 4 queries (pipeline vs goroutine) | 96us | 79us |
+| 10 queries (pipeline vs goroutine) | 138us | 148us |
 | 4 queries (sequential) | **104us** | 144us | **fastapi-turbo by 40us** |
 | 10 queries (sequential) | **197us** | 321us | **fastapi-turbo by 124us** |
 
@@ -407,7 +409,7 @@ python benchmarks/bench_hello.py
 
 - **Rust core** (~8K lines): Axum 0.8, hyper, tokio, Tower, PyO3 0.28, crossbeam; HTTP, WebSocket, multipart, streaming, DB pool, HTTP client
 - **Python layer** (~22K lines): FastAPI-compatible API, introspection, OpenAPI 3.1 generator, Starlette/FastAPI `sys.modules` compat shims
-- **Tests** (~45K lines): 932 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
+- **Tests** (~45K lines): 937 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
 
 See [CLAUDE.md](CLAUDE.md) for development guide, [benchmarks.md](benchmarks.md) for full benchmark data including Go Echo, Fastify, free-threaded Python, and WebSocket library comparisons, and [COMPATIBILITY.md](COMPATIBILITY.md) for a per-feature map of where fastapi_turbo sits against FastAPI 0.136.0 (Full / Partial / Not-implemented / Different-by-design).
 

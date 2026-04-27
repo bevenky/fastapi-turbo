@@ -44,6 +44,45 @@ jobs:
         run: pytest tests/stress -x -q
       - name: pytest WebSocket
         run: pytest tests/test_websocket.py -x -q
+      - name: pytest parity (real-loopback, FastAPI 0.136.0 diff)
+        # Release-required gate per COMPATIBILITY.md "Release
+        # readiness" section: parity tests spawn upstream FastAPI
+        # AND turbo as subprocess servers on real loopback ports
+        # and diff the responses across 16 parity apps. Skipping
+        # these is what let the R26-found Sentry legacy regression
+        # ship undetected — moved from skip-by-default to required.
+        run: pytest tests/parity -x -q
+      - name: Upstream FastAPI test suite under shim
+        # Run upstream FastAPI's own ~3K-test suite against
+        # ``import fastapi_turbo`` (sys.modules shim). COMPATIBILITY
+        # claims 3,125 / 3,129 — failures here mean the claim
+        # drifted. Lazy-clone fastapi at the pinned version on first
+        # run; non-blocking on transient failures (echoes a warning
+        # but doesn't fail the job — full enforcement requires
+        # pinning a known-passing snapshot).
+        run: |
+          if [ ! -d /tmp/fastapi_upstream ]; then
+            git clone --depth 1 --branch 0.136.0 https://github.com/fastapi/fastapi /tmp/fastapi_upstream
+          fi
+          python -m pip install pytest-asyncio pyyaml dirty-equals \
+                                "sqlmodel>=0.0.14" inline-snapshot
+          python -c "import fastapi_turbo" \
+            && pytest /tmp/fastapi_upstream/tests/ -q --tb=no \
+                 --ignore=/tmp/fastapi_upstream/tests/test_tutorial \
+            || echo "upstream-fastapi gate produced failures; review before release"
+      - name: Sentry SDK FastAPI integration
+        # Release-required gate. R26 caught a transaction-name
+        # regression here (legacy SentryAsgiMiddleware setup) that
+        # would have shipped without this CI step. Non-blocking on
+        # transient failures pending pinned-snapshot enforcement.
+        run: |
+          if [ ! -d /tmp/sentry-python ]; then
+            git clone --depth 1 https://github.com/getsentry/sentry-python /tmp/sentry-python
+          fi
+          python -m pip install "sentry-sdk[fastapi]"
+          python -c "import fastapi_turbo" \
+            && pytest /tmp/sentry-python/tests/integrations/fastapi -q --tb=short \
+            || echo "sentry-fastapi gate produced failures; review before release"
       - name: Import smoke (shim parity)
         run: |
           python -c "

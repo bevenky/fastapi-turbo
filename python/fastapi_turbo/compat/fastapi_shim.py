@@ -165,16 +165,60 @@ def _build() -> dict[str, types.ModuleType]:
     fastapi_routing.APIWebSocketRoute = APIWebSocketRoute  # type: ignore[attr-defined]
     # request_response — stac-fastapi, fastapi-pagination use this.
     # Upstream is a SYNC function returning an ASGI callable (the
-    # callable itself is async). Earlier shim was ``async def``,
-    # so calling ``request_response(handler)`` returned a coroutine
-    # instead of the ASGI app — ``app(scope, ...)`` then raised
-    # ``TypeError: 'coroutine' object is not callable``.
+    # callable itself is async). The returned callable builds a
+    # Request, calls the handler, awaits the response, and dispatches
+    # the response's ASGI events (status + body).
+    #
+    # Earlier shim was ``async def``: calling ``request_response
+    # (handler)`` returned a coroutine instead of the ASGI app —
+    # ``app(scope, ...)`` raised ``TypeError: 'coroutine' object
+    # is not callable``. R25 changed it to ``def`` but left the body
+    # as ``pass`` — fixed the type error but produced an empty
+    # response (zero ASGI messages, the test client hung). R26
+    # gives it real semantics: build Request → call handler → send
+    # Response, mirroring upstream's structure (without the
+    # AsyncExitStack instrumentation since fastapi_turbo manages
+    # its own lifecycle elsewhere).
     def request_response(func):
-        """Stub wrapping an endpoint into an ASGI handler. Matches
-        upstream FastAPI's ``request_response``: sync wrapper,
-        returns an async ASGI callable."""
+        """Wrap a ``func(request) -> Response`` into an ASGI app.
+
+        Matches the shape of upstream FastAPI's
+        ``fastapi.routing.request_response``: sync wrapper,
+        returns an ``async def app(scope, receive, send)`` that
+        builds the Request, calls ``func``, and sends the
+        Response."""
+        import asyncio
+        import inspect
+        from fastapi_turbo.requests import Request as _Request
+
+        is_async = inspect.iscoroutinefunction(func)
+
         async def app(scope, receive, send):
-            pass
+            request = _Request(scope, receive=receive, send=send)
+            if is_async:
+                response = await func(request)
+            else:
+                # Sync handler — run in the default executor so we
+                # don't block the event loop. Mirrors upstream's
+                # ``functools.partial(run_in_threadpool, func)``.
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(None, func, request)
+            # Dispatch the Response through our shared ASGI sender.
+            # ``fastapi_turbo.responses.Response`` doesn't implement
+            # the ``async __call__(scope, receive, send)`` protocol
+            # directly (unlike Starlette's Response); the dispatcher
+            # uses ``_send_asgi_response`` to translate it into ASGI
+            # ``http.response.start`` + ``http.response.body``
+            # frames. Reuse that here so streaming / file / JSON
+            # responses all serialise through one path.
+            if not hasattr(response, "status_code"):
+                # Best-effort: a handler that returned a raw dict gets
+                # wrapped in JSONResponse.
+                from fastapi_turbo.responses import JSONResponse as _JR
+                response = _JR(content=response)
+            from fastapi_turbo.applications import _send_asgi_response
+            await _send_asgi_response(send, response, scope=scope)
+
         return app
     fastapi_routing.request_response = request_response  # type: ignore[attr-defined]
 

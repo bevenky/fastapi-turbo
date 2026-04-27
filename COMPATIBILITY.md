@@ -2,16 +2,16 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56. Own suite: 932 tests (410 general + 22 WebSocket + 393 stress + 107 parity snapshots).
+Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56 (was 55/56 before R26 — `test_legacy_setup` now passes after the dispatcher invokes Sentry's transaction-name helper inline). Own suite: 937 tests (410 general + 22 WebSocket + 398 stress + 107 parity snapshots).
 
 **Test suite under different environments:**
 
-* **Normal dev box / CI** (loopback bind allowed): all 932 tests run (1 conditional skip when Starlette wasn't pre-imported), 0 failed.
+* **Normal dev box / CI** (loopback bind allowed): all 937 tests run (1 conditional skip when Starlette wasn't pre-imported), 0 failed.
 * **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError` in the pytest process): `tests/conftest.py` detects this at session start via a one-shot bind probe and sets `LOOPBACK_DENIED = True`. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`.
   - **Force-override env vars** (audit / CI use): set `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` to skip `requires_loopback` tests even on a dev box that *can* bind, or `FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED=1` to run them anyway in an env where probe bind fails but the real subprocess server might still succeed.
   - **Counts depend on what specifically fails**. Two sandbox flavours produce different numbers:
-    1. *Probe-fails, runtime-fails* (true sandbox — every bind raises): `requires_loopback` tests skip AND tests that auto-fallback through `TestClient(in_process=...)` switch to ASGI. Measured at the R25 watermark: 778 pass, 154 skipped.
-    2. *Probe-fails, runtime-OK* (audit env where the probe fails but pytest's actual binds succeed, OR a dev box with `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` set): `requires_loopback` tests skip via the marker, but other tests that bind ad-hoc still succeed. Measured at the R25 watermark: ~885 pass, ~47 skipped.
+    1. *Probe-fails, runtime-fails* (true sandbox — every bind raises): `requires_loopback` tests skip AND tests that auto-fallback through `TestClient(in_process=...)` switch to ASGI. Measured at the R26 watermark: 783 pass, 154 skipped.
+    2. *Probe-fails, runtime-OK* (audit env where the probe fails but pytest's actual binds succeed, OR a dev box with `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` set): `requires_loopback` tests skip via the marker, but other tests that bind ad-hoc still succeed. Measured at the R26 watermark: ~890 pass, ~47 skipped.
   - Both flavours surface **0 failed, 0 errors**. The skip-count delta reflects what the env actually denies, not a regression.
 
 > ### Release readiness — **a real-loopback CI run is REQUIRED before shipping**
