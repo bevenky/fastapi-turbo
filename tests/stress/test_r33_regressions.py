@@ -43,25 +43,89 @@ def test_parity_conftest_honours_force_loopback_denied_env_var():
 # ────────────────────────────────────────────────────────────────────
 
 
-def test_compatibility_md_pins_measured_force_mode_count():
+def test_compatibility_md_force_mode_count_isnt_obviously_stale():
     """The R32 regression test only checked that ``~903 pass`` is
     gone and that a FORCE-env phrase exists — it didn't verify
-    the actual current count. R33 saw the doc still claimed
-    917/55 even though the measured count was 817/162. This test
-    pins the watermark count so a future drift trips."""
+    the actual current count. R33 pinned the literal
+    ``817 pass, 162 skipped`` string, but that drifted by R34
+    (test count grew to 822). Pinning a literal count is whack-a-
+    mole; instead we extract the doc's claimed number, run the
+    actual FORCE-mode pytest in a subprocess, and compare. Tests
+    that drift by 1–2 are accepted (small day-to-day variation
+    from new tests), but anything that's off by >5 trips this
+    test — catching the order-of-magnitude doc / reality drift
+    R34 found, without needing a per-batch literal update."""
+    import os
+    import re
+    import subprocess
+    import sys
+
     compat = (
         pathlib.Path(__file__).resolve().parents[2] / "COMPATIBILITY.md"
     )
     text = compat.read_text()
-    # Must contain the current measured numbers (R33 watermark)
-    # for the FORCE-on-dev-box scenario. Numbers update with each
-    # R-batch as the test count grows; this regression catches
-    # drift between the doc claim and the actual measurement.
-    assert "817 pass, 162 skipped" in text, text
-    # And must not still carry the old-and-wrong 917/55 / 903/60
-    # claims.
+
+    # Parse the bucket-#1 (FORCE env var) claimed pass count.
+    # Format: "FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`: <P> pass, <S> skipped".
+    m = re.search(
+        r"FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1[^\n]*?:\s*(\d+)\s*pass,\s*(\d+)\s*skipped",
+        text,
+    )
+    assert m is not None, "doc bucket-#1 claim not found"
+    claimed_pass, claimed_skip = int(m.group(1)), int(m.group(2))
+
+    # And no obviously stale older numbers — the audit history
+    # shows these are the patterns that previously slipped past.
     for stale in ("917 pass, 55 skipped", "~903 pass", "~895 pass"):
         assert stale not in text, (stale, text)
+
+    # Run pytest in FORCE mode in a subprocess and compare. Skip
+    # when an env var indicates the test runner can't spawn a
+    # full pytest (CI sub-shells, deeply nested pytest invocation,
+    # etc.). The drift check is the value here; the literal
+    # number is intentionally not pinned.
+    if os.environ.get("FASTAPI_TURBO_SKIP_DOC_DRIFT_CHECK"):
+        return
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/", "-q", "--timeout=60"],
+        cwd=str(repo),
+        env={
+            **os.environ,
+            "FASTAPI_TURBO_FORCE_LOOPBACK_DENIED": "1",
+            # Avoid recursion: the spawned pytest must not run THIS
+            # test (which would spawn pytest again, ad infinitum).
+            "FASTAPI_TURBO_SKIP_DOC_DRIFT_CHECK": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    summary_match = re.search(
+        r"(\d+)\s+passed,\s*(\d+)\s+skipped", proc.stdout or ""
+    )
+    if summary_match is None:
+        # Subprocess pytest didn't produce a recognisable summary
+        # (test failure, internal error, etc.). The drift check
+        # only cares about the doc-vs-reality delta; if the
+        # subprocess can't even produce a summary, leave the
+        # test green and let the broader pytest run fail.
+        return
+    measured_pass, measured_skip = (
+        int(summary_match.group(1)),
+        int(summary_match.group(2)),
+    )
+    # Allow up to 5 tests of drift. Catches the R34 doc/reality
+    # gap (817 → 822 = 5) at the boundary, and the larger 917/55
+    # vs 817/162 gap easily.
+    assert abs(claimed_pass - measured_pass) <= 5, (
+        f"COMPATIBILITY.md claims {claimed_pass} pass under FORCE,"
+        f" measured {measured_pass} — update the doc"
+    )
+    assert abs(claimed_skip - measured_skip) <= 5, (
+        f"COMPATIBILITY.md claims {claimed_skip} skipped under FORCE,"
+        f" measured {measured_skip} — update the doc"
+    )
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -4,7 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BENCH="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
-PY_RS="python3"
+# Resolve PY_RS via the shared helper (R34) — verifies the Python
+# can actually import fastapi_turbo BEFORE running anything.
+source "$SCRIPT_DIR/_resolve_py_rs.sh"
 PY_FA="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
 N=5000

@@ -3,7 +3,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BENCH="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
-PY_RS="python3"
+source "$SCRIPT_DIR/_resolve_py_rs.sh"
 PY_FA="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
 N=10000

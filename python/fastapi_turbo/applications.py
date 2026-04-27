@@ -6541,6 +6541,25 @@ class FastAPI:
             return
 
         if scope["type"] == "http":
+            # Install the dynamic OpenAPI / docs / redoc routes on
+            # first ASGI request so ``GET /openapi.json``, ``/docs``,
+            # ``/redoc`` work under ``httpx.ASGITransport`` /
+            # ``TestClient(app, in_process=True)`` without binding a
+            # port. ``run()`` registers these for the Rust server
+            # path; the in-process path used to skip them entirely
+            # (probe-confirmed: ``/openapi.json`` returned 404 via
+            # ``ASGITransport``, breaking ~1273 upstream FastAPI
+            # tests in the offline gate). Idempotent — guarded by
+            # ``_in_process_dynamic_routes_installed``.
+            if not getattr(self, "_in_process_dynamic_routes_installed", False):
+                try:
+                    self._install_in_process_dynamic_routes()
+                except Exception:  # noqa: BLE001
+                    # Defensive: a failure here must not break a
+                    # request whose path doesn't need the dynamic
+                    # routes. The error surfaces normally when the
+                    # caller asks for a docs / openapi path.
+                    pass
             # Honour an explicit opt-out for the (rare) cases where the
             # caller wants the proxy path (existing regression workflows,
             # tests that specifically validate the proxy code path).
