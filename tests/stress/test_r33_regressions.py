@@ -206,6 +206,10 @@ def test_external_compat_helper_offline_mode_structurally_skips_network():
                     in_else_branch = True
                     continue
 
+            # Skip comment-only lines and lines inside heredocs —
+            # they're documentation, not executed commands.
+            if stripped.startswith("#"):
+                continue
             net_tokens = ("git clone http", "git -C /tmp/", "pip install")
             if any(tok in raw_line for tok in net_tokens):
                 assert in_offline_block and in_else_branch, (

@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BENCH="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
 source "$SCRIPT_DIR/_resolve_py_rs.sh"
+source "$SCRIPT_DIR/_bench_row.sh"
 PY_FA="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
 N=3000
@@ -43,10 +44,7 @@ seed() {
 bench_one() {
     local label=$1 port=$2 path=$3
     local out="$($BENCH 127.0.0.1 "$port" "$path" "$N" "$WARMUP" 2>&1)"
-    local rps=$(echo "$out" | grep -oE '[0-9]+ req/s' | head -1 | cut -d' ' -f1)
-    local p50=$(echo "$out" | grep -oE 'p50=[0-9]+' | head -1 | cut -d= -f2)
-    local p99=$(echo "$out" | grep -oE 'p99=[0-9]+' | head -1 | cut -d= -f2)
-    printf "%s\t%s\t%s\t%s\t%s\n" "$label" "$path" "${rps:-?}" "${p50:-?}" "${p99:-?}"
+    bench_row "$label" "$path" "$out"
 }
 
 run_one() {

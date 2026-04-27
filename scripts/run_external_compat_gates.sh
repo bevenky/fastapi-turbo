@@ -89,6 +89,27 @@ run_fastapi_gate() {
     echo "── Upstream FastAPI ${UPSTREAM_TAG} suite under shim ──"
     if [ "$OFFLINE" = "1" ]; then
         verify_at_tag /tmp/fastapi_upstream "$UPSTREAM_TAG"
+        # Verify test deps are available BEFORE running pytest. In
+        # OFFLINE mode we skipped the ``pip install`` step; if the
+        # env doesn't have pytest-asyncio / dirty-equals /
+        # inline-snapshot / sqlmodel / pyyaml, ~hundreds of tests
+        # fail with collection / fixture errors that look like
+        # genuine compat regressions but are actually missing
+        # dependencies. R34 audit hit this — 888 reported failures
+        # turned out to be missing-dep collection errors.
+        local missing=()
+        for dep in pytest_asyncio yaml dirty_equals sqlmodel inline_snapshot; do
+            if ! "$PYTHON_BIN" -c "import $dep" >/dev/null 2>&1; then
+                missing+=("$dep")
+            fi
+        done
+        if [ "${#missing[@]}" -gt 0 ]; then
+            echo "OFFLINE=1 set, but the following test dependencies are missing:" >&2
+            printf '  %s\n' "${missing[@]}" >&2
+            echo "Install them in the active env, or unset OFFLINE so the gate" >&2
+            echo "can pip-install them on the next run." >&2
+            exit 2
+        fi
     else
         if [ ! -d /tmp/fastapi_upstream/.git ]; then
             rm -rf /tmp/fastapi_upstream

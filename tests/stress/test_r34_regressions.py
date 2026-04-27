@@ -214,22 +214,22 @@ def test_bench_runners_source_shared_py_rs_resolver():
 
 
 def test_bench_v3_row_fails_loudly_on_unparsable_output():
-    """``run_benchmark_v3.sh``'s ``row()`` function must fail when
-    rps / p50 / p99 can't be parsed from the bench output, NOT
-    silently emit ``?`` fields. Earlier the ``${rps:-?}``
-    fallback published TSV rows like
-    ``fastapi-turbo\\tGET /health\\t?\\t?\\t?`` — downstream
-    docs would either drop these or pick up stale values from
-    a previous run, masking benchmark failures as a green run.
-    Soft-fail is opt-in via ``BENCH_ALLOW_UNPARSABLE=1``."""
+    """The v3 runner's ``row()`` (and every matrix runner's
+    ``bench_one``) must fail when rps / p50 / p99 can't be
+    parsed, NOT silently emit ``?`` fields. R34 introduced this
+    in v3 inline; R35 extracted it into a shared
+    ``_bench_row.sh`` so DB / Redis / SQLA runners get the same
+    contract. Test now looks at the shared helper."""
     repo = pathlib.Path(__file__).resolve().parents[2]
-    runner = (
-        repo / "comparison" / "bench-app" / "run_benchmark_v3.sh"
-    ).read_text()
-    # Must fail loudly when any field is empty (not just default
-    # to ``?``). The R34 implementation uses an explicit
-    # ``return 1`` in the ``row()`` body.
-    assert (
-        'BENCH_ALLOW_UNPARSABLE' in runner
-    ), "row() must support an opt-in soft-fail mode"
-    assert "return 1" in runner, "row() must fail loudly by default"
+    bench_dir = repo / "comparison" / "bench-app"
+    helper = (bench_dir / "_bench_row.sh").read_text()
+    assert "BENCH_ALLOW_UNPARSABLE" in helper, (
+        "shared bench-row helper must support an opt-in soft-fail mode"
+    )
+    assert "return 1" in helper, (
+        "shared bench-row helper must fail loudly by default"
+    )
+    # The v3 runner must source the helper (so its ``row()``
+    # function inherits the contract).
+    v3 = (bench_dir / "run_benchmark_v3.sh").read_text()
+    assert "_bench_row.sh" in v3, "v3 runner must source the shared helper"

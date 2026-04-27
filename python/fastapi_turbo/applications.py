@@ -5525,7 +5525,19 @@ class FastAPI:
         remain bound to a live event loop for the lifetime of the app
         (otherwise `asyncio.run(...)` would close the loop immediately,
         invalidating asyncpg pools / redis.asyncio clients etc.).
+
+        Idempotent — repeat calls are no-ops. Earlier R-batches had two
+        callers race to fire startup: ``_asgi_lifespan`` (driven by
+        ASGITransport / TestClient) and ``_install_in_process_dynamic_routes``
+        (lazily called on first http request). Without the guard,
+        ``@app.on_event("startup")`` ran twice — double-opening pools,
+        scheduling duplicate background jobs, or rerunning migrations.
+        Guard via ``_startup_handlers_ran`` so whichever caller wins
+        starts the app exactly once.
         """
+        if getattr(self, "_startup_handlers_ran", False):
+            return
+        self._startup_handlers_ran = True
         from fastapi_turbo._async_worker import submit as _submit
         for handler in self._collect_startup_handlers():
             if inspect.iscoroutinefunction(handler):
@@ -6552,14 +6564,27 @@ class FastAPI:
             # tests in the offline gate). Idempotent — guarded by
             # ``_in_process_dynamic_routes_installed``.
             if not getattr(self, "_in_process_dynamic_routes_installed", False):
+                # Startup failures must propagate. ``_install_in_process_
+                # dynamic_routes`` runs the user's ``@app.on_event
+                # ("startup")`` handlers BEFORE registering the docs
+                # routes; if those raise, the app is in a partially-
+                # initialised state and we MUST NOT serve requests
+                # against it (probe: a ``startup`` raising
+                # ``RuntimeError`` was silently dropped, then ``/ok``
+                # returned 200 against an uninitialised pool).
+                # Catch only OpenAPI-route-registration failures
+                # (which are non-fatal per the docstring) — let
+                # everything else surface so the caller / TestClient
+                # / ASGITransport sees the real exception.
                 try:
                     self._install_in_process_dynamic_routes()
-                except Exception:  # noqa: BLE001
-                    # Defensive: a failure here must not break a
-                    # request whose path doesn't need the dynamic
-                    # routes. The error surfaces normally when the
-                    # caller asks for a docs / openapi path.
-                    pass
+                except Exception:
+                    # Mark as "tried" so subsequent requests don't
+                    # re-run startup; then re-raise. The transport
+                    # will turn this into a 500 (or, with
+                    # ``raise_app_exceptions=True``, propagate it).
+                    self._in_process_dynamic_routes_installed = True
+                    raise
             # Honour an explicit opt-out for the (rare) cases where the
             # caller wants the proxy path (existing regression workflows,
             # tests that specifically validate the proxy code path).

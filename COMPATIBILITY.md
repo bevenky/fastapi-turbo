@@ -2,26 +2,26 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 89/89 (earlier R-batches reported a smaller subset; that count pre-dated the R23 / R25 / R26 fixes — `test_legacy_setup` and the active-thread-id tests are part of the now-green set). Own suite: 992 tests (410 general + 22 WebSocket + 453 stress + 107 parity snapshots).
+Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 89/89 (earlier R-batches reported a smaller subset; that count pre-dated the R23 / R25 / R26 fixes — `test_legacy_setup` and the active-thread-id tests are part of the now-green set). Own suite: 998 tests (410 general + 22 WebSocket + 459 stress + 107 parity snapshots).
 
 **Test suite under different environments:**
 
-* **Normal dev box / CI** (loopback bind allowed): all 992 tests run (1 conditional skip when Starlette wasn't pre-imported), 0 failed.
+* **Normal dev box / CI** (loopback bind allowed): all 998 tests run (1 conditional skip when Starlette wasn't pre-imported), 0 failed.
 * **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError` in the pytest process): `tests/conftest.py` detects this at session start via a one-shot bind probe and sets `LOOPBACK_DENIED = True`. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`.
   - **Force-override env vars** (audit / CI use): set `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` to skip `requires_loopback` tests even on a dev box that *can* bind, or `FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED=1` to run them anyway in an env where probe bind fails but the real subprocess server might still succeed.
-  - **Counts at the R34 watermark**, measured on macOS Apple Silicon:
+  - **Counts at the R35 watermark**, measured on macOS Apple Silicon:
     1. *True sandbox + FORCE env var* — every bind raises AND
-       `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`: 830 pass, 162 skipped.
+       `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`: 836 pass, 162 skipped.
        The conftest collection hooks (suite-level + parity-level)
        both honour the FORCE env var (R33), so this scenario also
        covers a dev box where the auditor wants the bucket-#1
        numbers without having to actually deny bind at the kernel.
     2. *Forced-fail bind only* — monkey-patched `socket.socket.bind`
-       to raise `PermissionError`, no env var: 830 pass, 162 skipped
+       to raise `PermissionError`, no env var: 836 pass, 162 skipped
        (same as #1 — the suite-level probe hits the patched bind
        first, propagates `LOOPBACK_DENIED=True`, parity collection
        hook also detects it).
-    3. *Bind works, no env var* (normal dev box): 990 pass, 1 skipped
+    3. *Bind works, no env var* (normal dev box): 996 pass, 1 skipped
        — full coverage. This is the "happy path" that CI / release
        runners hit.
   - The FORCE env var IS sufficient to produce bucket #1 numbers on

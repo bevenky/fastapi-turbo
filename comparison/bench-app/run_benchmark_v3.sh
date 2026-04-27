@@ -8,6 +8,7 @@ BENCH="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
 # Resolve PY_RS via the shared helper (R34) — verifies the Python
 # can actually import fastapi_turbo BEFORE running anything.
 source "$SCRIPT_DIR/_resolve_py_rs.sh"
+source "$SCRIPT_DIR/_bench_row.sh"
 
 PY_FA="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
@@ -93,27 +94,12 @@ asyncio.run(b())
 }
 
 row() {
-    local fw=$1 test=$2 out=$3
-    local rps=$(echo "$out" | grep -oE '[0-9]+ (req|msg)/s' | head -1 | cut -d' ' -f1)
-    local p50=$(echo "$out" | grep -oE 'p50=[0-9]+' | head -1 | cut -d= -f2)
-    local p99=$(echo "$out" | grep -oE 'p99=[0-9]+' | head -1 | cut -d= -f2)
-    # Fail loudly on unparsable rows. Earlier ``${rps:-?}`` fallbacks
-    # silently published ``?`` rows in the TSV — downstream rendered
-    # docs (latest_bench.md) would either drop them or pick up stale
-    # numbers from a previous run, masking benchmark failures as a
-    # green run. Set ``BENCH_ALLOW_UNPARSABLE=1`` to keep the old
-    # soft-fail when intentionally bisecting.
-    if [ -z "$rps" ] || [ -z "$p50" ] || [ -z "$p99" ]; then
-        if [ "${BENCH_ALLOW_UNPARSABLE:-0}" = "1" ]; then
-            printf "%s\t%s\t%s\t%s\t%s\n" "$fw" "$test" "${rps:-?}" "${p50:-?}" "${p99:-?}"
-        else
-            echo "bench row for ${fw} ${test} produced unparsable output:" >&2
-            echo "$out" >&2
-            return 1
-        fi
-    else
-        printf "%s\t%s\t%s\t%s\t%s\n" "$fw" "$test" "$rps" "$p50" "$p99"
-    fi
+    # Delegate to the shared parser. R35 audit caught DB / Redis /
+    # SQLA runners using their own grep-based parsers that emitted
+    # ``?`` placeholder rows on failure; centralising via
+    # ``_bench_row.sh`` keeps every runner's fail-on-unparsable
+    # contract identical.
+    bench_row "$1" "$2" "$3"
 }
 
 BODY='{"name":"X","price":42.99,"description":"t"}'

@@ -7,6 +7,7 @@ BENCH="$PROJECT_ROOT/target/release/fastapi-turbo-bench"
 # Resolve PY_RS via the shared helper (R34) — verifies the Python
 # can actually import fastapi_turbo BEFORE running anything.
 source "$SCRIPT_DIR/_resolve_py_rs.sh"
+source "$SCRIPT_DIR/_bench_row.sh"
 PY_FA="$PROJECT_ROOT/comparison/fastapi-venv/bin/python"
 
 N=5000
@@ -58,10 +59,7 @@ bench_one() {
     else
         out="$($BENCH 127.0.0.1 "$port" "$path" "$N" "$WARMUP" "$method" "$body" "application/json" 2>&1)"
     fi
-    local rps=$(echo "$out" | grep -oE '[0-9]+ req/s' | head -1 | cut -d' ' -f1)
-    local p50=$(echo "$out" | grep -oE 'p50=[0-9]+' | head -1 | cut -d= -f2)
-    local p99=$(echo "$out" | grep -oE 'p99=[0-9]+' | head -1 | cut -d= -f2)
-    printf "%s\t%s\t%s\t%s\t%s\n" "$label" "$path ($method)" "${rps:-?}" "${p50:-?}" "${p99:-?}"
+    bench_row "$label" "$path ($method)" "$out"
 }
 
 CREATE_BODY='{"name":"Bench","price":42.99,"category_id":1,"stock":10}'
