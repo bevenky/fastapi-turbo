@@ -6688,8 +6688,32 @@ class FastAPI:
                     if getattr(self, "_lifespan_cms", None):
                         self._run_lifespan_shutdown()
                     self._run_shutdown_handlers()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Surface the failure to the ASGI server (matches
+                    # Starlette / upstream FastAPI). Earlier impl
+                    # caught everything and reported
+                    # ``lifespan.shutdown.complete`` — production
+                    # supervisors lost the failure signal AND the
+                    # ``_run_shutdown_handlers`` reset never ran, so
+                    # ``_startup_state`` stayed at ``"started"`` and
+                    # a reused app skipped startup on the next
+                    # cycle (R37 audit caught this).
+                    #
+                    # Even when shutdown fails, we MUST still reset
+                    # the startup guard so a re-used app can
+                    # re-start cleanly — otherwise a one-off
+                    # cleanup error compounds into a poisoned
+                    # second cycle. Reset state here (the early
+                    # exception aborted ``_run_shutdown_handlers``
+                    # before its tail-side reset).
+                    self._startup_state = "not_started"
+                    self._startup_failure = None
+                    self._in_process_dynamic_routes_installed = False
+                    await send({
+                        "type": "lifespan.shutdown.failed",
+                        "message": str(exc),
+                    })
+                    return
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 

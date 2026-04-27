@@ -52,6 +52,32 @@ if ! "$PYTHON_BIN" -c 'import fastapi_turbo' >/dev/null 2>&1; then
     exit 2
 fi
 
+# Stale-build check: if the installed ``_fastapi_turbo_core.*.so``
+# is older than any tracked ``src/*.rs`` source file, the gate is
+# about to test against a stale Rust binary that doesn't reflect
+# the current HEAD. R37 audit hit this — auditor's gate ran a
+# pre-R34 ``.so`` and reported 888 failures even though the
+# Python source at HEAD bf3446c had the in-process dynamic-routes
+# fix that turns /openapi.json from 404 → 200. Surface the
+# stale state loudly and tell the user to rebuild instead of
+# letting them claim a regression that isn't there.
+SCRIPT_DIR_REAL="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR_REAL/.." && pwd)"
+if [ "${SKIP_STALE_BUILD_CHECK:-0}" != "1" ]; then
+    SO_PATH="$("$PYTHON_BIN" -c 'from fastapi_turbo import _fastapi_turbo_core as m; print(m.__file__)' 2>/dev/null || true)"
+    if [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
+        SRC_NEWER="$(find "$REPO_ROOT/src" -name '*.rs' -newer "$SO_PATH" -print -quit 2>/dev/null || true)"
+        if [ -n "$SRC_NEWER" ]; then
+            echo "STALE BUILD: at least one src/*.rs file is newer than" >&2
+            echo "             $SO_PATH" >&2
+            echo "             ($SRC_NEWER)" >&2
+            echo "Run \`maturin develop\` in the venv before re-running this gate," >&2
+            echo "or set SKIP_STALE_BUILD_CHECK=1 to override." >&2
+            exit 2
+        fi
+    fi
+fi
+
 echo "── External compat gates ── using ${PYTHON_BIN} ──"
 "$PYTHON_BIN" -c 'import sys; print("sys.executable:", sys.executable); import fastapi_turbo; print("fastapi_turbo from:", fastapi_turbo.__file__)'
 

@@ -258,39 +258,71 @@ def test_bench_row_parses_well_formed_input_correctly():
 
 @pytest.mark.requires_loopback
 def test_upstream_fastapi_gate_passes_canonical_threshold():
-    """Run the upstream FastAPI 0.136.0 suite under the shim and
-    assert the pass count is ≥ 3000 (well above the auditor's
-    reported 2237 in the failing case but well below the
-    healthy 3125 — leaves room for upstream test churn within
-    a single tag without re-pinning). Catches:
+    """Run the canonical release-gate script
+    (``scripts/run_external_compat_gates.sh fastapi``) and
+    assert the pass count is ≥ 3000.
 
-      * a regression in our shim that breaks ~30%+ of upstream
-        tests (the R36 reported failure mode);
-      * a stale ``/tmp/fastapi_upstream`` checkout pointing at
-        the wrong tag.
+    R36 originally invoked ``pytest`` directly, which decoupled
+    the regression test from the script that release / CI
+    actually run. The R37 audit caught this: the test passed
+    (3125) while the script reportedly failed (2237 passed,
+    888 failed) on the same machine the auditor ran from.
+    Calling the script directly removes that ambiguity — if
+    the script regresses, this test catches it; if the test
+    passes, the script passed.
 
-    Skipped in sandbox (subprocess pytest needs loopback) and
-    when ``/tmp/fastapi_upstream`` isn't available."""
+    Healthy state at the R37 watermark: 3125 tests pass, 4
+    xfailed, 2 skipped. The 3000 floor leaves headroom for
+    minor upstream churn within tag 0.136.0 without needing
+    a re-pin.
+
+    Skipped in sandbox (subprocess pytest + script needs
+    loopback) and when ``/tmp/fastapi_upstream`` isn't
+    available."""
     upstream = pathlib.Path("/tmp/fastapi_upstream")
     if not (upstream / "tests").is_dir():
         pytest.skip("/tmp/fastapi_upstream not available; run "
                     "scripts/run_external_compat_gates.sh fastapi first")
-    # Make sure the shim conftest is in place (the helper script
-    # would write it, but a hand-test may have wiped it).
-    conftest = upstream / "conftest.py"
-    if not conftest.exists():
-        conftest.write_text("import fastapi_turbo  # noqa: F401\n")
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    script = repo / "scripts" / "run_external_compat_gates.sh"
+    import os
     import sys
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/", "-q", "--tb=no"],
-        cwd=str(upstream), capture_output=True, text=True, timeout=600,
+        [str(script), "fastapi"],
+        env={
+            **os.environ,
+            "OFFLINE": "1",
+            "PYTHON_BIN": sys.executable,
+        },
+        capture_output=True, text=True, timeout=600,
     )
     import re
-    m = re.search(r"(\d+)\s+passed", proc.stdout or "")
-    assert m is not None, (proc.stdout, proc.stderr)
+    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    m = re.search(r"(\d+)\s+passed", combined)
+    assert m is not None, (
+        "release-gate script produced no pytest summary line "
+        f"(returncode={proc.returncode}; stdout tail: {proc.stdout[-500:]!r}; "
+        f"stderr tail: {proc.stderr[-500:]!r})"
+    )
     passed = int(m.group(1))
+    failed_match = re.search(r"(\d+)\s+failed", combined)
+    failed = int(failed_match.group(1)) if failed_match else 0
+    error_match = re.search(r"(\d+)\s+errors?", combined)
+    errors = int(error_match.group(1)) if error_match else 0
     assert passed >= 3000, (
-        f"upstream FastAPI gate passed {passed} tests; "
+        f"release-gate script passed {passed} tests "
+        f"(failed={failed}, errors={errors}); "
         "below the 3000 threshold means a real shim regression — "
         "investigate before shipping. (Healthy state is ~3125.)"
+    )
+    # The script's exit code must match its pytest result —
+    # earlier the test could pass while the script's overall
+    # exit was non-zero (the auditor's reported scenario). If
+    # pytest pass-count is healthy AND the script exited non-zero,
+    # something else in the gate (e.g. the OFFLINE-mode
+    # dep-presence check) trips before pytest runs — surface
+    # that loudly here.
+    assert proc.returncode == 0, (
+        f"release-gate script returncode={proc.returncode} despite "
+        f"pytest reporting {passed} passed. Script stderr: {proc.stderr[-1000:]!r}"
     )
