@@ -69,11 +69,32 @@ run_one() {
 }
 
 echo -e "label\tendpoint\trps\tp50\tp99"
-run_one "fastapi-turbo_SQLA_pg3-sync"  pg3       fastapi-turbo 19050 || true
-run_one "fastapi-turbo_SQLA_pg2-sync"  pg2       fastapi-turbo 19051 || true
-run_one "fastapi-turbo_SQLA_asyncpg"   async     fastapi-turbo 19052 || true
-run_one "fastapi-turbo_SQLA_pg3-async" pg3async  fastapi-turbo 19056 || true
-run_one "FastAPI_SQLA_pg3-sync"     pg3       uvicorn    19053 || true
-run_one "FastAPI_SQLA_pg2-sync"     pg2       uvicorn    19054 || true
-run_one "FastAPI_SQLA_asyncpg"      async     uvicorn    19055 || true
-run_one "FastAPI_SQLA_pg3-async"    pg3async  uvicorn    19057 || true
+# Track per-row exit status. Earlier runs swallowed every failure
+# with ``|| true``, so a missing pg2 driver or a timeout silently
+# produced a TSV with NO row for that combination — and downstream
+# tables in latest_bench.md kept the stale numbers from the previous
+# run. Now we record failures as TSV rows with ``ERR`` in place of
+# numbers and exit non-zero at the end so CI catches the gap. Set
+# ``SQLA_BENCH_ALLOW_FAILURES=1`` to force soft-failure mode (e.g.
+# when running against a pg2-less environment intentionally).
+FAILED=()
+run_or_record() {
+    local label="$1"; shift
+    local args=("$@")
+    if ! run_one "$label" "${args[@]}"; then
+        printf "%s\t%s\t%s\t%s\t%s\n" "$label" "ERR" "0" "0" "0"
+        FAILED+=("$label")
+    fi
+}
+run_or_record "fastapi-turbo_SQLA_pg3-sync"  pg3       fastapi-turbo 19050
+run_or_record "fastapi-turbo_SQLA_pg2-sync"  pg2       fastapi-turbo 19051
+run_or_record "fastapi-turbo_SQLA_asyncpg"   async     fastapi-turbo 19052
+run_or_record "fastapi-turbo_SQLA_pg3-async" pg3async  fastapi-turbo 19056
+run_or_record "FastAPI_SQLA_pg3-sync"     pg3       uvicorn    19053
+run_or_record "FastAPI_SQLA_pg2-sync"     pg2       uvicorn    19054
+run_or_record "FastAPI_SQLA_asyncpg"      async     uvicorn    19055
+run_or_record "FastAPI_SQLA_pg3-async"    pg3async  uvicorn    19057
+if [ ${#FAILED[@]} -gt 0 ] && [ "${SQLA_BENCH_ALLOW_FAILURES:-}" != "1" ]; then
+    echo "SQLA matrix: ${#FAILED[@]} row(s) failed: ${FAILED[*]}" >&2
+    exit 1
+fi

@@ -2,16 +2,17 @@
 
 Upstream Starlette / FastAPI's matcher stops at the FIRST registered
 route whose path matches and reports that route's methods in the
-405 Allow header. The in-process ASGI dispatch path mirrors that.
+405 Allow header. Both the in-process ASGI dispatch path and the
+Rust server now mirror that (R27 — the Rust path's
+``non_preflight_options_middleware`` walks templates in
+registration order and the per-path 405 fallback uses a
+first-match-wins Allow header).
 
-The Rust server's matcher (matchit + axum) currently uses a
-DIFFERENT rule — most-specific literal template wins — so OPTIONS
-to ``/items/special`` returns ``Allow: POST`` on the Rust path
-even though upstream returns ``Allow: GET``. That's a known
-different-by-design divergence (Rust router internals; flagged in
-COMPATIBILITY.md). To assert upstream parity here we force
-``in_process=True`` so the tests exercise the path that matches
-upstream behavior."""
+These tests still pin ``in_process=True`` because the in-process
+path is the cleanest place to assert ASGI dispatch behaviour without
+spinning up a real loopback server; ``test_r27_regressions.py``
+covers the same parity over the real Rust server (under
+``requires_loopback``)."""
 from __future__ import annotations
 
 import fastapi_turbo  # noqa: F401

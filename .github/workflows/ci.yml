@@ -56,33 +56,49 @@ jobs:
         # Run upstream FastAPI's own ~3K-test suite against
         # ``import fastapi_turbo`` (sys.modules shim). COMPATIBILITY
         # claims 3,125 / 3,129 — failures here mean the claim
-        # drifted. Lazy-clone fastapi at the pinned version on first
-        # run; non-blocking on transient failures (echoes a warning
-        # but doesn't fail the job — full enforcement requires
-        # pinning a known-passing snapshot).
+        # drifted. Pinned to FastAPI 0.136.0; gate is BLOCKING (set
+        # ``UPSTREAM_FASTAPI_ALLOW_FAILURES=1`` env override only
+        # when bisecting upstream churn).
+        #
+        # The shim must be installed inside the pytest process — a
+        # ``python -c "import fastapi_turbo"`` step in a separate
+        # process leaves the main pytest run unmodified. We write a
+        # ``conftest.py`` into the upstream test root that imports
+        # ``fastapi_turbo`` at session-start, so every test fixture
+        # / collection sees the shim.
         run: |
           if [ ! -d /tmp/fastapi_upstream ]; then
             git clone --depth 1 --branch 0.136.0 https://github.com/fastapi/fastapi /tmp/fastapi_upstream
           fi
           python -m pip install pytest-asyncio pyyaml dirty-equals \
                                 "sqlmodel>=0.0.14" inline-snapshot
-          python -c "import fastapi_turbo" \
-            && pytest /tmp/fastapi_upstream/tests/ -q --tb=no \
-                 --ignore=/tmp/fastapi_upstream/tests/test_tutorial \
-            || echo "upstream-fastapi gate produced failures; review before release"
+          cat > /tmp/fastapi_upstream/conftest.py <<'PY'
+          # Auto-injected by fastapi-turbo CI: install the
+          # ``from fastapi import ...`` shim into THIS pytest
+          # process so upstream tests resolve to fastapi-turbo.
+          import fastapi_turbo  # noqa: F401
+          PY
+          pytest /tmp/fastapi_upstream/tests/ -q --tb=no \
+                 --ignore=/tmp/fastapi_upstream/tests/test_tutorial
       - name: Sentry SDK FastAPI integration
-        # Release-required gate. R26 caught a transaction-name
-        # regression here (legacy SentryAsgiMiddleware setup) that
-        # would have shipped without this CI step. Non-blocking on
-        # transient failures pending pinned-snapshot enforcement.
+        # Release-required gate, BLOCKING. R26 caught a
+        # transaction-name regression here (legacy
+        # SentryAsgiMiddleware setup) that would have shipped without
+        # this CI step. Pinned to a sentry-python release tag so
+        # upstream churn doesn't silently break the gate.
         run: |
           if [ ! -d /tmp/sentry-python ]; then
-            git clone --depth 1 https://github.com/getsentry/sentry-python /tmp/sentry-python
+            git clone --depth 1 --branch 2.42.0 https://github.com/getsentry/sentry-python /tmp/sentry-python
           fi
-          python -m pip install "sentry-sdk[fastapi]"
-          python -c "import fastapi_turbo" \
-            && pytest /tmp/sentry-python/tests/integrations/fastapi -q --tb=short \
-            || echo "sentry-fastapi gate produced failures; review before release"
+          python -m pip install "sentry-sdk[fastapi]==2.42.0"
+          cat > /tmp/sentry-python/tests/integrations/fastapi/conftest.py <<'PY'
+          # Auto-injected by fastapi-turbo CI: install the shim
+          # inside THIS pytest process. Without this, the Sentry
+          # FastAPI tests resolve to upstream FastAPI and the gate
+          # is a false positive (it tests upstream, not our code).
+          import fastapi_turbo  # noqa: F401
+          PY
+          pytest /tmp/sentry-python/tests/integrations/fastapi -q --tb=short
       - name: Import smoke (shim parity)
         run: |
           python -c "

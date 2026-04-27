@@ -836,6 +836,77 @@ impl RouteInfo {
 
 // ── Path conversion ───────────────────────────────────────────────────
 
+/// Walk ``registration_order`` and return the methods of the first
+/// route whose FastAPI-form pattern matches the candidate (also given
+/// in axum/matchit form here — converted back to literal segments
+/// internally). Mirrors Starlette's ``Router.app`` first-match-wins
+/// semantics for OPTIONS / 405 fallbacks. ``None`` means the
+/// candidate has no matching pattern in registration order, in which
+/// case the caller falls back to the per-path declared methods.
+fn first_pattern_match(
+    registration_order: &[(String, Vec<String>)],
+    candidate_axum_path: &str,
+) -> Option<Vec<String>> {
+    let candidate_segments: Vec<&str> = candidate_axum_path.trim_matches('/').split('/').collect();
+
+    for (pattern, methods) in registration_order {
+        if pattern_matches_axum_path(pattern, &candidate_segments) {
+            return Some(methods.clone());
+        }
+    }
+    None
+}
+
+/// Check whether a FastAPI-form pattern (``/items/{id}``,
+/// ``/files/{path:path}``, etc.) matches the candidate path's
+/// segments. Param segments (``{name}``) match any single segment;
+/// catch-all (``{name:path}``) matches the rest. Literal segments
+/// must match exactly, including against axum's ``{name}`` param
+/// markers (a literal ``special`` would NOT match an axum-form
+/// segment ``{id}`` on the candidate side because the candidate
+/// segments come from the literal ``axum_path`` strings registered
+/// in ``by_path``).
+fn pattern_matches_axum_path(pattern: &str, candidate_segments: &[&str]) -> bool {
+    let pattern_segments: Vec<&str> = pattern.trim_matches('/').split('/').collect();
+
+    let mut pi = 0;
+    let mut ci = 0;
+    while pi < pattern_segments.len() && ci < candidate_segments.len() {
+        let p = pattern_segments[pi];
+        let c = candidate_segments[ci];
+
+        let is_param = p.starts_with('{') && p.ends_with('}');
+        if is_param {
+            let inner = &p[1..p.len() - 1];
+            if inner.ends_with(":path") || inner.starts_with('*') {
+                // Catch-all matches the rest of the candidate.
+                return true;
+            }
+            // Single-segment param matches whatever the candidate
+            // has at this position (literal OR param marker — both
+            // satisfy the pattern's ``one segment`` requirement).
+            pi += 1;
+            ci += 1;
+            continue;
+        }
+
+        // Literal pattern segment must match candidate exactly. The
+        // candidate may itself be an axum-form param marker
+        // (``{id}``) when the registered ``axum_path`` was a pure
+        // pattern; in that case the literal pattern doesn't match
+        // (a literal route doesn't satisfy a param-only path's
+        // first-match check, and pattern-vs-pattern is already
+        // handled by the param branch above).
+        if p != c {
+            return false;
+        }
+        pi += 1;
+        ci += 1;
+    }
+
+    pi == pattern_segments.len() && ci == candidate_segments.len()
+}
+
 fn convert_path(fastapi_path: &str) -> String {
     let mut result = String::with_capacity(fastapi_path.len());
     let mut chars = fastapi_path.chars().peekable();
@@ -1008,6 +1079,21 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
     // router (axum can't merge two routers when both have method-router
     // fallbacks on the same path).
     let mut ws_by_path: HashMap<String, Arc<WsRouteState>> = HashMap::new();
+
+    // Snapshot the original FastAPI route registration order with
+    // ``(pattern, methods)`` pairs so we can compute first-match-wins
+    // Allow headers below. Patterns are in FastAPI ``/items/{id}``
+    // form (NOT axum's matchit syntax). Built BEFORE the per-route
+    // loop consumes ``routes``.
+    let registration_order: Vec<(String, Vec<String>)> = routes
+        .iter()
+        .map(|r| {
+            (
+                r.path.clone(),
+                r.methods.iter().map(|m| m.to_uppercase()).collect(),
+            )
+        })
+        .collect();
 
     for route in routes {
         let axum_path = convert_path(&route.path);
@@ -1189,15 +1275,36 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
 
     // Attach 405 fallback per path. Matches FastAPI/Starlette exactly:
     //   - body: {"detail": "Method Not Allowed"}
-    //   - Allow header: only the explicitly-declared methods (no auto-HEAD,
-    //     no auto-OPTIONS). FastAPI expects this behaviour.
+    //   - Allow header: methods of the FIRST-REGISTERED route whose
+    //     pattern matches this path. Matters for overlapping literal/
+    //     param routes: ``/items/{id}`` (GET) registered before
+    //     ``/items/special`` (POST) means OPTIONS /items/special must
+    //     report ``Allow: GET`` (the {id} route wins by registration
+    //     order, even though /items/special is more specific). matchit
+    //     picks the most-specific match, which diverges from
+    //     Starlette's first-match-wins; computing the Allow header
+    //     here in registration order restores parity.
     //   - OPTIONS and HEAD on a GET-only route both return 405, matching
     //     Starlette. If the user wants OPTIONS (CORS preflight), they should
     //     mount CORSMiddleware or declare OPTIONS explicitly.
     for (path, mut mr, declared, _had_options, get_state) in by_path {
-        // Dedupe while preserving order
+        // For each REGISTERED path in by_path, find the first
+        // registration whose pattern matches this concrete path
+        // string and use ITS methods. ``path`` here is in axum's
+        // matchit syntax; we need to strip it back to FastAPI form
+        // for the comparison. The simplest reliable check: build the
+        // FastAPI-form path back from the original registration's
+        // axum_path, find first whose pattern matches the literal
+        // segments of `path` (treating param segments as wildcards
+        // in BOTH directions).
+        let allow_methods: Vec<String> =
+            if let Some(first_match) = first_pattern_match(&registration_order, &path) {
+                first_match
+            } else {
+                declared.clone()
+            };
         let mut seen = std::collections::HashSet::new();
-        let mut allow: Vec<String> = declared.clone();
+        let mut allow: Vec<String> = allow_methods.clone();
         allow.retain(|m| seen.insert(m.clone()));
         let allow_header = allow.join(", ");
 
@@ -1299,6 +1406,31 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
         if declared.iter().any(|m| m == "GET") && !declared.iter().any(|m| m == "HEAD") {
             let h = allow_header.clone();
             mr = mr.head(move || {
+                let h = h.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .status(StatusCode::METHOD_NOT_ALLOWED)
+                        .header("content-type", "application/json")
+                        .header("allow", h)
+                        .body(axum::body::Body::from(r#"{"detail":"Method Not Allowed"}"#))
+                        .unwrap()
+                }
+            });
+        }
+
+        // Same explicit-405 override for OPTIONS. Axum's MethodRouter
+        // has built-in 405 handling that uses ITS OWN registered-
+        // methods list as the Allow header — so when matchit picks
+        // ``/items/special`` (POST only) for an OPTIONS request,
+        // axum auto-emits ``Allow: POST`` regardless of our computed
+        // first-match-wins value. The ``.fallback(...)`` set below
+        // doesn't fire on a known HTTP method (axum returns 405 from
+        // its method-table first); the explicit ``mr.options(...)``
+        // here is what actually delivers the parity-correct Allow
+        // header to the client.
+        if !declared.iter().any(|m| m == "OPTIONS") {
+            let h = allow_header.clone();
+            mr = mr.options(move || {
                 let h = h.clone();
                 async move {
                     axum::response::Response::builder()

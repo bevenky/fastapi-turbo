@@ -2,16 +2,16 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 54/56 (was 55/56 before R26 — `test_legacy_setup` now passes after the dispatcher invokes Sentry's transaction-name helper inline). Own suite: 937 tests (410 general + 22 WebSocket + 398 stress + 107 parity snapshots).
+Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turbo` sys.modules shim. Sentry ASGI integration: 33/33. Sentry FastAPI integration: 89/89 (earlier R-batches reported a smaller subset; that count pre-dated the R23 / R25 / R26 fixes — `test_legacy_setup` and the active-thread-id tests are part of the now-green set). Own suite: 948 tests (410 general + 22 WebSocket + 409 stress + 107 parity snapshots).
 
 **Test suite under different environments:**
 
-* **Normal dev box / CI** (loopback bind allowed): all 937 tests run (1 conditional skip when Starlette wasn't pre-imported), 0 failed.
+* **Normal dev box / CI** (loopback bind allowed): all 948 tests run (1 conditional skip when Starlette wasn't pre-imported), 0 failed.
 * **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError` in the pytest process): `tests/conftest.py` detects this at session start via a one-shot bind probe and sets `LOOPBACK_DENIED = True`. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`.
   - **Force-override env vars** (audit / CI use): set `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` to skip `requires_loopback` tests even on a dev box that *can* bind, or `FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED=1` to run them anyway in an env where probe bind fails but the real subprocess server might still succeed.
   - **Counts depend on what specifically fails**. Two sandbox flavours produce different numbers:
-    1. *Probe-fails, runtime-fails* (true sandbox — every bind raises): `requires_loopback` tests skip AND tests that auto-fallback through `TestClient(in_process=...)` switch to ASGI. Measured at the R26 watermark: 783 pass, 154 skipped.
-    2. *Probe-fails, runtime-OK* (audit env where the probe fails but pytest's actual binds succeed, OR a dev box with `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` set): `requires_loopback` tests skip via the marker, but other tests that bind ad-hoc still succeed. Measured at the R26 watermark: ~890 pass, ~47 skipped.
+    1. *Probe-fails, runtime-fails* (true sandbox — every bind raises): `requires_loopback` tests skip AND tests that auto-fallback through `TestClient(in_process=...)` switch to ASGI. Measured at the R27 watermark: 792 pass, 156 skipped.
+    2. *Probe-fails, runtime-OK* (audit env where the probe fails but pytest's actual binds succeed, OR a dev box with `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` set): `requires_loopback` tests skip via the marker, but other tests that bind ad-hoc still succeed. Measured at the R27 watermark: ~895 pass, ~53 skipped.
   - Both flavours surface **0 failed, 0 errors**. The skip-count delta reflects what the env actually denies, not a regression.
 
 > ### Release readiness — **a real-loopback CI run is REQUIRED before shipping**
@@ -46,7 +46,7 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 | HEAD auto-handling from GET | Full | 405 + `Allow: <declared>` — matches upstream FastAPI byte-for-byte. |
 | OPTIONS auto-generation for CORS | Full | True preflights (`Origin` + `Access-Control-Request-Method`) are handled by `CORSMiddleware`; bare OPTIONS on undeclared method returns 405 + `Allow: <declared>` — matches upstream. |
 | 405 Method Not Allowed on wrong method | Full | |
-| 405 `Allow` header on overlapping routes (literal vs param) | Different-by-design (Rust path) / Full (in-process) | When ``@app.get('/items/{id}')`` and ``@app.post('/items/special')`` are both registered, OPTIONS /items/special on upstream FastAPI returns ``Allow: GET`` (first matched route's methods). The in-process / TestClient ASGI fallback path mirrors that. The Rust server's matcher (matchit + axum) returns ``Allow: POST`` (literal template wins over parameterised) — divergent. Real-server users who depend on first-match semantics should document this; the in-process path is parity-correct. |
+| 405 `Allow` header on overlapping routes (literal vs param) | Full | When ``@app.get('/items/{id}')`` and ``@app.post('/items/special')`` are both registered, OPTIONS /items/special on upstream FastAPI returns ``Allow: GET`` (first registered route's methods). Both the in-process / TestClient ASGI fallback AND the Rust server now return the first-match-wins Allow header — the Rust router post-processes its per-path Allow values via a registration-order pattern walk so matchit's most-specific-literal selection no longer leaks into the 405 response (R27). |
 
 ## Dependencies
 
@@ -97,7 +97,7 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 |---|---|---|
 | `app.add_middleware(SentryAsgiMiddleware)` | Full | Captures transactions + errors + request context end-to-end. |
 | `sentry_sdk.init(integrations=[FastApiIntegration(), StarletteIntegration()])` | Full | Auto-installs `SentryAsgiMiddleware`; transaction naming refined to route/endpoint; `failed_request_status_codes` honoured; `http_methods_to_capture` propagated. |
-| `SentryAsgiMiddleware(app)` legacy wrap | Partial | Works via `TestClient`'s ASGI-transport fallback. Active-thread profiling (`profiles_sample_rate=1.0`) is not wired across our tokio→httpx→asyncio boundaries. |
+| `SentryAsgiMiddleware(app)` legacy wrap | Full | The dispatcher invokes Sentry's `_set_transaction_name_and_source` inline when `FastApiIntegration` is loaded (R26), and `active_thread_id` propagates through the in-process loop (verified by the upstream `test_active_thread_id` cases passing). Run is gated in CI under the pinned Sentry-SDK version. |
 | Transaction name when a middleware rejects early (e.g. TrustedHost returns 400) | Full | `transaction_style="endpoint"` → MW class qualname; `url` → full URL. |
 
 ## WebSocket
@@ -168,7 +168,6 @@ Status: 3,125 / 3,129 FastAPI upstream tests pass under the `import fastapi_turb
 
 ## Known limitations
 
-- **Active-thread-id profiling under manual `SentryAsgiMiddleware(app)` wrap** — `profiles_sample_rate=1.0` requires thread-ident alignment across our tokio→httpx→asyncio hops. Not wired. Use the `integrations=[FastApiIntegration()]` pattern instead — that path gives full profiling.
 - **HTTP/3 + QUIC** — stack is HTTP/1.1 + HTTP/2 via Axum.
 - **Free-threaded Python (3.13t / 3.14t)** — works but not performance-tuned.
 - **In-process ASGI dispatch** — HTTP + WebSocket scopes now dispatch entirely in-process (path match + query + JSON/form/multipart bodies + `Depends` graph + `@app.middleware('http')` + raw-ASGI `add_middleware` chains + mounts). The loopback proxy remains as a final fallback for the very-rare combinations that fall outside the in-process surface, so existing uvicorn-backed deployments aren't affected.

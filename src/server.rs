@@ -455,10 +455,14 @@ pub fn run_server(
                 .collect();
             std::sync::Arc::new(opts)
         };
-        // Per-path declared-method map: the non-preflight OPTIONS
-        // middleware uses this to produce a path-specific `Allow:`
-        // header (matching upstream FastAPI), rather than a hardcoded
-        // generic list.
+        // Per-path declared-method map AND a registration-ordered
+        // ``Vec<(template, methods)>`` for the OPTIONS middleware.
+        // First-match-wins parity with upstream FastAPI requires
+        // walking templates in REGISTRATION order; the HashMap's
+        // iteration order is non-deterministic. Earlier code used
+        // "most specific" tiebreak (fewest ``{}`` segments) which
+        // matched matchit's behaviour but diverged from Starlette
+        // for overlapping literal/param routes (R27).
         let allow_methods_by_path_arc: std::sync::Arc<
             std::collections::HashMap<String, Vec<String>>,
         > = {
@@ -474,6 +478,28 @@ pub fn run_server(
                 }
             }
             std::sync::Arc::new(map)
+        };
+        let allow_methods_in_order_arc: std::sync::Arc<Vec<(String, Vec<String>)>> = {
+            let mut order: Vec<(String, Vec<String>)> = Vec::with_capacity(routes.len());
+            for r in &routes {
+                let methods: Vec<String> = r
+                    .methods
+                    .iter()
+                    .map(|m| m.to_ascii_uppercase())
+                    .collect();
+                if let Some(existing) =
+                    order.iter_mut().find(|(p, _)| p == &r.path)
+                {
+                    for m in methods {
+                        if !existing.1.iter().any(|x| x == &m) {
+                            existing.1.push(m);
+                        }
+                    }
+                } else {
+                    order.push((r.path.clone(), methods));
+                }
+            }
+            std::sync::Arc::new(order)
         };
         // Also populate the legacy globals for any single-app code paths
         // (best-effort; authoritative is the per-server Arc).
@@ -634,12 +660,16 @@ pub fn run_server(
             // headers fall through to method routing (→ 405 as expected).
             let opts_paths_arc = declared_options_paths_arc.clone();
             let allow_by_path_arc = allow_methods_by_path_arc.clone();
+            let allow_in_order_arc = allow_methods_in_order_arc.clone();
             app = app.layer(axum::middleware::from_fn(
                 move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
                     let paths = opts_paths_arc.clone();
                     let allow = allow_by_path_arc.clone();
+                    let order = allow_in_order_arc.clone();
                     async move {
-                        non_preflight_options_middleware_with_paths(req, next, paths, allow).await
+                        non_preflight_options_middleware_with_paths(
+                            req, next, paths, allow, order,
+                        ).await
                     }
                 },
             ));
@@ -710,7 +740,8 @@ async fn non_preflight_options_middleware_with_paths(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
     declared_options_paths: std::sync::Arc<std::collections::HashSet<String>>,
-    allow_methods_by_path: std::sync::Arc<std::collections::HashMap<String, Vec<String>>>,
+    _allow_methods_by_path: std::sync::Arc<std::collections::HashMap<String, Vec<String>>>,
+    allow_methods_in_order: std::sync::Arc<Vec<(String, Vec<String>)>>,
 ) -> axum::response::Response {
     if req.method() == axum::http::Method::OPTIONS {
         let has_origin = req.headers().contains_key("origin");
@@ -724,29 +755,19 @@ async fn non_preflight_options_middleware_with_paths(
                 .iter()
                 .any(|tpl| options_path_matches(tpl, path));
             if !has_explicit_opts {
-                // Look up the actual methods declared for this path.
-                // Without this, CorsLayer would rewrite the 405 to a 200
-                // (its default OPTIONS handling), so we short-circuit —
-                // but we emit a path-specific `Allow:` matching upstream
-                // FastAPI (not a generic catch-all list).
-                //
-                // When multiple registered templates match (e.g. an
-                // incoming ``/items/special`` against both ``/items/{id}``
-                // and ``/items/special``), prefer the most specific one.
-                // ``allow_methods_by_path`` is a ``HashMap`` whose
-                // iteration order is non-deterministic, so without this
-                // step the emitted ``Allow`` header could flap between
-                // equivalent runs. Specificity = fewer ``{param}``
-                // segments; tie → lexicographically smaller template.
-                let best = allow_methods_by_path
+                // Walk registration order and use the FIRST template
+                // whose pattern matches the incoming concrete path.
+                // Matches Starlette / FastAPI's first-match-wins
+                // semantics. Earlier code preferred the most-specific
+                // template (fewest ``{}`` segments) — that matches
+                // matchit's matcher but diverges from upstream when
+                // a literal path is registered AFTER an overlapping
+                // param path. Probe-confirmed: upstream returns the
+                // first-registered route's methods.
+                let first_match = allow_methods_in_order
                     .iter()
-                    .filter(|(tpl, _)| options_path_matches(tpl, path))
-                    .min_by(|(a, _), (b, _)| {
-                        let pa = a.matches('{').count();
-                        let pb = b.matches('{').count();
-                        pa.cmp(&pb).then_with(|| a.cmp(b))
-                    });
-                let allow_header = best
+                    .find(|(tpl, _)| options_path_matches(tpl, path));
+                let allow_header = first_match
                     .map(|(_, methods)| methods.join(", "))
                     .unwrap_or_else(String::new);
                 if allow_header.is_empty() {

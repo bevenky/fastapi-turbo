@@ -32,10 +32,17 @@ wait_port() {
 }
 
 # ── build ──
-cd "$SCRIPT_DIR/go-gin" && go build -o ecommerce-gin . 2>&1
-cd "$SCRIPT_DIR/go-echo-ecommerce" && go build -o ecommerce-echo . 2>&1
-cd "$SCRIPT_DIR/fastify" && npm install --silent 2>&1
-cd "$SCRIPT_DIR/rust-axum-ecommerce" && PATH="$HOME/.cargo/bin:$PATH" cargo build --release 2>&1 | tail -1
+# Redirect build noise to stderr so it doesn't pollute the TSV when
+# the runner is invoked as ``./run_benchmark_v3.sh > v3.tsv``. The
+# previous form piped cargo output to ``tail -1`` on stdout which
+# left "Finished `release` profile ..." as the first line of the
+# captured TSV — broke any tool that did header-based parsing.
+{
+    cd "$SCRIPT_DIR/go-gin" && go build -o ecommerce-gin .
+    cd "$SCRIPT_DIR/go-echo-ecommerce" && go build -o ecommerce-echo .
+    cd "$SCRIPT_DIR/fastify" && npm install --silent
+    cd "$SCRIPT_DIR/rust-axum-ecommerce" && PATH="$HOME/.cargo/bin:$PATH" cargo build --release
+} 1>&2
 cd "$PROJECT_ROOT"
 
 # ── start ──

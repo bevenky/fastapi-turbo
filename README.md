@@ -42,8 +42,7 @@ claim here**:
   multi-connection numbers (these change the picture).
 - **Hardware**: Apple Silicon M-series, local loopback. Linux numbers
   differ — epoll / kqueue overhead, NUMA effects, and distro scheduler
-  defaults all shift the results. CI publishes a Linux x86_64 run
-  per release; those are the numbers users should rely on.
+  defaults all shift the results. **Linux x86_64 numbers are not yet published** — see [benchmarks.md](benchmarks.md) "What we have NOT yet published" for the gap list. Until they are, treat the numbers below as macOS-loopback per-request overhead — useful for relative comparison on this hardware, not as production-rollout sizing.
 - **Cross-check**: rows in the single-connection table have been
   re-run with `oha -c 1` and the deltas noted when they disagree
   by more than 2 μs. `wrk` and `bombardier` cross-checks are still
@@ -235,8 +234,8 @@ def dashboard(user_id: int):
 | 1 query (autocommit) | 53us | 56us |
 | 4 queries (pipeline vs goroutine) | 96us | 79us |
 | 10 queries (pipeline vs goroutine) | 138us | 148us |
-| 4 queries (sequential) | **104us** | 144us | **fastapi-turbo by 40us** |
-| 10 queries (sequential) | **197us** | 321us | **fastapi-turbo by 124us** |
+| 4 queries (sequential) | 104us | 144us |
+| 10 queries (sequential) | 197us | 321us |
 
 ### Autocommit and transactions
 
@@ -409,7 +408,7 @@ python benchmarks/bench_hello.py
 
 - **Rust core** (~8K lines): Axum 0.8, hyper, tokio, Tower, PyO3 0.28, crossbeam; HTTP, WebSocket, multipart, streaming, DB pool, HTTP client
 - **Python layer** (~22K lines): FastAPI-compatible API, introspection, OpenAPI 3.1 generator, Starlette/FastAPI `sys.modules` compat shims
-- **Tests** (~45K lines): 937 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
+- **Tests** (~45K lines): 948 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
 
 See [CLAUDE.md](CLAUDE.md) for development guide, [benchmarks.md](benchmarks.md) for full benchmark data including Go Echo, Fastify, free-threaded Python, and WebSocket library comparisons, and [COMPATIBILITY.md](COMPATIBILITY.md) for a per-feature map of where fastapi_turbo sits against FastAPI 0.136.0 (Full / Partial / Not-implemented / Different-by-design).
 

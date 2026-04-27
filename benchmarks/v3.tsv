@@ -1,4 +1,3 @@
-    Finished `release` profile [optimized] target(s) in 0.03s
 framework	test	rps	p50	p99
 Go-Gin	GET /health	31068	28	75
 Go-Gin	GET /items?limit=1	32017	28	72
