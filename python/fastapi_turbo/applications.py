@@ -8793,6 +8793,15 @@ class FastAPI:
 
                 if kind == "query":
                     try:
+                        # Synthesized field-extraction params for
+                        # ``Annotated[Model, Query()]`` skip per-field
+                        # scalar validation — the builder dep runs
+                        # ``model_validate`` on the raw-string dict
+                        # so Pydantic emits all errors with ORIGINAL
+                        # raw inputs (FA contract:
+                        # ``test_query_param_model_invalid`` expects
+                        # ``input: "150"`` not ``input: 150``).
+                        _is_synth_field = bool(p.get("_param_model_field_name"))
                         if is_list_param:
                             vals = _extract_list_from_query(alias)
                             if not vals:
@@ -8803,10 +8812,13 @@ class FastAPI:
                                     continue
                                 kwargs[name] = _list_default_for_missing(p, default_val, has_default)
                                 continue
-                            kwargs[name] = _validate(
-                                scalar_validator, vals, "query", alias,
-                                annotation=p.get("_unwrapped_annotation"),
-                            )
+                            if _is_synth_field:
+                                kwargs[name] = vals
+                            else:
+                                kwargs[name] = _validate(
+                                    scalar_validator, vals, "query", alias,
+                                    annotation=p.get("_unwrapped_annotation"),
+                                )
                             continue
                         # Scalar query: first occurrence wins.
                         raw = None
@@ -8822,10 +8834,13 @@ class FastAPI:
                                 continue
                             kwargs[name] = default_val
                             continue
-                        kwargs[name] = _validate(
-                            scalar_validator, raw, "query", alias,
-                            annotation=p.get("_unwrapped_annotation"),
-                        )
+                        if _is_synth_field:
+                            kwargs[name] = raw
+                        else:
+                            kwargs[name] = _validate(
+                                scalar_validator, raw, "query", alias,
+                                annotation=p.get("_unwrapped_annotation"),
+                            )
                     except _RVE_err as _ve:
                         _outer_form_missing_errs.extend(
                             [
@@ -9464,7 +9479,35 @@ class FastAPI:
             elif response_class is _JR or _is_json_response_class(response_class):
                 out = response_class(content=_je(r), status_code=_eff_status)
             else:
-                out = response_class(content=r, status_code=_eff_status)
+                # Some response classes don't take ``content=`` —
+                # ``RedirectResponse`` takes ``url=``, ``FileResponse``
+                # takes ``path=``. The handler returns the URL /
+                # path string. Detect via the constructor signature
+                # and re-route the kwarg.
+                _rc_sig_params = ()
+                try:
+                    _rc_sig_params = tuple(
+                        _insp.signature(response_class).parameters.keys()
+                    )
+                except (TypeError, ValueError):
+                    pass
+                # Pass ``status_code`` only when the route
+                # explicitly set one; otherwise let the response
+                # class use its own default (``RedirectResponse``
+                # defaults to 307, ``FileResponse`` to 200).
+                _explicit_status_kwargs = (
+                    {"status_code": _eff_status}
+                    if _status_code or (_ri_for_status is not None and getattr(_ri_for_status, "status_code", None))
+                    else {}
+                )
+                if "content" in _rc_sig_params:
+                    out = response_class(content=r, **_explicit_status_kwargs)
+                elif "url" in _rc_sig_params:
+                    out = response_class(url=r, **_explicit_status_kwargs)
+                elif "path" in _rc_sig_params:
+                    out = response_class(path=r, **_explicit_status_kwargs)
+                else:
+                    out = response_class(r, **_explicit_status_kwargs)
             # Pull any dep-mutated Response even when the handler itself
             # didn't take one — deps often add headers via
             # ``response: Response`` while the handler returns a
