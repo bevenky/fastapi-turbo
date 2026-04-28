@@ -7826,16 +7826,67 @@ class FastAPI:
             # ``Depends(dep, scope='request')`` resolve to DIFFERENT
             # instances within one request (the function-scope copy
             # is torn down pre-response while request-scope persists
-            # past it). Including ``dep_scope`` in the cache key
-            # makes the two deps produce two distinct sessions —
-            # without this the first call's value leaks across
-            # scopes and a function-scope teardown closes the
-            # request-scope value too.
-            cache_key = (
-                actual_fn,
-                tuple(sorted(accumulated_scopes)),
-                (dep_scope or "request").lower(),
-            )
+            # past it). The cache key includes ``dep_scope`` to keep
+            # them separate. ``accumulated_scopes`` participate ONLY
+            # when the dep callable's signature actually consumes
+            # ``SecurityScopes`` — otherwise the same callable
+            # caches once per request regardless of which Security
+            # scope chain reached it. Probe-confirmed against
+            # ``test_security_scopes_dependency_called_once`` (no
+            # SecurityScopes → 1 call) and
+            # ``test_security_scopes_sub_dependency_caching`` (uses
+            # SecurityScopes → distinct calls per scope chain).
+            # Walk the dep callable's signature transitively; if it
+            # OR any nested dep consumes ``SecurityScopes``, the
+            # cache key includes the accumulated scope tuple.
+            # Otherwise the dep caches by callable alone — same dep
+            # called from two scope chains hits the same entry.
+            _dep_uses_security_scopes = False
+            _seen_for_scope_check: set = set()
+
+            def _consumes_security_scopes(_fn):
+                if _fn in _seen_for_scope_check:
+                    return False
+                _seen_for_scope_check.add(_fn)
+                try:
+                    _s = _insp.signature(_fn)
+                except (TypeError, ValueError):
+                    return False
+                from fastapi_turbo.dependencies import (
+                    Depends as _D2,
+                    Security as _S2,
+                )
+                for _pp in _s.parameters.values():
+                    _ann = _pp.annotation
+                    if isinstance(_ann, type) and issubclass(_ann, _SS_cls):
+                        return True
+                    # Walk into nested Depends/Security default markers.
+                    _dft = _pp.default
+                    if isinstance(_dft, (_D2, _S2)) and _dft.dependency is not None:
+                        if _consumes_security_scopes(_dft.dependency):
+                            return True
+                    # Walk into ``Annotated[T, Depends(...)]`` markers.
+                    if hasattr(_ann, "__metadata__"):
+                        for _m in getattr(_ann, "__metadata__", ()):
+                            if isinstance(_m, (_D2, _S2)) and _m.dependency is not None:
+                                if _consumes_security_scopes(_m.dependency):
+                                    return True
+                return False
+            try:
+                _dep_uses_security_scopes = _consumes_security_scopes(actual_fn)
+            except Exception:  # noqa: BLE001
+                _dep_uses_security_scopes = False
+            if _dep_uses_security_scopes:
+                cache_key = (
+                    actual_fn,
+                    tuple(sorted(accumulated_scopes)),
+                    (dep_scope or "request").lower(),
+                )
+            else:
+                cache_key = (
+                    actual_fn,
+                    (dep_scope or "request").lower(),
+                )
             # When the caller asked for ``use_cache=False``, skip the
             # cache lookup AND don't write back. FA's contract: each
             # ``Depends(d, use_cache=False)`` runs the dep fresh.
@@ -7895,6 +7946,18 @@ class FastAPI:
                         )
                         continue
                     if dkind == "query":
+                        # FA contract: a bare ``param: int`` on a
+                        # dep (no Query/Header/etc marker) takes its
+                        # value from the route's PATH params if the
+                        # name matches a path placeholder. Falls
+                        # back to query otherwise. Probe-confirmed
+                        # against ``test_param_in_path_and_dependency``.
+                        if dalias in path_params:
+                            sub_kwargs[dname] = _validate(
+                                dscalar, path_params[dalias], "path",
+                                dalias, annotation=dann,
+                            )
+                            continue
                         raw_q = None
                         for qk, qv in _qp_items:
                             if qk == dalias:
@@ -9747,14 +9810,13 @@ class FastAPI:
             break
 
         if matched_route is None:
-            # No matching WS route — close the handshake immediately
-            # rather than letting the client hang. Starlette closes
-            # with code 1006 (abnormal); we send websocket.close so
-            # the client side surfaces ``WebSocketDisconnect`` at
-            # ``__enter__``. Probe-confirmed against
-            # ``test_route_scope::test_websocket_invalid_path_doesnt_match``.
+            # No matching WS route — Starlette closes with 1000
+            # (normal closure) when no matching endpoint accepts.
+            # Probe-confirmed against
+            # ``test_route_scope::test_websocket_invalid_path_doesnt_match``
+            # AND ``test_ws_router::test_no_router``.
             try:
-                await send({"type": "websocket.close", "code": 1006})
+                await send({"type": "websocket.close", "code": 1000})
             except Exception:  # noqa: BLE001
                 pass
             return True
@@ -10245,6 +10307,44 @@ class FastAPI:
             # bad-type input closes with 1008 rather than passing a
             # raw string where the user expects an int.
             ws_dep_cache: dict = {}
+            # Run app/router/route-level extra dependencies BEFORE
+            # the handler params resolve. Their return values are
+            # discarded (FA contract — extra deps are for side
+            # effects: auth, audit, append-to-list). Probe-confirmed
+            # against ``test_ws_dependencies::test_index`` etc.
+            _ws_extra_deps: list = []
+            _ws_extra_deps.extend(getattr(self, "dependencies", []) or [])
+            _ws_extra_deps.extend(getattr(self.router, "dependencies", []) or [])
+            # FA's order: app → include-time deps (passed via
+            # ``app.include_router(router, dependencies=[...])``) →
+            # router's own deps → route's own deps. ``include_deps``
+            # is stamped by ``include_router`` from the kwargs.
+            _ws_extra_deps.extend(
+                getattr(matched_route, "_fastapi_turbo_include_deps", []) or []
+            )
+            _ws_owner_router = getattr(
+                matched_route, "_fastapi_turbo_owner_router", None
+            )
+            if _ws_owner_router is not None:
+                _ws_extra_deps.extend(
+                    getattr(_ws_owner_router, "dependencies", []) or []
+                )
+            _ws_extra_deps.extend(
+                getattr(matched_route, "dependencies", []) or []
+            )
+            from fastapi_turbo.dependencies import Depends as _Dep_marker_ws_extra
+            for _xd in _ws_extra_deps:
+                if isinstance(_xd, _Dep_marker_ws_extra):
+                    _xd_call = _xd.dependency
+                    if _xd_call is None:
+                        continue
+                    await _ws_resolve_dep(
+                        _xd_call,
+                        ws_dep_cache,
+                        use_cache=getattr(_xd, "use_cache", True),
+                        dep_scope=getattr(_xd, "scope", None),
+                    )
+
             for p in ws_introspect_params:
                 pname = p.get("name")
                 kind = p.get("kind")
@@ -10377,6 +10477,42 @@ class FastAPI:
                     pass
         except Exception as _exc:  # noqa: BLE001
             _log.debug("in-process WS endpoint raised: %r", _exc)
+            # Honour ``app.exception_handlers`` for the matched
+            # exception type. The handler signature is ``(websocket,
+            # exc)`` — same as Starlette. The handler typically calls
+            # ``websocket.close(code, reason)`` with a custom code,
+            # which our test client surfaces to ``pytest.raises``.
+            # Probe-confirmed against
+            # ``test_ws_router::test_depend_err_handler``.
+            _ws_handler, _ws_matched_cls = _find_exception_handler(self, _exc)
+            if _ws_handler is not None and _ws_matched_cls is not Exception:
+                try:
+                    if _insp_ws.iscoroutinefunction(_ws_handler):
+                        await _ws_handler(ws_obj, _exc)
+                    else:
+                        _r = _ws_handler(ws_obj, _exc)
+                        if _insp_ws.iscoroutine(_r):
+                            await _r
+                except Exception:  # noqa: BLE001
+                    pass
+                # Drain teardowns and return — the handler took care
+                # of closing the WS.
+                for _g2, _is_a2, _sc2 in reversed(ws_dep_teardowns):
+                    try:
+                        if _is_a2:
+                            try:
+                                await _g2.__anext__()
+                            except StopAsyncIteration:
+                                pass
+                        else:
+                            try:
+                                next(_g2)
+                            except StopIteration:
+                                pass
+                    except Exception:  # noqa: BLE001
+                        pass
+                ws_dep_teardowns.clear()
+                return True
             if not ws_obj._closed:
                 try:
                     await ws_obj.close(code=1011)

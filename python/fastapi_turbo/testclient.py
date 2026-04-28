@@ -1556,7 +1556,10 @@ class _InProcessWebSocketSession:
             self._accepted_subprotocol = first_msg.get("subprotocol")
         elif first_msg["type"] == "websocket.close":
             from fastapi_turbo.exceptions import WebSocketDisconnect
-            raise WebSocketDisconnect(code=first_msg.get("code", 1000))
+            raise WebSocketDisconnect(
+                code=first_msg.get("code", 1000),
+                reason=first_msg.get("reason", "") or "",
+            )
         else:
             raise RuntimeError(
                 f"unexpected first WS server message: {first_msg!r}"
