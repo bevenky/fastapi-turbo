@@ -9675,9 +9675,18 @@ class FastAPI:
               * Bare scalar with no marker → fall back to query
                 string lookup (Starlette WS-dep convention).
               * Bare param with a default → use the default verbatim.
+
+            Honour ``app.dependency_overrides`` first so WS deps
+            obey the same override contract as HTTP deps. Earlier
+            this resolver inspected ``dep_callable`` directly,
+            ignoring the override map and breaking
+            ``test_router_ws_depends_with_override``.
             """
-            if dep_callable in dep_cache:
-                return dep_cache[dep_callable]
+            _ws_overrides = getattr(self, "dependency_overrides", None) or {}
+            _ws_orig_callable = dep_callable
+            dep_callable = _ws_overrides.get(dep_callable, dep_callable)
+            if _ws_orig_callable in dep_cache:
+                return dep_cache[_ws_orig_callable]
             try:
                 dep_sig = _insp_ws.signature(dep_callable)
             except (TypeError, ValueError):
@@ -9727,7 +9736,11 @@ class FastAPI:
                 val = dep_callable(**dep_kwargs)
                 if _insp_ws.iscoroutine(val):
                     val = await val
-            dep_cache[dep_callable] = val
+            # Cache under the ORIGINAL callable so subsequent
+            # ``Depends(orig_callable)`` requests in the same WS
+            # session hit the cache regardless of any
+            # dependency_overrides indirection.
+            dep_cache[_ws_orig_callable] = val
             return val
 
         try:
