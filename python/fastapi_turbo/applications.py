@@ -7406,8 +7406,51 @@ class FastAPI:
         # ── Parse form / multipart body if any ``Form(...)`` or
         # ``File(...)`` params are present on the endpoint. Done once
         # up-front so subsequent kwarg assembly is O(1) per param.
+        # Also fire the parser when a ``Depends(...)`` callable has
+        # form params nested inside its own ``__init__`` (e.g.
+        # ``OAuth2PasswordRequestFormStrict``) — checking only the
+        # outer plan would miss those and the dep resolver later sees
+        # an empty form_fields, raising spurious 422 missing errors.
         form_fields: dict[str, object] = {}
-        if any(p.get("kind") in ("form", "file") for p in introspect_params) and body_bytes:
+        _outer_has_form = any(
+            p.get("kind") in ("form", "file") for p in introspect_params
+        )
+        _form_ct_match = False
+        if not _outer_has_form and body_bytes:
+            for _hk, _hv in scope.get("headers", []) or []:
+                _hkl = (
+                    _hk.decode("latin-1") if isinstance(_hk, bytes) else _hk
+                ).lower()
+                if _hkl == "content-type":
+                    _hvl = (
+                        _hv.decode("latin-1") if isinstance(_hv, bytes) else _hv
+                    ).lower()
+                    if (
+                        _hvl.startswith("application/x-www-form-urlencoded")
+                        or _hvl.startswith("multipart/form-data")
+                    ):
+                        # Only parse if a Depends(...) anywhere on the
+                        # route has at least one form param — content-
+                        # type alone isn't enough (a JSON endpoint with
+                        # a wrong CT shouldn't waste cycles parsing).
+                        for _pp in introspect_params:
+                            if _pp.get("kind") != "dependency":
+                                continue
+                            _dc = _pp.get("dep_callable")
+                            if _dc is None:
+                                continue
+                            try:
+                                _dplan_probe = introspect_endpoint(_dc, "/")
+                            except Exception:  # noqa: BLE001
+                                continue
+                            if any(
+                                _dpp.get("kind") in ("form", "file")
+                                for _dpp in _dplan_probe
+                            ):
+                                _form_ct_match = True
+                                break
+                    break
+        if (_outer_has_form or _form_ct_match) and body_bytes:
             import io
             content_type = ""
             for hk, hv in scope.get("headers", []) or []:
@@ -7732,6 +7775,13 @@ class FastAPI:
             except Exception:  # noqa: BLE001
                 _dep_plan = None
             sub_kwargs = {}
+            # Accumulate per-dep validation errors so a dep callable
+            # whose ``__init__`` declares 3 required ``Form(...)`` params
+            # (e.g. ``OAuth2PasswordRequestFormStrict``) emits all 3
+            # ``missing`` entries in one 422 — matches FA. Without
+            # this we raised on the first missing and the user only
+            # saw one of the three.
+            _form_missing_errs: list = []
             if _dep_plan is not None and sub_sig is not None:
                 for dp in _dep_plan:
                     dname = dp["name"]
@@ -7794,6 +7844,57 @@ class FastAPI:
                                 dscalar, raw_c, "cookie", dalias, annotation=dann
                             )
                         continue
+                    if dkind in ("form", "file"):
+                        # Form / file params on a dep callable
+                        # (typically FA's ``OAuth2PasswordRequestForm``
+                        # / ``OAuth2PasswordRequestFormStrict`` whose
+                        # ``__init__`` declares ``grant_type`` /
+                        # ``username`` / ``password`` / ``scope`` etc.
+                        # as ``Form(...)`` markers). Earlier they fell
+                        # through to the parameter-default fallback
+                        # and required fields raised
+                        # ``TypeError: missing keyword-only argument``
+                        # when the dep was instantiated.
+                        d_is_list = dp.get("container_type") is not None or (
+                            _tp_local.get_origin(dann) is list
+                        )
+                        d_val = form_fields.get(dalias)
+                        if d_is_list:
+                            if d_val is None:
+                                if drequired:
+                                    _form_missing_errs.append(
+                                        _missing("body", dalias)
+                                    )
+                                    continue
+                                sub_kwargs[dname] = _list_default_for_missing(
+                                    dp, ddefault, dp.get("has_default", False)
+                                )
+                                continue
+                            d_vals = d_val if isinstance(d_val, list) else [d_val]
+                            if dkind == "file":
+                                sub_kwargs[dname] = d_vals
+                            else:
+                                sub_kwargs[dname] = _validate(
+                                    dscalar, d_vals, "body", dalias, annotation=dann
+                                )
+                            continue
+                        if d_val is None:
+                            if drequired:
+                                _form_missing_errs.append(
+                                    _missing("body", dalias)
+                                )
+                                continue
+                            sub_kwargs[dname] = ddefault
+                        else:
+                            if isinstance(d_val, list):
+                                d_val = d_val[0]
+                            if dkind == "file":
+                                sub_kwargs[dname] = d_val
+                            else:
+                                sub_kwargs[dname] = _validate(
+                                    dscalar, d_val, "body", dalias, annotation=dann
+                                )
+                        continue
                     # SecurityScopes → inject.
                     raw_ann = dp.get("_raw_annotation")
                     if isinstance(raw_ann, type) and issubclass(raw_ann, _SS_cls):
@@ -7836,6 +7937,8 @@ class FastAPI:
                 # Skip the legacy sub_sig-walk below; the introspect
                 # plan has already populated ``sub_kwargs``.
                 sub_sig = None
+                if _form_missing_errs:
+                    raise _RVE_err(_form_missing_errs)
             if sub_sig is not None:
                 from fastapi_turbo.param_functions import _ParamMarker as _PM_dep
                 for sname, sp in sub_sig.parameters.items():
@@ -7919,6 +8022,13 @@ class FastAPI:
                 val = await actual_fn(**sub_kwargs)
             else:
                 val = actual_fn(**sub_kwargs)
+                # Class instances whose ``__call__`` is ``async def``
+                # (e.g. FA's ``OAuth2`` security schemes) don't trip
+                # ``iscoroutinefunction`` on the instance itself —
+                # only on the bound ``__call__``. Detect by inspecting
+                # the return value.
+                if _insp.iscoroutine(val):
+                    val = await val
             cache[cache_key] = val
             return val
 
