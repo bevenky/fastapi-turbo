@@ -8899,6 +8899,52 @@ class FastAPI:
                     r = await r
             if isinstance(r, _Resp):
                 return r
+            # FA 0.110+ async-generator / generator handlers are auto-
+            # wrapped. Respect ``response_class`` if the user pinned a
+            # streaming-friendly one (e.g. ``EventSourceResponse`` for
+            # SSE) — pass the generator through unchanged so the
+            # response class can drive its own framing. Otherwise
+            # default to NDJSON (FA's stream_json_lines tutorial). The
+            # Rust hot path detects this at compile time; the
+            # in-process dispatcher used to fall through to
+            # ``jsonable_encoder`` which raised ``'async_generator'
+            # object is not iterable``.
+            if _insp.isasyncgen(r) or _insp.isgenerator(r):
+                from fastapi_turbo.responses import StreamingResponse as _SR
+                _route_resp_class = getattr(
+                    matched_route, "response_class", None
+                )
+                _has_custom_resp_class = (
+                    _route_resp_class is not None
+                    and _route_resp_class is not _Resp
+                    and _route_resp_class is not _JR
+                    and not _is_json_response_class(_route_resp_class)
+                )
+                if _has_custom_resp_class:
+                    # Hand the generator to the user-pinned response
+                    # class; SSE / custom streamers know what to do.
+                    return _route_resp_class(r)
+                import json as _json_for_ndjson
+
+                async def _ndjson_iter(_gen):
+                    if _insp.isasyncgen(_gen):
+                        async for _item in _gen:
+                            yield (
+                                _json_for_ndjson.dumps(
+                                    _je(_item), separators=(",", ":"),
+                                ).encode("utf-8") + b"\n"
+                            )
+                    else:
+                        for _item in _gen:
+                            yield (
+                                _json_for_ndjson.dumps(
+                                    _je(_item), separators=(",", ":"),
+                                ).encode("utf-8") + b"\n"
+                            )
+                return _SR(
+                    _ndjson_iter(r),
+                    media_type="application/jsonl",
+                )
             # Apply response_model filtering / aliasing / exclude-unset.
             # Errors from this path must propagate — FA surfaces
             # ResponseValidationError as a 500; silently returning the
@@ -9038,21 +9084,45 @@ class FastAPI:
             # — finally blocks never fired in the unhandled-error
             # case (probe-confirmed against upstream's
             # ``test_dependency_contextmanager`` suite, ~16 tests).
+            # FA 0.110+ contract: a yield-dep that catches the
+            # handler's exception WITHOUT re-raising must trip a
+            # ``FastAPIError("...raising an exception and a dependency
+            # with yield...")``. Detect by the throw outcome:
+            #   * ``StopIteration`` / ``StopAsyncIteration`` (or
+            #     ``StopIteration`` raised by ``athrow`` returning
+            #     normally on a fully-exhausted gen) means the dep's
+            #     except arm swallowed the exception silently — raise
+            #     ``FastAPIError`` so the user can see the bug.
+            #   * The original exception type (or any other) means the
+            #     dep re-raised; the original exception propagates as
+            #     intended.
+            from fastapi_turbo.exceptions import FastAPIError as _FAPIErr
+            _yielddep_swallowed = False
             for gen, is_async in reversed(dep_teardowns):
                 try:
                     if is_async:
                         try:
                             await gen.athrow(exc)
-                        except (StopAsyncIteration, type(exc)):
+                        except StopAsyncIteration:
+                            _yielddep_swallowed = True
+                        except type(exc):
                             pass
                     else:
                         try:
                             gen.throw(exc)
-                        except (StopIteration, type(exc)):
+                        except StopIteration:
+                            _yielddep_swallowed = True
+                        except type(exc):
                             pass
                 except Exception:  # noqa: BLE001
                     pass
             dep_teardowns.clear()
+            if _yielddep_swallowed:
+                exc = _FAPIErr(
+                    "Dependency raising an exception and a dependency with"
+                    " yield without raising again the same exception or"
+                    " a new one"
+                )
             await _asgi_emit_exception(self, scope, send, exc)
             for gen, is_async in reversed(dep_teardowns):
                 try:
