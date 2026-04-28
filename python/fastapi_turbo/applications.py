@@ -8057,7 +8057,13 @@ class FastAPI:
             _qp_items = parse_qsl(_qs_bytes.decode("latin-1"), keep_blank_values=True)
 
         def _alias_for_header(marker, pname):
-            """Honour ``convert_underscores`` / ``alias`` on Header(...)."""
+            """Honour ``validation_alias`` / ``alias`` /
+            ``convert_underscores`` on Header(...). FA precedence:
+            ``validation_alias`` wins over ``alias``, both win over
+            the dash-converted python name."""
+            va = getattr(marker, "validation_alias", None)
+            if isinstance(va, str) and va:
+                return va
             if getattr(marker, "alias", None):
                 return marker.alias
             convert = getattr(marker, "convert_underscores", True)
@@ -8269,8 +8275,30 @@ class FastAPI:
                     getattr(matched_route, "_fastapi_turbo_include_deps", [])
                     or []
                 )
+                # Accumulate validation errors across multiple extra
+                # deps (app-level, router-level, route-level). FA
+                # contract: when 2+ extra deps EACH miss a required
+                # query/header/cookie/form param, ALL of them surface
+                # in one 422 response. Earlier we raised on the first
+                # dep's miss and the client only saw 1 of N errors —
+                # mismatch with upstream's bigger-applications tutorial
+                # snapshots.
+                _xdep_accum_errs: list = []
                 for _xdep in _extra_dep_markers:
-                    await _resolve_dep(_xdep, dep_cache, [])
+                    try:
+                        await _resolve_dep(_xdep, dep_cache, [])
+                    except _RVE_err as _rve:
+                        _xdep_accum_errs.extend(_rve.errors())
+                if _xdep_accum_errs:
+                    # Convert tuple ``loc`` (returned by ``.errors()``)
+                    # back to list shape that other emit sites use.
+                    _xdep_norm = [
+                        {**e, "loc": list(e["loc"])}
+                        if isinstance(e.get("loc"), tuple)
+                        else e
+                        for e in _xdep_accum_errs
+                    ]
+                    raise _RVE_err(_xdep_norm)
 
             # Accumulate per-endpoint form/file ``missing`` errors so a
             # request body that omits multiple required form fields
@@ -8288,8 +8316,19 @@ class FastAPI:
                 scalar_validator = p.get("scalar_validator")
                 model_class = p.get("model_class")
                 container_type = p.get("container_type")
-                is_list_param = container_type is not None or (
-                    _tp_local.get_origin(p.get("_unwrapped_annotation")) is list
+                _ann_for_list = p.get("_unwrapped_annotation")
+                _ann_origin = _tp_local.get_origin(_ann_for_list)
+                is_list_param = (
+                    container_type is not None
+                    or _ann_origin in (list, set, frozenset, tuple)
+                    # Bare ``list`` / ``set`` / ``tuple`` annotations
+                    # (no parametrization) are still sequence params —
+                    # FA collects repeated values into the appropriate
+                    # container. ``test_forms_from_non_typing_sequences``
+                    # asserts ``items: list = Form()`` returns
+                    # ``["first", "second", "third"]`` for a 3-value
+                    # form submission.
+                    or _ann_for_list in (list, set, frozenset, tuple)
                 )
 
                 if kind == "dependency":
