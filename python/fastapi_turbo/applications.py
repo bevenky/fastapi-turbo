@@ -8022,13 +8022,23 @@ class FastAPI:
                 val = await actual_fn(**sub_kwargs)
             else:
                 val = actual_fn(**sub_kwargs)
-                # Class instances whose ``__call__`` is ``async def``
-                # (e.g. FA's ``OAuth2`` security schemes) don't trip
-                # ``iscoroutinefunction`` on the instance itself —
-                # only on the bound ``__call__``. Detect by inspecting
-                # the return value.
+                # Detect generators / coroutines / async generators
+                # produced by callables that don't trip the function-
+                # level introspection: class instances whose ``__call__``
+                # is async / a generator (FA's ``OAuth2``,
+                # ``ClassInstanceGenDep``), or callables wrapped in
+                # ``functools.wraps`` (a plain ``def wrapper`` returning
+                # the inner generator). Inspect the return value.
                 if _insp.iscoroutine(val):
                     val = await val
+                elif _insp.isasyncgen(val):
+                    gen = val
+                    val = await gen.__anext__()
+                    dep_teardowns.append((gen, True))
+                elif _insp.isgenerator(val):
+                    gen = val
+                    val = next(gen)
+                    dep_teardowns.append((gen, False))
             cache[cache_key] = val
             return val
 
@@ -8180,23 +8190,51 @@ class FastAPI:
                         parsed_body = _json.loads(body_bytes)
                         body_parsed = True
                     except _json.JSONDecodeError as jde:
+                        # FA shape: ``msg`` is the bare ``"JSON decode
+                        # error"`` and the position-specific detail
+                        # lives in ``ctx={"error": jde.msg}``.
                         raise _RVE_err([{
                             "type": "json_invalid",
                             "loc": ["body", jde.pos],
-                            "msg": f"JSON decode error: {jde.msg}",
+                            "msg": "JSON decode error",
                             "input": {},
+                            "ctx": {"error": jde.msg},
                         }]) from None
             elif body_params and not body_bytes:
                 # Body expected but empty — emit a missing-body 422
-                # matching FA's shape (first body param's name).
+                # matching FA's shape. For an embedded single body
+                # (``Annotated[Item, Body(embed=True)]``) the loc is
+                # ``["body", "item"]`` — earlier we always emitted
+                # ``["body"]`` and dropped the field name. The
+                # combined-body path handles its own multi-field
+                # missing emission downstream.
+                _missing_body_errs: list = []
                 for _bp in body_params:
-                    if _bp.get("required"):
-                        raise _RVE_err([{
+                    if not _bp.get("required"):
+                        continue
+                    _bp_name = _bp.get("name")
+                    if _bp_name == "_combined_body":
+                        # Defer to the combined-body branch which
+                        # emits one missing per field.
+                        continue
+                    _bp_alias = _bp.get("alias") or _bp_name
+                    _bp_embed = _bp.get("_embed", False)
+                    if _bp_embed:
+                        _missing_body_errs.append({
+                            "type": "missing",
+                            "loc": ["body", _bp_alias],
+                            "msg": "Field required",
+                            "input": None,
+                        })
+                    else:
+                        _missing_body_errs.append({
                             "type": "missing",
                             "loc": ["body"],
                             "msg": "Field required",
                             "input": None,
-                        }])
+                        })
+                if _missing_body_errs:
+                    raise _RVE_err(_missing_body_errs)
 
             # Run app/router/route-level extra dependencies (those
             # declared via ``FastAPI(dependencies=[...])`` /
@@ -8234,6 +8272,12 @@ class FastAPI:
                 for _xdep in _extra_dep_markers:
                     await _resolve_dep(_xdep, dep_cache, [])
 
+            # Accumulate per-endpoint form/file ``missing`` errors so a
+            # request body that omits multiple required form fields
+            # surfaces ALL of them in one 422 — matches FA. Earlier we
+            # raised on the first missing and the client only saw a
+            # single entry.
+            _outer_form_missing_errs: list = []
             for p in introspect_params:
                 name = p["name"]
                 kind = p.get("kind")
@@ -8426,7 +8470,24 @@ class FastAPI:
                     if is_combined:
                         if parsed_body is None:
                             if required:
-                                raise _RVE_err([_missing("body", pname) for pname in sig.parameters])
+                                # Emit one ``missing`` per body field.
+                                # The combined model's ``model_fields``
+                                # has exactly the original body param
+                                # names ('item', 'user', 'importance',
+                                # ...), which is what FA expects in the
+                                # 422 detail. Earlier we used
+                                # ``sig.parameters`` (the FULL endpoint
+                                # signature) which produced a single
+                                # ``["body"]`` entry instead.
+                                _cb_fields = getattr(
+                                    model_class, "model_fields", {}
+                                ) or {}
+                                if _cb_fields:
+                                    raise _RVE_err([
+                                        _missing("body", _fn)
+                                        for _fn in _cb_fields
+                                    ])
+                                raise _RVE_err([_missing("body", name)])
                             continue
                         try:
                             if hasattr(model_class, "model_validate"):
@@ -8487,6 +8548,34 @@ class FastAPI:
                     # FA emits form/file errors under the ``body`` loc
                     # prefix (forms are classified as body in 422s) —
                     # ``["body", "p"]``, not ``["form", "p"]``.
+                    # When the user annotates the file param as
+                    # ``bytes`` / ``list[bytes]`` (rather than
+                    # ``UploadFile`` / ``list[UploadFile]``), FA reads
+                    # the upload content and hands the user the raw
+                    # bytes. Detect via the unwrapped annotation.
+                    _file_inner_ann = p.get("_unwrapped_annotation")
+                    _file_wants_bytes = False
+                    if kind == "file":
+                        _f_origin = _tp_local.get_origin(_file_inner_ann)
+                        if _f_origin is list:
+                            _f_args = _tp_local.get_args(_file_inner_ann)
+                            if _f_args and _f_args[0] in (bytes, bytearray):
+                                _file_wants_bytes = True
+                        elif _file_inner_ann in (bytes, bytearray):
+                            _file_wants_bytes = True
+
+                    def _uf_to_bytes(uf):
+                        # ``UploadFile.file`` is a SpooledTemporaryFile
+                        # / BytesIO with the upload contents.
+                        f = getattr(uf, "file", None)
+                        if f is None:
+                            return b""
+                        try:
+                            f.seek(0)
+                            return f.read()
+                        except Exception:  # noqa: BLE001
+                            return b""
+
                     if is_list_param:
                         # List form/file: collect into a list. The
                         # parser stores repeated keys as a list, single
@@ -8494,12 +8583,18 @@ class FastAPI:
                         # always receives a list.
                         if val is None:
                             if required:
-                                raise _RVE_err([_missing("body", alias)])
+                                _outer_form_missing_errs.append(
+                                    _missing("body", alias)
+                                )
+                                continue
                             kwargs[name] = _list_default_for_missing(p, default_val, has_default)
                             continue
                         vals = val if isinstance(val, list) else [val]
                         if kind == "file":
-                            kwargs[name] = vals
+                            if _file_wants_bytes:
+                                kwargs[name] = [_uf_to_bytes(_v) for _v in vals]
+                            else:
+                                kwargs[name] = vals
                         else:
                             kwargs[name] = _validate(
                                 p.get("scalar_validator"),
@@ -8511,7 +8606,10 @@ class FastAPI:
                         continue
                     if val is None:
                         if required:
-                            raise _RVE_err([_missing("body", alias)])
+                            _outer_form_missing_errs.append(
+                                _missing("body", alias)
+                            )
+                            continue
                         kwargs[name] = default_val
                     else:
                         if kind == "file":
@@ -8523,7 +8621,10 @@ class FastAPI:
                             # parity.
                             if isinstance(val, list):
                                 val = val[0]
-                            kwargs[name] = val
+                            if _file_wants_bytes:
+                                kwargs[name] = _uf_to_bytes(val)
+                            else:
+                                kwargs[name] = val
                         else:
                             # Coerce the form value to the parameter's
                             # declared type via Pydantic. Without this
@@ -8571,10 +8672,40 @@ class FastAPI:
                     continue
 
                 # Unknown kind — skip (defer to endpoint default).
+            if _outer_form_missing_errs:
+                raise _RVE_err(_outer_form_missing_errs)
         except Exception as exc:
             # Any param-resolution failure → route through the app's
             # exception handlers. This includes RequestValidationError
             # (→ 422) and HTTPException from a dep (→ its status).
+            # If the exception is a RequestValidationError raised
+            # without endpoint context, augment it so user
+            # ``@app.exception_handler(RequestValidationError)``
+            # implementations can log file / line / function alongside
+            # the validation errors. Matches FA's behaviour and
+            # upstream's ``test_validation_error_context`` suite.
+            if isinstance(exc, _RVE_err) and not getattr(exc, "endpoint_ctx", None):
+                try:
+                    _ep_for_ctx = endpoint
+                    _ep_func = getattr(_ep_for_ctx, "__name__", None)
+                    _ep_file = getattr(
+                        getattr(_ep_for_ctx, "__code__", None), "co_filename", None
+                    )
+                    _ep_line = getattr(
+                        getattr(_ep_for_ctx, "__code__", None), "co_firstlineno", None
+                    )
+                    exc.endpoint_ctx = {
+                        "function": _ep_func,
+                        "file": _ep_file,
+                        "line": _ep_line,
+                        "path": getattr(matched_route, "path", None),
+                    }
+                    exc.endpoint_function = _ep_func
+                    exc.endpoint_file = _ep_file
+                    exc.endpoint_line = _ep_line
+                    exc.endpoint_path = getattr(matched_route, "path", None)
+                except Exception:  # noqa: BLE001
+                    pass
             await _asgi_emit_exception(self, scope, send, exc)
             # Teardown any deps already committed.
             for gen, is_async in reversed(dep_teardowns):
@@ -8798,6 +8929,35 @@ class FastAPI:
             # user's `@app.exception_handler(HTTPException)` override
             # and surfaces ResponseValidationError / RequestValidationError
             # with FA-shaped bodies.
+            #
+            # IMPORTANT: do dep teardowns BEFORE
+            # ``_asgi_emit_exception`` because that helper re-raises
+            # for the unhandled-Exception case (so
+            # ``raise_server_exceptions=True`` propagates), which
+            # would otherwise unwind us past the teardown loop. Push
+            # the original exception into each active yield-dep via
+            # ``gen.throw(...)`` / ``gen.athrow(...)`` so a dep
+            # wrapping the request in ``try / except / finally`` sees
+            # the failure and runs its cleanup code. Earlier impl
+            # drove plain ``__anext__()`` AFTER ``_asgi_emit_exception``
+            # — finally blocks never fired in the unhandled-error
+            # case (probe-confirmed against upstream's
+            # ``test_dependency_contextmanager`` suite, ~16 tests).
+            for gen, is_async in reversed(dep_teardowns):
+                try:
+                    if is_async:
+                        try:
+                            await gen.athrow(exc)
+                        except (StopAsyncIteration, type(exc)):
+                            pass
+                    else:
+                        try:
+                            gen.throw(exc)
+                        except (StopIteration, type(exc)):
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
+            dep_teardowns.clear()
             await _asgi_emit_exception(self, scope, send, exc)
             for gen, is_async in reversed(dep_teardowns):
                 try:
@@ -8858,6 +9018,19 @@ class FastAPI:
                 if getattr(response_injected, "status_code", None):
                     final.status_code = response_injected.status_code
             await _send_asgi_response(send, final, scope=scope)
+        # FA / Starlette ordering: BG tasks run BEFORE yield-dep
+        # teardowns. The contract is that ``BackgroundTasks`` see the
+        # request's deps still in their pre-yield ("started") state —
+        # tests that read state inside the bg task expect ``a:
+        # started a / b: started b``, not ``a: finished a / b:
+        # finished b``. Reversed earlier (teardowns first) made bg see
+        # post-finalised state and broke
+        # ``test_dependency_contextmanager::test_background_tasks``.
+        if bg_injected is not None:
+            try:
+                bg_injected.run_sync()
+            except Exception as _exc:  # noqa: BLE001
+                _log.debug("in-process background task: %r", _exc)
         # Run yield-dep teardowns in reverse order (LIFO — FA semantics).
         # These fire after the response has been sent so a slow
         # teardown doesn't delay the client. Any error is logged and
@@ -8877,14 +9050,6 @@ class FastAPI:
                         pass
             except Exception as _exc:  # noqa: BLE001
                 _log.debug("in-process yield-dep teardown: %r", _exc)
-
-        # Background tasks run AFTER the response has been flushed —
-        # best-effort; if it raises we don't re-fail the request.
-        if bg_injected is not None:
-            try:
-                bg_injected.run_sync()
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("in-process background task: %r", _exc)
         return True
 
     # ── in-process WebSocket dispatch ────────────────────────────────

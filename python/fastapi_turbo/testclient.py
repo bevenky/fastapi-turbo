@@ -119,12 +119,17 @@ class _ASGISyncClientShim:
         self._app = app
         self._base_url = base_url
         self._follow_redirects = follow_redirects
-        # Pin ``Accept-Encoding: gzip, deflate`` as a session default
-        # (matches Starlette's TestClient — see comment in
-        # ``TestClient.__init__`` for the upstream-FastAPI Tutorial
-        # snapshot mismatch this fixes). User-supplied headers
-        # override; the default fills in if absent.
-        merged_headers: dict = {"accept-encoding": "gzip, deflate"}
+        # Pin ``Accept-Encoding: gzip, deflate`` and ``User-Agent:
+        # testclient`` as session defaults — matches Starlette's
+        # TestClient. Upstream FastAPI tutorial tests assert the exact
+        # ``user-agent: testclient`` value in 422 ``input`` dicts and
+        # in echo-header endpoints; httpx's default
+        # ``python-httpx/X.Y.Z`` would fail those snapshots. User-
+        # supplied headers override; the default fills in if absent.
+        merged_headers: dict = {
+            "accept-encoding": "gzip, deflate",
+            "user-agent": "testclient",
+        }
         for k, v in (headers or {}).items():
             merged_headers[str(k).lower()] = v
         self._headers = merged_headers
