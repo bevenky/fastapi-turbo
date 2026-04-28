@@ -7782,7 +7782,7 @@ class FastAPI:
                 _shared_response_holder[0] = _Resp_cls()
             return _shared_response_holder[0]
 
-        async def _resolve_dep(marker_or_fn, cache, accumulated_scopes, dep_scope=None, use_cache=True):
+        async def _resolve_dep(marker_or_fn, cache, accumulated_scopes, dep_scope=None, use_cache=True, _own_scopes_for_key=None):
             """Resolve ``marker_or_fn`` recursively. ``cache`` dedups
             calls for the same dep within one request (FA caching).
             ``accumulated_scopes`` is the list of OAuth2 scopes
@@ -7792,12 +7792,20 @@ class FastAPI:
             # FA 0.120+ ``scope`` carries through Depends/Security
             # markers — capture before unwrapping so the inner
             # generator's teardown is queued on the right list. Same
-            # for ``use_cache``.
+            # for ``use_cache``. The Security marker's OWN
+            # ``scopes`` argument also matters for the cache key
+            # (FA's ``own_oauth_scopes`` triggers ``_uses_scopes``
+            # → cache by scope list).
             _marker_scope = None
             _marker_use_cache = use_cache
+            _marker_own_scopes: list = []
             if isinstance(marker_or_fn, (_Sec_marker, _Dep_marker)):
                 _marker_scope = getattr(marker_or_fn, "scope", None)
                 _marker_use_cache = getattr(marker_or_fn, "use_cache", True)
+                if isinstance(marker_or_fn, _Sec_marker):
+                    _marker_own_scopes = list(
+                        getattr(marker_or_fn, "scopes", []) or []
+                    )
             # Unwrap Security marker → extend scopes + resolve its callable.
             if isinstance(marker_or_fn, _Sec_marker):
                 next_scopes = list(accumulated_scopes) + list(
@@ -7809,6 +7817,7 @@ class FastAPI:
                 return await _resolve_dep(
                     dep_fn, cache, next_scopes,
                     dep_scope=_marker_scope, use_cache=_marker_use_cache,
+                    _own_scopes_for_key=_marker_own_scopes,
                 )
             if isinstance(marker_or_fn, _Dep_marker):
                 dep_fn = marker_or_fn.dependency
@@ -7876,6 +7885,11 @@ class FastAPI:
                 _dep_uses_security_scopes = _consumes_security_scopes(actual_fn)
             except Exception:  # noqa: BLE001
                 _dep_uses_security_scopes = False
+            # FA's ``_uses_scopes`` is also True when THIS
+            # Dependant's own_oauth_scopes is non-empty — i.e. the
+            # IMMEDIATE Security marker had ``scopes=[...]``.
+            if _marker_own_scopes or _own_scopes_for_key:
+                _dep_uses_security_scopes = True
             if _dep_uses_security_scopes:
                 cache_key = (
                     actual_fn,
@@ -8757,6 +8771,15 @@ class FastAPI:
                         dep_callable, dep_cache, top_scopes,
                         dep_scope=p.get("_dep_scope"),
                         use_cache=p.get("use_cache", True),
+                        # Forward the IMMEDIATE Security marker's own
+                        # scopes so the cache key flips into "scope-
+                        # aware" mode at the leaf — required for
+                        # ``test_security_cache`` where two
+                        # ``Security(dep, scopes=["scope"])`` should
+                        # cache as the same entry but a third
+                        # ``Security(dep)`` (no scopes) should be
+                        # distinct.
+                        _own_scopes_for_key=top_scopes,
                     )
                     continue
 

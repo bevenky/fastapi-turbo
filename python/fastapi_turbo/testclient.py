@@ -150,8 +150,21 @@ class _ASGISyncClientShim:
         # to synthetic 500 responses so the test can assert on them.
         # Starlette's TestClient threads this via
         # ``raise_server_exceptions``; we match that semantic.
+        # Wrap the app to override ``scope["client"]`` to
+        # ``("testclient", 50000)`` — Starlette's TestClient pins
+        # this so user code reading ``request.client.host`` sees the
+        # canonical "testclient" string. httpx's ASGITransport
+        # defaults to ("127.0.0.1", port); FA tests assert on the
+        # exact "testclient" value (probe-confirmed against
+        # ``test_using_request_directly``).
+        async def _scope_overriding_app(_scope, _receive, _send):
+            if _scope.get("type") in ("http", "websocket"):
+                _scope = dict(_scope)
+                _scope["client"] = ("testclient", 50000)
+            await app(_scope, _receive, _send)
         transport = httpx.ASGITransport(
-            app=app, raise_app_exceptions=raise_app_exceptions,
+            app=_scope_overriding_app,
+            raise_app_exceptions=raise_app_exceptions,
         )
 
         async def _mk_client():
