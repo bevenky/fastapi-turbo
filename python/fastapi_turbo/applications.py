@@ -7453,6 +7453,16 @@ class FastAPI:
                 "body": _msg,
             })
             return True
+        except Exception as _drain_exc:  # noqa: BLE001
+            # A user-supplied raw-ASGI middleware can wrap ``receive``
+            # to raise ``HTTPException`` (e.g. content-size limits).
+            # Route through the standard exception emit path —
+            # without this the exception escaped past the dispatcher
+            # and the test client saw a network-level failure rather
+            # than the user's intended 422. Probe-confirmed against
+            # ``test_custom_middleware_exception``.
+            await _asgi_emit_exception(self, scope, send, _drain_exc)
+            return True
         req_scope["_fastapi_turbo_prebuffered_body"] = body_bytes
         req_scope["_body"] = body_bytes
 
@@ -8934,6 +8944,23 @@ class FastAPI:
                     from pydantic import ValidationError as _PyVE2
                     is_combined = name == "_combined_body" and model_class is not None
                     if is_combined:
+                        # Combined body needs a dict-shaped wire
+                        # payload. ``parsed_body=[]`` (empty list) /
+                        # other non-dict shapes have no field
+                        # mapping — emit per-field missing errors
+                        # rather than letting Pydantic produce a
+                        # ``model_attributes_type``. Probe-confirmed
+                        # against
+                        # ``test_body_multiple_params/test_post_body_empty_list``.
+                        if parsed_body is not None and not isinstance(parsed_body, dict):
+                            _cb_fields_nd = getattr(
+                                model_class, "model_fields", {}
+                            ) or {}
+                            if _cb_fields_nd:
+                                raise _RVE_err([
+                                    _missing("body", _fn) for _fn in _cb_fields_nd
+                                ])
+                            raise _RVE_err([_missing("body", name)])
                         if parsed_body is None:
                             if required:
                                 # Emit one ``missing`` per body field.
