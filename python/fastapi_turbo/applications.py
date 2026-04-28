@@ -8196,16 +8196,61 @@ class FastAPI:
                         parsed_body = _json.loads(body_bytes)
                         body_parsed = True
                     except _json.JSONDecodeError as jde:
-                        # FA shape: ``msg`` is the bare ``"JSON decode
-                        # error"`` and the position-specific detail
-                        # lives in ``ctx={"error": jde.msg}``.
-                        raise _RVE_err([{
-                            "type": "json_invalid",
-                            "loc": ["body", jde.pos],
-                            "msg": "JSON decode error",
-                            "input": {},
-                            "ctx": {"error": jde.msg},
-                        }]) from None
+                        # When content-type is JSON but the body
+                        # fails JSON parse: emit ``json_invalid``
+                        # (FA's parse-failure shape).
+                        # When content-type is something OTHER than
+                        # JSON (form-encoded, plain-text, missing)
+                        # but the endpoint declares a model body, FA
+                        # hands the raw body to ``model_validate``
+                        # so Pydantic's ``model_attributes_type``
+                        # error surfaces with the raw body in
+                        # ``input``. Detect via the request's
+                        # ``content-type``.
+                        _req_ct_l = ""
+                        for _hk_ct, _hv_ct in scope.get("headers", []) or []:
+                            _hkl_ct = (
+                                _hk_ct.decode("latin-1")
+                                if isinstance(_hk_ct, bytes)
+                                else _hk_ct
+                            ).lower()
+                            if _hkl_ct == "content-type":
+                                _req_ct_l = (
+                                    _hv_ct.decode("latin-1")
+                                    if isinstance(_hv_ct, bytes)
+                                    else _hv_ct
+                                ).lower()
+                                break
+                        _is_json_ct = (
+                            "application/json" in _req_ct_l
+                            or "application/" in _req_ct_l
+                            and "+json" in _req_ct_l
+                        )
+                        _model_body_present = any(
+                            (
+                                _bp.get("model_class") is not None
+                                or _bp.get("name") == "_combined_body"
+                            )
+                            for _bp in body_params
+                        )
+                        if _model_body_present and not _is_json_ct:
+                            try:
+                                _raw_body_str = body_bytes.decode("utf-8")
+                            except Exception:  # noqa: BLE001
+                                _raw_body_str = repr(body_bytes)
+                            parsed_body = _raw_body_str
+                            body_parsed = True
+                        else:
+                            # FA shape: ``msg`` is the bare ``"JSON
+                            # decode error"`` and the position-specific
+                            # detail lives in ``ctx={"error": jde.msg}``.
+                            raise _RVE_err([{
+                                "type": "json_invalid",
+                                "loc": ["body", jde.pos],
+                                "msg": "JSON decode error",
+                                "input": {},
+                                "ctx": {"error": jde.msg},
+                            }]) from None
             elif body_params and not body_bytes:
                 # Body expected but empty — emit a missing-body 422
                 # matching FA's shape. For an embedded single body
@@ -8848,6 +8893,21 @@ class FastAPI:
             "exclude_defaults": getattr(_route, "response_model_exclude_defaults", False),
             "exclude_none": getattr(_route, "response_model_exclude_none", False),
             "by_alias": getattr(_route, "response_model_by_alias", True),
+            # Carry endpoint context (function name / file / line /
+            # path) into the response_model validator so any
+            # ``ResponseValidationError`` it raises shows ``in
+            # <endpoint>`` in the user's exception_handler — matches
+            # FA's ``test_validation_error_context`` suite.
+            "endpoint_ctx": {
+                "function": getattr(endpoint, "__name__", None),
+                "file": getattr(
+                    getattr(endpoint, "__code__", None), "co_filename", None
+                ),
+                "line": getattr(
+                    getattr(endpoint, "__code__", None), "co_firstlineno", None
+                ),
+                "path": getattr(_route, "path", None),
+            },
         }
         _status_code = getattr(_route, "status_code", None)
 
