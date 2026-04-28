@@ -7420,7 +7420,17 @@ class FastAPI:
                 if ct_lower.startswith("application/x-www-form-urlencoded"):
                     from urllib.parse import parse_qsl
                     for k, v in parse_qsl(body_bytes.decode("utf-8"), keep_blank_values=True):
-                        form_fields[k] = v
+                        # Repeated keys ⇒ list (matches Starlette's
+                        # ``FormData`` semantics). Without this a
+                        # ``list[str]`` form param only saw the LAST
+                        # value of a multi-value submission.
+                        _existing_uf = form_fields.get(k)
+                        if _existing_uf is None:
+                            form_fields[k] = v
+                        elif isinstance(_existing_uf, list):
+                            _existing_uf.append(v)
+                        else:
+                            form_fields[k] = [_existing_uf, v]
                 elif ct_lower.startswith("multipart/form-data"):
                     import email.parser as _email_parser
                     # RFC 2045 §5.1: param names case-insensitive,
@@ -7575,6 +7585,29 @@ class FastAPI:
                 "input": raw,
             }
 
+        # ``_PARAM_MODEL_MISSING`` is the sentinel
+        # ``_maybe_expand_param_models`` puts in ``default_value`` for
+        # synthesized list-shaped extraction params. The builder dep
+        # later checks ``is _PARAM_MODEL_MISSING`` to decide whether
+        # the field was supplied — passing it through unchanged keeps
+        # that contract. For ``Optional[list[X]] = None`` the user's
+        # actual default is ``None`` and they want ``None`` back; only
+        # fall through to ``[]`` when there is no explicit default
+        # (which currently can't happen on a non-required list, but
+        # the third branch is defensive).
+        from fastapi_turbo._introspect import (
+            _PARAM_MODEL_MISSING as _PMM_local,
+        )
+
+        def _list_default_for_missing(_pdesc, dv, has_dflt):
+            if dv is _PMM_local:
+                return _PMM_local
+            if has_dflt:
+                if isinstance(dv, (list, tuple, set, frozenset)):
+                    return list(dv)
+                return dv
+            return []
+
         def _coerce(raw, target_ann):
             if target_ann is int:
                 return int(raw)
@@ -7634,6 +7667,24 @@ class FastAPI:
         from fastapi_turbo.security import SecurityScopes as _SS_cls
 
         dep_teardowns: list = []  # (gen, is_async) pairs
+
+        # Lazily-allocated single ``Response`` instance shared between
+        # the handler and any deps that ask for a ``response: Response``
+        # parameter. FastAPI's contract: deps mutating ``response.headers``
+        # must affect the FINAL response the user sees (e.g. an auth
+        # dep that adds an ``X-Auth-Source`` header to every reply).
+        # The handler-level resolver below allocates this on first
+        # use; the dep resolver pulls from the same slot.
+        _shared_response_holder: list = [None]
+        # Same shared-state pattern for ``BackgroundTasks`` so a dep
+        # that calls ``bg.add_task(...)`` and the handler that does
+        # the same end up scheduling against ONE container.
+        _bg_holder: list = [None]
+
+        def _get_or_create_response_inject():
+            if _shared_response_holder[0] is None:
+                _shared_response_holder[0] = _Resp_cls()
+            return _shared_response_holder[0]
 
         async def _resolve_dep(marker_or_fn, cache, accumulated_scopes):
             """Resolve ``marker_or_fn`` recursively. ``cache`` dedups
@@ -7747,6 +7798,34 @@ class FastAPI:
                     raw_ann = dp.get("_raw_annotation")
                     if isinstance(raw_ann, type) and issubclass(raw_ann, _SS_cls):
                         sub_kwargs[dname] = _SS_cls(scopes=list(accumulated_scopes))
+                        continue
+                    # Response / Request / BackgroundTasks injection
+                    # for deps. Earlier the dep resolver only handled
+                    # query / header / cookie / dependency / SecurityScopes
+                    # — params like ``response: Response`` fell through
+                    # to the query fallback and got None. Probe-confirmed
+                    # against upstream's
+                    # ``test_include_router_defaults_overrides`` (43
+                    # tests): a dep mutating ``response.headers``
+                    # crashed because response was None. Now we share
+                    # one Response instance with the handler-level
+                    # resolver via ``_shared_response_holder`` so
+                    # mutations propagate to the final response.
+                    if dkind == "inject_response":
+                        sub_kwargs[dname] = _get_or_create_response_inject()
+                        continue
+                    if dkind == "inject_request":
+                        sub_kwargs[dname] = _Req(req_scope, receive=receive)
+                        continue
+                    if dkind == "inject_background_tasks":
+                        # Reuse the request's BG container so deps and
+                        # handler share one ``add_task`` queue.
+                        nonlocal_bg = _bg_holder[0]
+                        if nonlocal_bg is None:
+                            nonlocal_bg = _BGT()
+                            nonlocal_bg._app = self
+                            _bg_holder[0] = nonlocal_bg
+                        sub_kwargs[dname] = nonlocal_bg
                         continue
                     # Fallback: parameter default.
                     if drequired:
@@ -8064,6 +8143,76 @@ class FastAPI:
                     if dep_callable is None:
                         kwargs[name] = None
                         continue
+                    # FA 0.115+ parameter-model synthetic builder:
+                    # ``_maybe_expand_param_models`` flattens
+                    # ``p: Annotated[MyModel, Query()]`` into N synthetic
+                    # extraction params (one per model field) plus this
+                    # builder dep that reconstructs the model from those
+                    # extracted values. Its ``dep_input_map`` pre-wires
+                    # the builder's kwargs to the synthesized field
+                    # names — running it through ``_resolve_dep`` would
+                    # introspect the wrapper closure (no params) and
+                    # drop the mapping. The Rust+resolver path handles
+                    # this via ``_resolution.py:624``; the in-process
+                    # dispatcher used to fall through to ``_resolve_dep``
+                    # and produce ``unexpected keyword argument
+                    # 'pm_p__p'`` 422s when the synthesized fields then
+                    # leaked into the user handler call.
+                    if p.get("_is_param_model_builder"):
+                        dep_in_map = p.get("dep_input_map") or []
+                        builder_kwargs = {}
+                        for dest_key, src_key in dep_in_map:
+                            if src_key == "__fastapi_turbo_raw_query__":
+                                # FA's ``model_validate(raw_query_dict)``
+                                # contract: hand the model the wire-key
+                                # → raw-value (last-occurrence wins for
+                                # scalar, list for repeated). Pydantic
+                                # then runs its own validator on the
+                                # whole model and surfaces FA-shaped
+                                # ``loc=["query","f"]`` errors.
+                                rd: dict = {}
+                                for qk, qv in _qp_items:
+                                    _ex = rd.get(qk)
+                                    if _ex is None:
+                                        rd[qk] = qv
+                                    elif isinstance(_ex, list):
+                                        _ex.append(qv)
+                                    else:
+                                        rd[qk] = [_ex, qv]
+                                builder_kwargs[dest_key] = rd
+                            elif src_key == "__fastapi_turbo_raw_headers__":
+                                rd_h: dict = {}
+                                for hk_, hv_ in scope.get("headers", []) or []:
+                                    _hk = (
+                                        hk_.decode("latin-1")
+                                        if isinstance(hk_, bytes)
+                                        else hk_
+                                    ).lower()
+                                    _hv = (
+                                        hv_.decode("latin-1")
+                                        if isinstance(hv_, bytes)
+                                        else hv_
+                                    )
+                                    _exh = rd_h.get(_hk)
+                                    if _exh is None:
+                                        rd_h[_hk] = _hv
+                                    elif isinstance(_exh, list):
+                                        _exh.append(_hv)
+                                    else:
+                                        rd_h[_hk] = [_exh, _hv]
+                                builder_kwargs[dest_key] = rd_h
+                            elif src_key == "__fastapi_turbo_raw_cookies__":
+                                builder_kwargs[dest_key] = dict(_scope_cookies)
+                            elif src_key == "__fastapi_turbo_raw_form__":
+                                builder_kwargs[dest_key] = dict(form_fields)
+                            else:
+                                # Normal extraction-step source — pull
+                                # from the kwargs we've already populated.
+                                if src_key in kwargs:
+                                    builder_kwargs[dest_key] = kwargs[src_key]
+                        # Builders are sync; ``model_validate`` is sync.
+                        kwargs[name] = dep_callable(**builder_kwargs)
+                        continue
                     # Seed with scopes from a top-level ``Security(...)``
                     # marker so the inner-dep ``SecurityScopes`` param
                     # sees them (matches FA semantics).
@@ -8085,7 +8234,7 @@ class FastAPI:
                         if not vals:
                             if required:
                                 raise _RVE_err([_missing("query", alias)])
-                            kwargs[name] = list(default_val) if default_val is not None else []
+                            kwargs[name] = _list_default_for_missing(p, default_val, has_default)
                             continue
                         kwargs[name] = _validate(
                             scalar_validator, vals, "query", alias,
@@ -8122,7 +8271,7 @@ class FastAPI:
                         if not vals:
                             if required:
                                 raise _RVE_err([_missing("header", hdr_alias)])
-                            kwargs[name] = list(default_val) if default_val is not None else []
+                            kwargs[name] = _list_default_for_missing(p, default_val, has_default)
                             continue
                         kwargs[name] = _validate(
                             scalar_validator, vals, "header", hdr_alias,
@@ -8225,20 +8374,53 @@ class FastAPI:
 
                 if kind in ("form", "file"):
                     val = form_fields.get(alias)
+                    # FA emits form/file errors under the ``body`` loc
+                    # prefix (forms are classified as body in 422s) —
+                    # ``["body", "p"]``, not ``["form", "p"]``.
+                    if is_list_param:
+                        # List form/file: collect into a list. The
+                        # parser stores repeated keys as a list, single
+                        # values as scalars; normalize so the param
+                        # always receives a list.
+                        if val is None:
+                            if required:
+                                raise _RVE_err([_missing("body", alias)])
+                            kwargs[name] = _list_default_for_missing(p, default_val, has_default)
+                            continue
+                        vals = val if isinstance(val, list) else [val]
+                        if kind == "file":
+                            kwargs[name] = vals
+                        else:
+                            kwargs[name] = _validate(
+                                p.get("scalar_validator"),
+                                vals,
+                                "body",
+                                alias,
+                                annotation=p.get("_unwrapped_annotation"),
+                            )
+                        continue
                     if val is None:
                         if required:
-                            raise _RVE_err([_missing(kind, alias)])
+                            raise _RVE_err([_missing("body", alias)])
                         kwargs[name] = default_val
                     else:
                         if kind == "file":
                             # File uploads stay raw — they're already
-                            # an ``UploadFile`` object.
+                            # an ``UploadFile`` object. If the parser
+                            # produced a list (multiple files under
+                            # the same field name) but the param is
+                            # scalar, take the first to preserve FA
+                            # parity.
+                            if isinstance(val, list):
+                                val = val[0]
                             kwargs[name] = val
                         else:
                             # Coerce the form value to the parameter's
                             # declared type via Pydantic. Without this
                             # ``age: int = Form(...)`` would receive
                             # the string ``"30"`` rather than ``30``.
+                            if isinstance(val, list):
+                                val = val[0]
                             kwargs[name] = _validate(
                                 p.get("scalar_validator"),
                                 val,
@@ -8257,15 +8439,25 @@ class FastAPI:
                     kwargs[name] = _Req(req_scope, receive=receive)
                     continue
                 if kind in ("inject_response",):
-                    resp_inst = _Resp_cls()
+                    # Share the SAME instance with any deps that asked
+                    # for ``response: Response``. ``_get_or_create_
+                    # response_inject`` lazy-allocates and stores in
+                    # ``_shared_response_holder[0]``; the dep resolver
+                    # reads from the same slot. Without this, deps had
+                    # their own (different) Response instance and any
+                    # headers they set didn't reach the handler's
+                    # response.
+                    resp_inst = _get_or_create_response_inject()
                     response_injected = resp_inst
                     kwargs[name] = resp_inst
                     continue
                 if kind in ("inject_background_tasks",):
-                    bg_inst = _BGT()
-                    bg_inst._app = self
-                    bg_injected = bg_inst
-                    kwargs[name] = bg_inst
+                    if _bg_holder[0] is None:
+                        bg_inst = _BGT()
+                        bg_inst._app = self
+                        _bg_holder[0] = bg_inst
+                    bg_injected = _bg_holder[0]
+                    kwargs[name] = bg_injected
                     continue
 
                 # Unknown kind — skip (defer to endpoint default).
@@ -8323,11 +8515,45 @@ class FastAPI:
         }
         _status_code = getattr(_route, "status_code", None)
 
+        # Filter ``kwargs`` to ONLY the keys the user handler actually
+        # takes. The synthesized field-extraction params from
+        # ``_maybe_expand_param_models`` (``pm_p__p`` etc.) feed the
+        # builder dep, not the handler. Without this filter the user
+        # function got hit with ``unexpected keyword argument
+        # 'pm_p__p'``. The endpoint signature is the source of truth —
+        # introspect_params has placeholders like ``_combined_body``
+        # that don't appear on the user fn, while the body splitter
+        # writes back to the original names (``qty`` etc.) that DO.
+        try:
+            _ep_sig_local = _insp.signature(endpoint)
+            _accepts_var_kw = any(
+                _pp.kind is _insp.Parameter.VAR_KEYWORD
+                for _pp in _ep_sig_local.parameters.values()
+            )
+            if not _accepts_var_kw:
+                _ep_param_names = set(_ep_sig_local.parameters.keys())
+                kwargs = {
+                    _kk: _vv for _kk, _vv in kwargs.items()
+                    if _kk in _ep_param_names
+                }
+        except (TypeError, ValueError):
+            # Builtin / C function with no introspectable signature —
+            # leave kwargs as-is so the runtime call still surfaces a
+            # meaningful error.
+            pass
+
         async def _call_endpoint(_request):
             """Invoke the endpoint + apply response_model. Exceptions
             propagate — the outer envelope routes them through the
             app's exception_handlers."""
             from fastapi_turbo._route_helpers import _apply_response_model
+            # We assign to ``response_injected`` below if a dep
+            # injected one but the handler didn't take a Response
+            # parameter. Mark it nonlocal so the assignment doesn't
+            # turn the name into a fresh local (which would shadow
+            # the outer scope's value and trip UnboundLocalError on
+            # the read-before-assign at line 8423).
+            nonlocal response_injected
 
             if _insp.iscoroutinefunction(endpoint):
                 r = await endpoint(**kwargs)
@@ -8359,8 +8585,28 @@ class FastAPI:
                 out = response_class(content=_je(r), status_code=status_code)
             else:
                 out = response_class(content=r, status_code=status_code)
+            # Pull any dep-mutated Response even when the handler itself
+            # didn't take one — deps often add headers via
+            # ``response: Response`` while the handler returns a
+            # plain dict. Without this fold, those header mutations
+            # got dropped on the floor.
+            if response_injected is None and _shared_response_holder[0] is not None:
+                response_injected = _shared_response_holder[0]
             if response_injected is not None:
+                # Iterate ``headers`` (the dict view) AND ``raw_headers``
+                # so we catch both ``response.headers["k"] = "v"``
+                # (which only updates the dict) AND
+                # ``response.headers.append("k", "v")`` (which also
+                # appends to raw_headers).
+                _seen_dup = set()
+                for k, v in (
+                    getattr(response_injected, "headers", {}) or {}
+                ).items():
+                    out.headers[k] = v
+                    _seen_dup.add((k, str(v)))
                 for k, v in getattr(response_injected, "raw_headers", []) or []:
+                    if (k, v) in _seen_dup:
+                        continue
                     out.raw_headers.append((k, v))
                 if getattr(response_injected, "status_code", None):
                     out.status_code = response_injected.status_code
@@ -8476,8 +8722,28 @@ class FastAPI:
                 final = response_class(content=_je(result))
             else:
                 final = response_class(content=result)
+            # Pull any dep-mutated Response even when the handler itself
+            # didn't take one — deps often add headers via
+            # ``response: Response`` while the handler returns a
+            # plain dict. Without this fold, those header mutations
+            # got dropped on the floor.
+            if response_injected is None and _shared_response_holder[0] is not None:
+                response_injected = _shared_response_holder[0]
             if response_injected is not None:
+                # Iterate ``headers`` (the dict view) AND ``raw_headers``
+                # so we catch both ``response.headers["k"] = "v"``
+                # (which only updates the dict) AND
+                # ``response.headers.append("k", "v")`` (which also
+                # appends to raw_headers).
+                _seen_dup = set()
+                for k, v in (
+                    getattr(response_injected, "headers", {}) or {}
+                ).items():
+                    final.headers[k] = v
+                    _seen_dup.add((k, str(v)))
                 for k, v in getattr(response_injected, "raw_headers", []) or []:
+                    if (k, v) in _seen_dup:
+                        continue
                     final.raw_headers.append((k, v))
                 if getattr(response_injected, "status_code", None):
                     final.status_code = response_injected.status_code
