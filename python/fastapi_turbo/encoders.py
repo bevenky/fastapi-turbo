@@ -101,6 +101,26 @@ def jsonable_encoder(
     if isinstance(obj, PurePath):
         return str(obj)
 
+    # Pydantic v2 ``Url`` / ``MultiHostUrl`` types — these are
+    # ``pydantic_core._pydantic_core.Url`` instances. Stringify like
+    # PurePath. Pydantic also wraps these in ``pydantic.networks.
+    # AnyUrl`` / ``HttpUrl`` / ``_BaseUrl`` which inherit a different
+    # MRO; cover both via duck-typing on ``__str__`` + the marker
+    # attribute. Without this the dict-iter fallback tries to
+    # iterate the URL and fails with ``object is not iterable``.
+    try:
+        from pydantic_core import Url as _PyCoreUrl, MultiHostUrl as _PyCoreMHUrl
+        if isinstance(obj, (_PyCoreUrl, _PyCoreMHUrl)):
+            return str(obj)
+    except ImportError:
+        pass
+    try:
+        from pydantic.networks import _BaseUrl as _PydBaseUrl  # type: ignore[attr-defined]
+        if isinstance(obj, _PydBaseUrl):
+            return str(obj)
+    except (ImportError, AttributeError):
+        pass
+
     # Primitives
     if isinstance(obj, (str, int, float, type(None))):
         return obj

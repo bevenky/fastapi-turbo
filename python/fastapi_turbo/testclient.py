@@ -1071,13 +1071,20 @@ class TestClient:
         # lifespan STARTUP phase before ``__enter__`` returns — the
         # tutorial ``app_testing/tutorial004`` pattern asserts the
         # lifespan populated ``items`` inside the ``with`` block.
-        # If the server-backed ensure_started wouldn't fire startup
-        # soon enough, run it explicitly in the current thread.
-        if (
+        # ``on_startup=`` handlers (router-level + app-level legacy
+        # ``@app.on_event('startup')``) must also fire here even when
+        # there is no lifespan context manager, since the in-process
+        # path doesn't go through the real server boot sequence that
+        # ordinarily drives them.
+        _has_lifespan = (
             hasattr(self.app, "_collect_lifespans")
             and self.app._collect_lifespans()
             and not getattr(self.app, "_lifespan_cms", None)
-        ):
+        )
+        _has_startup_handlers = bool(
+            getattr(self.app, "_collect_startup_handlers", lambda: [])()
+        )
+        if _has_lifespan or _has_startup_handlers:
             # Startup failures must propagate — Starlette's TestClient
             # raises whatever lifespan startup raised so the caller's
             # ``with TestClient(app) as cli:`` block surfaces a real
@@ -1087,6 +1094,10 @@ class TestClient:
             # app returned 200 against an uninitialised state
             # (probe-confirmed by R39).
             self.app._run_lifespan_startup()
+            if _has_startup_handlers:
+                _run = getattr(self.app, "_run_startup_handlers", None)
+                if _run is not None:
+                    _run()
         self._ensure_started()
         return self
 
@@ -1479,6 +1490,9 @@ class _InProcessWebSocketSession:
         self._accepted = False
         self._accepted_subprotocol: str | None = None
         self._closed = False
+        # Captured exception from the app task — re-raised in
+        # ``__exit__`` so server-side errors surface to the test.
+        self._task_exception: BaseException | None = None
 
     def _run(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
@@ -1590,6 +1604,15 @@ class _InProcessWebSocketSession:
                 self._loop.close()
         except Exception:  # noqa: BLE001
             pass
+        # Re-raise any server-side exception captured during
+        # ``close`` — Starlette parity (FA's
+        # ``raise_server_exceptions=True`` default surfaces in-app
+        # errors to the test client). Only re-raise if no exception
+        # is already in flight from the test body.
+        if self._task_exception is not None and not exc[0]:
+            _re = self._task_exception
+            self._task_exception = None
+            raise _re
 
     def __del__(self):
         try:
@@ -1666,10 +1689,18 @@ class _InProcessWebSocketSession:
             except Exception:  # noqa: BLE001
                 pass
             if self._app_task is not None:
+                # Capture the app task's exception (if any) so the
+                # session's caller can surface it. Starlette's
+                # ``WebSocketTestSession`` re-raises in __exit__ —
+                # we match that contract for ``raise_server_
+                # exceptions=True`` paths (FA's
+                # ``test_websocket_dependency_after_yield_broken``).
                 try:
                     await asyncio.wait_for(self._app_task, timeout=1.0)
-                except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                except asyncio.TimeoutError:
                     pass
+                except BaseException as _exc:  # noqa: BLE001
+                    self._task_exception = _exc
 
         try:
             self._run(_disconnect())

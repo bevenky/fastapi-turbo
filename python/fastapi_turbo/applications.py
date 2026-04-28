@@ -1778,22 +1778,51 @@ async def _asgi_emit_exception(app, scope, send, exc):
 
     if isinstance(exc, _HE):
         headers = getattr(exc, "headers", None) or {}
-        resp = _JR(content={"detail": exc.detail}, status_code=exc.status_code)
+        # Per RFC 9110 + Starlette: HTTP 1xx / 204 / 304 MUST NOT
+        # carry a body. Earlier we always emitted ``{"detail":null}``
+        # which broke ``test_starlette_exception::test_no_body_status_
+        # code_exception_handlers`` (response.content asserted empty).
+        from fastapi_turbo.responses import Response as _PlainResp
+        if exc.status_code in (204, 304) or 100 <= exc.status_code < 200:
+            resp = _PlainResp(status_code=exc.status_code)
+        else:
+            resp = _JR(content={"detail": exc.detail}, status_code=exc.status_code)
         for k, v in headers.items():
             resp.headers[k] = v
         await _send_asgi_response(send, resp)
         return
     if isinstance(exc, _RVE):
+        # Pydantic ``ctx`` may carry ``Decimal`` / ``Path`` /
+        # other JSON-non-native types that explode in
+        # ``json.dumps``. Run the error list through ``jsonable_
+        # encoder`` first so Decimal → float, datetime → str, etc.
+        # Probe-confirmed against
+        # ``test_multi_body_errors::test_jsonable_encoder_requiring_error``.
+        from fastapi_turbo.encoders import jsonable_encoder as _je2
         await _send_asgi_response(
-            send, _JR(content={"detail": exc.errors()}, status_code=422)
+            send, _JR(
+                content={"detail": _je2(exc.errors())}, status_code=422
+            )
         )
         return
-    # Unhandled non-FA exception. Upstream FastAPI / Starlette
-    # RE-RAISE these through the ASGI callable so TestClient /
-    # ASGITransport users see the real exception (and can assert
-    # on it). We match that contract: only synthesise a 500 when
-    # the app has registered an ``Exception`` handler to explicitly
-    # swallow it. Otherwise raise.
+    # Unhandled non-FA exception. Upstream Starlette's
+    # ``ServerErrorMiddleware`` ALWAYS sends a 500 with body
+    # ``Internal Server Error`` first, then re-raises so
+    # ``raise_server_exceptions=True`` tests still see the
+    # exception. With ``raise_server_exceptions=False``, the
+    # transport catches the re-raise and the rendered 500 body
+    # is what the test sees. Probe-confirmed against
+    # ``test_dependency_after_yield_streaming::test_broken_session_
+    # data_no_raise``: expects ``response.text == "Internal Server
+    # Error"`` under ``raise_server_exceptions=False``.
+    try:
+        from fastapi_turbo.responses import PlainTextResponse as _PTR
+        await _send_asgi_response(
+            send,
+            _PTR("Internal Server Error", status_code=500),
+        )
+    except Exception:  # noqa: BLE001
+        pass
     raise exc
 
 
@@ -3161,6 +3190,12 @@ class FastAPI:
                         )
                     if eff_extra_deps:
                         clone._fastapi_turbo_include_deps = list(eff_extra_deps)
+                    # Stamp the owning router so the in-process
+                    # dispatcher can resolve closest-wins precedence
+                    # for ``strict_content_type`` (and any other
+                    # router-level setting) at request time without
+                    # having to walk the include tree.
+                    clone._fastapi_turbo_owner_router = src_router
                     self.router.routes.append(clone)
                 for entry in getattr(src_router, "_included_routers", []):
                     child_router, child_prefix = entry[0], entry[1]
@@ -6083,7 +6118,13 @@ class FastAPI:
         _openapi_url_val = self.openapi_url
         from fastapi_turbo.routing import APIRoute
 
-        if _openapi_url_val is not None:
+        # FA contract: ``openapi_url=""`` (empty string) disables
+        # the OpenAPI schema endpoint entirely — same as
+        # ``openapi_url=None``. Probe-confirmed against
+        # ``test_conditional_openapi/test_tutorial001::test_disable
+        # _openapi`` which sets the env var to empty string and
+        # expects 404.
+        if _openapi_url_val:
             _app_ref = self
 
             def _openapi_dynamic():
@@ -6118,7 +6159,7 @@ class FastAPI:
         # into ``run_server``; for the in-process path we register
         # Python handlers that return the HTML produced by the
         # ``fastapi.openapi.docs`` helpers.
-        if self.docs_url is not None and _openapi_url_val is not None:
+        if self.docs_url is not None and _openapi_url_val:
             try:
                 import fastapi_turbo.compat as _c
                 _c.install()
@@ -6152,7 +6193,7 @@ class FastAPI:
                 _swag_route._fastapi_turbo_bypass_deps = True
                 self.router.routes.insert(0, _swag_route)
 
-        if self.redoc_url is not None and _openapi_url_val is not None:
+        if self.redoc_url is not None and _openapi_url_val:
             try:
                 import fastapi_turbo.compat as _c
                 _c.install()
@@ -6194,7 +6235,7 @@ class FastAPI:
         if (
             self.swagger_ui_oauth2_redirect_url is not None
             and self.docs_url is not None
-            and _openapi_url_val is not None
+            and _openapi_url_val
         ):
             try:
                 import fastapi_turbo.compat as _c
@@ -6279,7 +6320,7 @@ class FastAPI:
         # instances surface immediately
         # (``test_openapi_cache_root_path``).
         _openapi_url_val = self.openapi_url
-        if _openapi_url_val is not None:
+        if _openapi_url_val:
             _app_ref = self
 
             def _openapi_dynamic():
@@ -6378,7 +6419,7 @@ class FastAPI:
         # baked JSON so Rust's auto-registered ``/openapi.json`` route
         # is skipped. Keep ``openapi_url`` set because swagger/redoc
         # HTML uses it in the ``fetch('<url>')`` call.
-        if _openapi_url_val is not None:
+        if _openapi_url_val:
             openapi_json = None
         _openapi_url_for_rust = self.openapi_url
 
@@ -6704,6 +6745,18 @@ class FastAPI:
         if scope["type"] == "lifespan":
             await self._asgi_lifespan(scope, receive, send)
             return
+
+        # Inject the app's configured ``root_path`` into the ASGI
+        # scope when the transport didn't already supply one
+        # (httpx ``ASGITransport`` and TestClient default to
+        # ``""``). FA's reverse-proxy tutorial expects
+        # ``request.scope["root_path"]`` to reflect
+        # ``FastAPI(root_path="/api/v1")``.
+        if scope.get("type") in ("http", "websocket"):
+            _app_root = getattr(self, "root_path", "") or ""
+            if _app_root and not scope.get("root_path"):
+                scope = dict(scope)
+                scope["root_path"] = _app_root
 
         if scope["type"] == "http":
             # Install the dynamic OpenAPI / docs / redoc routes on
@@ -7729,13 +7782,22 @@ class FastAPI:
                 _shared_response_holder[0] = _Resp_cls()
             return _shared_response_holder[0]
 
-        async def _resolve_dep(marker_or_fn, cache, accumulated_scopes):
+        async def _resolve_dep(marker_or_fn, cache, accumulated_scopes, dep_scope=None, use_cache=True):
             """Resolve ``marker_or_fn`` recursively. ``cache`` dedups
             calls for the same dep within one request (FA caching).
             ``accumulated_scopes`` is the list of OAuth2 scopes
             collected along the resolution path (consumed by any
             ``SecurityScopes`` param deeper in the chain).
             """
+            # FA 0.120+ ``scope`` carries through Depends/Security
+            # markers — capture before unwrapping so the inner
+            # generator's teardown is queued on the right list. Same
+            # for ``use_cache``.
+            _marker_scope = None
+            _marker_use_cache = use_cache
+            if isinstance(marker_or_fn, (_Sec_marker, _Dep_marker)):
+                _marker_scope = getattr(marker_or_fn, "scope", None)
+                _marker_use_cache = getattr(marker_or_fn, "use_cache", True)
             # Unwrap Security marker → extend scopes + resolve its callable.
             if isinstance(marker_or_fn, _Sec_marker):
                 next_scopes = list(accumulated_scopes) + list(
@@ -7744,18 +7806,41 @@ class FastAPI:
                 dep_fn = marker_or_fn.dependency
                 if dep_fn is None:
                     return None
-                return await _resolve_dep(dep_fn, cache, next_scopes)
+                return await _resolve_dep(
+                    dep_fn, cache, next_scopes,
+                    dep_scope=_marker_scope, use_cache=_marker_use_cache,
+                )
             if isinstance(marker_or_fn, _Dep_marker):
                 dep_fn = marker_or_fn.dependency
                 if dep_fn is None:
                     return None
-                return await _resolve_dep(dep_fn, cache, accumulated_scopes)
+                return await _resolve_dep(
+                    dep_fn, cache, accumulated_scopes,
+                    dep_scope=_marker_scope, use_cache=_marker_use_cache,
+                )
             dep_fn = marker_or_fn
             # Honour dependency_overrides.
             override = (getattr(self, "dependency_overrides", None) or {}).get(dep_fn)
             actual_fn = override if override is not None else dep_fn
-            cache_key = (actual_fn, tuple(sorted(accumulated_scopes)))
-            if cache_key in cache:
+            # FA 0.120+: ``Depends(dep, scope='function')`` and
+            # ``Depends(dep, scope='request')`` resolve to DIFFERENT
+            # instances within one request (the function-scope copy
+            # is torn down pre-response while request-scope persists
+            # past it). Including ``dep_scope`` in the cache key
+            # makes the two deps produce two distinct sessions —
+            # without this the first call's value leaks across
+            # scopes and a function-scope teardown closes the
+            # request-scope value too.
+            cache_key = (
+                actual_fn,
+                tuple(sorted(accumulated_scopes)),
+                (dep_scope or "request").lower(),
+            )
+            # When the caller asked for ``use_cache=False``, skip the
+            # cache lookup AND don't write back. FA's contract: each
+            # ``Depends(d, use_cache=False)`` runs the dep fresh.
+            _do_cache = use_cache
+            if _do_cache and cache_key in cache:
                 return cache[cache_key]
             try:
                 sub_sig = _insp.signature(actual_fn)
@@ -7804,7 +7889,9 @@ class FastAPI:
                             dp.get("_security_scopes_top") or []
                         )
                         sub_kwargs[dname] = await _resolve_dep(
-                            inner_call, cache, next_scopes
+                            inner_call, cache, next_scopes,
+                            dep_scope=dp.get("_dep_scope"),
+                            use_cache=dp.get("use_cache", True),
                         )
                         continue
                     if dkind == "query":
@@ -8010,14 +8097,20 @@ class FastAPI:
                     elif isinstance(sann, type) and issubclass(sann, (_Req, _HC)):
                         sub_kwargs[sname] = _Req(req_scope)
                     # else: leave unset; the dep may have **kwargs etc.
+            # FA 0.120+ scope semantics: ``function`` teardowns run
+            # IMMEDIATELY after the handler returns (before the
+            # response is sent — they CAN raise to abort the
+            # response with a 503). ``request`` (default) teardowns
+            # run AFTER the response is flushed.
+            _scope_for_gen = (dep_scope or "request").lower()
             if _insp.isasyncgenfunction(actual_fn):
                 gen = actual_fn(**sub_kwargs)
                 val = await gen.__anext__()
-                dep_teardowns.append((gen, True))
+                dep_teardowns.append((gen, True, _scope_for_gen))
             elif _insp.isgeneratorfunction(actual_fn):
                 gen = actual_fn(**sub_kwargs)
                 val = next(gen)
-                dep_teardowns.append((gen, False))
+                dep_teardowns.append((gen, False, _scope_for_gen))
             elif _insp.iscoroutinefunction(actual_fn):
                 val = await actual_fn(**sub_kwargs)
             else:
@@ -8034,12 +8127,13 @@ class FastAPI:
                 elif _insp.isasyncgen(val):
                     gen = val
                     val = await gen.__anext__()
-                    dep_teardowns.append((gen, True))
+                    dep_teardowns.append((gen, True, _scope_for_gen))
                 elif _insp.isgenerator(val):
                     gen = val
                     val = next(gen)
-                    dep_teardowns.append((gen, False))
-            cache[cache_key] = val
+                    dep_teardowns.append((gen, False, _scope_for_gen))
+            if _do_cache:
+                cache[cache_key] = val
             return val
 
         import typing as _tp
@@ -8186,64 +8280,154 @@ class FastAPI:
                 and body_params[0].get("_unwrapped_annotation") in (bytes, bytearray)
             )
 
+            # FA 0.120+ ``strict_content_type=True`` (default): the
+            # body is rejected with 422 if the request's Content-Type
+            # doesn't match the param's declared media type. The Rust
+            # path enforces this at compile time; the in-process
+            # dispatcher needs the same check. Closest-wins
+            # precedence: route → router → app.
+            #
+            # Strict mode rejects BOTH missing CT and wrong CT; lax
+            # mode accepts missing CT but still rejects a present-
+            # but-wrong CT (probe-confirmed against
+            # ``test_lax_post_with_text_plain_is_still_rejected``).
+            _route_strict_eff = getattr(matched_route, "strict_content_type", None)
+            if _route_strict_eff is None:
+                _router_for_route = getattr(matched_route, "_fastapi_turbo_owner_router", None)
+                if _router_for_route is not None:
+                    _route_strict_eff = getattr(_router_for_route, "strict_content_type", None)
+            if _route_strict_eff is None:
+                _route_strict_eff = getattr(self, "strict_content_type", True)
+            _strict_active = _route_strict_eff is True
+            _lax_active = _route_strict_eff is False
+            if (
+                (_strict_active or _lax_active)
+                and body_params
+                and body_bytes
+                and not wants_raw_bytes
+            ):
+                # Determine the expected content-type family from the
+                # body params' kinds. Form/File → form/multipart;
+                # otherwise JSON. Mixed body+form is illegal — the
+                # introspect plan would surface that earlier.
+                _has_form_param = any(
+                    p.get("kind") in ("form", "file") for p in introspect_params
+                )
+                if _has_form_param:
+                    _ok_cts = (
+                        "application/x-www-form-urlencoded",
+                        "multipart/form-data",
+                    )
+                else:
+                    _ok_cts = ("application/json",)
+                _req_ct_full = ""
+                for _hk, _hv in scope.get("headers", []) or []:
+                    if (
+                        _hk.decode("latin-1")
+                        if isinstance(_hk, bytes)
+                        else _hk
+                    ).lower() == "content-type":
+                        _req_ct_full = (
+                            _hv.decode("latin-1")
+                            if isinstance(_hv, bytes)
+                            else _hv
+                        ).lower()
+                        break
+                _ct_type_ok = bool(_req_ct_full) and any(
+                    _req_ct_full.startswith(_c)
+                    or (_c == "application/json" and "+json" in _req_ct_full)
+                    for _c in _ok_cts
+                )
+                # Strict mode: require Content-Type to be PRESENT.
+                # Don't check the type — let body parsing proceed
+                # and surface Pydantic's ``model_attributes_type``
+                # (or similar) on a wrong CT so the client sees the
+                # real type mismatch. Probe-confirmed against
+                # ``test_post_form_for_json``.
+                # Lax mode: don't require CT presence. But if CT IS
+                # present, it must be a JSON-compatible type — text/
+                # plain with a JSON-shaped body should still 422
+                # because the user EXPLICITLY declared the wrong CT.
+                # Probe-confirmed against
+                # ``test_lax_post_with_text_plain_is_still_rejected``.
+                if _strict_active and not _req_ct_full:
+                    raise _RVE_err([{
+                        "type": "missing",
+                        "loc": ["header", "content-type"],
+                        "msg": "Field required",
+                        "input": None,
+                    }])
+                if _lax_active and _req_ct_full and not _ct_type_ok:
+                    raise _RVE_err([{
+                        "type": "missing",
+                        "loc": ["header", "content-type"],
+                        "msg": f"Unexpected Content-Type: {_req_ct_full}",
+                        "input": _req_ct_full,
+                    }])
+
             if body_params and body_bytes:
                 if wants_raw_bytes:
                     parsed_body = bytes(body_bytes)
                     body_parsed = True
                 else:
                     import json as _json
-                    try:
-                        parsed_body = _json.loads(body_bytes)
-                        body_parsed = True
-                    except _json.JSONDecodeError as jde:
-                        # When content-type is JSON but the body
-                        # fails JSON parse: emit ``json_invalid``
-                        # (FA's parse-failure shape).
-                        # When content-type is something OTHER than
-                        # JSON (form-encoded, plain-text, missing)
-                        # but the endpoint declares a model body, FA
-                        # hands the raw body to ``model_validate``
-                        # so Pydantic's ``model_attributes_type``
-                        # error surfaces with the raw body in
-                        # ``input``. Detect via the request's
-                        # ``content-type``.
-                        _req_ct_l = ""
-                        for _hk_ct, _hv_ct in scope.get("headers", []) or []:
-                            _hkl_ct = (
-                                _hk_ct.decode("latin-1")
-                                if isinstance(_hk_ct, bytes)
-                                else _hk_ct
+                    # Detect the request's content-type to drive the
+                    # body-parse strategy. When CT is anything OTHER
+                    # than JSON (e.g. text/plain, form-encoded for a
+                    # JSON endpoint), DON'T parse JSON — pass the raw
+                    # body string to Pydantic so it surfaces a
+                    # ``model_attributes_type`` error with the raw
+                    # body in ``input``. FA's contract: the user
+                    # explicitly set the wrong CT, so the parse step
+                    # is skipped; the model validator rejects with a
+                    # Pydantic error rather than us silently coercing
+                    # JSON-shaped text/plain. Probe-confirmed against
+                    # ``test_tutorial/test_body/test_tutorial001::test_
+                    # wrong_headers``.
+                    _ct_for_parse = ""
+                    for _hk_p, _hv_p in scope.get("headers", []) or []:
+                        if (
+                            _hk_p.decode("latin-1")
+                            if isinstance(_hk_p, bytes)
+                            else _hk_p
+                        ).lower() == "content-type":
+                            _ct_for_parse = (
+                                _hv_p.decode("latin-1")
+                                if isinstance(_hv_p, bytes)
+                                else _hv_p
                             ).lower()
-                            if _hkl_ct == "content-type":
-                                _req_ct_l = (
-                                    _hv_ct.decode("latin-1")
-                                    if isinstance(_hv_ct, bytes)
-                                    else _hv_ct
-                                ).lower()
-                                break
-                        _is_json_ct = (
-                            "application/json" in _req_ct_l
-                            or "application/" in _req_ct_l
-                            and "+json" in _req_ct_l
+                            break
+                    _ct_main = _ct_for_parse.split(";", 1)[0].strip()
+                    _ct_is_json = (
+                        not _ct_for_parse
+                        or _ct_main == "application/json"
+                        or (
+                            _ct_main.startswith("application/")
+                            and _ct_main.endswith("+json")
                         )
-                        _model_body_present = any(
-                            (
-                                _bp.get("model_class") is not None
-                                or _bp.get("name") == "_combined_body"
-                            )
-                            for _bp in body_params
-                        )
-                        if _model_body_present and not _is_json_ct:
-                            try:
-                                _raw_body_str = body_bytes.decode("utf-8")
-                            except Exception:  # noqa: BLE001
-                                _raw_body_str = repr(body_bytes)
-                            parsed_body = _raw_body_str
+                    )
+                    _has_form_param_for_parse = any(
+                        p.get("kind") in ("form", "file")
+                        for p in introspect_params
+                    )
+                    if not _ct_is_json and not _has_form_param_for_parse:
+                        # Pass raw body string to body validation —
+                        # model_class type-check at line 8830 surfaces
+                        # ``model_attributes_type``.
+                        try:
+                            parsed_body = body_bytes.decode("utf-8")
+                        except Exception:  # noqa: BLE001
+                            parsed_body = repr(body_bytes)
+                        body_parsed = True
+                    else:
+                        try:
+                            parsed_body = _json.loads(body_bytes)
                             body_parsed = True
-                        else:
+                        except _json.JSONDecodeError as jde:
                             # FA shape: ``msg`` is the bare ``"JSON
-                            # decode error"`` and the position-specific
-                            # detail lives in ``ctx={"error": jde.msg}``.
+                            # decode error"`` and the position-
+                            # specific detail lives in
+                            # ``ctx={"error": jde.msg}``.
                             raise _RVE_err([{
                                 "type": "json_invalid",
                                 "loc": ["body", jde.pos],
@@ -8251,6 +8435,22 @@ class FastAPI:
                                 "input": {},
                                 "ctx": {"error": jde.msg},
                             }]) from None
+                        except Exception as _other_je:  # noqa: BLE001
+                            # FA contract: a non-JSONDecodeError from
+                            # ``json.loads`` (e.g. ``json`` patched
+                            # out in tests, MemoryError, etc.) → 400
+                            # via HTTPException so the test sees a
+                            # graceful failure rather than a 500.
+                            # Probe-confirmed against
+                            # ``test_tutorial/test_body/test_tutorial001
+                            # ::test_other_exceptions``.
+                            from fastapi_turbo.exceptions import (
+                                HTTPException as _HE_je,
+                            )
+                            raise _HE_je(
+                                status_code=400,
+                                detail="There was an error parsing the body",
+                            ) from _other_je
             elif body_params and not body_bytes:
                 # Body expected but empty — emit a missing-body 422
                 # matching FA's shape. For an embedded single body
@@ -8349,7 +8549,11 @@ class FastAPI:
             # request body that omits multiple required form fields
             # surfaces ALL of them in one 422 — matches FA. Earlier we
             # raised on the first missing and the client only saw a
-            # single entry.
+            # single entry. Same accumulator covers query / header /
+            # cookie / path missing + bad-type so a request that
+            # supplies multiple invalid params shows them all in one
+            # 422 (FA's contract — ``test_foo_no_needy`` expects 3
+            # entries: 1 missing + 2 int_parsing).
             _outer_form_missing_errs: list = []
             for p in introspect_params:
                 name = p["name"]
@@ -8363,7 +8567,33 @@ class FastAPI:
                 container_type = p.get("container_type")
                 _ann_for_list = p.get("_unwrapped_annotation")
                 _ann_origin = _tp_local.get_origin(_ann_for_list)
-                is_list_param = (
+                # Pydantic ``Json[T]`` (``Annotated[T, pydantic.Json]``)
+                # is a JSON-encoded SCALAR — wire value is a single
+                # string. Don't trip the multi-value list path even
+                # if the inner T is ``list[X]``. Probe-confirmed
+                # against ``test_json_type::test_form_json_list`` /
+                # ``test_query_json_list`` / ``test_header_json_list``.
+                _raw_ann = p.get("_raw_annotation")
+                _is_json_marker = False
+                try:
+                    if _raw_ann is not None and hasattr(_raw_ann, "__metadata__"):
+                        for _m in getattr(_raw_ann, "__metadata__", ()):
+                            # Pydantic ``Json`` is a class whose
+                            # parameterised forms (``Json[list[str]]``)
+                            # produce subclasses with the same
+                            # ``__name__``. ``m is pydantic.Json``
+                            # fails for those; match on class name +
+                            # module instead.
+                            _mc = _m if isinstance(_m, type) else type(_m)
+                            if (
+                                getattr(_mc, "__name__", None) == "Json"
+                                and getattr(_mc, "__module__", "").startswith("pydantic")
+                            ):
+                                _is_json_marker = True
+                                break
+                except Exception:  # noqa: BLE001
+                    pass
+                is_list_param = (not _is_json_marker) and (
                     container_type is not None
                     or _ann_origin in (list, set, frozenset, tuple)
                     # Bare ``list`` / ``set`` / ``tuple`` annotations
@@ -8453,9 +8683,18 @@ class FastAPI:
                         continue
                     # Seed with scopes from a top-level ``Security(...)``
                     # marker so the inner-dep ``SecurityScopes`` param
-                    # sees them (matches FA semantics).
+                    # sees them (matches FA semantics). ``_dep_scope``
+                    # carries FA 0.120+'s ``Depends(..., scope=...)``
+                    # selector so the resolver appends the dep's
+                    # generator to the right teardown bucket
+                    # (function-scope drains pre-response, request-
+                    # scope drains post-response).
                     top_scopes = list(p.get("_security_scopes_top") or [])
-                    kwargs[name] = await _resolve_dep(dep_callable, dep_cache, top_scopes)
+                    kwargs[name] = await _resolve_dep(
+                        dep_callable, dep_cache, top_scopes,
+                        dep_scope=p.get("_dep_scope"),
+                        use_cache=p.get("use_cache", True),
+                    )
                     continue
 
                 if kind == "path":
@@ -8467,78 +8706,120 @@ class FastAPI:
                     continue
 
                 if kind == "query":
-                    if is_list_param:
-                        vals = _extract_list_from_query(alias)
-                        if not vals:
+                    try:
+                        if is_list_param:
+                            vals = _extract_list_from_query(alias)
+                            if not vals:
+                                if required:
+                                    _outer_form_missing_errs.append(
+                                        _missing("query", alias)
+                                    )
+                                    continue
+                                kwargs[name] = _list_default_for_missing(p, default_val, has_default)
+                                continue
+                            kwargs[name] = _validate(
+                                scalar_validator, vals, "query", alias,
+                                annotation=p.get("_unwrapped_annotation"),
+                            )
+                            continue
+                        # Scalar query: first occurrence wins.
+                        raw = None
+                        for k, v in _qp_items:
+                            if k == alias:
+                                raw = v
+                                break
+                        if raw is None:
                             if required:
-                                raise _RVE_err([_missing("query", alias)])
-                            kwargs[name] = _list_default_for_missing(p, default_val, has_default)
+                                _outer_form_missing_errs.append(
+                                    _missing("query", alias)
+                                )
+                                continue
+                            kwargs[name] = default_val
                             continue
                         kwargs[name] = _validate(
-                            scalar_validator, vals, "query", alias,
+                            scalar_validator, raw, "query", alias,
                             annotation=p.get("_unwrapped_annotation"),
                         )
-                        continue
-                    # Scalar query: first occurrence wins (FA semantics)
-                    raw = None
-                    for k, v in _qp_items:
-                        if k == alias:
-                            raw = v
-                            break
-                    if raw is None:
-                        if required:
-                            raise _RVE_err([_missing("query", alias)])
-                        kwargs[name] = default_val
-                        continue
-                    kwargs[name] = _validate(
-                        scalar_validator, raw, "query", alias,
-                        annotation=p.get("_unwrapped_annotation"),
-                    )
+                    except _RVE_err as _ve:
+                        _outer_form_missing_errs.extend(
+                            [
+                                {**_e, "loc": list(_e.get("loc") or ())}
+                                if isinstance(_e.get("loc"), tuple)
+                                else _e
+                                for _e in _ve.errors()
+                            ]
+                        )
                     continue
 
                 if kind == "header":
                     marker = p.get("_raw_marker")
-                    # ``alias`` from introspect already honours
-                    # convert_underscores, but fall back to compute
-                    # here for safety.
                     hdr_alias = alias
                     if marker is not None and not getattr(marker, "alias", None):
                         hdr_alias = _alias_for_header(marker, name)
-                    if is_list_param:
-                        vals = _scope_headers.getlist(hdr_alias)
-                        if not vals:
+                    try:
+                        if is_list_param:
+                            vals = _scope_headers.getlist(hdr_alias)
+                            if not vals:
+                                if required:
+                                    _outer_form_missing_errs.append(
+                                        _missing("header", hdr_alias)
+                                    )
+                                    continue
+                                kwargs[name] = _list_default_for_missing(p, default_val, has_default)
+                                continue
+                            kwargs[name] = _validate(
+                                scalar_validator, vals, "header", hdr_alias,
+                                annotation=p.get("_unwrapped_annotation"),
+                            )
+                            continue
+                        raw = _scope_headers.get(hdr_alias)
+                        if raw is None:
                             if required:
-                                raise _RVE_err([_missing("header", hdr_alias)])
-                            kwargs[name] = _list_default_for_missing(p, default_val, has_default)
+                                _outer_form_missing_errs.append(
+                                    _missing("header", hdr_alias)
+                                )
+                                continue
+                            kwargs[name] = default_val
                             continue
                         kwargs[name] = _validate(
-                            scalar_validator, vals, "header", hdr_alias,
+                            scalar_validator, raw, "header", hdr_alias,
                             annotation=p.get("_unwrapped_annotation"),
                         )
-                        continue
-                    raw = _scope_headers.get(hdr_alias)
-                    if raw is None:
-                        if required:
-                            raise _RVE_err([_missing("header", hdr_alias)])
-                        kwargs[name] = default_val
-                        continue
-                    kwargs[name] = _validate(
-                        scalar_validator, raw, "header", hdr_alias,
-                        annotation=p.get("_unwrapped_annotation"),
-                    )
+                    except _RVE_err as _ve:
+                        _outer_form_missing_errs.extend(
+                            [
+                                {**_e, "loc": list(_e.get("loc") or ())}
+                                if isinstance(_e.get("loc"), tuple)
+                                else _e
+                                for _e in _ve.errors()
+                            ]
+                        )
                     continue
 
                 if kind == "cookie":
-                    raw = _scope_cookies.get(alias)
-                    if raw is None:
-                        if required:
-                            raise _RVE_err([_missing("cookie", alias)])
-                        kwargs[name] = default_val
-                        continue
-                    kwargs[name] = _validate(
-                        scalar_validator, raw, "cookie", alias,
-                        annotation=p.get("_unwrapped_annotation"),
-                    )
+                    try:
+                        raw = _scope_cookies.get(alias)
+                        if raw is None:
+                            if required:
+                                _outer_form_missing_errs.append(
+                                    _missing("cookie", alias)
+                                )
+                                continue
+                            kwargs[name] = default_val
+                            continue
+                        kwargs[name] = _validate(
+                            scalar_validator, raw, "cookie", alias,
+                            annotation=p.get("_unwrapped_annotation"),
+                        )
+                    except _RVE_err as _ve:
+                        _outer_form_missing_errs.extend(
+                            [
+                                {**_e, "loc": list(_e.get("loc") or ())}
+                                if isinstance(_e.get("loc"), tuple)
+                                else _e
+                                for _e in _ve.errors()
+                            ]
+                        )
                     continue
 
                 if kind == "body":
@@ -8660,6 +8941,40 @@ class FastAPI:
                             "input": None,
                         }])
                     if model_class is not None:
+                        # Pre-check: if the request's content-type
+                        # was non-JSON AND val is a raw body string,
+                        # AND the target is a Pydantic ``BaseModel``
+                        # subclass, raise FA's
+                        # ``model_attributes_type`` directly.
+                        # Pydantic would emit ``model_type`` with a
+                        # different ``msg`` and ``ctx.class_name``
+                        # that doesn't match upstream's snapshot.
+                        # Probe-confirmed against
+                        # ``test_post_form_for_json``. We gate on
+                        # the non-JSON CT path only; JSON-shaped
+                        # values like a JSON-encoded string or
+                        # number must still flow through Pydantic
+                        # (which accepts them for str/int/float
+                        # typed bodies).
+                        try:
+                            from pydantic import BaseModel as _PBM_local
+                            _mc_is_basemodel = isinstance(model_class, type) and issubclass(model_class, _PBM_local)
+                        except Exception:  # noqa: BLE001
+                            _mc_is_basemodel = False
+                        if (
+                            _mc_is_basemodel
+                            and not _ct_is_json
+                            and isinstance(val, (str, bytes))
+                        ):
+                            raise _RVE_err([{
+                                "type": "model_attributes_type",
+                                "loc": ["body"],
+                                "msg": (
+                                    "Input should be a valid dictionary or "
+                                    "object to extract fields from"
+                                ),
+                                "input": val,
+                            }], body=val)
                         try:
                             if hasattr(model_class, "model_validate"):
                                 kwargs[name] = model_class.model_validate(val)
@@ -8752,6 +9067,17 @@ class FastAPI:
                             continue
                         kwargs[name] = default_val
                     else:
+                        # FA contract: an empty form / file value with
+                        # an Optional annotation falls back to the
+                        # param's default (``age: Optional[int] =
+                        # Form() = None`` returns ``None``, not 422).
+                        # Probe-confirmed against
+                        # ``test_form_default_url_encoded`` /
+                        # ``_multi_part``.
+                        _is_empty = val == "" or val == b""
+                        if _is_empty and not required:
+                            kwargs[name] = default_val
+                            continue
                         if kind == "file":
                             # File uploads stay raw — they're already
                             # an ``UploadFile`` object. If the parser
@@ -8848,7 +9174,7 @@ class FastAPI:
                     pass
             await _asgi_emit_exception(self, scope, send, exc)
             # Teardown any deps already committed.
-            for gen, is_async in reversed(dep_teardowns):
+            for gen, is_async, _td_scope in reversed(dep_teardowns):
                 try:
                     if is_async:
                         try:
@@ -9018,15 +9344,41 @@ class FastAPI:
             # on a FastAPI app would silently fall back to JSONResponse
             # for handlers that return raw strings.
             response_class = _resolve_response_class(matched_route, self)
-            # No try/except: if the response_class constructor raises
-            # (e.g. ``PlainTextResponse(content=<dict>)``), let the
-            # exception propagate to the app's exception_handlers and
-            # surface as a 500. Catching it would silently 200-OK a
-            # real application bug.
-            if response_class is _JR or _is_json_response_class(response_class):
-                out = response_class(content=_je(r), status_code=status_code)
+            # If a dep / handler injected ``response: Response`` and
+            # set ``response.status_code`` to a body-bearing code,
+            # the override beats the route's default. Probe-confirmed
+            # against ``test_reponse_set_reponse_code_empty``: a
+            # route with ``status_code=204`` whose handler does
+            # ``response.status_code = 400`` must serve the body
+            # (not the empty 204 path).
+            _eff_status = status_code
+            _ri_for_status = response_injected
+            if _ri_for_status is None and _shared_response_holder[0] is not None:
+                _ri_for_status = _shared_response_holder[0]
+            if _ri_for_status is not None:
+                _ri_status = getattr(_ri_for_status, "status_code", None)
+                if _ri_status:
+                    _eff_status = _ri_status
+            # No-body status codes (1xx / 204 / 304): RFC 9110 forbids
+            # a body. FA returns an empty Response regardless of what
+            # the handler returned (typically ``None`` / ``pass``).
+            # Probe-confirmed: ``test_response_code_no_body`` expects
+            # ``response.content == b""`` and no ``content-length``
+            # header.
+            if _eff_status in (204, 304) or 100 <= _eff_status < 200:
+                from fastapi_turbo.responses import Response as _PR
+                out = _PR(status_code=_eff_status)
+                # Strip default content-type/length so the assertion
+                # ``"content-length" not in response.headers`` holds.
+                try:
+                    if "content-length" in out.headers:
+                        del out.headers["content-length"]
+                except Exception:  # noqa: BLE001
+                    pass
+            elif response_class is _JR or _is_json_response_class(response_class):
+                out = response_class(content=_je(r), status_code=_eff_status)
             else:
-                out = response_class(content=r, status_code=status_code)
+                out = response_class(content=r, status_code=_eff_status)
             # Pull any dep-mutated Response even when the handler itself
             # didn't take one — deps often add headers via
             # ``response: Response`` while the handler returns a
@@ -9098,9 +9450,36 @@ class FastAPI:
                 result = await asyncio.wait_for(current_call(req_obj), timeout=_wt)
             else:
                 result = await current_call(req_obj)
+            # FA 0.120+: drain ``scope='function'`` teardowns
+            # IMMEDIATELY after the handler returns, before the
+            # response is built. Function-scope teardowns are allowed
+            # to raise (e.g. an HTTPException from
+            # ``raise_after_yield``) and the new exception aborts the
+            # response with the user's status code.
+            _func_scope_remaining: list = []
+            _request_scope_remaining: list = []
+            for _t in dep_teardowns:
+                if _t[2] == "function":
+                    _func_scope_remaining.append(_t)
+                else:
+                    _request_scope_remaining.append(_t)
+            for gen, is_async, _td_scope in reversed(_func_scope_remaining):
+                if is_async:
+                    try:
+                        await gen.__anext__()
+                    except StopAsyncIteration:
+                        pass
+                else:
+                    try:
+                        next(gen)
+                    except StopIteration:
+                        pass
+            # The drained teardowns should not run again post-
+            # response — keep only request-scope on the deferred list.
+            dep_teardowns[:] = _request_scope_remaining
         except asyncio.TimeoutError:
             # Drain dep teardowns then surface 504.
-            for gen, is_async in reversed(dep_teardowns):
+            for gen, is_async, _td_scope in reversed(dep_teardowns):
                 try:
                     if is_async:
                         try:
@@ -9158,33 +9537,48 @@ class FastAPI:
             #     intended.
             from fastapi_turbo.exceptions import FastAPIError as _FAPIErr
             _yielddep_swallowed = False
-            for gen, is_async in reversed(dep_teardowns):
+            # If a dep's ``except`` arm raises a NEW exception (e.g.
+            # ``except CustomError: raise HTTPException(418)``), that
+            # new exception SUPERSEDES the original handler exception.
+            # FA's contract: the response uses the most-recent thrown
+            # exception, not the handler's. Probe-confirmed against
+            # ``test_dependency_after_yield_raise::test_catching``.
+            _replacement_exc = None
+            for gen, is_async, _td_scope in reversed(dep_teardowns):
                 try:
                     if is_async:
                         try:
                             await gen.athrow(exc)
                         except StopAsyncIteration:
                             _yielddep_swallowed = True
-                        except type(exc):
-                            pass
+                        except BaseException as _new_exc:  # noqa: BLE001
+                            if _new_exc is exc or isinstance(_new_exc, type(exc)):
+                                pass
+                            else:
+                                _replacement_exc = _new_exc
                     else:
                         try:
                             gen.throw(exc)
                         except StopIteration:
                             _yielddep_swallowed = True
-                        except type(exc):
-                            pass
+                        except BaseException as _new_exc:  # noqa: BLE001
+                            if _new_exc is exc or isinstance(_new_exc, type(exc)):
+                                pass
+                            else:
+                                _replacement_exc = _new_exc
                 except Exception:  # noqa: BLE001
                     pass
             dep_teardowns.clear()
-            if _yielddep_swallowed:
+            if _replacement_exc is not None:
+                exc = _replacement_exc
+            elif _yielddep_swallowed:
                 exc = _FAPIErr(
                     "Dependency raising an exception and a dependency with"
                     " yield without raising again the same exception or"
                     " a new one"
                 )
             await _asgi_emit_exception(self, scope, send, exc)
-            for gen, is_async in reversed(dep_teardowns):
+            for gen, is_async, _td_scope in reversed(dep_teardowns):
                 try:
                     if is_async:
                         try:
@@ -9251,17 +9645,30 @@ class FastAPI:
         # finished b``. Reversed earlier (teardowns first) made bg see
         # post-finalised state and broke
         # ``test_dependency_contextmanager::test_background_tasks``.
+        # Pull the shared BG holder if a dep injected it (e.g. via
+        # ``Annotated[BackgroundTasks, Depends(add_bg)]``) — without
+        # this, ``bg_injected`` is only set when the handler took
+        # ``BackgroundTasks`` directly, and dep-added tasks would
+        # never run. Probe-confirmed against
+        # ``test_response_dependency::test_background_tasks_with_
+        # depends_annotated``.
+        if bg_injected is None and _bg_holder[0] is not None:
+            bg_injected = _bg_holder[0]
         if bg_injected is not None:
             try:
                 bg_injected.run_sync()
             except Exception as _exc:  # noqa: BLE001
                 _log.debug("in-process background task: %r", _exc)
         # Run yield-dep teardowns in reverse order (LIFO — FA semantics).
-        # These fire after the response has been sent so a slow
-        # teardown doesn't delay the client. Any error is logged and
-        # swallowed (matches the Rust hot-path behaviour for post-
-        # response teardowns).
-        for gen, is_async in reversed(dep_teardowns):
+        # These fire after the response has been sent. FA's contract:
+        # the FIRST exception raised by a teardown propagates out of
+        # the dispatcher so the TestClient's ``raise_server_
+        # exceptions=True`` path sees it (the response is already
+        # flushed; this is purely for in-process error visibility).
+        # Probe-confirmed against
+        # ``test_dependency_after_yield_raise::test_broken_raise``.
+        _post_teardown_exc: BaseException | None = None
+        for gen, is_async, _td_scope in reversed(dep_teardowns):
             try:
                 if is_async:
                     try:
@@ -9273,8 +9680,12 @@ class FastAPI:
                         next(gen)
                     except StopIteration:
                         pass
-            except Exception as _exc:  # noqa: BLE001
+            except BaseException as _exc:  # noqa: BLE001
                 _log.debug("in-process yield-dep teardown: %r", _exc)
+                if _post_teardown_exc is None:
+                    _post_teardown_exc = _exc
+        if _post_teardown_exc is not None:
+            raise _post_teardown_exc
         return True
 
     # ── in-process WebSocket dispatch ────────────────────────────────
@@ -9336,11 +9747,25 @@ class FastAPI:
             break
 
         if matched_route is None:
-            return False
+            # No matching WS route — close the handshake immediately
+            # rather than letting the client hang. Starlette closes
+            # with code 1006 (abnormal); we send websocket.close so
+            # the client side surfaces ``WebSocketDisconnect`` at
+            # ``__enter__``. Probe-confirmed against
+            # ``test_route_scope::test_websocket_invalid_path_doesnt_match``.
+            try:
+                await send({"type": "websocket.close", "code": 1006})
+            except Exception:  # noqa: BLE001
+                pass
+            return True
 
         endpoint = getattr(matched_route, "endpoint", None)
         if endpoint is None:
             return False
+        # Surface the matched route on the WS scope so handlers can
+        # read ``websocket.scope["route"].path`` (FA contract — used
+        # by Sentry tracing and ``test_route_scope::test_websocket``).
+        scope["route"] = matched_route
 
         # WebSocket shim built on the ASGI receive/send channels. Now
         # supports:
@@ -9657,7 +10082,9 @@ class FastAPI:
                 return d
             return _coerce_to(ann, raw)
 
-        async def _ws_resolve_dep(dep_callable, dep_cache, use_cache=True):
+        ws_dep_teardowns: list = []  # (gen, is_async, scope)
+
+        async def _ws_resolve_dep(dep_callable, dep_cache, use_cache=True, dep_scope=None):
             """Recursive ``Depends`` resolver for the WS path.
 
             Handles per-param resolution the way upstream FastAPI
@@ -9692,17 +10119,43 @@ class FastAPI:
             _ws_overrides = getattr(self, "dependency_overrides", None) or {}
             _ws_orig_callable = dep_callable
             dep_callable = _ws_overrides.get(dep_callable, dep_callable)
-            if use_cache and _ws_orig_callable in dep_cache:
-                return dep_cache[_ws_orig_callable]
+            _scope_norm = (dep_scope or "request").lower()
+            _cache_key_ws = (_ws_orig_callable, _scope_norm)
+            if use_cache and _cache_key_ws in dep_cache:
+                return dep_cache[_cache_key_ws]
             try:
                 dep_sig = _insp_ws.signature(dep_callable)
             except (TypeError, ValueError):
                 dep_sig = None
             dep_kwargs: dict = {}
             if dep_sig is not None:
+                # Look up Depends() markers stashed in
+                # ``Annotated[T, Depends(...)]`` metadata as well as
+                # as the parameter ``default``. Without this, an
+                # ``Annotated[Session, Depends(dep_session, scope=
+                # 'request')]`` param would fall through to "treat
+                # as path/query" and 422 the WS handshake.
+                import typing as _tp_ws_local
+                try:
+                    _dep_hints = _tp_ws_local.get_type_hints(
+                        dep_callable, include_extras=True,
+                    )
+                except Exception:  # noqa: BLE001
+                    _dep_hints = {}
                 for dpname, dp in dep_sig.parameters.items():
                     default = dp.default
                     ann = dp.annotation
+                    # Pull from Annotated metadata if no default-form
+                    # marker was supplied.
+                    _ann_marker = None
+                    _hint = _dep_hints.get(dpname)
+                    if _hint is not None and hasattr(_hint, "__metadata__"):
+                        for _m in getattr(_hint, "__metadata__", ()):
+                            if isinstance(_m, _Dep_marker_ws):
+                                _ann_marker = _m
+                                break
+                    if _ann_marker is not None and not isinstance(default, _Dep_marker_ws):
+                        default = _ann_marker
                     # Nested Depends.
                     if isinstance(default, _Dep_marker_ws):
                         nested = default.dependency
@@ -9711,6 +10164,7 @@ class FastAPI:
                                 nested,
                                 dep_cache,
                                 use_cache=getattr(default, "use_cache", True),
+                                dep_scope=getattr(default, "scope", None),
                             )
                         continue
                     # Query / Header / Path / Cookie markers — coerce
@@ -9739,20 +10193,45 @@ class FastAPI:
                     # close the socket — better to surface than to
                     # let the dep run with a missing kwarg (TypeError).
                     raise _ws_required_missing(dpname)
-            if _insp_ws.iscoroutinefunction(dep_callable):
+            # Handle generator / async-generator yield-deps so the
+            # FA contract works: dep yields the value, then the
+            # teardown runs after the WS handler completes (request
+            # scope) or before it returns (function scope, FA
+            # 0.120+).
+            # Use the resolver-arg ``dep_scope`` (passed by callers).
+            _scope_for_gen_ws = (dep_scope or "request").lower()
+            if _insp_ws.isasyncgenfunction(dep_callable):
+                _gen = dep_callable(**dep_kwargs)
+                val = await _gen.__anext__()
+                ws_dep_teardowns.append((_gen, True, _scope_for_gen_ws))
+            elif _insp_ws.isgeneratorfunction(dep_callable):
+                _gen = dep_callable(**dep_kwargs)
+                val = next(_gen)
+                ws_dep_teardowns.append((_gen, False, _scope_for_gen_ws))
+            elif _insp_ws.iscoroutinefunction(dep_callable):
                 val = await dep_callable(**dep_kwargs)
             else:
                 val = dep_callable(**dep_kwargs)
                 if _insp_ws.iscoroutine(val):
                     val = await val
+                elif _insp_ws.isasyncgen(val):
+                    _gen = val
+                    val = await _gen.__anext__()
+                    ws_dep_teardowns.append((_gen, True, _scope_for_gen_ws))
+                elif _insp_ws.isgenerator(val):
+                    _gen = val
+                    val = next(_gen)
+                    ws_dep_teardowns.append((_gen, False, _scope_for_gen_ws))
             # Cache under the ORIGINAL callable so subsequent
             # ``Depends(orig_callable)`` requests in the same WS
             # session hit the cache regardless of any
             # dependency_overrides indirection. Only store when
             # the caller asked us to cache — ``use_cache=False``
-            # callers want a fresh value next time.
+            # callers want a fresh value next time. Cache key
+            # includes ``dep_scope`` to keep function/request copies
+            # of the same callable separate (FA 0.120+).
             if use_cache:
-                dep_cache[_ws_orig_callable] = val
+                dep_cache[(_ws_orig_callable, _scope_for_gen_ws)] = val
             return val
 
         try:
@@ -9778,6 +10257,7 @@ class FastAPI:
                             dep_callable,
                             ws_dep_cache,
                             use_cache=p.get("use_cache", True),
+                            dep_scope=p.get("_dep_scope"),
                         )
                     continue
                 if kind == "path":
@@ -9832,6 +10312,36 @@ class FastAPI:
                 result = endpoint(**kwargs)
                 if _insp_ws.iscoroutine(result):
                     await result
+            # Drain ALL dep teardowns (function-scope first, then
+            # request-scope — same order as HTTP, LIFO within each).
+            # WS doesn't have a "post-response" phase distinct from
+            # the handler returning, so all teardowns flush here.
+            # The cache key already separates function/request copies
+            # of the same callable, so the handler reads correct
+            # ``func_is_open`` / ``req_is_open`` snapshots BEFORE
+            # this drain. Errors propagate to the WS dispatcher's
+            # outer envelope so the test client surfaces them
+            # (matches FA's
+            # ``test_websocket_dependency_after_yield_broken``).
+            _ws_post_teardown_exc: BaseException | None = None
+            for _g, _is_a, _sc in reversed(ws_dep_teardowns):
+                try:
+                    if _is_a:
+                        try:
+                            await _g.__anext__()
+                        except StopAsyncIteration:
+                            pass
+                    else:
+                        try:
+                            next(_g)
+                        except StopIteration:
+                            pass
+                except BaseException as _exc:  # noqa: BLE001
+                    if _ws_post_teardown_exc is None:
+                        _ws_post_teardown_exc = _exc
+            ws_dep_teardowns.clear()
+            if _ws_post_teardown_exc is not None:
+                raise _ws_post_teardown_exc
         except _WSE as _wsex:
             # Endpoint raised ``WebSocketException(code=…)`` — Starlette
             # closes the WS with the user's code rather than the
@@ -9845,11 +10355,14 @@ class FastAPI:
                     )
                 except Exception:  # noqa: BLE001
                     pass
-        except _WSD:
+        except _WSD as _wsd:
             # Disconnects propagate from receive helpers when the
-            # client closes mid-handler — not a server error. Leave
-            # the close state alone (client already sent disconnect).
-            pass
+            # client closes mid-handler. Starlette stores this on
+            # the task so the test client can surface it via
+            # ``pytest.raises(WebSocketDisconnect)`` — match that
+            # contract by re-raising. Probe-confirmed against
+            # ``test_tutorial/test_websockets/test_tutorial002``.
+            raise
         except _WS_PyVE as _vex:
             # Bad input type for a path / query / header (e.g.
             # ``room: int`` with ``/ws/abc``). Close with 1008
@@ -9869,6 +10382,54 @@ class FastAPI:
                     await ws_obj.close(code=1011)
                 except Exception:  # noqa: BLE001
                     pass
+            # Surface unhandled server-side exceptions to the test
+            # client (FA's contract — ``raise_server_exceptions=
+            # True`` propagates). The TestClient's ``__exit__`` on
+            # the WS session re-raises any task exception caught
+            # here. Probe-confirmed against
+            # ``test_dependency_after_yield_websockets::test_websocket
+            # _dependency_after_yield_broken``.
+            try:
+                _raise_se = getattr(self, "_fastapi_turbo_raise_server_exceptions", True)
+            except Exception:  # noqa: BLE001
+                _raise_se = True
+            # Drain teardowns BEFORE re-raising so dep finalisers
+            # run cleanly first.
+            for _g2, _is_a2, _sc2 in reversed(ws_dep_teardowns):
+                try:
+                    if _is_a2:
+                        try:
+                            await _g2.__anext__()
+                        except StopAsyncIteration:
+                            pass
+                    else:
+                        try:
+                            next(_g2)
+                        except StopIteration:
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
+            ws_dep_teardowns.clear()
+            if _raise_se:
+                raise
+        # Drain any teardowns left over after error paths so dep
+        # finalisers run on every exit (including WS close
+        # failures). Mirrors the HTTP post-response drain.
+        for _g, _is_a, _sc in reversed(ws_dep_teardowns):
+            try:
+                if _is_a:
+                    try:
+                        await _g.__anext__()
+                    except StopAsyncIteration:
+                        pass
+                else:
+                    try:
+                        next(_g)
+                    except StopIteration:
+                        pass
+            except Exception:  # noqa: BLE001
+                pass
+        ws_dep_teardowns.clear()
         return True
 
     # ── server bootstrap ──────────────────────────────────────────────
