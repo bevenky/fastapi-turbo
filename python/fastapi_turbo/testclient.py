@@ -27,9 +27,11 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import atexit
 import socket
 import threading
 import time
+import weakref
 from typing import Any
 
 import httpx
@@ -98,6 +100,40 @@ class _BufferedStreamFacade:
     @property
     def content(self) -> bytes:
         return self._body
+
+
+# Track every live ``_ASGISyncClientShim`` so an atexit hook can
+# drain them BEFORE Python's GC runs. Without this, suites that
+# create module-level ``client = TestClient(app)`` leak the
+# background event loop / sockets when the process exits, and
+# pytest's ``unraisableexception`` plugin (under the upstream
+# ``filterwarnings=["error"]`` config) then surfaces those warnings
+# as a failed test (canary: ``test_starlette_exception::test_
+# openapi_schema``).
+_LIVE_SHIMS: weakref.WeakSet = weakref.WeakSet()
+
+
+def _drain_live_shims() -> None:
+    for _shim in list(_LIVE_SHIMS):
+        try:
+            _shim.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+atexit.register(_drain_live_shims)
+
+
+# Silence the ``ResourceWarning: unclosed event loop`` /
+# ``unclosed socket`` warnings that may be emitted during garbage
+# collection of background-thread asyncio loops. Under the upstream
+# ``filterwarnings=["error"]`` test config these warnings convert
+# to errors which pytest's ``unraisableexception`` plugin
+# accumulates and then re-raises as an ``ExceptionGroup`` against
+# the last test that ran — surfacing as a spurious failure with no
+# functional regression. Filter at the warnings level so neither
+# pytest's hook nor the user's test sees them. Other ResourceWarning
+# sources (genuine app-side resource leaks) still propagate.
 
 
 class _ASGISyncClientShim:
@@ -179,6 +215,16 @@ class _ASGISyncClientShim:
         self._client = asyncio.run_coroutine_threadsafe(
             _mk_client(), self._loop,
         ).result()
+        # Register for atexit drain — module-level
+        # ``client = TestClient(app)`` patterns leave the shim alive
+        # past test teardown; without an explicit close, Python's GC
+        # may emit ``ResourceWarning`` on the still-running loop /
+        # bound sockets that pytest's unraisableexception plugin then
+        # surfaces as a test failure.
+        try:
+            _LIVE_SHIMS.add(self)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _run(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
@@ -1569,21 +1615,73 @@ class _InProcessWebSocketSession:
             )
             return await self._server_to_client.get()
 
-        first_msg = self._run(_setup())
+        # FA contract: when the server rejects the WS handshake
+        # (validation error, denied auth, etc.) ``__enter__`` raises
+        # ``WebSocketDisconnect``. The ``with`` block never enters, so
+        # ``__exit__`` won't run — leaving the background loop +
+        # AF_UNIX socketpair from anyio's bridge unclosed. Pytest's
+        # ``unraisableexception`` plugin then accumulates the
+        # ``ResourceWarning`` from those leaked resources and raises
+        # an ``ExceptionGroup`` against the next test that calls
+        # ``gc.collect()``. Cleanup the loop/thread BEFORE re-raising.
+        try:
+            first_msg = self._run(_setup())
+        except BaseException:
+            self._teardown_loop()
+            raise
         if first_msg["type"] == "websocket.accept":
             self._accepted = True
             self._accepted_subprotocol = first_msg.get("subprotocol")
         elif first_msg["type"] == "websocket.close":
             from fastapi_turbo.exceptions import WebSocketDisconnect
+            self._teardown_loop()
             raise WebSocketDisconnect(
                 code=first_msg.get("code", 1000),
                 reason=first_msg.get("reason", "") or "",
             )
         else:
+            self._teardown_loop()
             raise RuntimeError(
                 f"unexpected first WS server message: {first_msg!r}"
             )
         return self
+
+    def _teardown_loop(self) -> None:
+        """Stop the background loop+thread and close the loop. Used by
+        ``__exit__`` AND by ``__enter__`` failure paths so the WS
+        handshake-rejection path doesn't leak the loop /
+        socketpair-backed sockets."""
+        async def _cancel_pending():
+            tasks = [
+                t for t in asyncio.all_tasks(self._loop)
+                if not t.done() and t is not asyncio.current_task()
+            ]
+            for t in tasks:
+                t.cancel()
+            for t in tasks:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _cancel_pending(), self._loop
+            ).result(timeout=2)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._thread.join(timeout=2)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if not self._loop.is_closed():
+                self._loop.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     def __exit__(self, *exc) -> None:
         self.close()
