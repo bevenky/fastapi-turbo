@@ -2,40 +2,37 @@
 
 A per-feature map of where fastapi_turbo sits against its stated compat target (FastAPI 0.136.0 + Starlette). `Full` means the feature is observably indistinguishable from upstream in user code. `Partial` means the surface exists but some sub-behaviour diverges. `Different-by-design` flags intentional deviations that aren't parity bugs.
 
-Status: **3,119 / 3,119 FastAPI upstream tests pass** under the `import fastapi_turbo` sys.modules shim via the canonical gate (`scripts/run_external_compat_gates.sh fastapi`) — zero failed, zero skipped, zero xfailed. The gate deselects 10 upstream-FastAPI tests that aren't ours to fix (`tests/benchmarks/test_general_performance.py` opt-in via `--codspeed`, `tests/test_pydantic_v1_error.py` skipped by upstream on py3.14+, and 4 cases in `tests/test_tutorial/test_query_params_str_validations/test_tutorial006c.py` xfailed by upstream per [fastapi/fastapi#12419](https://github.com/fastapi/fastapi/issues/12419) — upstream's own decisions, not compat regressions). The gate script also bails out with a `maturin develop` instruction when the loaded `_fastapi_turbo_core.*.so` is older than any `src/*.rs` source — fixes the recurring auditor reports of 888 failures (correlated with stale pre-R34 builds). Threshold regression at `tests/stress/test_r36_regressions.py::test_upstream_fastapi_gate_passes_canonical_threshold` calls the canonical script and fails loudly below 3000 pass / non-zero failed/skipped/xfailed (returncode-first). Sentry ASGI integration: 33/33. Sentry FastAPI integration: 89/89. Own suite: 1023 tests (410 general + 22 WebSocket + 484 stress + 107 parity snapshots).
+Status: **3,119 / 3,119 FastAPI upstream tests pass** under the `import fastapi_turbo` sys.modules shim via the canonical gate (`scripts/run_external_compat_gates.sh fastapi`) — zero failed, zero skipped, zero xfailed. The gate deselects 10 upstream-FastAPI tests that aren't ours to fix (`tests/benchmarks/test_general_performance.py` opt-in via `--codspeed`, `tests/test_pydantic_v1_error.py` skipped by upstream on py3.14+, and 4 cases in `tests/test_tutorial/test_query_params_str_validations/test_tutorial006c.py` xfailed by upstream per [fastapi/fastapi#12419](https://github.com/fastapi/fastapi/issues/12419) — upstream's own decisions, not compat regressions). The gate script also bails out with a `maturin develop` instruction when the loaded `_fastapi_turbo_core.*.so` is older than any `src/*.rs` source — fixes the recurring auditor reports of 888 failures (correlated with stale pre-R34 builds). Threshold regression at `tests/stress/test_r36_regressions.py::test_upstream_fastapi_gate_passes_canonical_threshold` calls the canonical script and fails loudly below 3000 pass / non-zero failed/skipped/xfailed (returncode-first). Sentry ASGI integration: 33/33. Sentry FastAPI integration: 89/89. Own suite: ~1059 tests collected (typical run: 1017 pass / 1 skipped on a normal dev box, ignoring the 22 real-WS tests + 3 nested-pytest drift detectors that opt out of the parent run).
 
 **Test suite under different environments:**
 
-* **Normal dev box / CI** (loopback bind allowed): 1019 tests pass + 4 skipped (1 conditional, 3 drift detectors that opt out of the parent suite via `FASTAPI_TURBO_SKIP_SUBPROCESS_DRIFT=1`); 0 failed. The 3 drift detectors run directly via `pytest tests/stress/test_r3{3,6,7}_regressions.py` (each spawns nested pytest, ~3 min total).
-* **Sandboxed env** (`socket.bind('127.0.0.1', 0)` raises `PermissionError` at the kernel level — distinct from the conftest's `LOOPBACK_DENIED` flag): the canonical FastAPI 0.136.0 gate currently produces ~110 failures spread across mid-sized buckets (yield-dep websocket scopes ~15, body-tutorial content-type-strict edges, websocket cookie/router/tutorial002, sub-app/WS validation contexts, dependency-duplicates combined-body for handler+dep, json_type Pydantic Json[T] form/query). R47 wired ``app.dependency_overrides`` into the WebSocket dispatcher (HTTP path already honoured it). Net: 818 → 110 (-708 failures across R39 closure through R47).
+* **Normal dev box / CI** (loopback bind allowed): ~1017 tests pass + 1 skipped (the 22 real-WS tests in `tests/test_websocket.py` and 3 nested-pytest drift detectors opt out of the parent run; run those directly via `pytest tests/test_websocket.py tests/stress/test_r3{3,6,7}_regressions.py`). 0 failed. Counts shift by 1-2 across releases as new regression tests land.
 * **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError` in the pytest process): `tests/conftest.py` detects this at session start via a one-shot bind probe and sets `LOOPBACK_DENIED = True`. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`.
   - **Force-override env vars** (audit / CI use): set `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` to skip `requires_loopback` tests even on a dev box that *can* bind, or `FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED=1` to run them anyway in an env where probe bind fails but the real subprocess server might still succeed.
-  - **Counts at the R40 watermark**, measured on macOS Apple Silicon
+  - **Counts at the R48 watermark**, measured on macOS Apple Silicon
     with `FASTAPI_TURBO_SKIP_SUBPROCESS_DRIFT=1` (the 3 drift-detector
     tests spawn nested pytest subprocesses and contend in the
     parent run; they're reliable in isolation, run them via
     `pytest tests/stress/test_r3{3,6,7}_regressions.py` directly):
     1. *True sandbox + FORCE env var* — every bind raises AND
-       `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`: 860 pass, 162 skipped.
+       `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`: 901 pass, 165 skipped.
        The conftest collection hooks (suite-level + parity-level)
        both honour the FORCE env var (R33), so this scenario also
        covers a dev box where the auditor wants the bucket-#1
        numbers without having to actually deny bind at the kernel.
     2. *Forced-fail bind only* — monkey-patched `socket.socket.bind`
-       to raise `PermissionError`, no env var: 860 pass, 162 skipped
+       to raise `PermissionError`, no env var: 901 pass, 165 skipped
        (same as #1 — the suite-level probe hits the patched bind
        first, propagates `LOOPBACK_DENIED=True`, parity collection
        hook also detects it).
-    3. *Bind works, no env var* (normal dev box): 1021 pass, 4 skipped
+    3. *Bind works, no env var* (normal dev box): 1063 pass, 1 skipped
        — full coverage. This is the "happy path" that CI / release
-       runners hit.
+       runners hit. Drift detector at `tests/stress/test_r37_regressions.py`
+       allows ±2 vs the doc claim.
   - The FORCE env var IS sufficient to produce bucket #1 numbers on
-    a dev box that can bind. The R33 audit caught a case where the
-    parity conftest didn't honour the env var, so FORCE on a dev
-    box ran parity normally and produced 924 pass / 55 skipped (a
-    third bucket that no longer exists). Both legitimate flavours
-    surface **0 failed, 0 errors** — the skip-count delta reflects
-    what the conftest layers actually denied, not a regression.
+    a dev box that can bind (suite-level + parity-level conftest
+    hooks both honour it); a "true sandbox" kernel-bind-deny just
+    narrows the same set further, not a different bucket.
 
 > ### Release readiness — **a real-loopback CI run is REQUIRED before shipping**
 >

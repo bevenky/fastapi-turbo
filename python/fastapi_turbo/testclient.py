@@ -663,11 +663,65 @@ class _ASGISyncClientShim:
         return self._client.base_url
 
     def close(self) -> None:
+        # Idempotent — close() may be called twice (manual + GC, or
+        # nested ``with TestClient(...)`` contexts).
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        # 1. Close the AsyncClient on the loop thread (drains the
+        #    httpx ASGITransport sockets).
         try:
             self._run(self._client.aclose())
         except Exception:  # noqa: BLE001
             pass
-        self._loop.call_soon_threadsafe(self._loop.stop)
+        # 2. Cancel any leftover tasks on the loop and run one more
+        #    iteration so they unwind cleanly. Without this, a long-
+        #    running yield-dep teardown that hadn't completed by
+        #    ``aclose`` keeps a coroutine reference live and the loop
+        #    can't close.
+        async def _cancel_pending():
+            tasks = [
+                t for t in asyncio.all_tasks(self._loop)
+                if not t.done() and t is not asyncio.current_task()
+            ]
+            for t in tasks:
+                t.cancel()
+            for t in tasks:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _cancel_pending(), self._loop
+            ).result(timeout=2)
+        except Exception:  # noqa: BLE001
+            pass
+        # 3. Stop the loop and join the worker thread so we don't
+        #    leak it past close. Without join, the thread may still
+        #    hold socket fds when the parent process exits.
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._thread.join(timeout=2)
+        except Exception:  # noqa: BLE001
+            pass
+        # 4. Close the loop. Closing emits ``ResourceWarning`` if
+        #    skipped — and Python 3.14's ``BaseEventLoop.__del__``
+        #    will warn loudly under ``-W error::ResourceWarning``.
+        try:
+            if not self._loop.is_closed():
+                self._loop.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class TestClient:
@@ -1497,7 +1551,54 @@ class _InProcessWebSocketSession:
 
     def __exit__(self, *exc) -> None:
         self.close()
-        self._loop.call_soon_threadsafe(self._loop.stop)
+        # Cancel any pending task on the loop (e.g. the
+        # ``_run_app_task`` coroutine still waiting for more messages
+        # if the user closed mid-stream), then stop + join the
+        # worker thread and close the loop. Without this the loop's
+        # thread leaks past session exit and ``-W error::Resource
+        # Warning`` runs trip on the ``unclosed event loop`` /
+        # ``unclosed socket`` warnings emitted by
+        # ``BaseEventLoop.__del__``.
+        async def _cancel_pending():
+            tasks = [
+                t for t in asyncio.all_tasks(self._loop)
+                if not t.done() and t is not asyncio.current_task()
+            ]
+            for t in tasks:
+                t.cancel()
+            for t in tasks:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _cancel_pending(), self._loop
+            ).result(timeout=2)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._thread.join(timeout=2)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if not self._loop.is_closed():
+                self._loop.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def __del__(self):
+        try:
+            if not self._closed:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            if not self._loop.is_closed():
+                self._loop.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     @property
     def accepted_subprotocol(self) -> str | None:

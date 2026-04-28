@@ -89,9 +89,20 @@ OFFLINE="${OFFLINE:-0}"
 
 verify_at_tag() {
     local tree="$1" tag="$2"
-    if [ ! -d "$tree/.git" ]; then
-        echo "OFFLINE=1 set, but $tree is not a git checkout." >&2
-        echo "Pre-clone the repo and check out tag $tag, then re-run." >&2
+    # Validate the checkout is REALLY a usable git work tree.
+    # Earlier we only checked ``-d "$tree/.git"`` which a partial
+    # / corrupted clone passes (the ``.git`` dir exists but
+    # ``git rev-parse`` blows up, leaving a confusing exit-128
+    # downstream). R48 audit caught a Sentry checkout at
+    # /tmp/sentry-python that had a ``.git`` dir but
+    # ``git status`` reported "not a git repository". Use the
+    # canonical ``--is-inside-work-tree`` check instead.
+    if ! git -C "$tree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "OFFLINE=1 set, but $tree is not a usable git checkout." >&2
+        echo "Either:" >&2
+        echo "  * pre-clone the repo and check out tag $tag, then re-run, or" >&2
+        echo "  * remove $tree (\`rm -rf $tree\`) and re-run with OFFLINE unset" >&2
+        echo "    so the script can clone fresh." >&2
         exit 2
     fi
     local current_tag
@@ -137,7 +148,12 @@ run_fastapi_gate() {
             exit 2
         fi
     else
-        if [ ! -d /tmp/fastapi_upstream/.git ]; then
+        # Re-clone if the existing tree isn't a usable git checkout
+        # (corrupted ``.git`` dir, partial init, etc.). The audit
+        # caught a case where ``-d .git`` passed but ``git rev-parse``
+        # didn't — without this branch the next ``git fetch`` exits
+        # 128 with no useful remediation path.
+        if ! git -C /tmp/fastapi_upstream rev-parse --is-inside-work-tree >/dev/null 2>&1; then
             rm -rf /tmp/fastapi_upstream
             git clone https://github.com/fastapi/fastapi /tmp/fastapi_upstream
         fi
@@ -174,7 +190,16 @@ PY
     #
     # ``--no-header`` keeps the output noise down. Result: a green
     # "N passed" line with no skipped / xfailed asterisks.
-    (cd /tmp/fastapi_upstream && "$PYTHON_BIN" -m pytest tests/ -q --tb=no --no-header \
+    #
+    # Scrub ``OFFLINE`` from the pytest child env. The variable is a
+    # script-helper switch (clone vs verify-existing-checkout) — it
+    # has no defined meaning inside pytest. Leaking it would let any
+    # test (ours or upstream's) accidentally branch on the value
+    # and create a hidden coupling between gate-mode and test-result
+    # that's easy to mistake for a compat regression. R48 audit
+    # caught exactly that risk.
+    (cd /tmp/fastapi_upstream && env -u OFFLINE \
+        "$PYTHON_BIN" -m pytest tests/ -q --tb=no --no-header \
         --ignore=tests/benchmarks/test_general_performance.py \
         --ignore=tests/test_pydantic_v1_error.py \
         --deselect=tests/test_tutorial/test_query_params_str_validations/test_tutorial006c.py)
@@ -185,7 +210,10 @@ run_sentry_gate() {
     if [ "$OFFLINE" = "1" ]; then
         verify_at_tag /tmp/sentry-python "$SENTRY_TAG"
     else
-        if [ ! -d /tmp/sentry-python/.git ]; then
+        # Re-clone if the existing tree isn't a usable git checkout
+        # — same recovery rule as the FastAPI gate. ``-d .git`` is
+        # not enough to tell that the checkout is intact.
+        if ! git -C /tmp/sentry-python rev-parse --is-inside-work-tree >/dev/null 2>&1; then
             rm -rf /tmp/sentry-python
             git clone https://github.com/getsentry/sentry-python /tmp/sentry-python
         fi
@@ -203,7 +231,9 @@ import fastapi_turbo  # noqa: F401
 PY
     done
 
-    "$PYTHON_BIN" -m pytest \
+    # Same OFFLINE scrub as the FastAPI gate — a script-only
+    # variable should never reach pytest.
+    env -u OFFLINE "$PYTHON_BIN" -m pytest \
         /tmp/sentry-python/tests/integrations/fastapi \
         /tmp/sentry-python/tests/integrations/asgi \
         -q --tb=short

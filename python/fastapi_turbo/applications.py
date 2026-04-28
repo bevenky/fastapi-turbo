@@ -9657,7 +9657,7 @@ class FastAPI:
                 return d
             return _coerce_to(ann, raw)
 
-        async def _ws_resolve_dep(dep_callable, dep_cache):
+        async def _ws_resolve_dep(dep_callable, dep_cache, use_cache=True):
             """Recursive ``Depends`` resolver for the WS path.
 
             Handles per-param resolution the way upstream FastAPI
@@ -9677,15 +9677,22 @@ class FastAPI:
               * Bare param with a default → use the default verbatim.
 
             Honour ``app.dependency_overrides`` first so WS deps
-            obey the same override contract as HTTP deps. Earlier
-            this resolver inspected ``dep_callable`` directly,
-            ignoring the override map and breaking
-            ``test_router_ws_depends_with_override``.
+            obey the same override contract as HTTP deps.
+
+            ``use_cache`` mirrors ``Depends(..., use_cache=...)``:
+            when False, the resolver re-runs the dep on every
+            usage within one WS session. Earlier this resolver
+            unconditionally consulted ``dep_cache``, so two
+            ``Depends(d, use_cache=False)`` params in one handler
+            both got the FIRST call's value — broke FA's
+            ``no-cache`` contract (probe-confirmed: turbo returned
+            ``a=1, b=1, calls=1`` where upstream returns
+            ``a=1, b=2, calls=2``).
             """
             _ws_overrides = getattr(self, "dependency_overrides", None) or {}
             _ws_orig_callable = dep_callable
             dep_callable = _ws_overrides.get(dep_callable, dep_callable)
-            if _ws_orig_callable in dep_cache:
+            if use_cache and _ws_orig_callable in dep_cache:
                 return dep_cache[_ws_orig_callable]
             try:
                 dep_sig = _insp_ws.signature(dep_callable)
@@ -9701,7 +9708,9 @@ class FastAPI:
                         nested = default.dependency
                         if nested is not None:
                             dep_kwargs[dpname] = await _ws_resolve_dep(
-                                nested, dep_cache
+                                nested,
+                                dep_cache,
+                                use_cache=getattr(default, "use_cache", True),
                             )
                         continue
                     # Query / Header / Path / Cookie markers — coerce
@@ -9739,8 +9748,11 @@ class FastAPI:
             # Cache under the ORIGINAL callable so subsequent
             # ``Depends(orig_callable)`` requests in the same WS
             # session hit the cache regardless of any
-            # dependency_overrides indirection.
-            dep_cache[_ws_orig_callable] = val
+            # dependency_overrides indirection. Only store when
+            # the caller asked us to cache — ``use_cache=False``
+            # callers want a fresh value next time.
+            if use_cache:
+                dep_cache[_ws_orig_callable] = val
             return val
 
         try:
@@ -9763,7 +9775,9 @@ class FastAPI:
                     dep_callable = p.get("dep_callable")
                     if dep_callable is not None:
                         kwargs[pname] = await _ws_resolve_dep(
-                            dep_callable, ws_dep_cache
+                            dep_callable,
+                            ws_dep_cache,
+                            use_cache=p.get("use_cache", True),
                         )
                     continue
                 if kind == "path":
