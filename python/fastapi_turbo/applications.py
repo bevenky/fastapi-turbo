@@ -8521,9 +8521,18 @@ class FastAPI:
                                 _cb_fields = getattr(
                                     model_class, "model_fields", {}
                                 ) or {}
+
+                                def _cb_alias_or_name(_fn):
+                                    _fi = _cb_fields.get(_fn)
+                                    if _fi is None:
+                                        return _fn
+                                    _va = getattr(_fi, "validation_alias", None)
+                                    if isinstance(_va, str) and _va:
+                                        return _va
+                                    return getattr(_fi, "alias", None) or _fn
                                 if _cb_fields:
                                     raise _RVE_err([
-                                        _missing("body", _fn)
+                                        _missing("body", _cb_alias_or_name(_fn))
                                         for _fn in _cb_fields
                                     ])
                                 raise _RVE_err([_missing("body", name)])
@@ -8537,11 +8546,46 @@ class FastAPI:
                                 instance = parsed_body
                         except _PyVE2 as pve:
                             errs = []
+                            def _cb_field_alias_for(_fi, _fn):
+                                _va = getattr(_fi, "validation_alias", None)
+                                if isinstance(_va, str) and _va:
+                                    return _va
+                                return getattr(_fi, "alias", None) or _fn
+                            _cb_field_aliases = {
+                                _fn: _cb_field_alias_for(_fi, _fn)
+                                for _fn, _fi in (
+                                    getattr(model_class, "model_fields", {}) or {}
+                                ).items()
+                            }
                             for e in pve.errors():
-                                # Preserve ``ctx`` (R39).
+                                # Preserve ``ctx`` (R39). Remap each
+                                # leading loc segment from the
+                                # synthetic-model field NAME to the FA
+                                # ALIAS so 422 ``loc`` matches the
+                                # wire shape — ``["body", "p_alias"]``
+                                # for ``Body(alias="p_alias")``, not
+                                # the python-side ``["body", "p"]``.
                                 new = {k: v for k, v in e.items() if k != "url"}
                                 loc = list(new.get("loc", ()))
+                                if loc and isinstance(loc[0], str):
+                                    loc[0] = _cb_field_aliases.get(loc[0], loc[0])
                                 new["loc"] = ["body", *loc] if loc else ["body"]
+                                # FA contract: ``input`` is ``None``
+                                # ONLY for top-level missing fields
+                                # (e.g. ``loc=["body", "user"]`` where
+                                # ``user`` is absent from the payload).
+                                # Nested missing (``loc=["body", "item",
+                                # "price"]``) keeps Pydantic's input —
+                                # the partial parent dict — so the
+                                # client can see what WAS supplied.
+                                # Detect via the original ``loc`` depth
+                                # before we prepended ``"body"``.
+                                _orig_loc_len = len(list(e.get("loc", ())))
+                                if (
+                                    new.get("type") == "missing"
+                                    and _orig_loc_len <= 1
+                                ):
+                                    new["input"] = None
                                 errs.append(new)
                             raise _RVE_err(errs, body=parsed_body) from None
                         # Split fields back into user-signature kwargs.
@@ -8558,6 +8602,18 @@ class FastAPI:
                     if val is None and not required:
                         kwargs[name] = default_val
                         continue
+                    # Single-body required missing emits ``loc=["body"]``
+                    # (FA's contract: the field name lives in the
+                    # endpoint signature, not the wire payload — there
+                    # is no aliased "body root" name). The combined-
+                    # body path handles the embedded multi-field case.
+                    if val is None and required:
+                        raise _RVE_err([{
+                            "type": "missing",
+                            "loc": ["body"],
+                            "msg": "Field required",
+                            "input": None,
+                        }])
                     if model_class is not None:
                         try:
                             if hasattr(model_class, "model_validate"):
