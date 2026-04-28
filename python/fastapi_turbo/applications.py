@@ -2432,6 +2432,134 @@ def _is_json_response_class(cls) -> bool:
         return isinstance(cls, type) and issubclass(cls, _JR)
 
 
+def _build_effective_body_plan(introspect_params, endpoint):
+    """Return a copy of ``introspect_params`` extended with a
+    ``_combined_body`` step covering handler + dep body fields when
+    multiple distinct body names are reachable through the dep tree.
+
+    FA's contract for ``Depends(d)`` where ``d`` declares a body param:
+    the body field becomes part of the *route's* request body. If the
+    handler has ``item: Item`` and a dep has ``item2: Item2``, the
+    wire format is ``{"item": ..., "item2": ...}``; if both share
+    name+type the body is shared (single field). Mirrors
+    ``build_resolution_plan``'s combining logic but produces only the
+    extraction step the in-process dispatcher needs.
+    """
+    from fastapi_turbo._introspect import (
+        introspect_endpoint as _ie_local,
+        _TypeAdapterProxy as _TAP_local,
+    )
+
+    handler_bodies = [
+        p for p in introspect_params
+        if p.get("kind") == "body" and p.get("name") != "_combined_body"
+    ]
+
+    dep_bodies: list[dict] = []
+    visited: set[int] = set()
+
+    def _walk(callable_):
+        if callable_ is None:
+            return
+        cid = id(callable_)
+        if cid in visited:
+            return
+        visited.add(cid)
+        try:
+            sub = _ie_local(callable_, "/")
+        except Exception:  # noqa: BLE001
+            return
+        for sp in sub:
+            sk = sp.get("kind")
+            if sk == "body":
+                dep_bodies.append(sp)
+            elif sk == "dependency":
+                _walk(sp.get("dep_callable"))
+
+    for p in introspect_params:
+        if p.get("kind") == "dependency":
+            _walk(p.get("dep_callable"))
+
+    # Dedup: same name → keep one. We accept the first occurrence
+    # (handler before deps; deps in walk order). FA's "duplicate"
+    # rule is name-based; types must match too, but the in-process
+    # dispatcher already enforces that via the chosen model_class.
+    seen_names: set[str] = set()
+    merged: list[dict] = []
+    for bp in handler_bodies + dep_bodies:
+        nm = bp.get("name")
+        if nm in seen_names:
+            continue
+        seen_names.add(nm)
+        merged.append(bp)
+
+    if len(merged) <= 1:
+        return introspect_params
+
+    # Build a synthetic ``_combined_body`` step. Replace handler body
+    # params with this single step.
+    try:
+        from pydantic import create_model
+    except ImportError:
+        return introspect_params
+
+    field_definitions: dict = {}
+    for bp in merged:
+        model_cls = bp.get("model_class")
+        if isinstance(model_cls, _TAP_local):
+            model_cls = model_cls._annotation
+        if model_cls is not None:
+            if bp.get("required", True):
+                field_definitions[bp["name"]] = (model_cls, ...)
+            else:
+                field_definitions[bp["name"]] = (model_cls, bp.get("default_value"))
+        else:
+            from typing import Any as _Any
+            type_map = {"int": int, "float": float, "bool": bool, "str": str}
+            py_type = type_map.get(bp.get("type_hint", ""), _Any)
+            field_definitions[bp["name"]] = (
+                py_type,
+                ... if bp.get("required", True) else bp.get("default_value"),
+            )
+
+    _endpoint_name = getattr(endpoint, "__name__", "endpoint")
+    try:
+        CombinedBody = create_model(f"Body_{_endpoint_name}", **field_definitions)
+    except Exception:  # noqa: BLE001
+        return introspect_params
+
+    body_names = [bp["name"] for bp in merged]
+    handler_body_names = {bp.get("name") for bp in handler_bodies}
+    _combined_required = any(bp.get("required", True) for bp in merged)
+    combined_step = {
+        "name": "_combined_body",
+        "kind": "body",
+        "type_hint": "model",
+        "required": _combined_required,
+        "default_value": None,
+        "has_default": not _combined_required,
+        "model_class": CombinedBody,
+        "alias": None,
+        "_embed": False,
+        "_body_param_names": body_names,
+        "_handler_body_names": list(handler_body_names),
+        "_is_handler_param": True,
+        "_is_combined_body_for_deps": True,
+    }
+    new_params: list = []
+    seen_combined = False
+    for p in introspect_params:
+        if p.get("kind") == "body":
+            if not seen_combined:
+                new_params.append(combined_step)
+                seen_combined = True
+            continue
+        new_params.append(p)
+    if not seen_combined:
+        new_params.append(combined_step)
+    return new_params
+
+
 async def _send_asgi_response(send, response, scope=None) -> None:
     # ``FileResponse`` stores ``content=b""`` because the Rust server
     # reads ``response.path`` from disk at serve time. Over the in-
@@ -6801,11 +6929,77 @@ class FastAPI:
             return
 
         if scope["type"] == "websocket":
+            # WS mount handling: when a sub-app is mounted at
+            # ``/sub`` and the client opens ``/sub/ws/...``, strip
+            # the prefix and forward to the mounted app's ``__call__``
+            # with ``scope['root_path']`` updated. Mirrors the HTTP
+            # path's mount routing so sub-apps' WS endpoints work.
+            ws_path_local = scope.get("path", "/")
+            for _mp, _ma, _mn in getattr(self, "_mounts", []) or []:
+                _mp_strip = (_mp or "").rstrip("/")
+                if not _mp_strip:
+                    continue
+                if (
+                    ws_path_local == _mp_strip
+                    or ws_path_local.startswith(_mp_strip + "/")
+                ):
+                    if not callable(_ma):
+                        continue
+                    sub_ws_scope = dict(scope)
+                    sub_ws_path = ws_path_local[len(_mp_strip):] or "/"
+                    sub_ws_scope["path"] = sub_ws_path
+                    sub_ws_scope["raw_path"] = sub_ws_path.encode("latin-1")
+                    sub_ws_scope["root_path"] = (
+                        scope.get("root_path", "") + _mp_strip
+                    )
+                    await _ma(sub_ws_scope, receive, send)
+                    return
+
+            # WS middleware: Starlette-style ASGI middleware
+            # registered via ``Middleware(websocket_middleware)`` /
+            # ``add_middleware(callable)`` wraps the dispatch chain
+            # so user middleware can ``try/except`` errors raised by
+            # WS deps. Mirrors FA's
+            # ``test_ws_router::test_depend_err_middleware``.
+            ws_mw_factories = []
+            try:
+                for _cls, _kw in getattr(self, "_middleware_stack", []) or []:
+                    # Function-style middleware (callable but not a
+                    # type) — Starlette accepts these as factory:
+                    # ``cls(app) -> wrapped_app``.
+                    if callable(_cls) and not isinstance(_cls, type):
+                        ws_mw_factories.append((_cls, _kw))
+            except Exception:  # noqa: BLE001
+                pass
+
             # Try in-process WS dispatch first (sandbox-friendly),
             # fall back to the loopback proxy when the in-process
             # path can't satisfy the request.
             force_proxy = bool(scope.get("_fastapi_turbo_force_proxy"))
             if not force_proxy:
+                if ws_mw_factories:
+                    async def _ws_inner_app(_s, _r, _sd):
+                        # Mark scope so the dispatcher knows a
+                        # middleware will catch errors — skip the
+                        # default 1011 close so the middleware's
+                        # ``websocket.close(code=…, reason=…)`` is
+                        # the one delivered to the client.
+                        _ms = dict(_s) if not _s.get(
+                            "_fastapi_turbo_ws_in_mw"
+                        ) else _s
+                        _ms["_fastapi_turbo_ws_in_mw"] = True
+                        await self._asgi_dispatch_ws_in_process(_ms, _r, _sd)
+                    _ws_app = _ws_inner_app
+                    for _mc, _mk in reversed(ws_mw_factories):
+                        try:
+                            _ws_app = _mc(_ws_app, **_mk)
+                        except TypeError:
+                            try:
+                                _ws_app = _mc(_ws_app)
+                            except Exception:  # noqa: BLE001
+                                pass
+                    await _ws_app(scope, receive, send)
+                    return
                 dispatched = await self._asgi_dispatch_ws_in_process(
                     scope, receive, send
                 )
@@ -7358,10 +7552,28 @@ class FastAPI:
             return False
         endpoint = getattr(raw_endpoint, "_fastapi_turbo_original_endpoint", raw_endpoint)
         import inspect as _insp
+        # PEP 649 (py3.14+): some annotations reference names defined
+        # only under ``if TYPE_CHECKING:``. Eager evaluation of
+        # ``inspect.signature(endpoint)`` raises ``NameError`` then.
+        # Use ``Format.FORWARDREF`` so unresolved names become
+        # opaque ``ForwardRef`` objects (we only need the param
+        # NAMES + KINDS here; the user dependency runs unbothered).
         try:
-            sig = _insp.signature(endpoint)
-        except (TypeError, ValueError):
-            return False
+            import annotationlib as _al_local
+            try:
+                sig = _insp.signature(
+                    endpoint, annotation_format=_al_local.Format.FORWARDREF
+                )
+            except (TypeError, ValueError, NameError):
+                try:
+                    sig = _insp.signature(endpoint)
+                except (TypeError, ValueError, NameError):
+                    return False
+        except ImportError:
+            try:
+                sig = _insp.signature(endpoint)
+            except (TypeError, ValueError, NameError):
+                return False
 
         # ── Build the param plan via ``_introspect.introspect_endpoint`` ──
         # Same introspection the Rust hot path uses, so we get Pydantic-
@@ -7388,6 +7600,26 @@ class FastAPI:
                 setattr(matched_route, _plan_cache_attr, introspect_params)
             except (AttributeError, TypeError):
                 pass
+
+        # FA's "dependency duplicates" semantics: when the handler and any
+        # sub-dep declare body params, FA computes a UNION of their body
+        # fields. Same name+type → shared (one body field). Different
+        # names → combined into one body model with all fields. Walk the
+        # dep tree to collect dep-level body params and, if necessary,
+        # synthesise a ``_combined_body`` step that supersedes the
+        # handler-only body. Cache the effective plan separately so the
+        # route's own ``introspect_params`` cache stays untouched.
+        _eff_plan_attr = "_fastapi_turbo_asgi_effective_plan"
+        _effective_plan = getattr(matched_route, _eff_plan_attr, None)
+        if _effective_plan is None:
+            _effective_plan = _build_effective_body_plan(
+                introspect_params, endpoint
+            )
+            try:
+                setattr(matched_route, _eff_plan_attr, _effective_plan)
+            except (AttributeError, TypeError):
+                pass
+        introspect_params = _effective_plan
 
         # Pre-scan: does the endpoint need a body? (so we know whether
         # to drain receive.)
@@ -7917,10 +8149,27 @@ class FastAPI:
             _do_cache = use_cache
             if _do_cache and cache_key in cache:
                 return cache[cache_key]
+            # PEP 649: forward refs (TYPE_CHECKING-only names) need
+            # ``Format.FORWARDREF`` so signature() doesn't raise
+            # NameError. We only consume param NAMES + KINDS for
+            # routing.
             try:
-                sub_sig = _insp.signature(actual_fn)
-            except (TypeError, ValueError):
-                sub_sig = None
+                import annotationlib as _al_dep
+                try:
+                    sub_sig = _insp.signature(
+                        actual_fn,
+                        annotation_format=_al_dep.Format.FORWARDREF,
+                    )
+                except (TypeError, ValueError, NameError):
+                    try:
+                        sub_sig = _insp.signature(actual_fn)
+                    except (TypeError, ValueError, NameError):
+                        sub_sig = None
+            except ImportError:
+                try:
+                    sub_sig = _insp.signature(actual_fn)
+                except (TypeError, ValueError, NameError):
+                    sub_sig = None
             sub_hints = {}
             try:
                 sub_hints = _tp.get_type_hints(actual_fn)
@@ -8017,6 +8266,67 @@ class FastAPI:
                             sub_kwargs[dname] = _validate(
                                 dscalar, raw_c, "cookie", dalias, annotation=dann
                             )
+                        continue
+                    if dkind == "body":
+                        # FA "dependency duplicates": a dep that takes a
+                        # body param shares it with the handler.
+                        # ``_combined_body`` (when synthesised) was
+                        # already split into kwargs[<field_name>] —
+                        # look up the dep's body name there. For the
+                        # single-body shared case the handler's body
+                        # value is in kwargs[<handler_body_name>] under
+                        # the same model_class — use that when name+
+                        # type match.
+                        from fastapi_turbo._introspect import (
+                            _TypeAdapterProxy as _TAP_dep,
+                        )
+                        if dname in kwargs:
+                            sub_kwargs[dname] = kwargs[dname]
+                            continue
+                        # Single-body case: find a handler body of the
+                        # same model_class.
+                        d_model = dp.get("model_class")
+                        if isinstance(d_model, _TAP_dep):
+                            d_model = d_model._annotation
+                        _matched_handler = None
+                        for _hp in introspect_params:
+                            if _hp.get("kind") != "body":
+                                continue
+                            if _hp.get("name") == "_combined_body":
+                                continue
+                            _hm = _hp.get("model_class")
+                            if isinstance(_hm, _TAP_dep):
+                                _hm = _hm._annotation
+                            if _hm is d_model and _hp.get("name") in kwargs:
+                                _matched_handler = _hp.get("name")
+                                break
+                        if _matched_handler is not None:
+                            sub_kwargs[dname] = kwargs[_matched_handler]
+                            continue
+                        # Fallback: parse body directly. ``parsed_body``
+                        # is the raw decoded body (dict / value). When
+                        # the dep has a model_class, validate against
+                        # it; else use raw.
+                        if parsed_body is None:
+                            if drequired:
+                                raise _RVE_err([_missing("body", dalias)])
+                            sub_kwargs[dname] = ddefault
+                            continue
+                        if d_model is not None and hasattr(
+                            d_model, "model_validate"
+                        ):
+                            try:
+                                sub_kwargs[dname] = d_model.model_validate(
+                                    parsed_body
+                                )
+                            except Exception:  # noqa: BLE001
+                                if drequired:
+                                    raise _RVE_err(
+                                        [_missing("body", dalias)]
+                                    )
+                                sub_kwargs[dname] = ddefault
+                        else:
+                            sub_kwargs[dname] = parsed_body
                         continue
                     if dkind in ("form", "file"):
                         # Form / file params on a dep callable
@@ -9288,16 +9598,23 @@ class FastAPI:
                     _ep_line = getattr(
                         getattr(_ep_for_ctx, "__code__", None), "co_firstlineno", None
                     )
+                    # Mounted apps: the route's local ``path`` is
+                    # ``/items/`` but the user-facing URL includes the
+                    # mount prefix (``/sub``). Prepend ``root_path``
+                    # from scope so error handlers see the full path.
+                    _route_local = getattr(matched_route, "path", None) or ""
+                    _root_local = scope.get("root_path", "") or ""
+                    _full_path = (_root_local + _route_local) if _route_local else _route_local
                     exc.endpoint_ctx = {
                         "function": _ep_func,
                         "file": _ep_file,
                         "line": _ep_line,
-                        "path": getattr(matched_route, "path", None),
+                        "path": _full_path,
                     }
                     exc.endpoint_function = _ep_func
                     exc.endpoint_file = _ep_file
                     exc.endpoint_line = _ep_line
-                    exc.endpoint_path = getattr(matched_route, "path", None)
+                    exc.endpoint_path = _full_path
                 except Exception:  # noqa: BLE001
                     pass
             await _asgi_emit_exception(self, scope, send, exc)
@@ -9360,7 +9677,13 @@ class FastAPI:
                 "line": getattr(
                     getattr(endpoint, "__code__", None), "co_firstlineno", None
                 ),
-                "path": getattr(_route, "path", None),
+                # Mounted apps: prepend ``scope['root_path']`` so the
+                # full URL surfaces in ``ResponseValidationError`` —
+                # otherwise sub-app handlers report ``/items/`` and
+                # the user's exception handler sees a stripped path.
+                "path": (scope.get("root_path", "") or "") + (
+                    getattr(_route, "path", None) or ""
+                ),
             },
         }
         _status_code = getattr(_route, "status_code", None)
@@ -9375,7 +9698,17 @@ class FastAPI:
         # that don't appear on the user fn, while the body splitter
         # writes back to the original names (``qty`` etc.) that DO.
         try:
-            _ep_sig_local = _insp.signature(endpoint)
+            try:
+                import annotationlib as _al_filter
+                try:
+                    _ep_sig_local = _insp.signature(
+                        endpoint,
+                        annotation_format=_al_filter.Format.FORWARDREF,
+                    )
+                except (TypeError, ValueError, NameError):
+                    _ep_sig_local = _insp.signature(endpoint)
+            except ImportError:
+                _ep_sig_local = _insp.signature(endpoint)
             _accepts_var_kw = any(
                 _pp.kind is _insp.Parameter.VAR_KEYWORD
                 for _pp in _ep_sig_local.parameters.values()
@@ -9386,8 +9719,9 @@ class FastAPI:
                     _kk: _vv for _kk, _vv in kwargs.items()
                     if _kk in _ep_param_names
                 }
-        except (TypeError, ValueError):
-            # Builtin / C function with no introspectable signature —
+        except (TypeError, ValueError, NameError):
+            # Builtin / C function with no introspectable signature
+            # OR a still-NameError (forward-ref fallback failed) —
             # leave kwargs as-is so the runtime call still surfaces a
             # meaningful error.
             pass
@@ -9440,31 +9774,126 @@ class FastAPI:
                     return _route_resp_class(r)
                 import json as _json_for_ndjson
 
+                # FA: when the handler's return annotation is
+                # ``AsyncIterable[Item]`` / ``Iterable[Item]``,
+                # validate each yielded item against ``Item`` and
+                # raise ``ResponseValidationError`` on mismatch.
+                # Mirrors the Rust-handler-compilation path.
+                _stream_item_adapter = None
+                try:
+                    import typing as _tp_strm
+                    import collections.abc as _cabc_strm
+                    _ret_ann = (
+                        _tp_strm.get_type_hints(endpoint).get("return")
+                        if endpoint is not None else None
+                    )
+                    if _tp_strm.get_origin(_ret_ann) in {
+                        _cabc_strm.AsyncIterable,
+                        _cabc_strm.AsyncIterator,
+                        _cabc_strm.AsyncGenerator,
+                        _cabc_strm.Iterable,
+                        _cabc_strm.Iterator,
+                        _cabc_strm.Generator,
+                    }:
+                        _ret_args = _tp_strm.get_args(_ret_ann)
+                        if _ret_args:
+                            from pydantic import TypeAdapter as _TA_strm
+                            try:
+                                _stream_item_adapter = _TA_strm(_ret_args[0])
+                            except Exception:  # noqa: BLE001
+                                _stream_item_adapter = None
+                except Exception:  # noqa: BLE001
+                    _stream_item_adapter = None
+
+                _app_for_strm = self
+
+                def _strm_check(item):
+                    if _stream_item_adapter is None:
+                        return item
+                    from pydantic import ValidationError as _PyVE_strm
+                    from fastapi_turbo.exceptions import (
+                        ResponseValidationError as _RVE_strm,
+                    )
+                    try:
+                        return _stream_item_adapter.validate_python(item)
+                    except _PyVE_strm as _ve_strm:
+                        _rve = _RVE_strm(
+                            errors=_ve_strm.errors(), body=item
+                        )
+                        if _app_for_strm is not None:
+                            _app_for_strm._captured_server_exceptions.append(_rve)
+                        raise _rve from None
+
                 async def _ndjson_iter(_gen):
                     if _insp.isasyncgen(_gen):
                         async for _item in _gen:
+                            _v = _strm_check(_item)
                             yield (
                                 _json_for_ndjson.dumps(
-                                    _je(_item), separators=(",", ":"),
+                                    _je(_v), separators=(",", ":"),
                                 ).encode("utf-8") + b"\n"
                             )
                     else:
                         for _item in _gen:
+                            _v = _strm_check(_item)
                             yield (
                                 _json_for_ndjson.dumps(
-                                    _je(_item), separators=(",", ":"),
+                                    _je(_v), separators=(",", ":"),
                                 ).encode("utf-8") + b"\n"
                             )
                 return _SR(
                     _ndjson_iter(r),
                     media_type="application/jsonl",
                 )
+            # Fast-path snapshot: when no filtering/aliasing options
+            # apply, the route uses the default JSONResponse, and the
+            # handler returned a BaseModel matching ``response_model``,
+            # we can serialise via Pydantic's ``__pydantic_serializer__
+            # .to_json`` directly. ``test_dump_json_fast_path`` asserts
+            # ``json.dumps`` is NOT called on this path.
+            _fast_json_ok = False
+            try:
+                from pydantic import BaseModel as _PBM_fastpath
+                _has_filters_fast = (
+                    _rm_opts.get("include") is not None
+                    or _rm_opts.get("exclude") is not None
+                    or _rm_opts.get("exclude_unset")
+                    or _rm_opts.get("exclude_defaults")
+                    or _rm_opts.get("exclude_none")
+                    or _rm_opts.get("by_alias") is False
+                )
+                _route_explicit_rc = getattr(
+                    matched_route, "response_class", None
+                )
+                if (
+                    not _has_filters_fast
+                    and _route_explicit_rc is None
+                    and isinstance(_resp_model, type)
+                    and issubclass(_resp_model, _PBM_fastpath)
+                    and isinstance(r, _PBM_fastpath)
+                    and type(r) is _resp_model
+                ):
+                    _fast_json_ok = True
+            except Exception:  # noqa: BLE001
+                _fast_json_ok = False
+            _fast_json_bytes: bytes | None = None
+            if _fast_json_ok:
+                try:
+                    # FA defaults ``response_model_by_alias=True`` —
+                    # honour Pydantic ``Field(alias=...)``. Without
+                    # this, fields like ``aliased_name`` would emit
+                    # under their python-side ``name`` key.
+                    _fast_json_bytes = r.__pydantic_serializer__.to_json(
+                        r, by_alias=True,
+                    )
+                except Exception:  # noqa: BLE001
+                    _fast_json_bytes = None
             # Apply response_model filtering / aliasing / exclude-unset.
             # Errors from this path must propagate — FA surfaces
             # ResponseValidationError as a 500; silently returning the
             # unvalidated payload is a security hole (we'd leak fields
             # the schema intended to strip).
-            if _resp_model is not None:
+            if _resp_model is not None and _fast_json_bytes is None:
                 r = _apply_response_model(r, _resp_model, **_rm_opts)
             status_code = _status_code or 200
             # Resolve response class: route → app default → JSONResponse.
@@ -9504,7 +9933,23 @@ class FastAPI:
                 except Exception:  # noqa: BLE001
                     pass
             elif response_class is _JR or _is_json_response_class(response_class):
-                out = response_class(content=_je(r), status_code=_eff_status)
+                if _fast_json_bytes is not None:
+                    # Fast path: build a bare Response with pre-
+                    # serialised JSON bytes so ``JSONResponse.render``
+                    # / ``json.dumps`` is never invoked. Probe-
+                    # confirmed against
+                    # ``test_dump_json_fast_path::test_default_
+                    # response_class_skips_json_dumps``.
+                    from fastapi_turbo.responses import Response as _Resp_fast
+                    out = _Resp_fast(
+                        content=_fast_json_bytes,
+                        status_code=_eff_status,
+                        media_type="application/json",
+                    )
+                else:
+                    out = response_class(
+                        content=_je(r), status_code=_eff_status,
+                    )
             else:
                 # Some response classes don't take ``content=`` —
                 # ``RedirectResponse`` takes ``url=``, ``FileResponse``
@@ -9815,6 +10260,32 @@ class FastAPI:
                 bg_injected.run_sync()
             except Exception as _exc:  # noqa: BLE001
                 _log.debug("in-process background task: %r", _exc)
+        # Close any ``UploadFile`` instances that were injected as
+        # form params. Starlette's contract: once the response is
+        # sent, the underlying file handle is closed so subsequent
+        # reads see ``.closed=True``. Probe-confirmed against
+        # ``test_datastructures::test_upload_file_is_closed``.
+        try:
+            from fastapi_turbo.param_functions import UploadFile as _UF_close
+            for _ufv in kwargs.values():
+                if isinstance(_ufv, _UF_close):
+                    try:
+                        _f_close = getattr(_ufv, "file", None)
+                        if _f_close is not None:
+                            _f_close.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif isinstance(_ufv, list):
+                    for _v in _ufv:
+                        if isinstance(_v, _UF_close):
+                            try:
+                                _fc = getattr(_v, "file", None)
+                                if _fc is not None:
+                                    _fc.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+        except Exception:  # noqa: BLE001
+            pass
         # Run yield-dep teardowns in reverse order (LIFO — FA semantics).
         # These fire after the response has been sent. FA's contract:
         # the FIRST exception raised by a teardown propagates out of
@@ -10329,8 +10800,23 @@ class FastAPI:
                             default, dpname, ann
                         )
                         continue
-                    # WebSocket injection.
-                    if isinstance(ann, type) and issubclass(ann, _WS_cls):
+                    # WebSocket / HTTPConnection injection. WS deps
+                    # commonly take ``HTTPConnection`` (parent of
+                    # ``WebSocket`` — Starlette parity) so a single
+                    # dep works for both HTTP and WS routes. The
+                    # WebSocket itself satisfies that annotation.
+                    try:
+                        from fastapi_turbo.requests import (
+                            HTTPConnection as _HC_local,
+                        )
+                    except ImportError:
+                        _HC_local = None
+                    if isinstance(ann, type) and (
+                        issubclass(ann, _WS_cls)
+                        or (
+                            _HC_local is not None and issubclass(ann, _HC_local)
+                        )
+                    ):
                         dep_kwargs[dpname] = ws_obj
                         continue
                     # Bare path-param shorthand.
@@ -10563,6 +11049,63 @@ class FastAPI:
             # the generic 1011 "internal error" which the client
             # would interpret as a server-side bug.
             _log.debug("in-process WS coercion failed: %r", _vex)
+            # FA: route through ``WebSocketRequestValidationError``
+            # exception handler if one is registered. The handler
+            # captures ``exc`` (with ``endpoint_ctx``), then re-
+            # raises (or closes the WS itself). Mirrors HTTP path's
+            # validation-error contract for parity with
+            # ``test_validation_error_context``.
+            try:
+                from fastapi_turbo.exceptions import (
+                    WebSocketRequestValidationError as _WRVE_local,
+                )
+            except ImportError:
+                _WRVE_local = None
+            _ws_endpoint_ctx_local: dict = {}
+            try:
+                import inspect as _ins_local
+                _ws_endpoint_ctx_local["function"] = getattr(
+                    endpoint, "__name__", None
+                )
+                _ws_endpoint_ctx_local["file"] = _ins_local.getsourcefile(
+                    endpoint
+                )
+                _ws_endpoint_ctx_local["line"] = _ins_local.getsourcelines(
+                    endpoint
+                )[1]
+            except (TypeError, OSError):
+                pass
+            # Use the FULL mounted path so sub-app endpoints surface
+            # the user-visible URL (``/sub/ws/...``), not the local
+            # one (``/ws/...``). ``scope['root_path']`` carries the
+            # mount prefix when the request was routed through
+            # ``app.mount("/sub", sub_app)``.
+            _route_path_local = (
+                getattr(matched_route, "path", None) or "/"
+            )
+            _root_path_for_ctx = scope.get("root_path", "") or ""
+            _ws_endpoint_ctx_local["path"] = (
+                _root_path_for_ctx + _route_path_local
+            )
+            if _WRVE_local is not None:
+                try:
+                    _wrve = _WRVE_local(
+                        errors=getattr(_vex, "errors", lambda: [])(),
+                        endpoint_ctx=_ws_endpoint_ctx_local,
+                    )
+                except Exception:  # noqa: BLE001
+                    _wrve = None
+                if _wrve is not None:
+                    _wrve_handler = (
+                        getattr(self, "exception_handlers", {}) or {}
+                    ).get(_WRVE_local)
+                    if _wrve_handler is not None:
+                        try:
+                            _r = _wrve_handler(ws_obj, _wrve)
+                            if _insp_ws.iscoroutine(_r):
+                                await _r
+                        except Exception:  # noqa: BLE001
+                            pass
             if not ws_obj._closed:
                 try:
                     await ws_obj.close(code=1008)
@@ -10606,7 +11149,14 @@ class FastAPI:
                         pass
                 ws_dep_teardowns.clear()
                 return True
-            if not ws_obj._closed:
+            # Skip the default 1011 close when an outer WS
+            # middleware will observe the raised exception — the
+            # middleware's own ``websocket.close(...)`` should be
+            # the one delivered. Probe-confirmed against
+            # ``test_ws_router::test_depend_err_middleware`` (a
+            # custom middleware closes with 1006/repr(exc)).
+            _ws_in_mw_flag = scope.get("_fastapi_turbo_ws_in_mw", False)
+            if not _ws_in_mw_flag and not ws_obj._closed:
                 try:
                     await ws_obj.close(code=1011)
                 except Exception:  # noqa: BLE001

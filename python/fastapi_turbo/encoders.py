@@ -56,7 +56,17 @@ def jsonable_encoder(
         if isinstance(obj, BaseModel):
             # Pydantic v2
             if hasattr(obj, "model_dump"):
-                dump_kwargs: dict[str, Any] = {"by_alias": by_alias}
+                # FA uses ``mode="json"`` so Pydantic emits the
+                # JSON-shape representation of every field (Decimal
+                # becomes string, datetime becomes ISO 8601, UUID
+                # becomes string, etc.). Without it our encoder's
+                # Decimal branch would emit int/float, breaking
+                # ``test_multi_body_errors::test_put_correct_body``
+                # (expects ``"age": "5"``).
+                dump_kwargs: dict[str, Any] = {
+                    "by_alias": by_alias,
+                    "mode": "json",
+                }
                 if include is not None:
                     dump_kwargs["include"] = include
                 if exclude is not None:

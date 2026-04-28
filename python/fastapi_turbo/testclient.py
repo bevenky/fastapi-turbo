@@ -721,9 +721,15 @@ class _ASGISyncClientShim:
             self._thread.join(timeout=2)
         except Exception:  # noqa: BLE001
             pass
-        # 4. Close the loop. Closing emits ``ResourceWarning`` if
-        #    skipped — and Python 3.14's ``BaseEventLoop.__del__``
-        #    will warn loudly under ``-W error::ResourceWarning``.
+        # 4. Close the loop unconditionally — even if steps 1-3
+        #    raised. Skipping the close emits ``ResourceWarning``
+        #    via ``BaseEventLoop.__del__`` on Python 3.14, which
+        #    pytest's ``unraisableexception`` plugin accumulates and
+        #    raises as an ``ExceptionGroup`` at session end (probe-
+        #    confirmed: ``test_starlette_exception::test_openapi_
+        #    schema`` was the canary). Wrap step 4 in its own try/
+        #    except so we always reach ``loop.close()`` regardless of
+        #    upstream failure.
         try:
             if not self._loop.is_closed():
                 self._loop.close()
