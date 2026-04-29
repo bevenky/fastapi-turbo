@@ -42,6 +42,18 @@ fallback tests should not assert ``_port`` or ``_app_servers``."
 """
 from __future__ import annotations
 
+# Pre-import Starlette BEFORE any test triggers ``import
+# fastapi_turbo`` (which installs the sys.modules shim). This
+# exercises the real "user code imported starlette first, then
+# fastapi_turbo" path so ``compat.PRESHIM_STARLETTE_UPLOADFILE``
+# captures the original Starlette ``UploadFile`` instead of None.
+# Without this conftest-level pre-import, the regression test in
+# ``tests/stress/test_r25_regressions.py::test_compat_captures_
+# preshim_uploadfile_at_install_time`` skips with "Starlette not
+# pre-imported in this process" — turning what should be a real
+# coverage assertion into a perpetual no-op.
+import starlette.datastructures  # noqa: F401  # pre-shim capture
+
 import os
 import socket
 
