@@ -1089,16 +1089,33 @@ class Client:
         timeout: float | Timeout | _UseClientDefault | None = USE_CLIENT_DEFAULT,
         extensions: dict | None = None,
     ) -> Request:
-        # Resolve URL
+        # Resolve URL — match httpx's path-append + ``..``/``.``
+        # resolution semantics. With ``base_url='https://h/api/v1'``
+        # both ``x`` and ``/x`` join to ``https://h/api/v1/x`` (httpx
+        # treats relative URLs as directory-style appends, not the
+        # ``urljoin`` segment-replace behaviour). ``..`` segments are
+        # resolved against the joined path so ``../x`` produces
+        # ``https://h/api/x``.
         url_str = str(url)
         if self.base_url and not urlparse(url_str).scheme:
-            url_str = str(self.base_url).rstrip("/") + "/" + url_str.lstrip("/")
+            url_str = _httpx_url_join(str(self.base_url), url_str)
 
-        # Merge params
+        # Merge params. httpx semantics: when ``params=`` is supplied
+        # explicitly to a per-request call, it REPLACES any query
+        # string already present on the URL (rather than merging).
+        # Client-level ``self.params`` are always merged-in.
         merged_params = {**self.params}
         if params:
             merged_params.update(params)
         if merged_params:
+            # Strip the URL's existing query if the caller passed
+            # ``params=`` — httpx parity. Client-level params alone
+            # leave the existing query intact (they're a default,
+            # not an override).
+            if params:
+                qpos = url_str.find("?")
+                if qpos >= 0:
+                    url_str = url_str[:qpos]
             sep = "&" if "?" in url_str else "?"
             url_str = url_str + sep + urlencode(merged_params, doseq=True)
 
@@ -1116,11 +1133,27 @@ class Client:
             cookie_str = "; ".join(f"{k}={v}" for k, v in merged_cookies.items())
             merged_headers["cookie"] = cookie_str
 
-        # Build body
+        # Build body. httpx semantics:
+        #   * ``json``    → JSON body (Content-Type: application/json)
+        #   * ``data`` + ``files``    → multipart with BOTH form
+        #     fields and file parts merged into one body. The
+        #     elif-chain previously dropped ``files`` whenever
+        #     ``data`` was set; now we route through
+        #     ``_encode_multipart`` which accepts both halves.
+        #   * ``data`` alone → urlencoded (or raw bytes)
+        #   * ``content``    → raw bytes (Content-Type unchanged)
+        #   * ``files`` alone → multipart with file parts only
         body = None
         if json is not None:
             body = _json.dumps(json).encode("utf-8")
             merged_headers.setdefault("content-type", "application/json")
+        elif files is not None:
+            # data is form-fields, files is file parts — both flow
+            # into the same multipart body.
+            body, content_type = _encode_multipart(
+                files, data=data if isinstance(data, dict) else None,
+            )
+            merged_headers["content-type"] = content_type
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data).encode("utf-8")
@@ -1129,9 +1162,6 @@ class Client:
                 body = data if isinstance(data, bytes) else str(data).encode("utf-8")
         elif content is not None:
             body = content.encode("utf-8") if isinstance(content, str) else content
-        elif files is not None:
-            body, content_type = _encode_multipart(files)
-            merged_headers["content-type"] = content_type
 
         return Request(
             method=method,
@@ -1432,10 +1462,34 @@ def _digest_hash(data: str, algorithm: str) -> str:
         return hashlib.md5(data.encode()).hexdigest()
 
 
-def _encode_multipart(files: Any) -> tuple[bytes, str]:
-    """Encode files for multipart/form-data upload."""
+def _encode_multipart(
+    files: Any, data: dict | None = None,
+) -> tuple[bytes, str]:
+    """Encode ``data`` form fields + ``files`` file parts into a single
+    ``multipart/form-data`` body. ``data`` parts come first, then files
+    — matches httpx ordering for fixture-style assertions. When ``data``
+    is None or empty the body is files-only.
+    """
     boundary = secrets.token_hex(16)
     parts = []
+
+    # Form-field parts first (matches httpx ``Request`` ordering).
+    if data:
+        for field_name, value in data.items():
+            if isinstance(value, (list, tuple)) and not isinstance(value, (bytes, bytearray)):
+                _vals = list(value)
+            else:
+                _vals = [value]
+            for v in _vals:
+                if isinstance(v, bytes):
+                    v_bytes = v
+                else:
+                    v_bytes = str(v).encode("utf-8")
+                header = (
+                    f'--{boundary}\r\nContent-Disposition: form-data; '
+                    f'name="{field_name}"\r\n\r\n'
+                ).encode("utf-8")
+                parts.append(header + v_bytes + b"\r\n")
 
     items = files.items() if isinstance(files, dict) else files
 
@@ -1476,6 +1530,50 @@ def _encode_multipart(files: Any) -> tuple[bytes, str]:
     body = b"".join(parts) + f"--{boundary}--\r\n".encode("utf-8")
     content_type = f"multipart/form-data; boundary={boundary}"
     return body, content_type
+
+
+def _httpx_url_join(base: str, url: str) -> str:
+    """Join ``url`` to ``base`` using httpx's path-append + ``..``/``.``
+    resolution semantics (NOT ``urllib.parse.urljoin``'s segment-
+    replace behaviour). Probe-confirmed against ``httpx.Client(base_
+    url=...).build_request(...)``:
+
+      * ``base='https://h/api/v1', url='x'``       → ``https://h/api/v1/x``
+      * ``base='https://h/api/v1', url='/x'``      → ``https://h/api/v1/x``
+      * ``base='https://h/api/v1', url='../x'``    → ``https://h/api/x``
+      * ``base='https://h/api/v1', url='./x'``     → ``https://h/api/v1/x``
+      * absolute URL passes through unchanged.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme:
+        return url
+    base_p = urlparse(base)
+    base_path = base_p.path or "/"
+    rel = url.lstrip("/")
+    # Append rel to base_path with a "/" separator.
+    if not base_path.endswith("/"):
+        joined = base_path + "/" + rel
+    else:
+        joined = base_path + rel
+    # Resolve ``..`` and ``.`` segments.
+    segments: list[str] = []
+    for seg in joined.split("/"):
+        if seg == "..":
+            if segments and segments[-1] != "":
+                segments.pop()
+        elif seg == ".":
+            continue
+        else:
+            segments.append(seg)
+    final_path = "/".join(segments)
+    if not final_path.startswith("/"):
+        final_path = "/" + final_path
+    out = f"{base_p.scheme}://{base_p.netloc}{final_path}"
+    if parsed.query:
+        out += f"?{parsed.query}"
+    if parsed.fragment:
+        out += f"#{parsed.fragment}"
+    return out
 
 
 _STATUS_PHRASES = {

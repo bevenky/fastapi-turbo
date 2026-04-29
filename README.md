@@ -332,7 +332,7 @@ with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
 
 ## HTTP Client
 
-`fastapi_turbo.http.Client` is a drop-in replacement for `httpx.Client`, backed by Rust `reqwest`. Matches httpx's API exactly (same `Client`, `Response`, `Auth`, `Timeout`, `Limits`, event hooks, generator-based auth flow), but 2.2x faster on single requests and up to 3x faster on parallel fan-out.
+`fastapi_turbo.http.Client` is a Rust-`reqwest`-backed httpx-compatible client. Same `Client`, `Response`, `Auth`, `Timeout`, `Limits`, event hooks, generator-based auth flow, but 2.2x faster on single requests and up to 3x faster on parallel fan-out. Request-construction parity (URL joining, `data`/`files`/`json`/`content`/cookies/query) is contract-tested against the real `httpx.Client` in `tests/test_http_client_httpx_parity.py`. See COMPATIBILITY.md for the surfaces that are NOT yet under contract test (redirect chain, full auth-flow generator, event hooks, HTTP/2, proxies, streaming response) — add a parity case before relying on those.
 
 ```python
 from fastapi_turbo.http import Client, BasicAuth, Timeout
@@ -410,7 +410,7 @@ python benchmarks/bench_hello.py
 
 - **Rust core** (~8K lines): Axum 0.8, hyper, tokio, Tower, PyO3 0.28, crossbeam; HTTP, WebSocket, multipart, streaming, DB pool, HTTP client
 - **Python layer** (~22K lines): FastAPI-compatible API, introspection, OpenAPI 3.1 generator, Starlette/FastAPI `sys.modules` compat shims
-- **Tests** (~45K lines): ~1059 tests spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async
+- **Tests** (~45K lines): own test suite spanning HTTP, WebSocket, parity against real FastAPI on 16 parity apps, OpenAPI schema diffs, validation-error shape, SQLAlchemy × 3 drivers, Redis sync+async. Latest verified counts in [COMPATIBILITY.md](COMPATIBILITY.md) under "Test suite under different environments" (snapshot date + HEAD pinned there to avoid stale numbers in this README).
 
 See [CLAUDE.md](CLAUDE.md) for development guide, [benchmarks.md](benchmarks.md) for full benchmark data including Go Echo, Fastify, free-threaded Python, and WebSocket library comparisons, and [COMPATIBILITY.md](COMPATIBILITY.md) for a per-feature map of where fastapi_turbo sits against FastAPI 0.136.0 (Full / Partial / Not-implemented / Different-by-design).
 
