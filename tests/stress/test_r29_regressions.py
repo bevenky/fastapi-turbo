@@ -126,25 +126,28 @@ def test_release_workflow_runs_websocket_parity_upstream_sentry_gates():
     release-required steps as ci.yml — earlier release.yml only
     ran the fast subset + stress + import smoke, so a tag could
     publish wheels without parity / WS / upstream-FastAPI / Sentry
-    coverage."""
-    rel = (
-        pathlib.Path(__file__).resolve().parents[2]
-        / ".github"
-        / "workflows"
-        / "release.yml"
-    )
-    text = rel.read_text()
+    coverage. R51 consolidated the gate runners into the canonical
+    ``scripts/run_external_compat_gates.sh``; this test now
+    enforces (a) release.yml still runs WS + parity + the canonical
+    script, (b) the script keeps the pin contract."""
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    rel_text = (repo / ".github" / "workflows" / "release.yml").read_text()
+    script_text = (
+        repo / "scripts" / "run_external_compat_gates.sh"
+    ).read_text()
     # WebSocket suite gate.
-    assert "pytest tests/test_websocket.py" in text, text
+    assert "pytest tests/test_websocket.py" in rel_text, rel_text
     # Real-loopback parity gate.
-    assert "pytest tests/parity" in text, text
-    # Upstream FastAPI under shim — pinned tag + force reset.
-    assert "UPSTREAM_TAG=0.136.0" in text, text
-    assert "git -C /tmp/fastapi_upstream reset --hard" in text, text
-    # Sentry FastAPI + ASGI integration.
-    assert "SENTRY_TAG=2.42.0" in text, text
-    assert "/tmp/sentry-python/tests/integrations/fastapi" in text, text
-    assert "/tmp/sentry-python/tests/integrations/asgi" in text, text
+    assert "pytest tests/parity" in rel_text, rel_text
+    # Release workflow invokes the canonical script for both gates.
+    assert "scripts/run_external_compat_gates.sh fastapi" in rel_text, rel_text
+    assert "scripts/run_external_compat_gates.sh sentry" in rel_text, rel_text
+    # Pin contract lives in the script (single source of truth).
+    assert 'UPSTREAM_TAG="0.136.0"' in script_text, script_text
+    assert "git -C /tmp/fastapi_upstream" in script_text and "reset --hard" in script_text, script_text
+    assert 'SENTRY_TAG="2.42.0"' in script_text, script_text
+    assert "/tmp/sentry-python/tests/integrations/fastapi" in script_text, script_text
+    assert "/tmp/sentry-python/tests/integrations/asgi" in script_text, script_text
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -159,21 +162,18 @@ def test_ci_workflow_runs_upstream_fastapi_from_root_not_ignoring_tutorial():
     lookups work. Earlier the step ran ``pytest /tmp/fastapi_upstream/
     tests/`` with ``--ignore=test_tutorial``, which silently dropped
     a third of the suite — the canonical 3,125 / 3,129
-    compatibility claim was never enforced."""
-    ci = (
-        pathlib.Path(__file__).resolve().parents[2]
-        / ".github"
-        / "workflows"
-        / "ci.yml"
-    )
-    text = ci.read_text()
-    upstream_idx = text.find("Upstream FastAPI test suite")
-    assert upstream_idx != -1, "upstream FastAPI step missing"
-    sentry_idx = text.find("Sentry SDK FastAPI", upstream_idx)
-    upstream_block = text[upstream_idx:sentry_idx]
-    assert "cd /tmp/fastapi_upstream" in upstream_block, upstream_block
-    # The --ignore=test_tutorial flag must not be present any more.
-    assert "--ignore=/tmp/fastapi_upstream/tests/test_tutorial" not in upstream_block, upstream_block
+    compatibility claim was never enforced. R51 moved the cwd
+    + invocation into the canonical script — this test enforces
+    the contract there now."""
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    script_text = (
+        repo / "scripts" / "run_external_compat_gates.sh"
+    ).read_text()
+    # The script must cd into the upstream root before running pytest.
+    assert "cd /tmp/fastapi_upstream" in script_text, script_text
+    # And must NOT --ignore the tutorial subtree.
+    assert "--ignore=tests/test_tutorial" not in script_text, script_text
+    assert "--ignore=/tmp/fastapi_upstream/tests/test_tutorial" not in script_text, script_text
 
 
 # ────────────────────────────────────────────────────────────────────

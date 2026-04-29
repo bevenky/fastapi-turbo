@@ -88,21 +88,26 @@ def test_ci_workflow_injects_shim_conftest_for_external_suites():
     clones (no pre-existing shim conftest), so the gate was a false
     positive: it tested upstream FastAPI / Sentry against itself.
     R27 writes a per-tree conftest that imports fastapi_turbo at
-    session-start so the shim is live during collection + teardown."""
-    ci = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
-    text = ci.read_text()
-    # Shim injection conftest must appear for the upstream tree.
-    assert "/tmp/fastapi_upstream/conftest.py" in text, text
-    # Sentry injection covers both fastapi AND asgi trees (R28
-    # added the asgi tree). The upstream-Sentry workflow loops
-    # over both via ``for tree in fastapi asgi`` so both
-    # ``tests/integrations/<tree>/conftest.py`` paths are written.
-    assert "for tree in fastapi asgi" in text or (
-        "/tmp/sentry-python/tests/integrations/fastapi/conftest.py" in text
-        and "/tmp/sentry-python/tests/integrations/asgi/conftest.py" in text
-    ), text
-    # Both written via heredoc that imports fastapi_turbo.
-    assert "import fastapi_turbo" in text
+    session-start so the shim is live during collection + teardown.
+    R51 moved the conftest-injection logic into the canonical
+    ``scripts/run_external_compat_gates.sh``; this test now
+    enforces it on the script (single source of truth)."""
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    ci_text = (repo / ".github" / "workflows" / "ci.yml").read_text()
+    script_text = (
+        repo / "scripts" / "run_external_compat_gates.sh"
+    ).read_text()
+    # CI invokes the canonical script.
+    assert "scripts/run_external_compat_gates.sh" in ci_text, ci_text
+    # Canonical script writes the shim conftest for the upstream tree.
+    assert "/tmp/fastapi_upstream/conftest.py" in script_text, script_text
+    # And for both Sentry integration trees (fastapi + asgi).
+    assert "for tree in fastapi asgi" in script_text or (
+        "/tmp/sentry-python/tests/integrations/fastapi/conftest.py" in script_text
+        and "/tmp/sentry-python/tests/integrations/asgi/conftest.py" in script_text
+    ), script_text
+    # Each shim conftest imports fastapi_turbo at session-start.
+    assert "import fastapi_turbo" in script_text, script_text
 
 
 def test_ci_workflow_external_gates_are_blocking():
@@ -111,26 +116,29 @@ def test_ci_workflow_external_gates_are_blocking():
     succeeded. R27 removes the soft-fail and pins the external repos.
     R28 changes the pinning mechanism from ``git clone --branch <tag>``
     to ``git fetch + reset --hard <tag>`` so reused runners don't
-    silently inherit a stale checkout — this test enforces the new
-    contract."""
-    ci = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
-    text = ci.read_text()
-    upstream_idx = text.find("Upstream FastAPI test suite")
-    sentry_idx = text.find("Sentry SDK FastAPI")
-    assert upstream_idx != -1 and sentry_idx != -1, "expected blocks not found"
+    silently inherit a stale checkout. R51 consolidates both gates
+    into the canonical ``scripts/run_external_compat_gates.sh`` so
+    PR CI / release CI / local audit run identical semantics —
+    this test now enforces "the workflow MUST invoke the script
+    AND the script MUST keep the pinning + reset-hard contract"."""
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    ci_text = (repo / ".github" / "workflows" / "ci.yml").read_text()
+    script_text = (repo / "scripts" / "run_external_compat_gates.sh").read_text()
 
-    upstream_block = text[upstream_idx:sentry_idx]
-    sentry_block = text[sentry_idx:sentry_idx + 3000]
-    assert "|| echo" not in upstream_block, upstream_block
-    assert "|| echo" not in sentry_block, sentry_block
-
-    # External repos must be pinned to a specific version. R28 uses
-    # ``UPSTREAM_TAG=…`` / ``SENTRY_TAG=…`` env vars + a hard reset
-    # so reused runners can't drift.
-    assert "UPSTREAM_TAG=0.136.0" in upstream_block, upstream_block
-    assert "SENTRY_TAG=2.42.0" in sentry_block, sentry_block
-    assert "reset --hard" in upstream_block, upstream_block
-    assert "reset --hard" in sentry_block, sentry_block
+    # 1. CI must invoke the canonical script (no inline drift).
+    assert "scripts/run_external_compat_gates.sh" in ci_text, ci_text
+    # 2. No soft-fail anywhere in the CI compat-gate region.
+    assert "|| echo" not in ci_text, ci_text
+    # 3. The canonical script must keep the pinning + force-reset
+    #    contract for both external trees.
+    assert 'UPSTREAM_TAG="0.136.0"' in script_text, script_text
+    assert 'SENTRY_TAG="2.42.0"' in script_text, script_text
+    assert "git -C /tmp/fastapi_upstream" in script_text and "reset --hard" in script_text, (
+        "canonical script must force-reset /tmp/fastapi_upstream to the pin"
+    )
+    assert "git -C /tmp/sentry-python" in script_text and "reset --hard" in script_text, (
+        "canonical script must force-reset /tmp/sentry-python to the pin"
+    )
 
 
 # ────────────────────────────────────────────────────────────────────

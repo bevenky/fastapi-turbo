@@ -94,31 +94,36 @@ def test_ci_workflow_force_resets_external_pins():
     """Earlier CI did ``[ ! -d /tmp/sentry-python ] && git clone``
     — on a reused runner with a stale checkout (e.g. 2.58.0 instead
     of the pinned 2.42.0), the gate silently tested the wrong
-    version. R28 force-fetches and resets to the pin every run."""
-    ci = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
-    text = ci.read_text()
-    # Both external trees must reset to a tag, not lazily skip the
-    # clone.
+    version. R28 force-fetches and resets to the pin every run.
+    R51 consolidates the logic into ``scripts/run_external_compat_
+    gates.sh``; the contract is enforced on the script now."""
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    ci_text = (repo / ".github" / "workflows" / "ci.yml").read_text()
+    script_text = (
+        repo / "scripts" / "run_external_compat_gates.sh"
+    ).read_text()
+    # CI invokes the canonical script (single source of truth).
+    assert "scripts/run_external_compat_gates.sh" in ci_text, ci_text
+    # Both external trees must hard-reset to the pin, never lazy-
+    # skip the clone via ``[ ! -d <tree> ]``.
     for tree in ("/tmp/fastapi_upstream", "/tmp/sentry-python"):
-        # The ``reset --hard "$..._TAG"`` line must appear for each.
-        assert f"git -C {tree} reset --hard" in text, tree
-        # And the ``[ ! -d ... ]`` short-circuit on clone must be
-        # gone (replaced with ``[ ! -d ${tree}/.git ]`` which is the
-        # safer "no working clone yet" check, plus an unconditional
-        # reset right after).
-        assert f"[ ! -d {tree} ]" not in text, tree
+        assert f"git -C {tree}" in script_text, tree
+        assert "reset --hard" in script_text, tree
+        assert f"[ ! -d {tree} ]" not in script_text, tree
 
 
 def test_ci_workflow_runs_sentry_asgi_integration_tree_too():
     """COMPATIBILITY.md claims Sentry ASGI 33/33 + FastAPI 89/89.
     The earlier CI workflow only ran ``tests/integrations/fastapi``
-    so the ASGI claim was never enforced. R28 gates BOTH trees."""
-    ci = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
-    text = ci.read_text()
-    # The pytest invocation in the Sentry step must include both
-    # integration trees.
-    assert "/tmp/sentry-python/tests/integrations/fastapi" in text, text
-    assert "/tmp/sentry-python/tests/integrations/asgi" in text, text
+    so the ASGI claim was never enforced. R28 gates BOTH trees;
+    R51 moved the invocation into the canonical script — this
+    test enforces that the script runs both."""
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    script_text = (
+        repo / "scripts" / "run_external_compat_gates.sh"
+    ).read_text()
+    assert "/tmp/sentry-python/tests/integrations/fastapi" in script_text, script_text
+    assert "/tmp/sentry-python/tests/integrations/asgi" in script_text, script_text
 
 
 # ────────────────────────────────────────────────────────────────────

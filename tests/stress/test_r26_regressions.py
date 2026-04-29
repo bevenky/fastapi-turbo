@@ -204,17 +204,27 @@ def test_ci_workflow_runs_parity_tests():
     real-loopback parity is required before shipping. This test
     locks the CI workflow against a regression where parity was
     skipped (which is what let the R26 Sentry findings ship in
-    earlier audits)."""
+    earlier audits). R51 consolidated the upstream-FastAPI +
+    Sentry gates into ``scripts/run_external_compat_gates.sh``;
+    this test now enforces (a) ci.yml runs parity + invokes the
+    canonical script, (b) the script keeps the upstream + Sentry
+    contract."""
     import pathlib
 
-    ci = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
-    text = ci.read_text()
-    assert "tests/parity" in text, "CI must run tests/parity"
-    assert "fastapi_upstream" in text or "fastapi/fastapi" in text, (
-        "CI must run upstream FastAPI suite under the shim"
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    ci_text = (repo / ".github" / "workflows" / "ci.yml").read_text()
+    script_text = (
+        repo / "scripts" / "run_external_compat_gates.sh"
+    ).read_text()
+    assert "tests/parity" in ci_text, "CI must run tests/parity"
+    # CI delegates upstream + Sentry gates to the canonical script.
+    assert "scripts/run_external_compat_gates.sh" in ci_text, ci_text
+    # Canonical script must run BOTH external trees.
+    assert "fastapi_upstream" in script_text or "fastapi/fastapi" in script_text, (
+        "canonical script must run upstream FastAPI suite under the shim"
     )
-    assert "sentry-python" in text or "sentry-fastapi" in text.lower(), (
-        "CI must run Sentry FastAPI integration tests"
+    assert "sentry-python" in script_text or "sentry-fastapi" in script_text.lower(), (
+        "canonical script must run Sentry FastAPI integration tests"
     )
 
 
