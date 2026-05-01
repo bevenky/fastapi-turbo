@@ -79,24 +79,25 @@ jobs:
         # release workflow MUST too — earlier R29 audit caught a
         # tag publish path that bypassed this check.
         run: pytest tests/parity -x -q
-      - name: pytest upstream FastAPI suite under shim (3.14 + 3.11)
-        # Release-required: COMPATIBILITY claims 3,125 / 3,129
-        # passing under the sys.modules shim. Run the canonical
-        # script (single source of truth — audit R51 finding 5) so
-        # CI / release / local audit cannot drift in their
-        # checkout / install / deselect decisions. Runs on py3.14
-        # AND py3.11: the floor (>=3.10 per pyproject.toml) needs
-        # the same shim parity as the latest, otherwise a Python-
-        # version-specific regression on the floor slips to
-        # release (audit R51 finding 3 — gate was 3.14-only).
-        if: matrix.python == '3.14' || matrix.python == '3.11'
+      - name: pytest upstream FastAPI suite under shim (3.10 + 3.11 + 3.14)
+        # Release-required: the canonical script is the single
+        # source of truth (R51 finding 5). Run on:
+        #   * 3.14 — latest, where most parity tests are landed first
+        #   * 3.11 — common production target
+        #   * 3.10 — pyproject.toml floor; without it a Python-
+        #     version-specific regression on the floor slips to
+        #     release (R52 finding 4 — was previously 3.11+3.14
+        #     only).
+        if: matrix.python == '3.14' || matrix.python == '3.11' || matrix.python == '3.10'
         run: ./scripts/run_external_compat_gates.sh fastapi
-      - name: pytest Sentry SDK FastAPI + ASGI integration
+      - name: pytest Sentry SDK FastAPI + ASGI integration (3.11 + 3.14)
         # Release-required: caught the R26 transaction-name
-        # regression. Delegates to the canonical script so this
-        # path stays in sync with local audit / PR-CI runs (audit
-        # R51 finding 5 — inline copy was a drift risk).
-        if: matrix.python == '3.14'
+        # regression. Run on 3.14 AND 3.11 — sentry-sdk 2.42.0
+        # supports both, and a 3.11-only Sentry transaction-name
+        # regression (the bug class R26 caught) would otherwise
+        # ship from release with only the 3.14 path covered
+        # (R52 finding 4).
+        if: matrix.python == '3.14' || matrix.python == '3.11'
         run: ./scripts/run_external_compat_gates.sh sentry
       - name: Import smoke test (shim parity)
         run: |
@@ -134,27 +135,66 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
           manylinux: auto
-      # Smoke-test the ACTUAL wheel by installing it (not the source
-      # tree) and running a TestClient roundtrip. Skip aarch64 cross
-      # builds since the runner can't execute the artefact locally.
-      - name: Smoke-test wheel
+      # Linux x86_64: smoke-test the ACTUAL wheel — both in-process
+      # AND real Rust loopback (HTTP + WebSocket) so the platform
+      # native-extension exercises the same paths as macOS / Windows
+      # release jobs (R52 finding 4 — previously in_process=True only).
+      - name: Smoke-test wheel x86_64 (in-process + real loopback HTTP + WebSocket)
         if: matrix.platform.target == 'x86_64'
         run: |
-          python -m pip install -U pip httpx "pydantic>=2"
+          python -m pip install -U pip httpx "pydantic>=2" "websockets>=12"
           python -m pip install dist/*.whl
           python -c "
           import fastapi_turbo, uuid
-          from fastapi import FastAPI
+          from fastapi import FastAPI, WebSocket
           from fastapi.testclient import TestClient
           marker = str(uuid.uuid4())
           app = FastAPI()
           @app.get('/m')
           def m(): return {'marker': marker}
+          @app.websocket('/ws')
+          async def ws_ep(websocket: WebSocket):
+              await websocket.accept()
+              await websocket.send_text(f'ws-{marker}')
+              await websocket.close()
           with TestClient(app, in_process=True) as c:
-              body = c.get('/m').json()
-          assert body == {'marker': marker}, body
-          print(f'wheel smoke ok: {marker}')
+              assert c.get('/m').json() == {'marker': marker}
+          print(f'in-process smoke ok: {marker}')
+          with TestClient(app) as c:
+              assert c.get('/m').json() == {'marker': marker}
+              with c.websocket_connect('/ws') as ws:
+                  assert ws.receive_text() == f'ws-{marker}'
+          print(f'loopback smoke ok: {marker}')
           "
+      # Linux aarch64: cross-compiled, can't be executed natively on
+      # the x86_64 runner. Use docker + qemu-user-static via
+      # ``uraimo/run-on-arch-action`` so the cross-built wheel is at
+      # least exercised under emulation (R52 finding 4 — previously
+      # cross-aarch64 wheels shipped with NO executable smoke test).
+      - name: Smoke-test wheel aarch64 (under qemu-user-static)
+        if: matrix.platform.target == 'aarch64'
+        uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: aarch64
+          distro: ubuntu22.04
+          githubToken: ${{ github.token }}
+          install: |
+            apt-get update -q && apt-get install -y python3 python3-pip
+          run: |
+            python3 -m pip install -q -U pip httpx "pydantic>=2"
+            python3 -m pip install -q dist/*.whl
+            python3 -c "
+            import fastapi_turbo, uuid
+            from fastapi import FastAPI
+            from fastapi.testclient import TestClient
+            marker = str(uuid.uuid4())
+            app = FastAPI()
+            @app.get('/m')
+            def m(): return {'marker': marker}
+            with TestClient(app, in_process=True) as c:
+                assert c.get('/m').json() == {'marker': marker}
+            print(f'aarch64 in-process smoke ok: {marker}')
+            "
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.platform.target }}-py${{ matrix.python }}

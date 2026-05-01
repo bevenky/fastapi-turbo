@@ -217,8 +217,13 @@ class Headers(dict):
     def get(self, key, default=None):
         return super().get(key.lower(), default)
 
-    def multi_items(self) -> list[tuple[str, str]]:
-        return list(self.items())
+    # ``multi_items`` is intentionally NOT redefined here — the
+    # earlier ``def multi_items(...)`` above (line ~197) returns the
+    # ``_raw_list`` so duplicate-name headers like ``Set-Cookie`` are
+    # preserved. A duplicate definition at this point in the class
+    # body would shadow it with ``list(self.items())`` (dict-collapsed
+    # — duplicates lost), which broke ``Response.cookies`` for
+    # multi-cookie responses (R52 finding 2).
 
     @classmethod
     def _from_raw(cls, raw_list: list[tuple[str, str]]) -> Headers:
@@ -1435,9 +1440,23 @@ def options(url: str, **kwargs) -> Response:
 
 
 def _iter_header_values(headers: Headers, name: str) -> list[str]:
-    """Get all values for a header (handles multi-value via raw list)."""
+    """Get all values for a header (handles multi-value via raw list).
+
+    For headers like ``Set-Cookie`` the wire frequently carries
+    multiple instances and ``Response.cookies`` must read each one
+    separately. ``Headers.items()`` is dict-backed and collapses
+    duplicates to a single value (last-write-wins). Use
+    ``multi_items`` (which reads from ``_raw_list``) so duplicates
+    survive — fixes the cookie-collapse bug in R52 finding 2.
+    """
     name = name.lower()
-    return [v for k, v in headers.items() if k == name]
+    multi = getattr(headers, "multi_items", None)
+    if multi is not None:
+        try:
+            return [v for k, v in multi() if k.lower() == name]
+        except Exception:  # noqa: BLE001
+            pass
+    return [v for k, v in headers.items() if k.lower() == name]
 
 
 def _parse_digest_challenge(header: str) -> dict[str, str]:

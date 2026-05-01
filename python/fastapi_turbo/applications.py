@@ -2832,6 +2832,7 @@ class FastAPI:
         include_in_schema: bool = True,
         openapi_prefix: str = "",
         strict_content_type: bool = True,
+        routes: Sequence | None = None,
         **kwargs: Any,
     ):
         self.title = title
@@ -2912,6 +2913,25 @@ class FastAPI:
         self.state = State()
         self.dependency_overrides: dict[Callable, Callable] = {}
         self.dependencies: list = list(dependencies or [])
+        # FA / Starlette parity: ``FastAPI(routes=[...])`` registers
+        # the supplied Starlette ``Route`` / ``WebSocketRoute`` /
+        # ``Mount`` instances on the router so they're served like
+        # any decorator-registered route. Earlier the kwarg was
+        # accepted via ``**kwargs`` and silently dropped — the route
+        # collection went nowhere and clients hit 404 (R52 finding 1).
+        # Mark each as Starlette-passthrough so the in-process
+        # dispatcher dispatches via Starlette ASGI semantics
+        # (``await endpoint(request)``) instead of FastAPI's
+        # parameter-injection introspection — the user's endpoint
+        # is a ``(request) -> Response`` callable, not the
+        # decorator-style ``def hi(item: Item): ...``.
+        if routes:
+            for _r in routes:
+                try:
+                    _r._fastapi_turbo_starlette_passthrough = True  # type: ignore[attr-defined]
+                except (AttributeError, TypeError):
+                    pass
+                self.router.routes.append(_r)
 
         self._middleware_stack: list[tuple[type, dict[str, Any]]] = []
         # @app.middleware("http") registered middlewares — Python-side HTTP middlewares
@@ -3014,8 +3034,8 @@ class FastAPI:
     # WebSocket decorator
     # ------------------------------------------------------------------
 
-    def websocket(self, path: str, **kwargs: Any):
-        return self.router.websocket(path, **kwargs)
+    def websocket(self, path: str, name: str | None = None, **kwargs: Any):
+        return self.router.websocket(path, name=name, **kwargs)
 
     # ------------------------------------------------------------------
     # Imperative route registration
@@ -7540,6 +7560,38 @@ class FastAPI:
                 await _send_asgi_response(send, result, scope=scope)
                 return True
 
+        # ``FastAPI(routes=[...])`` / ``APIRouter(routes=[...])``:
+        # routes constructed from Starlette ``Route`` / similar
+        # are tagged ``_fastapi_turbo_starlette_passthrough = True``
+        # at registration time. Their endpoint is a
+        # ``(request) -> Response`` callable (Starlette convention),
+        # NOT the FastAPI ``def hi(item: Item, q: int): ...`` shape
+        # the rest of the dispatcher introspects. Dispatch via the
+        # Starlette protocol: build a ``Request`` from the scope,
+        # call ``endpoint(request)``, send the resulting response.
+        # Probe-confirmed: ``upstream 200, turbo 404`` for
+        # ``FastAPI(routes=[Route('/hi', hi)])`` (R52 finding 1).
+        if getattr(matched_route, "_fastapi_turbo_starlette_passthrough", False):
+            _ep_pt = getattr(matched_route, "endpoint", None)
+            if _ep_pt is not None:
+                from fastapi_turbo.requests import Request as _Req_pt
+                _scope_pt = dict(scope)
+                _scope_pt["path_params"] = path_params
+                _scope_pt.setdefault("router", self.router)
+                _scope_pt.setdefault("app", self)
+                req_pt = _Req_pt(_scope_pt, receive=receive, send=send)
+                if inspect.iscoroutinefunction(_ep_pt):
+                    _resp_pt = await _ep_pt(req_pt)
+                else:
+                    _resp_pt = _ep_pt(req_pt)
+                    if inspect.iscoroutine(_resp_pt):
+                        _resp_pt = await _resp_pt
+                if _resp_pt is not None:
+                    # Send the Response via the in-process helper —
+                    # our Response classes don't expose ASGI ``__call__``.
+                    await _send_asgi_response(send, _resp_pt, scope=_scope_pt)
+                return True
+
         # The route's ``endpoint`` is the ``_try_compile_handler``
         # wrapper that expects Rust-synthesised kwargs
         # (``_combined_body``, ``_request_*`` metadata, etc.). The
@@ -11407,3 +11459,100 @@ class FastAPI:
                 await send({"type": "websocket.close", "code": 1011})
             except Exception:
                 pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Public-API ``inspect.signature`` parity (R52 finding 6)
+#
+# Upstream FastAPI's HTTP-method decorators (``FastAPI.get``,
+# ``APIRouter.get`` and friends) declare the full path-operation
+# kwarg surface explicitly so SDK generators / type-aware tooling
+# can introspect the signature. Our methods used ``**kwargs`` for
+# brevity — runtime worked, but ``inspect.signature(FastAPI.get)``
+# returned ``(self, path, **kwargs)`` and tools like the upstream
+# ``generate_clients`` example, IDE intellisense, and Sphinx
+# autosummary lost the kwarg names. Build a canonical Signature
+# once at module import and attach it via ``__signature__`` on
+# every HTTP-method decorator on both classes.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _install_path_operation_signatures() -> None:
+    import inspect as _insp_sig
+    from fastapi_turbo.routing import APIRouter as _APIRouter_sig
+
+    # Canonical kwargs accepted by FastAPI / APIRouter HTTP-method
+    # decorators. Mirrors upstream FastAPI 0.136.0; deliberately
+    # drops the verbose ``Annotated[..., Doc(...)]`` payload — only
+    # the parameter NAMES + DEFAULTS are needed for introspection.
+    _Param = _insp_sig.Parameter
+    _self = _Param("self", _Param.POSITIONAL_OR_KEYWORD)
+    _path = _Param(
+        "path", _Param.POSITIONAL_OR_KEYWORD, annotation=str,
+    )
+    _http_kw_specs = [
+        ("response_model", None),
+        ("status_code", None),
+        ("tags", None),
+        ("dependencies", None),
+        ("summary", None),
+        ("description", None),
+        ("response_description", "Successful Response"),
+        ("responses", None),
+        ("deprecated", None),
+        ("operation_id", None),
+        ("response_model_include", None),
+        ("response_model_exclude", None),
+        ("response_model_by_alias", True),
+        ("response_model_exclude_unset", False),
+        ("response_model_exclude_defaults", False),
+        ("response_model_exclude_none", False),
+        ("include_in_schema", True),
+        ("response_class", None),
+        ("name", None),
+        ("callbacks", None),
+        ("openapi_extra", None),
+        ("generate_unique_id_function", None),
+    ]
+    _http_kw = [
+        _Param(n, _Param.KEYWORD_ONLY, default=d)
+        for n, d in _http_kw_specs
+    ]
+    _http_sig = _insp_sig.Signature([_self, _path, *_http_kw])
+    # ``api_route`` adds a ``methods`` kwarg.
+    _api_route_kw = [
+        _Param("methods", _Param.KEYWORD_ONLY, default=None),
+        *_http_kw,
+    ]
+    _api_route_sig = _insp_sig.Signature([_self, _path, *_api_route_kw])
+    # ``websocket`` takes path + name; no path-operation kwargs.
+    _ws_sig = _insp_sig.Signature([
+        _self,
+        _path,
+        _Param("name", _Param.KEYWORD_ONLY, default=None),
+    ])
+
+    _http_methods = ("get", "post", "put", "delete", "patch", "options", "head", "trace")
+    for _cls in (FastAPI, _APIRouter_sig):
+        for _name in _http_methods:
+            _fn = getattr(_cls, _name, None)
+            if _fn is not None:
+                try:
+                    _fn.__signature__ = _http_sig  # type: ignore[attr-defined]
+                except (AttributeError, TypeError):
+                    pass
+        _ar = getattr(_cls, "api_route", None)
+        if _ar is not None:
+            try:
+                _ar.__signature__ = _api_route_sig  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                pass
+        _ws = getattr(_cls, "websocket", None)
+        if _ws is not None:
+            try:
+                _ws.__signature__ = _ws_sig  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                pass
+
+
+_install_path_operation_signatures()

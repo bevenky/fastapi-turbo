@@ -347,9 +347,10 @@ class APIRouter:
         dependency_overrides_provider: Any = None,
         default: Any = None,
         strict_content_type: bool | None = None,
+        routes: Sequence | None = None,
         **kwargs: Any,
     ):
-        self.routes: list[APIRoute] = []
+        self.routes: list = []
         self._included_routers: list[tuple[APIRouter, str, list[str], dict]] = []
         self.strict_content_type = strict_content_type
         self.prefix = prefix
@@ -369,6 +370,21 @@ class APIRouter:
         self.dependency_overrides_provider = dependency_overrides_provider
         self.default = default
         self._mounts: list[tuple[str, Any, str | None]] = []
+        # FA / Starlette parity: ``APIRouter(routes=[...])`` accepts
+        # pre-constructed Starlette ``Route`` / ``WebSocketRoute`` /
+        # ``Mount`` instances and registers them on this router so
+        # they're served like any decorator-registered APIRoute.
+        # Earlier the kwarg was accepted via ``**kwargs`` and silently
+        # dropped (R52 finding 1). Mark each as Starlette-passthrough
+        # so the in-process dispatcher uses ``await endpoint(request)``
+        # rather than FastAPI's parameter-injection introspection.
+        if routes:
+            for _r in routes:
+                try:
+                    _r._fastapi_turbo_starlette_passthrough = True  # type: ignore[attr-defined]
+                except (AttributeError, TypeError):
+                    pass
+                self.routes.append(_r)
 
     # ------------------------------------------------------------------
     # Core registration

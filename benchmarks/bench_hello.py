@@ -1,25 +1,50 @@
-"""Benchmark fastapi-turbo vs baseline overhead measurement."""
+"""Benchmark fastapi-turbo vs baseline overhead measurement.
+
+Drives requests with both the Rust-reqwest-backed
+``fastapi_turbo.http.Client`` (the README-promoted client) AND
+``httpx.Client`` so the table reflects what each client measures.
+Earlier this script used only httpx, so the README's Rust-client
+numbers were never reproduced from this file (R52 finding 3).
+"""
 import time
 import statistics
 import sys
 
-def bench_requests(url, n=500):
-    """Benchmark N sequential requests."""
-    import httpx
-    client = httpx.Client()
+
+def bench_requests(url, n=500, client_kind="turbo"):
+    """Benchmark N sequential requests using the named client.
+
+    ``client_kind`` ∈ {``"turbo"``, ``"httpx"``} — determines
+    which library issues requests. ``"turbo"`` uses
+    ``fastapi_turbo.http.Client`` so the numbers are directly
+    comparable to the Rust-client claims in the README.
+    """
+    if client_kind == "turbo":
+        import fastapi_turbo  # noqa: F401  # ensure shim installed
+        from fastapi_turbo.http import Client as _C
+        client = _C()
+        get = client.get
+        close = client.close
+    elif client_kind == "httpx":
+        import httpx
+        client = httpx.Client()
+        get = client.get
+        close = client.close
+    else:
+        raise ValueError(f"unknown client_kind {client_kind!r}")
     # Warmup
     for _ in range(10):
-        client.get(url)
-    
+        get(url)
+
     latencies = []
     for _ in range(n):
         start = time.perf_counter_ns()
-        resp = client.get(url)
+        resp = get(url)
         elapsed_us = (time.perf_counter_ns() - start) / 1000
         latencies.append(elapsed_us)
         assert resp.status_code == 200
-    
-    client.close()
+
+    close()
     latencies.sort()
     return {
         "p50": latencies[len(latencies) // 2],
@@ -63,18 +88,18 @@ app.run(host="127.0.0.1", port=""" + str(port) + """)
     time.sleep(2)
     
     print("=== fastapi-turbo Benchmark ===\n")
-    
-    print("GET /hello (no deps, sync handler):")
-    stats = bench_requests(f"http://127.0.0.1:{port}/hello", n=1000)
-    for k, v in stats.items():
-        print(f"  {k}: {v:.0f} μs")
-    
-    print()
-    
-    print("GET /with-deps (2-level Depends chain, async):")
-    stats = bench_requests(f"http://127.0.0.1:{port}/with-deps", n=1000)
-    for k, v in stats.items():
-        print(f"  {k}: {v:.0f} μs")
+
+    for endpoint, label in (("/hello", "GET /hello (no deps, sync handler)"),
+                            ("/with-deps", "GET /with-deps (2-level Depends chain, async)")):
+        print(f"{label}:")
+        for kind in ("turbo", "httpx"):
+            stats = bench_requests(
+                f"http://127.0.0.1:{port}{endpoint}", n=1000, client_kind=kind,
+            )
+            print(f"  [client={kind}]")
+            for k, v in stats.items():
+                print(f"    {k}: {v:.0f} μs")
+        print()
     
     proc.kill()
     proc.wait()

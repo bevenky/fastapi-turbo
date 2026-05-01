@@ -407,9 +407,30 @@ def _write_md(rows: list) -> None:
     block = "\n".join(lines) + "\n"
     print("\nMarkdown:\n")
     print(block)
-    out = ROOT / "benchmarks" / "latest_bench.md"
-    out.write_text(block)
-    print(f"wrote: {out}")
+    # Audit R52 finding 3: ``benchmarks/latest_bench.md`` is the
+    # CURATED multi-matrix benchmark doc. A naked ``run_bench.py``
+    # invocation previously overwrote it with a single small table,
+    # silently destroying the richer doc. Now writing happens only
+    # when the user opts in via ``--write=<path>`` (or the legacy
+    # ``--write-latest-bench`` flag for the canonical filename) —
+    # otherwise the table is printed and the curated file stays
+    # intact.
+    write_target: Path | None = None
+    for arg in sys.argv[1:]:
+        if arg.startswith("--write="):
+            write_target = Path(arg.split("=", 1)[1]).expanduser().resolve()
+        elif arg == "--write-latest-bench":
+            write_target = ROOT / "benchmarks" / "latest_bench.md"
+    if write_target is not None:
+        write_target.parent.mkdir(parents=True, exist_ok=True)
+        write_target.write_text(block)
+        print(f"wrote: {write_target}")
+    else:
+        print(
+            "(not writing — pass --write=<path> or --write-latest-bench "
+            "to overwrite a file; the curated benchmarks/latest_bench.md "
+            "is preserved by default)"
+        )
 
 
 if __name__ == "__main__":
