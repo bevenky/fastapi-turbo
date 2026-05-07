@@ -34,6 +34,7 @@ Usage:
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import datetime
 import hashlib
 import json as _json
@@ -372,6 +373,8 @@ class Response:
         elapsed: datetime.timedelta | None = None,
         http_version: str = "HTTP/1.1",
         history: list[Response] | None = None,
+        is_closed: bool = True,
+        is_stream_consumed: bool = True,
     ):
         self.status_code = status_code
         self.headers = headers or Headers()
@@ -382,8 +385,8 @@ class Response:
         self.history = history or []
         self.extensions: dict = {}
         self.encoding = "utf-8"
-        self.is_closed = False
-        self.is_stream_consumed = True
+        self.is_closed = is_closed
+        self.is_stream_consumed = is_stream_consumed
 
     @classmethod
     def _from_raw(cls, raw: RawResponse, request: Request | None = None) -> Response:
@@ -410,6 +413,8 @@ class Response:
         return _json.loads(self._content, **kwargs)
 
     def read(self) -> bytes:
+        self.is_stream_consumed = True
+        self.is_closed = True
         return self._content
 
     # ── Status helpers ───────────────────────────────────────────
@@ -463,9 +468,21 @@ class Response:
         location = self.headers["location"]
         url = self.url.join(location) if self.request else URL(location)
         method = self.request.method if self.request else "GET"
+        headers = Headers(self.request.headers) if self.request else Headers()
+        content = self.request.content if self.request else b""
+        extensions = dict(self.request.extensions) if self.request else {}
         if self.status_code in (301, 302, 303):
             method = "GET"
-        return Request(method=method, url=url)
+            content = b""
+            headers.pop("content-length", None)
+            headers.pop("transfer-encoding", None)
+        return Request(
+            method=method,
+            url=url,
+            headers=headers,
+            content=content,
+            extensions=extensions,
+        )
 
     @property
     def reason_phrase(self) -> str:
@@ -490,13 +507,21 @@ class Response:
 
     def close(self):
         self.is_closed = True
+        self.is_stream_consumed = True
 
     # ── Streaming stubs (for httpx compat) ───────────────────────
 
     def iter_bytes(self, chunk_size: int | None = None) -> Iterator[bytes]:
         cs = chunk_size or 4096
-        for i in range(0, len(self._content), cs):
-            yield self._content[i : i + cs]
+        try:
+            for i in range(0, len(self._content), cs):
+                yield self._content[i : i + cs]
+        finally:
+            self.is_stream_consumed = True
+            self.is_closed = True
+
+    def iter_raw(self, chunk_size: int | None = None) -> Iterator[bytes]:
+        yield from self.iter_bytes(chunk_size)
 
     def iter_text(self, chunk_size: int | None = None) -> Iterator[str]:
         for chunk in self.iter_bytes(chunk_size):
@@ -505,6 +530,12 @@ class Response:
     def iter_lines(self) -> Iterator[str]:
         for line in self.text.splitlines():
             yield line
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     def __repr__(self):
         return f"<Response [{self.status_code} {self.reason_phrase}]>"
@@ -852,9 +883,6 @@ class Client:
         self._headers_list_cached: list[tuple[str, str]] | None = (
             list(self.headers.items()) if self.headers else None
         )
-        self._base_prefix: str | None = (
-            str(self.base_url).rstrip("/") if self.base_url else None
-        )
         self._timeout_read: float | None = self.timeout.read
 
     # ── Fast path detection ──────────────────────────────────────
@@ -875,12 +903,13 @@ class Client:
     def _fast_request(
         self, method: str, url: str | URL, body: bytes | None = None,
         extra_headers: list[tuple[str, str]] | None = None,
+        timeout_secs: float | None | object = _UNSET,
     ) -> Response:
         """Fast path: skip build_request/send, call transport directly."""
-        # Inline URL resolution (skip urlparse, use str.startswith)
+        # Keep the fast path on the same URL semantics as build_request().
         url_str = url if type(url) is str else str(url)
-        if self._base_prefix and not (url_str.startswith("http://") or url_str.startswith("https://")):
-            url_str = self._base_prefix + "/" + url_str.lstrip("/")
+        if self.base_url and not urlparse(url_str).scheme:
+            url_str = _httpx_url_join(str(self.base_url), url_str)
 
         # Use cached headers list (built once in __init__)
         if extra_headers:
@@ -888,8 +917,34 @@ class Client:
         else:
             headers_list = self._headers_list_cached
 
-        raw = self._transport.request(method, url_str, headers_list, body, self._timeout_read)
-        return Response._from_raw(raw)
+        effective_timeout = self._timeout_read if timeout_secs is _UNSET else timeout_secs
+        request_timeout = self.timeout if timeout_secs is _UNSET else Timeout(timeout_secs)
+        request = Request(
+            method=method,
+            url=url_str,
+            headers=Headers(headers_list or []),
+            content=body,
+            extensions={"timeout": request_timeout.as_dict()},
+        )
+        try:
+            raw = self._transport.request(
+                method,
+                url_str,
+                headers_list,
+                body,
+                effective_timeout,
+            )
+        except TimeoutError as e:
+            raise TimeoutException(str(e), request=request) from e
+        except ConnectionError as e:
+            raise ConnectError(str(e), request=request) from e
+        except Exception as e:
+            raise TransportError(str(e), request=request) from e
+
+        response = Response._from_raw(raw, request=request)
+        for name, value in response.cookies.items():
+            self.cookies[name] = value
+        return response
 
     # ── HTTP methods (match httpx exactly) ───────────────────────
 
@@ -1076,8 +1131,43 @@ class Client:
             method, url, content=content, data=data, files=files,
             json=json, params=params, headers=headers, cookies=cookies,
             timeout=timeout,
+            extensions=extensions,
         )
         return self.send(request, auth=auth, follow_redirects=follow_redirects)
+
+    @contextmanager
+    def stream(
+        self,
+        method: str,
+        url: str | URL,
+        *,
+        content: bytes | str | None = None,
+        data: dict | None = None,
+        files: Any = None,
+        json: Any = None,
+        params: dict | None = None,
+        headers: dict | None = None,
+        cookies: dict | None = None,
+        auth: tuple | Auth | _UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | _UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: float | Timeout | _UseClientDefault | None = USE_CLIENT_DEFAULT,
+        extensions: dict | None = None,
+    ) -> Iterator[Response]:
+        request = self.build_request(
+            method, url, content=content, data=data, files=files,
+            json=json, params=params, headers=headers, cookies=cookies,
+            timeout=timeout, extensions=extensions,
+        )
+        response = self.send(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            stream=True,
+        )
+        try:
+            yield response
+        finally:
+            response.close()
 
     def build_request(
         self,
@@ -1168,12 +1258,16 @@ class Client:
         elif content is not None:
             body = content.encode("utf-8") if isinstance(content, str) else content
 
+        request_extensions = dict(extensions or {})
+        timeout_obj = self.timeout if isinstance(timeout, _UseClientDefault) else _coerce_timeout(timeout, self.timeout)
+        request_extensions.setdefault("timeout", timeout_obj.as_dict())
+
         return Request(
             method=method,
             url=URL(url_str),
             headers=merged_headers,
             content=body,
-            extensions=extensions or {},
+            extensions=request_extensions,
         )
 
     def send(
@@ -1182,6 +1276,7 @@ class Client:
         *,
         auth: tuple | Auth | _UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | _UseClientDefault = USE_CLIENT_DEFAULT,
+        stream: bool = False,
     ) -> Response:
         # Resolve defaults
         if isinstance(auth, _UseClientDefault):
@@ -1199,9 +1294,14 @@ class Client:
         if auth_obj:
             if auth_obj.requires_request_body:
                 _ = request.read()
-            return self._send_with_auth(request, auth_obj, do_follow)
+            response = self._send_with_auth(request, auth_obj, do_follow)
         else:
-            return self._send_with_redirects(request, do_follow)
+            response = self._send_with_redirects(request, do_follow)
+
+        if stream:
+            response.is_closed = False
+            response.is_stream_consumed = False
+        return response
 
     def _send_with_auth(self, request: Request, auth: Auth, follow_redirects: bool) -> Response:
         flow = auth.auth_flow(request)
@@ -1257,7 +1357,7 @@ class Client:
         """Send via Rust transport."""
         headers_list = list(request.headers.items())
         body = request.content if request.content else None
-        timeout_secs = self.timeout.read
+        timeout_secs = _timeout_read_from_extensions(request.extensions, self.timeout)
 
         try:
             raw = self._transport.request(
@@ -1349,7 +1449,16 @@ class Client:
         # Fast path: single URL → direct request (skip gather ceremony)
         if len(urls) == 1:
             extra = list(headers.items()) if headers else None
-            return [self._fast_request(method.upper(), urls[0], extra_headers=extra)]
+            if timeout is None:
+                return [self._fast_request(method.upper(), urls[0], extra_headers=extra)]
+            return [
+                self._fast_request(
+                    method.upper(),
+                    urls[0],
+                    extra_headers=extra,
+                    timeout_secs=timeout,
+                )
+            ]
 
         # Build headers list once (shared across all requests)
         if headers:
@@ -1367,21 +1476,49 @@ class Client:
         elif self.cookies:
             headers_list = [("cookie", "; ".join(f"{k}={v}" for k, v in self.cookies.items()))]
 
-        # Build request tuples inline — no Request/URL object creation
-        base_prefix = str(self.base_url).rstrip("/") if self.base_url else None
+        # Build request tuples inline for the transport, while keeping
+        # Request objects so Response.request / Response.url match httpx.
         method_upper = method.upper()
         requests_list = [None] * len(urls)
+        request_objects: list[Request] = []
         for i, url in enumerate(urls):
             url_str = url if isinstance(url, str) else str(url)
-            if base_prefix and not url_str.startswith(("http://", "https://")):
-                url_str = base_prefix + "/" + url_str.lstrip("/")
+            if self.base_url and not urlparse(url_str).scheme:
+                url_str = _httpx_url_join(str(self.base_url), url_str)
             requests_list[i] = (method_upper, url_str, headers_list, None)
+            request_objects.append(
+                Request(
+                    method=method_upper,
+                    url=url_str,
+                    headers=Headers(headers_list or []),
+                    extensions={"timeout": self.timeout.as_dict()},
+                )
+            )
 
         timeout_secs = timeout if timeout is not None else self.timeout.read
-        raw_responses = self._transport.gather(requests_list, timeout_secs=timeout_secs)
+        try:
+            raw_responses = self._transport.gather(
+                requests_list,
+                timeout_secs=timeout_secs,
+            )
+        except TimeoutError as e:
+            request = request_objects[0] if request_objects else None
+            raise TimeoutException(str(e), request=request) from e
+        except ConnectionError as e:
+            request = request_objects[0] if request_objects else None
+            raise ConnectError(str(e), request=request) from e
+        except Exception as e:
+            request = request_objects[0] if request_objects else None
+            raise TransportError(str(e), request=request) from e
 
-        # Build Response objects (list comprehension is fastest)
-        return [Response._from_raw(raw) for raw in raw_responses]
+        responses = [
+            Response._from_raw(raw, request=request)
+            for raw, request in zip(raw_responses, request_objects)
+        ]
+        for response in responses:
+            for name, value in response.cookies.items():
+                self.cookies[name] = value
+        return responses
 
     # ── Lifecycle ────────────────────────────────────────────────
 
@@ -1436,7 +1573,35 @@ def options(url: str, **kwargs) -> Response:
     return _module_request("OPTIONS", url, **kwargs)
 
 
+@contextmanager
+def stream(method: str, url: str, **kwargs) -> Iterator[Response]:
+    with Client() as client:
+        with client.stream(method, url, **kwargs) as response:
+            yield response
+
+
 # ── Helpers ──────────────────────────────────────────────────────────
+
+
+def _coerce_timeout(timeout: float | tuple | Timeout | None | object, default: Timeout) -> Timeout:
+    if isinstance(timeout, Timeout):
+        return timeout
+    if isinstance(timeout, (int, float)):
+        return Timeout(float(timeout))
+    if isinstance(timeout, tuple):
+        return Timeout(timeout)
+    if timeout is None:
+        return Timeout(None)
+    return default
+
+
+def _timeout_read_from_extensions(extensions: Mapping[str, Any], default: Timeout) -> float | None:
+    timeout = extensions.get("timeout")
+    if isinstance(timeout, Timeout):
+        return timeout.read
+    if isinstance(timeout, Mapping):
+        return timeout.get("read")
+    return default.read
 
 
 def _iter_header_values(headers: Headers, name: str) -> list[str]:
@@ -1568,7 +1733,7 @@ def _httpx_url_join(base: str, url: str) -> str:
         return url
     base_p = urlparse(base)
     base_path = base_p.path or "/"
-    rel = url.lstrip("/")
+    rel = parsed.path.lstrip("/")
     # Append rel to base_path with a "/" separator.
     if not base_path.endswith("/"):
         joined = base_path + "/" + rel

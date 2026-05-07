@@ -3,8 +3,9 @@
 Drop-in replacement for FastAPI, powered by Rust + Axum. **Hello-world throughput on macOS loopback at `c=1` only** is competitive with Fastify (Node.js), Go Gin, and Go Echo — at higher concurrencies (`c=32+`) Go's per-core goroutine model pulls ahead. CRUD-style workloads (Pydantic body validation + JSON encode + ORM hops) land at roughly 65–85% of Go on the same hardware. See [benchmarks.md](benchmarks.md) and [benchmarks/latest_bench.md](benchmarks/latest_bench.md) for the full breakdown across `c=1 / 32 / 256` and CRUD/echo/redis/sql/sse workloads, and the documented caveats (Linux-x86_64 numbers pending, `wrk`/`bombardier` cross-checks pending).
 
 ```python
-# Change one import — everything else stays the same
-from fastapi_turbo import FastAPI, Depends, Query, Header
+# Activate fastapi-turbo once — keep importing FastAPI symbols from fastapi
+import fastapi_turbo  # noqa: F401
+from fastapi import FastAPI, Depends, Query, Header
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -165,7 +166,8 @@ To disable this and use both FastAPI and fastapi-turbo side by side, set `FASTAP
   worker memory — a trivial DoS footgun. Set it:
 
   ```python
-  from fastapi_turbo import FastAPI
+  import fastapi_turbo  # noqa: F401
+  from fastapi import FastAPI
 
   app = FastAPI(max_request_size=10 * 1024 * 1024)  # 10 MiB
   ```
@@ -188,7 +190,8 @@ pip install "psycopg[binary,pool]"
 ```
 
 ```python
-from fastapi_turbo import FastAPI
+import fastapi_turbo  # noqa: F401
+from fastapi import FastAPI
 from fastapi_turbo.db import create_pool
 
 app = FastAPI()

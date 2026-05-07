@@ -54,8 +54,9 @@ class Security(Depends):
 
     Usage::
 
-        from fastapi_turbo import Security
-        from fastapi_turbo.security import OAuth2PasswordBearer
+        import fastapi_turbo  # noqa: F401
+        from fastapi import Security
+        from fastapi.security import OAuth2PasswordBearer
 
         oauth2 = OAuth2PasswordBearer(tokenUrl="token")
 

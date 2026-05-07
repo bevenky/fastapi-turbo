@@ -5,8 +5,9 @@ an httpx-based client for making real HTTP requests.
 
 Usage::
 
-    from fastapi_turbo import FastAPI
-    from fastapi_turbo.testclient import TestClient
+    import fastapi_turbo  # noqa: F401
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
 
     app = FastAPI()
 
@@ -1149,7 +1150,35 @@ class TestClient:
         _has_startup_handlers = bool(
             getattr(self.app, "_collect_startup_handlers", lambda: [])()
         )
-        if _has_lifespan or _has_startup_handlers:
+        # in_process=True: bring up the ASGI shim FIRST so its
+        # background loop exists, then drive lifespan on that loop —
+        # the same loop that will serve requests via ASGITransport. The
+        # sync ``_run_*`` variants would otherwise submit through
+        # ``_async_worker.submit`` and bind any asyncio resource the
+        # user creates in lifespan (asyncpg pool, ``redis.asyncio``
+        # client, aiohttp session) to the worker thread's loop, so the
+        # first request awaiting that resource hits "Future attached to
+        # a different loop". Issue #1.
+        # in_process=False: keep the sync path — the Rust server runs
+        # handlers on ``_async_worker`` too, so lifespan and handlers
+        # stay on the same (worker) loop.
+        if self._in_process and (_has_lifespan or _has_startup_handlers):
+            self._ensure_started()
+            shim_run = getattr(self._client, "_run", None)
+            if shim_run is None:
+                # Shouldn't happen for the in_process path, but fall
+                # through to the sync helpers if the shim somehow
+                # wasn't installed (e.g. ``hasattr(app, 'run')``
+                # mismatch).
+                self.app._run_lifespan_startup()
+                if _has_startup_handlers:
+                    self.app._run_startup_handlers()
+            else:
+                if _has_lifespan:
+                    shim_run(self.app._async_run_lifespan_startup())
+                if _has_startup_handlers:
+                    shim_run(self.app._async_run_startup_handlers())
+        elif _has_lifespan or _has_startup_handlers:
             # Startup failures must propagate — Starlette's TestClient
             # raises whatever lifespan startup raised so the caller's
             # ``with TestClient(app) as cli:`` block surfaces a real
@@ -1190,6 +1219,26 @@ class TestClient:
             stop_chain = getattr(self.app, "_stop_lifespan_mw_chain", None)
             if stop_chain is not None and stop_chain():
                 pass
+            elif self._in_process and self._client is not None and getattr(
+                self._client, "_run", None
+            ) is not None:
+                # Mirror __enter__: drive shutdown on the shim's loop
+                # so ctx-manager teardown sees the same loop the
+                # resources were created on (issue #1).
+                shim_run = self._client._run
+                async_shutdown = getattr(
+                    self.app, "_async_run_shutdown_handlers", None
+                )
+                if async_shutdown is not None:
+                    shim_run(async_shutdown())
+                async_lifespan_stop = getattr(
+                    self.app, "_async_run_lifespan_shutdown", None
+                )
+                if async_lifespan_stop is not None and (
+                    getattr(self.app, "lifespan", None)
+                    or getattr(self.app, "_lifespan_cms", None)
+                ):
+                    shim_run(async_lifespan_stop())
             else:
                 shutdown = getattr(self.app, "_run_shutdown_handlers", None)
                 if shutdown is not None:

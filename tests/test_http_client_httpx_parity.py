@@ -22,12 +22,18 @@ documented in the R51 audit.
 from __future__ import annotations
 
 import json
+import threading
+import time
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
 
 import fastapi_turbo  # noqa: F401  # install shim
-from fastapi_turbo.http import Client as TurboClient
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from fastapi_turbo.http import Auth, Client as TurboClient, TimeoutException
 
 
 def _read_request(req):
@@ -70,6 +76,19 @@ def _multipart_parts(body: bytes, content_type: str) -> list[bytes]:
     return out
 
 
+@contextmanager
+def _serve(handler_cls: type[BaseHTTPRequestHandler]):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 # ────────────────────────────────────────────────────────────────────
 # URL joining parity
 # ────────────────────────────────────────────────────────────────────
@@ -103,6 +122,47 @@ def test_absolute_url_bypasses_base():
     httpx_url = str(httpx.Client(base_url=base).build_request("GET", "https://other/y").url)
     turbo_url = str(TurboClient(base_url=base).build_request("GET", "https://other/y").url)
     assert turbo_url == httpx_url == "https://other/y"
+
+
+def test_fast_path_base_url_join_matches_httpx_for_dot_segments():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(self.path.encode("utf-8"))
+
+        def log_message(self, *_args):
+            return
+
+    with _serve(Handler) as base:
+        client = TurboClient(base_url=f"{base}/api/v1/")
+        response = client.get("../x?y=1")
+        httpx_url = str(
+            httpx.Client(base_url=f"{base}/api/v1/").build_request("GET", "../x?y=1").url
+        )
+        assert str(response.url) == httpx_url
+        assert response.text == "/api/x?y=1"
+
+
+def test_gather_base_url_join_matches_httpx_for_dot_segments():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(self.path.encode("utf-8"))
+
+        def log_message(self, *_args):
+            return
+
+    with _serve(Handler) as base:
+        client = TurboClient(base_url=f"{base}/api/v1/")
+        responses = client.gather(["../x", "/root"])
+        httpx_client = httpx.Client(base_url=f"{base}/api/v1/")
+        assert [str(response.url) for response in responses] == [
+            str(httpx_client.build_request("GET", "../x").url),
+            str(httpx_client.build_request("GET", "/root").url),
+        ]
+        assert [response.text for response in responses] == ["/api/x", "/api/v1/root"]
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -211,3 +271,205 @@ def test_cookies_header_set():
     h_cookie = sorted((h.headers.get("cookie") or "").split("; "))
     t_cookie = sorted((t.headers.get("cookie") or "").split("; "))
     assert h_cookie == t_cookie
+
+
+def test_build_request_includes_httpx_style_timeout_extension():
+    h = httpx.Client(timeout=7).build_request("GET", "https://x/y")
+    t = TurboClient(timeout=7).build_request("GET", "https://x/y")
+    assert t.extensions["timeout"] == h.extensions["timeout"]
+
+
+def test_per_request_timeout_override_reaches_transport():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            time.sleep(0.3)
+            self.send_response(200)
+            self.end_headers()
+            try:
+                self.wfile.write(b"slow")
+            except BrokenPipeError:
+                pass
+
+        def log_message(self, *_args):
+            return
+
+    with _serve(Handler) as base:
+        client = TurboClient(timeout=2.0)
+        started = time.monotonic()
+        with pytest.raises(TimeoutException):
+            client.get(f"{base}/slow", timeout=0.05)
+        assert time.monotonic() - started < 1.0
+
+
+def test_single_url_gather_timeout_override_reaches_fast_path():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            time.sleep(0.3)
+            self.send_response(200)
+            self.end_headers()
+            try:
+                self.wfile.write(b"slow")
+            except BrokenPipeError:
+                pass
+
+        def log_message(self, *_args):
+            return
+
+    with _serve(Handler) as base:
+        client = TurboClient(timeout=2.0)
+        started = time.monotonic()
+        with pytest.raises(TimeoutException):
+            client.gather([f"{base}/slow"], timeout=0.05)
+        assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.parametrize(
+    "status, expected_final_method, expected_final_body",
+    [
+        (302, "GET", b""),
+        (307, "POST", b"abc"),
+    ],
+)
+def test_follow_redirects_preserves_replayable_request_parts(
+    status, expected_final_method, expected_final_body
+):
+    seen: list[tuple[str, str, str | None, bytes]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("content-length") or 0)
+            body = self.rfile.read(length)
+            seen.append((self.command, self.path, self.headers.get("x-test"), body))
+            if self.path == "/start":
+                self.send_response(status)
+                self.send_header("Location", "/final")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def do_GET(self):  # noqa: N802
+            seen.append((self.command, self.path, self.headers.get("x-test"), b""))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *_args):
+            return
+
+    with _serve(Handler) as base:
+        response = TurboClient(follow_redirects=True).post(
+            f"{base}/start",
+            content=b"abc",
+            headers={"x-test": "1", "content-type": "text/plain"},
+        )
+
+    assert response.status_code == 200
+    assert [(entry[0], entry[1], entry[2]) for entry in seen] == [
+        ("POST", "/start", "1"),
+        (expected_final_method, "/final", "1"),
+    ]
+    assert seen[1][3] == expected_final_body
+    assert [history.status_code for history in response.history] == [status]
+
+
+def test_request_and_response_event_hooks_fire_for_redirect_chain():
+    events: list[tuple[str, str | int]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path == "/start":
+                self.send_response(302)
+                self.send_header("Location", "/final")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *_args):
+            return
+
+    with _serve(Handler) as base:
+        client = TurboClient(
+            follow_redirects=True,
+            event_hooks={
+                "request": [lambda request: events.append(("request", request.url.path))],
+                "response": [lambda response: events.append(("response", response.status_code))],
+            },
+        )
+        response = client.get(f"{base}/start")
+
+    assert response.status_code == 200
+    assert events == [
+        ("request", "/start"),
+        ("response", 302),
+        ("request", "/final"),
+        ("response", 200),
+    ]
+
+
+def test_generator_auth_flow_can_retry_with_updated_request():
+    seen: list[str | None] = []
+
+    class RefreshAuth(Auth):
+        def auth_flow(self, request):
+            request.headers["authorization"] = "Bearer stale"
+            response = yield request
+            if response.status_code == 401:
+                request.headers["authorization"] = "Bearer fresh"
+                yield request
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            auth = self.headers.get("authorization")
+            seen.append(auth)
+            if auth != "Bearer fresh":
+                self.send_response(401)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *_args):
+            return
+
+    with _serve(Handler) as base:
+        response = TurboClient(auth=RefreshAuth()).get(f"{base}/auth")
+
+    assert response.status_code == 200
+    assert seen == ["Bearer stale", "Bearer fresh"]
+
+
+def test_stream_context_manager_exposes_basic_httpx_iteration_contract():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"abcdef")
+
+        def log_message(self, *_args):
+            return
+
+    with _serve(Handler) as base:
+        with TurboClient().stream("GET", f"{base}/stream") as response:
+            assert response.status_code == 200
+            assert response.is_closed is False
+            assert response.is_stream_consumed is False
+            assert list(response.iter_bytes(2)) == [b"ab", b"cd", b"ef"]
+            assert response.is_stream_consumed is True
+            assert response.is_closed is True
+        assert response.is_closed is True
+
+
+def test_http_client_import_pattern_keeps_fastapi_symbols_on_fastapi_module():
+    app = FastAPI()
+
+    @app.get("/")
+    def root():
+        return {"ok": True}
+
+    with TestClient(app, in_process=True) as client:
+        assert client.get("/").json() == {"ok": True}

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import types
 import typing
 from typing import Any, get_type_hints
 
@@ -43,6 +44,10 @@ def _marker_is_required(marker: _ParamMarker) -> bool:
 # Matches both `{name}` and `{name:convertor}` forms (FastAPI/Starlette use
 # `:path` for multi-segment captures — we only care about the name here).
 _PATH_PARAM_RE = re.compile(r"\{(\w+)(?::\w+)?\}")
+
+
+def _is_union_origin(origin: Any) -> bool:
+    return origin is typing.Union or origin is types.UnionType
 
 
 def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
@@ -359,7 +364,7 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
                     # the signature default, strip the outer Discriminator
                     # wrapper so the schema emits plain ``anyOf``.
                     _ta_ann = annotation
-                    if typing.get_origin(annotation) is typing.Union:
+                    if _is_union_origin(typing.get_origin(annotation)):
                         _orig = _original_before_unwrap
                         if (
                             typing.get_origin(_orig) is typing.Annotated
@@ -607,7 +612,7 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
             if _inner_args:
                 _original_annotation = _inner_args[0]
         _is_optional_param = False
-        if typing.get_origin(_original_annotation) is typing.Union:
+        if _is_union_origin(typing.get_origin(_original_annotation)):
             _is_optional_param = any(
                 a is type(None) for a in typing.get_args(_original_annotation)
             )
@@ -618,7 +623,7 @@ def introspect_endpoint(endpoint, path: str) -> list[dict[str, Any]]:
         try:
             import enum as _enum_mod
             probe = annotation
-            if typing.get_origin(probe) is typing.Union:
+            if _is_union_origin(typing.get_origin(probe)):
                 probe = next(
                     (a for a in typing.get_args(probe) if a is not type(None)),
                     probe,
@@ -742,7 +747,7 @@ def _maybe_expand_param_models(params: list[dict[str, Any]]) -> list[dict[str, A
         # model's Pydantic validator in turn and returns the first that
         # accepts the form data.
         _union_models: list[type] | None = None
-        if kind == "form" and typing.get_origin(ann) is typing.Union:
+        if kind == "form" and _is_union_origin(typing.get_origin(ann)):
             _u_args = [a for a in typing.get_args(ann) if a is not type(None)]
             if all(isinstance(a, type) and issubclass(a, _BM) for a in _u_args) and _u_args:
                 _union_models = list(_u_args)
@@ -810,7 +815,7 @@ def _maybe_expand_param_models(params: list[dict[str, Any]]) -> list[dict[str, A
             sub_is_optional = False
             try:
                 _origin = typing.get_origin(field_ann)
-                if _origin is typing.Union:
+                if _is_union_origin(_origin):
                     sub_is_optional = any(
                         a is type(None) for a in typing.get_args(field_ann)
                     )
@@ -1355,7 +1360,7 @@ def _get_type_name(annotation) -> str:
     origin = typing.get_origin(annotation) or getattr(annotation, "__origin__", None)
     if origin is not None:
         # Optional[X] / Union[X, None] — strip None, recurse
-        if origin is typing.Union:
+        if _is_union_origin(origin):
             args = [a for a in annotation.__args__ if a is not type(None)]
             if args:
                 return _get_type_name(args[0])
@@ -1408,7 +1413,7 @@ def _get_container_type(annotation) -> str | None:
     if annotation is inspect.Parameter.empty or annotation is None:
         return None
     origin = typing.get_origin(annotation) or getattr(annotation, "__origin__", None)
-    if origin is typing.Union:
+    if _is_union_origin(origin):
         for a in typing.get_args(annotation):
             if a is type(None):
                 continue
@@ -1430,13 +1435,18 @@ def _is_upload_file_type(annotation) -> bool:
         from fastapi_turbo.param_functions import UploadFile as _UF
     except ImportError:
         return False
+    origin = typing.get_origin(annotation) or getattr(annotation, "__origin__", None)
+    if _is_union_origin(origin):
+        return any(
+            arg is not type(None) and _is_upload_file_type(arg)
+            for arg in typing.get_args(annotation)
+        )
     # Direct annotation: `f: UploadFile`
     if annotation is _UF:
         return True
     # Generic: `f: list[UploadFile]`, `f: Optional[UploadFile]`, etc.
-    origin = getattr(annotation, "__origin__", None)
     if origin is not None:
-        args = getattr(annotation, "__args__", ())
+        args = typing.get_args(annotation) or getattr(annotation, "__args__", ())
         for arg in args:
             if arg is _UF:
                 return True
@@ -1498,7 +1508,7 @@ def _unwrap_optional(annotation):
     return the annotation unchanged."""
     if annotation is inspect.Parameter.empty or annotation is None:
         return None
-    if typing.get_origin(annotation) is typing.Union:
+    if _is_union_origin(typing.get_origin(annotation)):
         non_none = [a for a in typing.get_args(annotation) if a is not type(None)]
         if len(non_none) == 1:
             return non_none[0]
@@ -1513,7 +1523,7 @@ def _probe_enum_class(annotation):
         return None
     import enum as _enum_mod
     probe = annotation
-    if typing.get_origin(probe) is typing.Union:
+    if _is_union_origin(typing.get_origin(probe)):
         probe = next(
             (a for a in typing.get_args(probe) if a is not type(None)),
             probe,
@@ -1591,7 +1601,7 @@ def _needs_scalar_validator(annotation) -> bool:
         pass
     origin = typing.get_origin(annotation)
     # Unwrap Optional[T] / Union[T, None]
-    if origin is typing.Union:
+    if _is_union_origin(origin):
         args = [a for a in typing.get_args(annotation) if a is not type(None)]
         if not args:
             return False
@@ -1796,7 +1806,7 @@ def _is_body_type(annotation) -> bool:
 
     # Unwrap ``Optional[T]`` / ``Union[T, None]`` / ``T | None`` before
     # classifying — ``foo: Foo | None = None`` is a body param in FA.
-    if origin is typing.Union:
+    if _is_union_origin(origin):
         _non_none = [a for a in typing.get_args(annotation) if a is not type(None)]
         if len(_non_none) == 1:
             return _is_body_type(_non_none[0])

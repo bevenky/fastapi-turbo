@@ -10,7 +10,7 @@ Status: **all upstream FastAPI tests pass** under the `import fastapi_turbo` sys
 |---|---|---|---|
 | Upstream FastAPI shim gate (sandboxed; py3.14, direct `pytest tests/`) | 3,125 passed, 2 skipped, 4 xfailed | 2026-05-01 | post-R51 (`45236fc`) |
 | Upstream FastAPI canonical script (`run_external_compat_gates.sh fastapi`, deselects upstream's own opt-outs) | 3,119 passed, 10 deselected | 2026-05-01 | post-R51 (`45236fc`) |
-| Own suite (`pytest tests/`, `FASTAPI_TURBO_SKIP_SUBPROCESS_DRIFT=1`) | 1,079 passed, 3 skipped | 2026-05-01 | post-R51 (`45236fc`) |
+| Own suite (`pytest tests/`, `FASTAPI_TURBO_SKIP_SUBPROCESS_DRIFT=1`) | 1,125 passed, 3 skipped | 2026-05-07 | post-R53 (issue #1 fix) |
 | Sentry SDK FastAPI + ASGI integration | 75 passed (was 33+89=122 on older sentry-sdk; 2.42.0 surface is smaller — track via canonical script run) | 2026-05-01 | post-R51 (`45236fc`) |
 
 Snapshot counts shift as new regression tests land. Replace numbers with what `scripts/run_external_compat_gates.sh all` and `pytest tests/` print on the current HEAD before claiming a regression — the audit report fields are dated on purpose so a doc-vs-code drift is auditable rather than ambiguous (R51 finding 4).
@@ -20,23 +20,23 @@ Snapshot counts shift as new regression tests land. Replace numbers with what `s
 * **Normal dev box / CI** (loopback bind allowed): the full own-suite + 22 real-WS tests + 3 nested-pytest drift detectors all green. Latest snapshot above (table) records the most recently verified pass count + date + HEAD; refer to it instead of memorising a fixed number, since counts shift by 1-2 across releases as new regression tests land. Run those drift-detectors directly via `pytest tests/test_websocket.py tests/stress/test_r3{3,6,7}_regressions.py`.
 * **Sandbox / restricted CI** (`socket.bind('127.0.0.1', 0)` denied with `PermissionError` in the pytest process): `tests/conftest.py` detects this at session start via a one-shot bind probe and sets `LOOPBACK_DENIED = True`. Tests that exercise the in-process / ASGI dispatch path run cleanly via a sandbox-aware `server_app` fixture (exec's the app in-process, routes `httpx.*` through `ASGITransport`); tests that genuinely need a real loopback port are skipped via `@pytest.mark.requires_loopback`.
   - **Force-override env vars** (audit / CI use): set `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1` to skip `requires_loopback` tests even on a dev box that *can* bind, or `FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED=1` to run them anyway in an env where probe bind fails but the real subprocess server might still succeed.
-  - **Counts at the R52 watermark**, measured on macOS Apple Silicon
+  - **Counts at the R53 watermark**, measured on macOS Apple Silicon
     with `FASTAPI_TURBO_SKIP_SUBPROCESS_DRIFT=1` (the 3 drift-detector
     tests spawn nested pytest subprocesses and contend in the
     parent run; they're reliable in isolation, run them via
     `pytest tests/stress/test_r3{3,6,7}_regressions.py` directly):
     1. *True sandbox + FORCE env var* — every bind raises AND
-       `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`: 918 pass, 164 skipped.
+       `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`: 965 pass, 162 skipped.
        The conftest collection hooks (suite-level + parity-level)
        both honour the FORCE env var (R33), so this scenario also
        covers a dev box where the auditor wants the bucket-#1
        numbers without having to actually deny bind at the kernel.
     2. *Forced-fail bind only* — monkey-patched `socket.socket.bind`
-       to raise `PermissionError`, no env var: 918 pass, 164 skipped
+       to raise `PermissionError`, no env var: 965 pass, 162 skipped
        (same as #1 — the suite-level probe hits the patched bind
        first, propagates `LOOPBACK_DENIED=True`, parity collection
        hook also detects it).
-    3. *Bind works, no env var* (normal dev box): 1079 pass, 3 skipped
+    3. *Bind works, no env var* (normal dev box): 1106 pass, 0 skipped
        — full coverage. This is the "happy path" that CI / release
        runners hit. Drift detector at `tests/stress/test_r37_regressions.py`
        allows ±2 vs the doc claim.

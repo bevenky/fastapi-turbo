@@ -60,6 +60,38 @@ def test_async_with_await(server_app):
     assert r.json() == {"message": "done"}
 
 
+def test_async_no_dep_handler_has_running_loop_from_first_instruction(server_app):
+    """Async no-dep handlers must not be probed outside an event loop.
+
+    Some libraries (redis.asyncio, asyncpg) call get_running_loop() before
+    their first await and catch RuntimeError internally. If fastapi-turbo
+    probes the coroutine with send(None), fallback cannot see the error and
+    the handler observes a false "no running event loop" state.
+    """
+    import httpx
+
+    url = server_app("""
+        import asyncio
+        import fastapi_turbo  # noqa: F401 — installs compat shim
+        from fastapi import FastAPI
+        app = FastAPI()
+
+        @app.get("/loop")
+        async def loop_check():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError as exc:
+                return {"ok": False, "detail": str(exc)}
+            await asyncio.sleep(0)
+            return {"ok": loop.is_running()}
+
+        app.run(host="127.0.0.1", port=__PORT__)
+    """)
+    r = httpx.get(f"{url}/loop")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+
 def test_async_with_path_params(server_app):
     """Async handler with path params."""
     import httpx

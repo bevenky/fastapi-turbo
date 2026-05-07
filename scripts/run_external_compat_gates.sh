@@ -129,13 +129,15 @@ run_fastapi_gate() {
         # Verify test deps are available BEFORE running pytest. In
         # OFFLINE mode we skipped the ``pip install`` step; if the
         # env doesn't have pytest-asyncio / dirty-equals /
-        # inline-snapshot / sqlmodel / pyyaml, ~hundreds of tests
+        # inline-snapshot / sqlmodel / pyyaml / coverage /
+        # optional tutorial deps (GraphQL + WSGI + security),
+        # ~hundreds of tests
         # fail with collection / fixture errors that look like
         # genuine compat regressions but are actually missing
         # dependencies. R34 audit hit this — 888 reported failures
         # turned out to be missing-dep collection errors.
         local missing=()
-        for dep in pytest_asyncio yaml dirty_equals sqlmodel inline_snapshot; do
+        for dep in pytest_asyncio yaml dirty_equals sqlmodel inline_snapshot coverage strawberry a2wsgi flask jwt pwdlib; do
             if ! "$PYTHON_BIN" -c "import $dep" >/dev/null 2>&1; then
                 missing+=("$dep")
             fi
@@ -161,7 +163,9 @@ run_fastapi_gate() {
         git -C /tmp/fastapi_upstream reset --hard "$UPSTREAM_TAG"
         git -C /tmp/fastapi_upstream clean -fdx -- ':!conftest.py'
         "$PYTHON_BIN" -m pip install -q pytest-asyncio pyyaml dirty-equals \
-                                       "sqlmodel>=0.0.14" inline-snapshot
+                                       "sqlmodel>=0.0.14" inline-snapshot \
+                                       coverage strawberry-graphql a2wsgi flask \
+                                       pyjwt "pwdlib[argon2]"
     fi
 
     cat > /tmp/fastapi_upstream/conftest.py <<'PY'
@@ -222,7 +226,15 @@ run_sentry_gate() {
         git -C /tmp/sentry-python clean -fdx \
             -- ':!tests/integrations/fastapi/conftest.py' \
                ':!tests/integrations/asgi/conftest.py'
-        "$PYTHON_BIN" -m pip install -q "sentry-sdk[fastapi]==${SENTRY_TAG}"
+        local sentry_test_deps=(
+            "pytest-localserver"
+            "jsonschema"
+            "async-asgi-testclient"
+            "pytest-asyncio"
+            "python-multipart"
+            "requests"
+        )
+        "$PYTHON_BIN" -m pip install -q "sentry-sdk[fastapi]==${SENTRY_TAG}" "${sentry_test_deps[@]}"
     fi
 
     for tree in fastapi asgi; do
@@ -236,7 +248,7 @@ PY
     env -u OFFLINE "$PYTHON_BIN" -m pytest \
         /tmp/sentry-python/tests/integrations/fastapi \
         /tmp/sentry-python/tests/integrations/asgi \
-        -q --tb=short
+        -q --tb=short -o addopts=
 }
 
 case "$GATE" in

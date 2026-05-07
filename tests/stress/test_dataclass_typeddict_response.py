@@ -5,6 +5,10 @@ This suite locks in parity: dataclasses / TypedDicts serialise cleanly,
 the response JSON has the declared fields only (filtering works), and
 the generated OpenAPI schema is structurally sound.
 
+On Python <3.12, Pydantic requires ``typing_extensions.TypedDict``
+for the positive TypedDict path; stdlib ``typing.TypedDict`` is
+rejected by upstream FastAPI with ``PydanticUserError``.
+
 ``msgspec.Struct`` is intentionally NOT covered: upstream FastAPI
 rejects it at decoration time with the same FastAPIError we raise, so
 the parity outcome is "both frameworks say no". A regression there
@@ -13,9 +17,9 @@ would be an upstream-divergence bug, so we test the negative case too.
 from __future__ import annotations
 
 import dataclasses
-from typing import TypedDict
 
 import pytest
+from typing_extensions import TypedDict
 
 import fastapi_turbo  # noqa: F401
 

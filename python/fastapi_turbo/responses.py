@@ -187,6 +187,11 @@ class Response:
             return content
         return content.encode("utf-8")
 
+    async def __call__(self, scope, receive, send) -> None:
+        from fastapi_turbo.applications import _send_asgi_response
+
+        await _send_asgi_response(send, self, scope=scope)
+
     def set_cookie(
         self,
         key: str,

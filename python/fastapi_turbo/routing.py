@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import inspect
 import re
+import types
 import typing
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
+
+
+def _is_union_origin(origin: Any) -> bool:
+    return origin is typing.Union or origin is types.UnionType
 
 
 def _default_generate_unique_id(route: "APIRoute", method: str) -> str:
@@ -37,6 +42,101 @@ def _safe_signature(endpoint):
         raise
     except (TypeError, ValueError):
         raise
+
+
+def _looks_like_starlette_mount(route: Any) -> bool:
+    cls_name = type(route).__name__
+    return cls_name == "Mount" or (
+        hasattr(route, "routes")
+        and hasattr(route, "app")
+        and not hasattr(route, "endpoint")
+    )
+
+
+def _looks_like_starlette_websocket_route(route: Any) -> bool:
+    return (
+        getattr(route, "_is_websocket", False)
+        or type(route).__name__ == "WebSocketRoute"
+    )
+
+
+def _is_websocket_endpoint_class(endpoint: Any) -> bool:
+    if not isinstance(endpoint, type):
+        return False
+    return any(base.__name__ == "WebSocketEndpoint" for base in endpoint.__mro__)
+
+
+async def _maybe_await_ws_result(result: Any) -> Any:
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _adapt_websocket_endpoint_class(endpoint: Callable) -> Callable:
+    """Adapt Starlette ``WebSocketEndpoint`` classes to FastAPI handler shape."""
+    if not _is_websocket_endpoint_class(endpoint):
+        return endpoint
+
+    async def _endpoint(websocket, _endpoint_cls=endpoint):
+        from fastapi_turbo.exceptions import WebSocketDisconnect as _WSD
+
+        instance = _endpoint_cls()
+        close_code = 1000
+        try:
+            await _maybe_await_ws_result(instance.on_connect(websocket))
+            while True:
+                encoding = getattr(instance, "encoding", None)
+                if encoding == "text":
+                    message = await websocket.receive_text()
+                elif encoding == "bytes":
+                    message = await websocket.receive_bytes()
+                elif encoding == "json":
+                    message = await websocket.receive_json()
+                else:
+                    message = await websocket.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        close_code = message.get("code", 1000)
+                        break
+                    if "text" in message:
+                        message = message["text"]
+                    elif "bytes" in message:
+                        message = message["bytes"]
+                await _maybe_await_ws_result(
+                    instance.on_receive(websocket, message)
+                )
+        except _WSD as exc:
+            close_code = getattr(exc, "code", 1000)
+        except Exception:
+            close_code = 1011
+            raise
+        finally:
+            await _maybe_await_ws_result(
+                instance.on_disconnect(websocket, close_code)
+            )
+
+    _endpoint.__name__ = getattr(endpoint, "__name__", "websocket_endpoint")
+    return _endpoint
+
+
+def _mark_starlette_compat_route(route: Any) -> None:
+    if _looks_like_starlette_mount(route):
+        try:
+            route._fastapi_turbo_starlette_mount = True  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            pass
+        return
+    if _looks_like_starlette_websocket_route(route):
+        try:
+            route.endpoint = _adapt_websocket_endpoint_class(route.endpoint)
+            route._is_websocket = True  # type: ignore[attr-defined]
+            route._fastapi_turbo_starlette_websocket = True  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            pass
+        return
+    try:
+        route._fastapi_turbo_starlette_passthrough = True  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
 
 
 def _ws_check_scope_mismatch(endpoint: Callable) -> None:
@@ -380,10 +480,7 @@ class APIRouter:
         # rather than FastAPI's parameter-injection introspection.
         if routes:
             for _r in routes:
-                try:
-                    _r._fastapi_turbo_starlette_passthrough = True  # type: ignore[attr-defined]
-                except (AttributeError, TypeError):
-                    pass
+                _mark_starlette_compat_route(_r)
                 self.routes.append(_r)
 
     # ------------------------------------------------------------------
@@ -813,7 +910,7 @@ class APIRouter:
                     ):
                         return True
             # bare ``dict | None`` — check union of dicts
-            if origin is _typing.Union:
+            if _is_union_origin(origin):
                 for sub in _typing.get_args(ann):
                     if sub is dict or _typing.get_origin(sub) is dict:
                         return True
@@ -888,7 +985,14 @@ class APIRouter:
     # Generic route decorator and imperative registration
     # ------------------------------------------------------------------
 
-    def route(self, path: str, methods: list[str] | None = None, **kwargs: Any):
+    def route(
+        self,
+        path: str,
+        methods: list[str] | None = None,
+        name: str | None = None,
+        include_in_schema: bool = True,
+        **kwargs: Any,
+    ):
         """Generic route decorator (Starlette-compatible).
 
         Usage::
@@ -898,7 +1002,14 @@ class APIRouter:
         """
 
         def decorator(func: Callable) -> Callable:
-            self.add_api_route(path, func, methods=methods, **kwargs)
+            self.add_route(
+                path,
+                func,
+                methods=methods,
+                name=name,
+                include_in_schema=include_in_schema,
+                **kwargs,
+            )
             return func
 
         return decorator
@@ -908,10 +1019,22 @@ class APIRouter:
         path: str,
         endpoint: Callable,
         methods: list[str] | None = None,
+        name: str | None = None,
+        include_in_schema: bool = True,
         **kwargs: Any,
     ) -> None:
         """Imperative generic route registration (Starlette-compatible)."""
-        self.add_api_route(path, endpoint, methods=methods, **kwargs)
+        kwargs.setdefault("response_model", None)
+        route = APIRoute(
+            path,
+            endpoint,
+            methods=methods or ["GET"],
+            name=name,
+            include_in_schema=include_in_schema,
+            **kwargs,
+        )
+        _mark_starlette_compat_route(route)
+        self.routes.append(route)
 
     # ------------------------------------------------------------------
     # WebSocket routes
@@ -921,11 +1044,11 @@ class APIRouter:
         self,
         path: str,
         endpoint: Callable,
-        *,
         name: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Register a WebSocket route."""
+        endpoint = _adapt_websocket_endpoint_class(endpoint)
         # FastAPI 0.120+ scope rule check. Raise FastAPIError at
         # decoration time when a request-scope yield-dep depends on a
         # function-scope yield-dep — matches FA parity so tests asserting
@@ -946,7 +1069,6 @@ class APIRouter:
         self,
         path: str,
         endpoint: Callable,
-        *,
         name: str | None = None,
         **kwargs: Any,
     ) -> None:

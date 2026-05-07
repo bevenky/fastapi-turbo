@@ -7,6 +7,7 @@ wrappers that delegate directly to the v2 API.
 
 from __future__ import annotations
 
+import types
 from typing import Any
 
 
@@ -85,7 +86,7 @@ def _iter_optional_args(annotation: Any):
     """
     import typing as _t
     origin = _t.get_origin(annotation)
-    if origin is _t.Union:
+    if origin is _t.Union or origin is types.UnionType:
         for a in _t.get_args(annotation):
             if a is type(None):
                 continue
