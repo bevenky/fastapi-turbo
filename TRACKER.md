@@ -86,7 +86,23 @@ adopt + extend.
 
 ## P2 — Crate-substitution levers + two doors 🔄  (gated on the green P1 gate)
 
-### ⚠️ WATCH: multi-range FileResponse one-time failure (instrumented, not reproduced)
+### ⚠️ WATCH: load-sensitive I/O-path failures under full-suite runs (2 seen)
+Two DIFFERENT tests have each failed ONCE in a full `tests/` run and PASSED in
+isolation, both in timing-sensitive I/O code I did NOT modify:
+1. `test_multi_range_no_full_file_buffer::...large_file` (FileResponse range) —
+   instrumented with `_range_diag()` (commit a4e700b); ~50 repro attempts failed.
+2. `test_r29_regressions::test_rust_ws_server_initiated_close_doesnt_emit_connection_reset`
+   (WS graceful-close / ConnectionReset noise — the exact subject of audit R30)
+   — failed once in the B full-suite run, PASSES in isolation; `websocket.rs` is
+   untouched by any of my commits, so NOT a regression. Same flake class as R30's
+   "ws_iter_text flake" stress note.
+PATTERN: the full ~1100-test suite under load surfaces pre-existing timing
+flakiness in the WS-close + file-streaming subprocess paths. NOT caused by the
+rewrite work. The B WS additions add WS load to the suite, which can raise the
+odds of surfacing the pre-existing WS-close flake. Real (don't dismiss), but
+pre-existing and isolation-green. Revisit with the dispatcher collapse (which
+removes a whole class of in-process/subprocess timing surface) or by hardening
+the WS-close drain. Detail on #1:
 `tests/stress/test_multi_range_no_full_file_buffer.py::test_multi_range_correct_slices_on_large_file`
 failed ONCE in a full `tests/` run (during the 422-mw verification). NOT a
 regression from that change (touches no middleware/range code). Could NOT
