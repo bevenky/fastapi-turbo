@@ -527,3 +527,71 @@ class TestDependencyInjection:
     def test_P100_dep_yield_cleanup(self, client, dual_servers):
         fa, rs = hit(client, dual_servers, "get", "/p100-dep-yield-cleanup")
         assert_json_match(fa, rs)
+
+
+# ══════════════════════════════════════════════════════════════════
+# DOCS / OPENAPI (P101-P106) — corpus expansion (P1)
+#
+# These guard the auto-generated docs surface so the L6 lever
+# (drop the embedded Swagger/ReDoc HTML in favour of Python-rendered
+# HTML) can be verified safe: /docs and /redoc must still serve HTML
+# that loads the schema, and /openapi.json must expose the same paths.
+# HTML bodies are allowed to differ between renderers, so we assert on
+# status + content-type + structural openapi equality, not byte-equality.
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestDocsOpenAPI:
+    def test_P101_openapi_json_status_and_content_type(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/openapi.json")
+        assert_status_match(fa, rs)
+        assert fa.status_code == 200, fa.text
+        assert "application/json" in fa.headers.get("content-type", "")
+        assert "application/json" in rs.headers.get("content-type", "")
+
+    def test_P102_openapi_paths_set_matches(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/openapi.json")
+        fa_paths = set(fa.json().get("paths", {}))
+        rs_paths = set(rs.json().get("paths", {}))
+        assert fa_paths == rs_paths, (
+            f"openapi paths differ:\n  only FA={sorted(fa_paths - rs_paths)}\n"
+            f"  only RS={sorted(rs_paths - fa_paths)}"
+        )
+
+    def test_P103_openapi_version_and_info(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/openapi.json")
+        fa_j, rs_j = fa.json(), rs.json()
+        assert fa_j.get("openapi") == rs_j.get("openapi"), (
+            f"openapi version: FA={fa_j.get('openapi')} RS={rs_j.get('openapi')}"
+        )
+        assert fa_j.get("info") == rs_j.get("info"), (
+            f"info block differs:\n  FA={fa_j.get('info')}\n  RS={rs_j.get('info')}"
+        )
+
+    def test_P104_swagger_docs_served(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/docs")
+        assert_status_match(fa, rs)
+        assert fa.status_code == 200, fa.text
+        assert "text/html" in fa.headers.get("content-type", "")
+        assert "text/html" in rs.headers.get("content-type", "")
+        # Both must reference the schema URL so the UI can load it.
+        assert "/openapi.json" in fa.text
+        assert "/openapi.json" in rs.text
+
+    def test_P105_redoc_served(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/redoc")
+        assert_status_match(fa, rs)
+        assert fa.status_code == 200, fa.text
+        assert "text/html" in fa.headers.get("content-type", "")
+        assert "text/html" in rs.headers.get("content-type", "")
+        assert "/openapi.json" in fa.text
+        assert "/openapi.json" in rs.text
+
+    def test_P106_openapi_components_schemas_set_matches(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/openapi.json")
+        fa_c = set(fa.json().get("components", {}).get("schemas", {}))
+        rs_c = set(rs.json().get("components", {}).get("schemas", {}))
+        assert fa_c == rs_c, (
+            f"component schema names differ:\n  only FA={sorted(fa_c - rs_c)}\n"
+            f"  only RS={sorted(rs_c - fa_c)}"
+        )
