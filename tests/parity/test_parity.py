@@ -854,3 +854,129 @@ class TestMiddlewareOrdering:
         fa, rs = hit(client, dual_servers, "get", "/no-such-route-xyz")
         assert_status_match(fa, rs)
         assert fa.headers.get("x-mw-trace") == rs.headers.get("x-mw-trace")
+
+
+# ══════════════════════════════════════════════════════════════════
+# WEBSOCKET PARITY (P150-P154) — corpus expansion (P1), folded into the gate
+#
+# Drives a real ws client against BOTH dual servers (FastAPI+uvicorn and turbo
+# app.run) and diffs observable behaviour. turbo runs each WS connection on a
+# dedicated per-connection OS thread + local event loop (src/websocket.rs), with
+# the GIL RELEASED while parked on receive (py.detach + crossbeam) — so this is
+# the in-the-gate safety net for the dispatcher collapse (WS has its own
+# in-process dispatch twin). Endpoints live on parity_app under /pws/*.
+# ══════════════════════════════════════════════════════════════════
+
+
+def _ws_url(dual_servers, which, path):
+    port = dual_servers.fa_port if which == "fa" else dual_servers.rs_port
+    return f"ws://127.0.0.1:{port}{path}"
+
+
+def _ws_both(dual_servers, path, scenario):
+    """Run ``scenario(connect, url)`` against FA and turbo; return (fa, rs)."""
+    from websockets.sync.client import connect
+    out = {}
+    for which in ("fa", "rs"):
+        out[which] = scenario(connect, _ws_url(dual_servers, which, path))
+    return out["fa"], out["rs"]
+
+
+class TestWebSocketParity:
+    def test_P150_ws_echo_text(self, dual_servers):
+        def scen(connect, url):
+            with connect(url) as ws:
+                ws.send("hello")
+                a = ws.recv()
+                ws.send("world")
+                b = ws.recv()
+                return [a, b]
+        fa, rs = _ws_both(dual_servers, "/pws/echo", scen)
+        assert fa == rs == ["hello", "world"], f"FA={fa} RS={rs}"
+
+    def test_P151_ws_echo_json(self, dual_servers):
+        import json as _j
+
+        def scen(connect, url):
+            with connect(url) as ws:
+                ws.send(_j.dumps({"name": "bob", "n": 3}))
+                return _j.loads(ws.recv())
+        fa, rs = _ws_both(dual_servers, "/pws/json", scen)
+        assert fa == rs == {"echo": {"name": "bob", "n": 3}}, f"FA={fa} RS={rs}"
+
+    def test_P152_ws_scope_path_query_header(self, dual_servers):
+        import json as _j
+
+        def scen(connect, url):
+            with connect(url, additional_headers={"x-test": "hdrval"}) as ws:
+                return _j.loads(ws.recv())
+        fa, rs = _ws_both(dual_servers, "/pws/scope/alice?q=42", scen)
+        assert fa == rs, f"FA={fa} RS={rs}"
+        assert fa == {"who": "alice", "q": "42", "hdr": "hdrval"}, fa
+
+    def test_P153_ws_close_code_and_reason(self, dual_servers):
+        def scen(connect, url):
+            with connect(url) as ws:
+                payload = ws.recv()
+                code = reason = None
+                try:
+                    ws.recv()
+                except Exception as exc:  # ConnectionClosed*
+                    code = getattr(exc, "code", None)
+                    reason = getattr(exc, "reason", None)
+                return {"payload": payload, "code": code, "reason": reason}
+        fa, rs = _ws_both(dual_servers, "/pws/close-code", scen)
+        assert fa == rs, f"FA={fa} RS={rs}"
+        assert fa["payload"] == "first-and-only" and fa["code"] == 4002, fa
+
+    def test_P154_ws_dep_reject_then_pass(self, dual_servers):
+        # Reject = dep raises WebSocketException(4401) before accept (the
+        # normative Starlette path). The connection is refused; the client
+        # sees either an HTTP reject status or a close code — capture both
+        # shapes and just require FA and turbo agree.
+        def scen_reject(connect, url):
+            try:
+                with connect(url) as ws:
+                    ws.recv()
+            except Exception as exc:
+                return {
+                    "kind": type(exc).__name__,
+                    "code": getattr(exc, "code", None),
+                    "status": getattr(getattr(exc, "response", None), "status_code", None),
+                }
+            return {"kind": "connected", "code": None, "status": None}
+
+        def scen_pass(connect, url):
+            with connect(url) as ws:
+                return ws.recv()
+
+        fa_r, rs_r = _ws_both(dual_servers, "/pws/dep", scen_reject)
+        assert fa_r == rs_r, f"reject: FA={fa_r} RS={rs_r}"
+        fa_p, rs_p = _ws_both(dual_servers, "/pws/dep?token=secret", scen_pass)
+        assert fa_p == rs_p == "authed:secret", f"pass: FA={fa_p} RS={rs_p}"
+
+    @pytest.mark.xfail(
+        reason="REAL PARITY DIVERGENCE (found by this corpus): a WS handler that "
+        "does `await ws.close()` BEFORE `accept()` is rejected by Starlette at the "
+        "HTTP layer (client sees HTTP 403 / InvalidStatus), but turbo completes the "
+        "upgrade and then sends a WS close (client sees close code 4401). Verified "
+        "FA={kind:InvalidStatus,status:403} vs turbo={kind:ConnectionClosedError,"
+        "code:4401}. Same class as the 422-middleware bug (Rust path diverges on a "
+        "reject path). The normative reject (raise WebSocketException before accept, "
+        "P154) already matches. Fix = make close-before-accept refuse the handshake "
+        "(403) like Starlette. Tracked in TRACKER.md P2 (ws-close-before-accept).",
+        strict=True,
+    )
+    def test_P155_ws_close_before_accept(self, dual_servers):
+        def scen(connect, url):
+            try:
+                with connect(url) as ws:
+                    ws.recv()
+            except Exception as exc:
+                return {
+                    "kind": type(exc).__name__,
+                    "status": getattr(getattr(exc, "response", None), "status_code", None),
+                }
+            return {"kind": "connected", "status": None}
+        fa, rs = _ws_both(dual_servers, "/pws/close-before-accept", scen)
+        assert fa == rs, f"FA={fa} RS={rs}"

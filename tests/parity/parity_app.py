@@ -13,7 +13,7 @@ from typing import Annotated, Optional, Union
 from fastapi import (
     FastAPI, APIRouter, Depends, Query, Path, Header, Cookie, Body, Form,
     File, UploadFile, HTTPException, Request, Response, Security,
-    BackgroundTasks, status,
+    BackgroundTasks, status, WebSocket, WebSocketDisconnect,
 )
 from fastapi.responses import (
     JSONResponse, HTMLResponse, PlainTextResponse, RedirectResponse,
@@ -262,6 +262,80 @@ async def _mw_outer(request, call_next):
 @app.get("/pmw-trace")
 def pmw_trace():
     return {"ok": True}
+
+
+# ── WebSocket parity (PWS) — corpus expansion (P1), folded into the gate ──
+# WS runs on a dedicated per-connection OS thread + local event loop in turbo
+# (src/websocket.rs), NOT the shared async loop. These prove the observable
+# client-side behaviour matches FastAPI through the SAME dual-server gate as
+# HTTP — incl. that WS coexists with the @app.middleware("http") above (http
+# middleware must NOT wrap the websocket scope). Safety net for the dispatcher
+# collapse (WS has its own in-process dispatch twin).
+
+@app.websocket("/pws/echo")
+async def pws_echo(ws: WebSocket) -> None:
+    await ws.accept()
+    try:
+        while True:
+            msg = await ws.receive_text()
+            await ws.send_text(msg)
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/pws/json")
+async def pws_json(ws: WebSocket) -> None:
+    await ws.accept()
+    data = await ws.receive_json()
+    await ws.send_json({"echo": data})
+    await ws.close()
+
+
+@app.websocket("/pws/scope/{who}")
+async def pws_scope(ws: WebSocket, who: str) -> None:
+    await ws.accept()
+    await ws.send_json(
+        {
+            "who": who,
+            "q": ws.query_params.get("q", ""),
+            "hdr": ws.headers.get("x-test", ""),
+        }
+    )
+    await ws.close()
+
+
+@app.websocket("/pws/close-code")
+async def pws_close_code(ws: WebSocket) -> None:
+    await ws.accept()
+    await ws.send_text("first-and-only")
+    await ws.close(code=4002, reason="bye-now")
+
+
+def _pws_auth(token: str = Query(default="")) -> str:
+    # Normative Starlette reject path: raising WebSocketException BEFORE
+    # accept rejects the connection with a custom close code (matches the
+    # proven run_websocket_parity.py auth_dep pattern). NOTE: the
+    # ``await ws.close(code=...)`` before accept pattern showed an FA=4401 /
+    # turbo=None divergence — tracked as a WATCH item, not exercised here.
+    from fastapi import WebSocketException
+    if not token:
+        raise WebSocketException(code=4401, reason="missing token")
+    return token
+
+
+@app.websocket("/pws/dep")
+async def pws_dep(ws: WebSocket, token: str = Depends(_pws_auth)) -> None:
+    await ws.accept()
+    await ws.send_text(f"authed:{token}")
+    await ws.close()
+
+
+@app.websocket("/pws/close-before-accept")
+async def pws_close_before_accept(ws: WebSocket) -> None:
+    # Reject by closing BEFORE accept. Starlette refuses the handshake at the
+    # HTTP layer (client sees HTTP 403); turbo completes the upgrade then sends
+    # a WS close (client sees close code 4401). KNOWN divergence — see P155.
+    await ws.close(code=4401, reason="nope")
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -100,19 +100,34 @@ ACTION TAKEN: added `_range_diag()` so any future failure surfaces status /
 content-type / content-length / body-head / `app._captured_server_exceptions`
 instead of a bare assert. Revisit with a real traceback if it recurs.
 
-### WebSocket parity — status (2026-06-01)
-- ✅ `tests/test_websocket.py` (22 real-loopback ws-client tests) GREEN on branch.
-- ✅ `tests/parity/run_websocket_parity.py` (standalone dual-server: FA+uvicorn vs
-  turbo) **11/11 PASS** — echo text/bytes/json, close code+reason, subprotocol,
-  scope (path/query/header/cookie), app.state, reject-before-accept, dep-reject,
-  dep-pass, router-prefix. WS behavior is byte-identical to FastAPI.
-- GAP (not a bug): WS parity isn't in the pytest-collected dual-server gate
-  (`conftest.py::DualServers` is HTTP-only). OPEN FORK for user: (a) wire the
-  existing green runner as a blocking CI gate (low effort, no new code), (b) add a
-  WS dual-server fixture + TestWebSocket class to fold WS into the 145-test gate
-  (more infra; coverage already proven so it's hardening, not bug-finding), or
-  (c) defer gate-wiring and go straight to the dispatcher collapse (the real P2
-  prize). Asked the user before spending the infra effort.
+### WebSocket parity — DONE (option B, user-chosen): folded WS into the gate
+- ✅ `tests/test_websocket.py` (22 real-loopback ws-client tests) GREEN.
+- ✅ `tests/parity/run_websocket_parity.py` standalone dual-server **11/11 PASS**.
+- ✅ **WS now in the pytest dual-server gate**: `TestWebSocketParity` (P150-P155)
+  in `test_parity.py` drives a real ws client against BOTH servers via the
+  existing `DualServers` fixture (no fixture change needed — ws:// URLs use the
+  same ports). P150 echo, P151 json, P152 scope, P153 close-code+reason, P154
+  dep reject/pass = **5 passed**. Full gate now **150 passed**.
+- 🐞 **NEW divergence found by P155 (xfail-strict): WS close-before-accept.**
+  A handler doing `await ws.close(code=...)` BEFORE `accept()` → Starlette refuses
+  the handshake at HTTP layer (client: **HTTP 403 / InvalidStatus**); turbo
+  completes the upgrade then sends a WS close (client: **ConnectionClosedError
+  code 4401**). Verified directly FA vs turbo. Same class as the 422-mw bug (Rust
+  reject path diverges). NORMATIVE reject (`raise WebSocketException` before
+  accept) already matches (P154 green). FIX (hot-path Rust, websocket.rs
+  handle_ws_upgrade): when the handler closes before accept, reject the upgrade
+  with 403 instead of completing it. Lower urgency than 422-mw (close-before-accept
+  is the non-normative reject pattern), but real — pin kept as P155 xfail.
+
+### NOTE on WS + GIL (answered for user): WS is NOT GIL-blocked on I/O wait.
+Each WS connection runs on a DEDICATED OS thread via `spawn_blocking` with its own
+thread-local event loop (websocket.rs handle_ws_upgrade ~754), NOT the shared
+async worker loop. `await ws.receive_*()` blocks via `ChannelAwaitable.__next__`
+→ `py.detach(|| rx.recv())` (websocket.rs 127/181/222) = **GIL RELEASED** while
+parked. So N idle WS connections don't serialize on the GIL; only the brief
+per-message CPU (decode→handler→encode) contends, same as any handler (the general
+free-threading/V2 story). Better isolation than the HTTP async path (which funnels
+through the single shared `_async_worker` loop).
 
 ### ✅ FIXED: middleware-on-422 parity bug (committed 2d4ad35)
 Was: on a 422 the Rust fast path returned the response directly, bypassing the
