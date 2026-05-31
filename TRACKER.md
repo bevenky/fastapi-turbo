@@ -98,12 +98,15 @@ adopt + extend.
   `application/javascript` for `.js`, but Starlette uses Python `mimetypes` →
   `text/javascript` on py3.12+ (`application/javascript` on 3.10/3.11). A
   hardcoded Rust table is wrong-by-construction across Python versions — exactly
-  the audit's point. P123 is `xfail` pending the fix. **Proper fix options:**
-  (a) derive static content-type from Python `mimetypes` at mount setup (matches
-  Starlette on ANY version — preferred, on-thesis), or (b) ServeDir+mime_guess
-  (verify mime_guess actually returns `text/javascript` first — it may not, so
-  (a) is safer). Do (a) as the L3 work; it also lets the 222-line CachedServeDir
-  shrink. Behind the green parity gate.
+  the audit's point. P123 is `xfail` pending the fix.
+  **VERIFIED 2026-05-31: tower-http `ServeDir` (via `mime_guess` 2.0.5) maps
+  `.js` → `text/javascript`** (checked the crate's mime_types.rs — only `.mjs`
+  is `application/javascript`). So **ServeDir both fixes the parity bug AND
+  delivers the −222 LOC cleanup.** User chose "Full L3 (ServeDir)". Execute:
+  replace `CachedServeDir` (server.rs:15-237) with `tower_http::services::ServeDir`
+  (the `fs` feature is already enabled); flip P123 from xfail → real assert;
+  verify via maturin develop → parity gate (expect 128 passed, 0 xfailed) →
+  full suite. Behind the green parity gate.
 - 🟡 **L4 collapse 15-variant 422 shaper** (router.rs:3158-3624) — **safety net
   READY** (committed 5e7e887: `TestValidation422`, 10 byte-for-byte 422 cases, all
   green → Rust 422 == upstream). On reading the code, the 15 functions are mostly
