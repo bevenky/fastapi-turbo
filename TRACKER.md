@@ -95,9 +95,13 @@ adopt + extend.
 - ⬜ **L3 CachedServeDir → tower-http `ServeDir`** (server.rs:15-237, −210) — next
   candidate; FIRST add static-file parity coverage (parity_app has none yet), then
   swap. Output should be identical; the in-memory mtime cache has no spec'd behavior.
-- ⬜ **L4 collapse 15-variant 422 shaper → 2 fns** (router.rs:3158-3624, −340) —
-  pure refactor, heavily covered by validation tests + upstream gate; intricate
-  (loc-prefix/single-vs-combined/with-body axes) so do as one careful focused edit.
+- 🟡 **L4 collapse 15-variant 422 shaper** (router.rs:3158-3624) — **safety net
+  READY** (committed 5e7e887: `TestValidation422`, 10 byte-for-byte 422 cases, all
+  green → Rust 422 == upstream). On reading the code, the 15 functions are mostly
+  **thin one-line delegators to 2 real `_impl` fns** (`pydantic_error_response_with_loc_ext_impl`,
+  `pydantic_error_to_response_impl`) — so the real LOC win is **modest (~closer to
+  −120 than −340)** and it's hot-path. Lower priority than first thought; do it as
+  one careful focused edit when convenient, with the gate as the guardrail.
 - ⬜ L2 (JSON writer), L7 (async-mechanism consolidation) — later.
 
 ### Two doors (the bigger P2)
