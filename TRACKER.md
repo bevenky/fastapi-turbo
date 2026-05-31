@@ -99,14 +99,19 @@ adopt + extend.
   `text/javascript` on py3.12+ (`application/javascript` on 3.10/3.11). A
   hardcoded Rust table is wrong-by-construction across Python versions — exactly
   the audit's point. P123 is `xfail` pending the fix.
-  **VERIFIED 2026-05-31: tower-http `ServeDir` (via `mime_guess` 2.0.5) maps
-  `.js` → `text/javascript`** (checked the crate's mime_types.rs — only `.mjs`
-  is `application/javascript`). So **ServeDir both fixes the parity bug AND
-  delivers the −222 LOC cleanup.** User chose "Full L3 (ServeDir)". Execute:
-  replace `CachedServeDir` (server.rs:15-237) with `tower_http::services::ServeDir`
-  (the `fs` feature is already enabled); flip P123 from xfail → real assert;
-  verify via maturin develop → parity gate (expect 128 passed, 0 xfailed) →
-  full suite. Behind the green parity gate.
+  **COMPREHENSIVE MIME CHECK (2026-05-31, user-requested "all MIME types"):**
+  Python `mimetypes` vs `mime_guess` 2.0.5 across 35 extensions → ServeDir matches
+  on `.js` but **DIVERGES on `.mjs` `.ico` `.xml` `.md` `.map` `.yaml/.yml` `.otf`**.
+  Starlette uses Python's `mimetypes` (varies by Python version + reads OS mime
+  files) so NO Rust-side table (hardcoded OR mime_guess) can match it.
+  **DECISION (user): Option A — derive Content-Type from Python `mimetypes`.**
+  Execute: at static mount, Python builds `{ext: content_type}` via `mimetypes`
+  and passes it to Rust (through `run_server` / the mount config); the static
+  handler looks up by extension instead of the hardcoded `mime_for()` table.
+  Matches Starlette by construction on every extension + every Python version.
+  Keeps the existing CachedServeDir file I/O (the −222 LOC ServeDir swap is a
+  SEPARATE optional cleanup, not the parity fix). Flip P123 xfail → real assert;
+  verify maturin develop → parity gate (expect 128 passed, 0 xfailed) → full suite.
 - 🟡 **L4 collapse 15-variant 422 shaper** (router.rs:3158-3624) — **safety net
   READY** (committed 5e7e887: `TestValidation422`, 10 byte-for-byte 422 cases, all
   green → Rust 422 == upstream). On reading the code, the 15 functions are mostly
