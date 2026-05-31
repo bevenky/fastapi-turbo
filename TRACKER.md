@@ -84,7 +84,23 @@ adopt + extend.
 
 ---
 
-## P2 — Two doors over the existing engine ⬜  (gated on P1)
+## P2 — Crate-substitution levers + two doors 🔄  (gated on the green P1 gate)
+
+### Crate-substitution levers — status (each: maturin develop → parity → full suite)
+- ❌ **L6 docs HTML — SKIPPED (verified unsafe).** The embedded Swagger/ReDoc
+  consts in `server.rs:564,596` are a real fallback for when Python rendering is
+  unavailable (`applications.py:7210-7232`, `try/except: pass`, str starts `None`).
+  Happy-path parity gate can't cover the degraded path → keep the fallback.
+  STRATEGY §4 corrected. (Lesson: verify "dead default" claims before cutting.)
+- ⬜ **L3 CachedServeDir → tower-http `ServeDir`** (server.rs:15-237, −210) — next
+  candidate; FIRST add static-file parity coverage (parity_app has none yet), then
+  swap. Output should be identical; the in-memory mtime cache has no spec'd behavior.
+- ⬜ **L4 collapse 15-variant 422 shaper → 2 fns** (router.rs:3158-3624, −340) —
+  pure refactor, heavily covered by validation tests + upstream gate; intricate
+  (loc-prefix/single-vs-combined/with-body axes) so do as one careful focused edit.
+- ⬜ L2 (JSON writer), L7 (async-mechanism consolidation) — later.
+
+### Two doors (the bigger P2)
 
 - ⬜ Make the Rust core callable as a function (`process_request(scope, body)
   -> (status, headers, bytes)`), not only runnable as a server

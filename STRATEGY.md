@@ -182,7 +182,12 @@ strictly `#[allow(dead_code)]`).
 - **L3** delete `CachedServeDir` (222 LOC custom `tower::Service`) → `ServeDir::new`. −210, risk S-M.
 - **L4** collapse 15-variant 422 shaper → `error_response()` + `pydantic_to_details()`. −340, risk M.
 - **L5** genericize `build_router`; let axum own 405/OPTIONS + Starlette own slash-redirect (3 hand-rolled path-matchers in server.rs go). −590, risk L, **pivot-dependent**.
-- **L6** delete embedded Swagger/ReDoc HTML (Python already passes rendered HTML). −146, risk S.
+- **L6** ~~delete embedded Swagger/ReDoc HTML~~ — **RE-CLASSIFIED unsafe (verified
+  in P2)**: `applications.py:7210-7232` computes `swagger_ui_html_str`/`redoc_html_str`
+  inside a `try/except: pass`, starting at `None`; `server.rs:564,596` uses the
+  embedded HTML as a real **fallback** when Python rendering is unavailable/throws.
+  Deleting it breaks `/docs` in the degraded path, which the happy-path parity gate
+  does NOT cover. Keep the fallback. (Net: −0, not −146.)
 - **L7** consolidate handler_bridge's two async mechanisms (`EVENT_LOOP` path vs `_async_worker` path), delete dead. −150, risk M.
 
 **Correction to an earlier hypothesis:** there are **no `register_*` pyfunctions**
