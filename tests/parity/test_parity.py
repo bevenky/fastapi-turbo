@@ -843,17 +843,6 @@ class TestMiddlewareOrdering:
         assert_json_match(fa, rs)
         assert fa.headers.get("x-mw-trace") == rs.headers.get("x-mw-trace")
 
-    @pytest.mark.xfail(
-        reason="REAL PARITY BUG (found by this corpus): on a 422 the Rust fast "
-        "path emits the validation-error response WITHOUT routing it through the "
-        "Python @app.middleware('http') chain, so middleware-added headers are "
-        "missing (FastAPI includes them). Note 404 (P143) and normal responses "
-        "(P140/P141) DO go through middleware — only Rust-generated 422s skip it. "
-        "User-facing impact: auth/logging/request-id/CORS middleware doesn't wrap "
-        "validation errors. Fix = route Rust-generated 422s through the middleware "
-        "wrapper. Tracked in TRACKER.md P2 (middleware-on-422).",
-        strict=True,
-    )
     def test_P142_mw_headers_on_error_response(self, client, dual_servers):
         # Middleware wraps error responses too (422) — trace must still match.
         fa, rs = hit(client, dual_servers, "get", "/p012-query-int?n=bad")

@@ -368,6 +368,22 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
         # JSON responses before the user MW sees them. Without an equivalent
         # conversion here, our user-MW `except` clauses would catch
         # `HTTPException` and mangle it — diverging from FastAPI.
+        # Rust-generated 422 (param coercion / missing) is deferred into this
+        # chain (the wrapper advertises ``_fastapi_turbo_defers_extraction_errors``
+        # below) so user ``@app.middleware("http")`` wraps validation errors the
+        # same way FastAPI's ExceptionMiddleware does. A COMPILED endpoint
+        # handles the ``__fastapi_turbo_extraction_errors__`` sentinel itself
+        # (running deps first, so a dep HTTPException can pre-empt the 422); a
+        # RAW endpoint can't, so build the FA-shaped 422 here and return it —
+        # returning (not raising) lets it flow back out through ``call_next`` so
+        # middlewares add their headers. Shape matches Rust ``dispatch_validation_error``.
+        if not getattr(endpoint, "_fastapi_turbo_defers_extraction_errors", False):
+            _ee = kwargs.get("__fastapi_turbo_extraction_errors__")
+            if _ee is not None:
+                import json as _ee_json
+                return _JSONResponse(
+                    content={"detail": _ee_json.loads(_ee)}, status_code=422
+                )
         # When the endpoint is a RAW user handler (no ``_try_compile_handler``
         # wrap, which happens for no-deps / no-response-model routes), it
         # won't accept our framework-private kwargs. Filter them out.
@@ -529,6 +545,12 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
                 request._pending_teardowns = []
 
     wrapped_sync._has_http_middleware = True
+    # Tell Rust to DEFER param-validation (422) errors into this wrapper instead
+    # of returning them directly — otherwise middleware never wraps validation
+    # errors (a drop-in violation: auth/logging/CORS headers missing on 422s).
+    # ``_call_handler_sync`` above converts the deferred sentinel to a 422 for
+    # raw endpoints; compiled endpoints raise it themselves after running deps.
+    wrapped_sync._fastapi_turbo_defers_extraction_errors = True
     # Preserve the original user endpoint reference through the
     # middleware wrapper so Sentry endpoint-style transaction naming
     # (which calls ``transaction_from_function(endpoint)``) sees
