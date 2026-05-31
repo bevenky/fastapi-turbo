@@ -86,18 +86,19 @@ adopt + extend.
 
 ## P2 — Crate-substitution levers + two doors 🔄  (gated on the green P1 gate)
 
-### 🐞 REAL PARITY BUG found by corpus (middleware-on-422) — fix candidate
-On a **422 validation error**, the Rust fast path emits the response WITHOUT
-routing it through the Python `@app.middleware("http")` chain → middleware-added
-headers are missing (FastAPI includes them). **404s and normal responses DO go
-through middleware; only Rust-generated 422s skip it** (verified: parity P140/141
-+ P143 pass, P142 xfail-strict). User impact: auth / logging / request-id / CORS
-middleware does NOT wrap validation-error responses — a drop-in violation that
-hits real apps. Fix (hot-path Rust, server.rs/router.rs): route Rust-generated
-422 responses through the same middleware wrapper used for normal + 404
-responses. Guard: parity P142 (flip xfail→assert when fixed). This is the same
-class of dual-path divergence the dispatcher-collapse eliminates, but worth a
-targeted fix sooner. Surfaced 2026-05-31 (committed with the middleware corpus).
+### ✅ FIXED: middleware-on-422 parity bug (committed 2d4ad35)
+Was: on a 422 the Rust fast path returned the response directly, bypassing the
+Python `@app.middleware("http")` chain → middleware headers missing on validation
+errors (auth/logging/request-id/CORS), a drop-in violation. Root cause: the mw
+wrapper advertised `_has_http_middleware=True` but not
+`_fastapi_turbo_defers_extraction_errors`, so Rust (router.rs:2898) returned the
+422 instead of deferring it into the chain. Fix (Python-only, `_middleware_wrap.py`,
+~12 lines): advertise the defers flag + convert the deferred
+`__fastapi_turbo_extraction_errors__` sentinel into a FA-shaped 422 JSONResponse
+for raw endpoints (compiled endpoints still raise it after running deps, preserving
+dep-exception-pre-empts-422 ordering). Verified: parity P140-143 all pass (P142 was
+xfail); full suite 1103 passed (1 unrelated pre-existing flake in
+test_multi_range_no_full_file_buffer, passes in isolation).
 
 ### Crate-substitution levers — status (each: maturin develop → parity → full suite)
 - ❌ **L6 docs HTML — SKIPPED (verified unsafe).** The embedded Swagger/ReDoc
