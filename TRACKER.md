@@ -100,6 +100,20 @@ ACTION TAKEN: added `_range_diag()` so any future failure surfaces status /
 content-type / content-length / body-head / `app._captured_server_exceptions`
 instead of a bare assert. Revisit with a real traceback if it recurs.
 
+### WebSocket parity — status (2026-06-01)
+- ✅ `tests/test_websocket.py` (22 real-loopback ws-client tests) GREEN on branch.
+- ✅ `tests/parity/run_websocket_parity.py` (standalone dual-server: FA+uvicorn vs
+  turbo) **11/11 PASS** — echo text/bytes/json, close code+reason, subprotocol,
+  scope (path/query/header/cookie), app.state, reject-before-accept, dep-reject,
+  dep-pass, router-prefix. WS behavior is byte-identical to FastAPI.
+- GAP (not a bug): WS parity isn't in the pytest-collected dual-server gate
+  (`conftest.py::DualServers` is HTTP-only). OPEN FORK for user: (a) wire the
+  existing green runner as a blocking CI gate (low effort, no new code), (b) add a
+  WS dual-server fixture + TestWebSocket class to fold WS into the 145-test gate
+  (more infra; coverage already proven so it's hardening, not bug-finding), or
+  (c) defer gate-wiring and go straight to the dispatcher collapse (the real P2
+  prize). Asked the user before spending the infra effort.
+
 ### ✅ FIXED: middleware-on-422 parity bug (committed 2d4ad35)
 Was: on a 422 the Rust fast path returned the response directly, bypassing the
 Python `@app.middleware("http")` chain → middleware headers missing on validation
