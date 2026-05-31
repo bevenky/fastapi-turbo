@@ -86,6 +86,19 @@ adopt + extend.
 
 ## P2 — Crate-substitution levers + two doors 🔄  (gated on the green P1 gate)
 
+### 🐞 REAL PARITY BUG found by corpus (middleware-on-422) — fix candidate
+On a **422 validation error**, the Rust fast path emits the response WITHOUT
+routing it through the Python `@app.middleware("http")` chain → middleware-added
+headers are missing (FastAPI includes them). **404s and normal responses DO go
+through middleware; only Rust-generated 422s skip it** (verified: parity P140/141
++ P143 pass, P142 xfail-strict). User impact: auth / logging / request-id / CORS
+middleware does NOT wrap validation-error responses — a drop-in violation that
+hits real apps. Fix (hot-path Rust, server.rs/router.rs): route Rust-generated
+422 responses through the same middleware wrapper used for normal + 404
+responses. Guard: parity P142 (flip xfail→assert when fixed). This is the same
+class of dual-path divergence the dispatcher-collapse eliminates, but worth a
+targeted fix sooner. Surfaced 2026-05-31 (committed with the middleware corpus).
+
 ### Crate-substitution levers — status (each: maturin develop → parity → full suite)
 - ❌ **L6 docs HTML — SKIPPED (verified unsafe).** The embedded Swagger/ReDoc
   consts in `server.rs:564,596` are a real fallback for when Python rendering is

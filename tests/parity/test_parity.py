@@ -811,3 +811,57 @@ class TestMultipartParity:
         fa, rs = hit(client, dual_servers, "post", "/pmp-echo-file",
                      files={"file": ("résumé.txt", b"unicode name", "text/plain")})
         assert_json_match(fa, rs)
+
+
+# ══════════════════════════════════════════════════════════════════
+# MIDDLEWARE ORDERING (P140-P143) — corpus expansion (P1)
+#
+# FastAPI/Starlette run middleware in reverse-registration order
+# (last-registered = outermost). Two @app.middleware("http") each append
+# their name to X-MW-Trace on the way out; the resulting header reveals
+# nesting order. The Rust engine and the Python in-process dispatcher
+# apply middleware independently, so this guards that they nest identically
+# before we collapse the two engines (P2 "two doors").
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestMiddlewareOrdering:
+    def test_P140_mw_trace_order_matches(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/pmw-trace")
+        assert_json_match(fa, rs)
+        fa_trace = fa.headers.get("x-mw-trace")
+        rs_trace = rs.headers.get("x-mw-trace")
+        assert fa_trace == rs_trace, (
+            f"middleware nesting order differs: FA={fa_trace!r} RS={rs_trace!r}"
+        )
+        # Sanity: both middlewares ran (inner appended before outer).
+        assert fa_trace == "inner,outer", f"unexpected FA trace: {fa_trace!r}"
+
+    def test_P141_mw_headers_present_on_normal_route(self, client, dual_servers):
+        # Middleware-added headers appear on a regular (non-dedicated) route too.
+        fa, rs = hit(client, dual_servers, "get", "/p001-basic-get")
+        assert_json_match(fa, rs)
+        assert fa.headers.get("x-mw-trace") == rs.headers.get("x-mw-trace")
+
+    @pytest.mark.xfail(
+        reason="REAL PARITY BUG (found by this corpus): on a 422 the Rust fast "
+        "path emits the validation-error response WITHOUT routing it through the "
+        "Python @app.middleware('http') chain, so middleware-added headers are "
+        "missing (FastAPI includes them). Note 404 (P143) and normal responses "
+        "(P140/P141) DO go through middleware — only Rust-generated 422s skip it. "
+        "User-facing impact: auth/logging/request-id/CORS middleware doesn't wrap "
+        "validation errors. Fix = route Rust-generated 422s through the middleware "
+        "wrapper. Tracked in TRACKER.md P2 (middleware-on-422).",
+        strict=True,
+    )
+    def test_P142_mw_headers_on_error_response(self, client, dual_servers):
+        # Middleware wraps error responses too (422) — trace must still match.
+        fa, rs = hit(client, dual_servers, "get", "/p012-query-int?n=bad")
+        assert_status_match(fa, rs)
+        assert fa.headers.get("x-mw-trace") == rs.headers.get("x-mw-trace")
+
+    def test_P143_mw_headers_on_404(self, client, dual_servers):
+        # Middleware wraps the 404 fallback too.
+        fa, rs = hit(client, dual_servers, "get", "/no-such-route-xyz")
+        assert_status_match(fa, rs)
+        assert fa.headers.get("x-mw-trace") == rs.headers.get("x-mw-trace")

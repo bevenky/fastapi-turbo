@@ -229,6 +229,41 @@ def health():
     return {"status": "ok"}
 
 
+# ── Middleware-ordering parity (PMW) — corpus expansion (P1) ──────
+# FastAPI/Starlette run middleware in REVERSE registration order
+# (last-registered = outermost). Each middleware appends its name to an
+# X-MW-Trace response header on the way OUT, so the final header value
+# reveals the nesting order. The parity gate diffs that header between the
+# Rust engine and real FastAPI — if turbo nests middleware differently,
+# the trace differs. Safety net for the dispatcher collapse (middleware is
+# applied independently on the Rust and Python in-process paths).
+#
+# These run on EVERY response; existing parity tests assert on status +
+# json/text body only (not headers), so they're unaffected.
+
+@app.middleware("http")
+async def _mw_inner(request, call_next):
+    # Registered FIRST → innermost → appends FIRST (closest to handler).
+    response = await call_next(request)
+    trace = response.headers.get("X-MW-Trace", "")
+    response.headers["X-MW-Trace"] = (trace + ",inner").lstrip(",")
+    return response
+
+
+@app.middleware("http")
+async def _mw_outer(request, call_next):
+    # Registered SECOND → outermost → appends LAST.
+    response = await call_next(request)
+    trace = response.headers.get("X-MW-Trace", "")
+    response.headers["X-MW-Trace"] = (trace + ",outer").lstrip(",")
+    return response
+
+
+@app.get("/pmw-trace")
+def pmw_trace():
+    return {"ok": True}
+
+
 # ══════════════════════════════════════════════════════════════════
 # PATTERNS 1-30: Routing
 # ══════════════════════════════════════════════════════════════════
