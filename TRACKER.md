@@ -86,6 +86,20 @@ adopt + extend.
 
 ## P2 — Crate-substitution levers + two doors 🔄  (gated on the green P1 gate)
 
+### ⚠️ WATCH: multi-range FileResponse one-time failure (instrumented, not reproduced)
+`tests/stress/test_multi_range_no_full_file_buffer.py::test_multi_range_correct_slices_on_large_file`
+failed ONCE in a full `tests/` run (during the 422-mw verification). NOT a
+regression from that change (touches no middleware/range code). Could NOT
+reproduce in ~50 attempts: 8× isolation, 12× standalone script (varying
+`os.urandom` payloads), 12× pytest-file loop, full stress dir (520 passed), and a
+fresh full `tests/` run (1104 passed). The original `-q` log captured no cause, so
+the "500" was never confirmed — not claiming a root cause. Only ever seen under
+the full 1100-test suite → likely a cross-test resource/timing interaction (test
+allocates 8–32 MiB `os.urandom` + in-process TestClient servers), not range logic.
+ACTION TAKEN: added `_range_diag()` so any future failure surfaces status /
+content-type / content-length / body-head / `app._captured_server_exceptions`
+instead of a bare assert. Revisit with a real traceback if it recurs.
+
 ### ✅ FIXED: middleware-on-422 parity bug (committed 2d4ad35)
 Was: on a 422 the Rust fast path returned the response directly, bypassing the
 Python `@app.middleware("http")` chain → middleware headers missing on validation
