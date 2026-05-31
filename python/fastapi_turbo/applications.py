@@ -7274,6 +7274,32 @@ class FastAPI:
                 _log.debug("silent catch in applications: %r", _exc)
                 redoc_html_str = None
 
+        # Static-file Content-Type map derived from Python's ``mimetypes`` —
+        # Starlette's source of truth (``StaticFiles`` → ``FileResponse`` →
+        # ``guess_type(name)[0] or "text/plain"``, then ``; charset=utf-8`` iff
+        # the type is ``text/*``). A hardcoded Rust table / ``mime_guess``
+        # cannot match this across Python versions + OS mime files (``.js`` is
+        # ``text/javascript`` on 3.12+ but ``application/javascript`` on
+        # 3.10/3.11; ``.yaml`` / ``.xml`` / ``.otf`` also differ), so we compute
+        # the ext→content-type map here and hand it to Rust. Keys are lowercase
+        # extensions WITHOUT the dot. Bound unconditionally so the run_server
+        # call below always has it (empty when no static mounts).
+        _static_content_types: list[tuple[str, str]] = []
+        if static_mounts:
+            import mimetypes as _mimetypes
+            _mimetypes.init()
+            _ct_by_ext: dict[str, str] = {}
+            for _ext, _mtype in _mimetypes.types_map.items():
+                _e = _ext.lstrip(".").lower()
+                if not _e:
+                    continue
+                _ct_by_ext[_e] = (
+                    f"{_mtype}; charset=utf-8"
+                    if _mtype.startswith("text/")
+                    else _mtype
+                )
+            _static_content_types = list(_ct_by_ext.items())
+
         run_server(
             route_infos,
             host,
@@ -7293,6 +7319,7 @@ class FastAPI:
             self.swagger_ui_oauth2_redirect_url,
             swagger_ui_html_str,
             redoc_html_str,
+            _static_content_types,
         )
 
     # ------------------------------------------------------------------

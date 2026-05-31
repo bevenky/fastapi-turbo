@@ -193,7 +193,10 @@ app.include_router(include_dep_router, dependencies=[Depends(side_effect_dep)])
 # ── StaticFiles mount (parity gate for the L3 ServeDir lever) ─────
 # A small mount so the byte-for-byte gate covers static-file serving
 # (content-type by extension, body bytes). Uses ONLY stock imports.
-from fastapi.staticfiles import StaticFiles  # noqa: E402
+try:  # noqa: E402 — stock FastAPI import; fall back to Starlette under the shim
+    from fastapi.staticfiles import StaticFiles
+except ImportError:  # pragma: no cover
+    from starlette.staticfiles import StaticFiles
 
 _PARITY_STATIC_DIR = tempfile.mkdtemp(prefix="parity_static_")
 with open(os.path.join(_PARITY_STATIC_DIR, "data.txt"), "w") as _f:
@@ -202,6 +205,20 @@ with open(os.path.join(_PARITY_STATIC_DIR, "style.css"), "w") as _f:
     _f.write("body { color: red; }")
 with open(os.path.join(_PARITY_STATIC_DIR, "app.js"), "w") as _f:
     _f.write("console.log('hello');")
+# Extensions where mime_guess (tower-http ServeDir) DIVERGES from Python
+# mimetypes — included to prove the L3 fix matches Starlette across the board,
+# not just for .js.
+for _name, _data in [
+    ("mod.mjs", "export const x = 1;"),
+    ("doc.xml", "<root/>"),
+    ("conf.yaml", "a: 1"),
+    ("icon.svg", "<svg/>"),
+    ("readme.md", "# hi"),
+    ("data.json", '{"k": 1}'),
+    ("blob.unknownext", "raw bytes"),
+]:
+    with open(os.path.join(_PARITY_STATIC_DIR, _name), "w") as _f:
+        _f.write(_data)
 app.mount("/static", StaticFiles(directory=_PARITY_STATIC_DIR), name="static")
 
 

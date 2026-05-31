@@ -23,7 +23,7 @@ const STATIC_CACHE_MAX_BYTES: u64 = 1024 * 1024;
 #[derive(Clone)]
 struct CachedFile {
     bytes: bytes::Bytes,
-    content_type: &'static str,
+    content_type: String,
     mtime: SystemTime,
     /// Monotonic instant of the last mtime validation. We revalidate at most
     /// once per `STATIC_TTL`; within that window, serve from cache without
@@ -42,27 +42,41 @@ fn static_cache() -> &'static Mutex<HashMap<String, CachedFile>> {
     STATIC_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn mime_for(path: &str) -> &'static str {
+/// Extension → Content-Type map, populated once at startup from Python's
+/// ``mimetypes`` module (Starlette's source of truth). A hardcoded Rust
+/// table — or ``mime_guess`` — cannot match Starlette across Python
+/// versions / OS mime files (e.g. ``.js`` is ``text/javascript`` on 3.12+
+/// but ``application/javascript`` on 3.10/3.11; ``.yaml`` / ``.xml`` /
+/// ``.otf`` also differ). The map values already include the charset
+/// suffix per Starlette's rule (``; charset=utf-8`` iff ``text/*``).
+/// Keys are lowercase extensions WITHOUT the dot (e.g. "js").
+static STATIC_MIME_MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+/// Starlette's fallback when ``mimetypes.guess_type`` returns None:
+/// ``media_type = "text/plain"`` then ``; charset=utf-8`` (it's ``text/*``).
+const STATIC_MIME_FALLBACK: &str = "text/plain; charset=utf-8";
+
+/// Install the Python-derived extension→Content-Type map. Idempotent
+/// (first call wins; later ``run_server`` calls in a test session reuse
+/// the process-global ``mimetypes`` registry, which doesn't change).
+fn set_static_mime_map(pairs: Vec<(String, String)>) {
+    let _ = STATIC_MIME_MAP.set(pairs.into_iter().collect());
+}
+
+fn mime_for(path: &str) -> String {
     let p = path.to_ascii_lowercase();
-    let ext = p.rsplit('.').next().unwrap_or("");
-    match ext {
-        "html" | "htm" => "text/html; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "js" | "mjs" => "application/javascript; charset=utf-8",
-        "json" => "application/json",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "ico" => "image/x-icon",
-        "wasm" => "application/wasm",
-        "txt" => "text/plain; charset=utf-8",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        _ => "application/octet-stream",
+    // Only treat a trailing ".ext" as an extension — guard against paths
+    // with no dot (rsplit would yield the whole filename otherwise).
+    let ext = match p.rsplit_once('.') {
+        Some((_, e)) => e,
+        None => return STATIC_MIME_FALLBACK.to_string(),
+    };
+    if let Some(map) = STATIC_MIME_MAP.get() {
+        if let Some(ct) = map.get(ext) {
+            return ct.clone();
+        }
     }
+    STATIC_MIME_FALLBACK.to_string()
 }
 
 /// Set of static-mount prefixes ("/static", etc.) — populated at server
@@ -201,7 +215,7 @@ where
                                     full_str,
                                     CachedFile {
                                         bytes: bytes.clone(),
-                                        content_type: ct,
+                                        content_type: ct.clone(),
                                         mtime,
                                         validated_at: std::time::Instant::now(),
                                     },
@@ -389,7 +403,7 @@ const REDOC_HTML: &str = r#"
 ///
 /// This function blocks until the server shuts down (Ctrl-C).
 #[pyfunction]
-#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![], root_path=None, redirect_slashes=true, max_request_size=None, not_found_handler=None, app=None, validation_handler=None, swagger_ui_oauth2_redirect_url=None, swagger_ui_html=None, redoc_html=None))]
+#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![], root_path=None, redirect_slashes=true, max_request_size=None, not_found_handler=None, app=None, validation_handler=None, swagger_ui_oauth2_redirect_url=None, swagger_ui_html=None, redoc_html=None, static_content_types=vec![]))]
 pub fn run_server(
     py: Python<'_>,
     routes: Vec<RouteInfo>,
@@ -410,7 +424,14 @@ pub fn run_server(
     swagger_ui_oauth2_redirect_url: Option<String>,
     swagger_ui_html: Option<String>,
     redoc_html: Option<String>,
+    static_content_types: Vec<(String, String)>,
 ) -> PyResult<()> {
+    // Install the Python-derived extension→Content-Type map (Starlette's
+    // ``mimetypes``-based source of truth) before any static request is
+    // served. Empty when the app declares no static mounts.
+    if !static_content_types.is_empty() {
+        set_static_mime_map(static_content_types);
+    }
     // Stash the user's 404 handler so the Rust Router fallback can dispatch
     // through Python when nothing else matched. Set once per process.
     // Always overwrite (RwLock, not OnceLock) so successive app.run()

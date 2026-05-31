@@ -726,16 +726,6 @@ class TestStaticFiles:
             f"css content-type differs: FA={_ct_base(fa)} RS={_ct_base(rs)}"
         )
 
-    @pytest.mark.xfail(
-        reason="KNOWN BUG (found by this corpus): server.rs::mime_for hardcodes "
-        "'application/javascript' for .js, but Starlette delegates to Python "
-        "mimetypes which returns 'text/javascript' on py3.12+ (and "
-        "'application/javascript' on 3.10/3.11). A hardcoded Rust table can't "
-        "match across Python versions — the real fix is the L3 lever (derive "
-        "content-type from Python mimetypes, or tower-http ServeDir). Tracked in "
-        "TRACKER.md P2/L3.",
-        strict=False,
-    )
     def test_P123_static_js_content_type(self, client, dual_servers):
         fa, rs = hit(client, dual_servers, "get", "/static/app.js")
         assert_status_match(fa, rs)
@@ -748,3 +738,25 @@ class TestStaticFiles:
         fa, rs = hit(client, dual_servers, "get", "/static/does-not-exist.txt")
         assert_status_match(fa, rs)
         assert fa.status_code == 404, fa.text
+
+    # P125-P131: content-type parity on extensions where mime_guess/ServeDir
+    # DIVERGES from Python mimetypes. Proves the L3 fix matches Starlette for
+    # ALL extensions (it derives content-type from Python mimetypes), not just
+    # the .js case that first surfaced the bug.
+    @pytest.mark.parametrize("path", [
+        "/static/mod.mjs",
+        "/static/doc.xml",
+        "/static/conf.yaml",
+        "/static/icon.svg",
+        "/static/readme.md",
+        "/static/data.json",
+        "/static/blob.unknownext",
+    ])
+    def test_P125_static_divergent_ext_content_type(self, client, dual_servers, path):
+        fa, rs = hit(client, dual_servers, "get", path)
+        assert_status_match(fa, rs)
+        assert fa.status_code == 200, fa.text
+        assert fa.content == rs.content
+        assert _ct_base(fa) == _ct_base(rs), (
+            f"{path}: content-type differs — FA={_ct_base(fa)} RS={_ct_base(rs)}"
+        )
