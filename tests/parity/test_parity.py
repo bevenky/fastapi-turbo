@@ -595,3 +595,95 @@ class TestDocsOpenAPI:
             f"component schema names differ:\n  only FA={sorted(fa_c - rs_c)}\n"
             f"  only RS={sorted(rs_c - fa_c)}"
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# VALIDATION 422 BODIES (P110-P119) — corpus expansion (P1)
+#
+# Guards the FULL 422 error body (not just status) byte-for-byte
+# across every shape the Rust 422 shaper emits — int/float/bool path,
+# int/bool query, missing required query, body model (missing field,
+# wrong type, malformed JSON), and a nested body error. This is the
+# safety net for the P2 'L4' lever (collapse the 15-variant Rust 422
+# shaper into 2 functions): the {detail:[{type,loc,msg,input}]} shape
+# must stay identical to upstream FastAPI through the refactor.
+# ══════════════════════════════════════════════════════════════════
+
+
+def assert_422_body_match(fa_r, rs_r):
+    """422 status + identical detail array (order-insensitive)."""
+    assert fa_r.status_code == rs_r.status_code, (
+        f"status mismatch: FA={fa_r.status_code} RS={rs_r.status_code}\n"
+        f"  FA body={fa_r.text[:300]}\n  RS body={rs_r.text[:300]}"
+    )
+    assert fa_r.status_code == 422, f"expected 422, got {fa_r.status_code}: {fa_r.text[:300]}"
+
+    def norm(resp):
+        detail = resp.json().get("detail", [])
+        # Order-insensitive: FA/turbo may emit multi-error details in a
+        # different order. Compare as a set of canonical tuples.
+        return sorted(
+            (
+                e.get("type"),
+                tuple(e.get("loc", [])),
+                e.get("msg"),
+                repr(e.get("input")),
+            )
+            for e in detail
+        )
+
+    fa_n, rs_n = norm(fa_r), norm(rs_r)
+    assert fa_n == rs_n, (
+        f"422 detail differs:\n  FA={fa_n}\n  RS={rs_n}"
+    )
+
+
+class TestValidation422:
+    def test_P110_path_int_bad(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/p006-path-int/notanint")
+        assert_422_body_match(fa, rs)
+
+    def test_P111_path_float_bad(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/p008-path-float/notafloat")
+        assert_422_body_match(fa, rs)
+
+    def test_P112_query_int_bad(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/p012-query-int?n=notanint")
+        assert_422_body_match(fa, rs)
+
+    def test_P113_query_bool_bad(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/p013-query-bool?flag=notabool")
+        assert_422_body_match(fa, rs)
+
+    def test_P114_query_required_missing(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/p009-query-required")
+        assert_422_body_match(fa, rs)
+
+    def test_P115_body_missing_required_field(self, client, dual_servers):
+        # Item requires name + price; omit price.
+        fa, rs = hit(client, dual_servers, "post", "/p019-body-model",
+                     json={"name": "x"})
+        assert_422_body_match(fa, rs)
+
+    def test_P116_body_wrong_type(self, client, dual_servers):
+        # price must be a float-coercible value.
+        fa, rs = hit(client, dual_servers, "post", "/p019-body-model",
+                     json={"name": "x", "price": "not_a_number"})
+        assert_422_body_match(fa, rs)
+
+    def test_P117_body_malformed_json(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "post", "/p019-body-model",
+                     content=b"{not valid json",
+                     headers={"content-type": "application/json"})
+        assert_422_body_match(fa, rs)
+
+    def test_P118_body_wrong_root_type(self, client, dual_servers):
+        # Send a JSON array where an object is expected.
+        fa, rs = hit(client, dual_servers, "post", "/p019-body-model",
+                     json=[1, 2, 3])
+        assert_422_body_match(fa, rs)
+
+    def test_P119_nested_body_error(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "post", "/p055-nested-validation",
+                     json={"child": {"value": "not_int"}, "label": "x"})
+        assert_422_body_match(fa, rs)
