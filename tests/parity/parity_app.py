@@ -360,6 +360,61 @@ async def p025(name: str = Form(), file: UploadFile = File()):
     content = await file.read()
     return {"name": name, "filename": file.filename, "size": len(content)}
 
+# ── Multipart byte-parity endpoints (P132-P137) — corpus expansion (P1) ──
+# These echo back EVERYTHING the multipart parser produces so the parity
+# gate can diff the Rust (multer) parser against python-multipart/Starlette
+# byte-for-byte: filename, content-type, exact bytes (latin-1 round-trip),
+# size, multiple files, and form fields interleaved with files. This is the
+# safety net for the dispatcher collapse (multipart is parsed independently
+# on the Rust path and the Python in-process path).
+
+@app.post("/pmp-echo-file")
+async def pmp_echo_file(file: UploadFile = File()):
+    content = await file.read()
+    return {
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "size": len(content),
+        "content": content.decode("latin-1"),
+    }
+
+
+@app.post("/pmp-multi-files")
+async def pmp_multi_files(files: list[UploadFile] = File()):
+    out = []
+    for f in files:
+        c = await f.read()
+        out.append({
+            "filename": f.filename,
+            "content_type": f.content_type,
+            "content": c.decode("latin-1"),
+        })
+    return {"count": len(files), "files": out}
+
+
+@app.post("/pmp-form-and-files")
+async def pmp_form_and_files(
+    title: str = Form(),
+    tags: list[str] = Form(),
+    file: UploadFile = File(),
+):
+    c = await file.read()
+    return {
+        "title": title,
+        "tags": tags,
+        "filename": file.filename,
+        "content": c.decode("latin-1"),
+    }
+
+
+@app.post("/pmp-binary")
+async def pmp_binary(file: UploadFile = File()):
+    c = await file.read()
+    # Echo the raw bytes back as a latin-1 string so the test can compare
+    # exact byte content (incl. NULs / high bytes) without JSON escaping loss.
+    return {"size": len(c), "sha_like": sum(c) % 65521, "content": c.decode("latin-1")}
+
+
 # P026: response_model (filters extra fields)
 @app.get("/p026-response-model", response_model=ItemOut)
 def p026():

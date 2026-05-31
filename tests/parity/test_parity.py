@@ -760,3 +760,54 @@ class TestStaticFiles:
         assert _ct_base(fa) == _ct_base(rs), (
             f"{path}: content-type differs — FA={_ct_base(fa)} RS={_ct_base(rs)}"
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# MULTIPART BYTE PARITY (P132-P137) — corpus expansion (P1)
+#
+# The Rust path parses multipart with `multer`; the Python in-process
+# dispatcher parses it independently. Both must match Starlette/
+# python-multipart byte-for-byte on filename, content-type, exact bytes,
+# multiple files, and form fields interleaved with files. This is the
+# safety net for collapsing the two request engines (P2 "two doors").
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestMultipartParity:
+    def test_P132_filename_and_content_type_roundtrip(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "post", "/pmp-echo-file",
+                     files={"file": ("rep ort.txt", b"hello world", "text/plain")})
+        assert_json_match(fa, rs)
+
+    def test_P133_no_explicit_content_type(self, client, dual_servers):
+        # httpx will guess; both servers must report the SAME guess.
+        fa, rs = hit(client, dual_servers, "post", "/pmp-echo-file",
+                     files={"file": ("data.csv", b"a,b,c\n1,2,3")})
+        assert_json_match(fa, rs)
+
+    def test_P134_multiple_files_same_field(self, client, dual_servers):
+        files = [
+            ("files", ("a.txt", b"alpha", "text/plain")),
+            ("files", ("b.txt", b"beta", "text/plain")),
+            ("files", ("c.bin", b"\x00\x01\x02gamma", "application/octet-stream")),
+        ]
+        fa, rs = hit(client, dual_servers, "post", "/pmp-multi-files", files=files)
+        assert_json_match(fa, rs)
+
+    def test_P135_form_fields_and_file_interleaved(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "post", "/pmp-form-and-files",
+                     data={"title": "My Doc", "tags": ["x", "y", "z"]},
+                     files={"file": ("body.txt", b"the body", "text/plain")})
+        assert_json_match(fa, rs)
+
+    def test_P136_binary_content_exact_bytes(self, client, dual_servers):
+        # All 256 byte values — catches any charset / boundary mangling.
+        blob = bytes(range(256)) * 4
+        fa, rs = hit(client, dual_servers, "post", "/pmp-binary",
+                     files={"file": ("blob.bin", blob, "application/octet-stream")})
+        assert_json_match(fa, rs)
+
+    def test_P137_filename_with_unicode(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "post", "/pmp-echo-file",
+                     files={"file": ("résumé.txt", b"unicode name", "text/plain")})
+        assert_json_match(fa, rs)
