@@ -33,11 +33,12 @@ def test_python_multipart_is_a_runtime_dep():
     ), deps
 
 
-def test_db_extra_exposes_psycopg_and_redis():
+def test_db_extra_removed():
+    """The ``db`` extra (psycopg/redis) was removed with the
+    out-of-scope ``fastapi_turbo.db`` add-on — FastAPI ships no DB
+    pools. See STRATEGY.md (bucket 2 — non-FastAPI add-ons)."""
     extras = _read_pyproject()["project"]["optional-dependencies"]
-    db = extras.get("db", [])
-    assert any(d.startswith("psycopg") for d in db), db
-    assert any(d.startswith("redis") for d in db), db
+    assert "db" not in extras, "db extra should be gone with the db add-on"
 
 
 def test_templates_extra_has_jinja():
@@ -46,10 +47,11 @@ def test_templates_extra_has_jinja():
 
 
 def test_all_meta_extra_is_superset():
-    """`all` should bundle every optional extra so `pip install
-    fastapi-turbo[all]` gets everything."""
+    """`all` should bundle every (remaining) optional extra so `pip install
+    fastapi-turbo[all]` gets everything. psycopg/redis were dropped with
+    the db add-on; `all` now bundles templates + the json accelerators."""
     extras = _read_pyproject()["project"]["optional-dependencies"]
     all_set = {d.split(">=")[0].split("[")[0] for d in extras.get("all", [])}
     assert "jinja2" in all_set
-    assert "psycopg" in all_set
-    assert "redis" in all_set
+    assert "psycopg" not in all_set
+    assert "redis" not in all_set

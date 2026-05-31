@@ -34,16 +34,9 @@ dependencies = [
 [project.optional-dependencies]
 # Jinja2 for ``fastapi_turbo.templating.Jinja2Templates``.
 templates = ["jinja2>=3.1"]
-# Postgres + Redis helpers under ``fastapi_turbo.db``.
-db = [
-    "psycopg[binary,pool]>=3.1",
-    "redis[hiredis]>=5.0",
-]
 # Meta extra — pulls everything. Mirrors FastAPI's ``[all]`` convention.
 all = [
     "jinja2>=3.1",
-    "psycopg[binary,pool]>=3.1",
-    "redis[hiredis]>=5.0",
     "orjson>=3.9",
     "ujson>=5.8",
 ]

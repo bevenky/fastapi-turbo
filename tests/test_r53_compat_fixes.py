@@ -14,7 +14,6 @@ from fastapi._compat import is_uploadfile_sequence_annotation
 from fastapi._compat.shared import is_bytes_sequence_annotation
 from fastapi.openapi.docs import get_swagger_ui_oauth2_redirect_html
 from fastapi.testclient import TestClient
-from fastapi_turbo.http import Client as TurboClient, ConnectError
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.endpoints import HTTPEndpoint, WebSocketEndpoint
@@ -281,45 +280,3 @@ def test_response_is_asgi_callable_and_runs_background_task():
     assert messages[0]["type"] == "http.response.start"
     assert messages[1] == {"type": "http.response.body", "body": b"ok"}
     assert called == ["done"]
-
-
-def test_http_client_fast_path_attaches_request_url_and_persists_cookies():
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Set-Cookie", "session=abc; Path=/")
-            self.end_headers()
-            self.wfile.write(self.path.encode("utf-8"))
-
-        def log_message(self, *_args):
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
-    try:
-        client = TurboClient()
-        response = client.get(f"{base}/hello")
-        assert response.status_code == 200
-        assert response.text == "/hello"
-        assert response.request is not None
-        assert str(response.url) == f"{base}/hello"
-        assert dict(client.cookies) == {"session": "abc"}
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-
-def test_http_client_fast_path_maps_connection_refusal_to_connect_error():
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-
-    client = TurboClient(timeout=0.2)
-    with pytest.raises(ConnectError) as exc_info:
-        client.get(f"http://127.0.0.1:{port}/")
-    assert exc_info.value.request is not None

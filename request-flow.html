@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fastapi-turbo · Request Flow & the Road to Multi-Core</title>
+<style>
+:root{
+  /* light theme palette */
+  --bg:#fbfcfe; --bg-grad-a:#f4f7fb; --bg-grad-b:#fbfcfe;
+  --ink:#19222e; --ink-soft:#3c4858; --muted:#6b7888; --faint:#97a3b2;
+  --line:#e6ebf1; --line-soft:#eef2f7; --card:#ffffff;
+  --shadow:0 1px 2px rgba(20,30,45,.04),0 8px 24px rgba(20,30,45,.05);
+  --shadow-sm:0 1px 2px rgba(20,30,45,.05);
+
+  --rust:#c2410c; --rust-bg:#fff3ec; --rust-bd:#fad4bd;
+  --py:#2563a8;   --py-bg:#eef5fc;   --py-bd:#c2dcf3;
+  --ext:#5a6b7c;  --ext-bg:#f1f4f7;  --ext-bd:#d7dee6;
+  --go:#0891b2;   --go-bg:#e8f7fb;   --go-bd:#b4e4ee;
+
+  --held:#dc2626; --held-bg:#fdecec;
+  --free:#16a34a; --free-bg:#e9f8ee;
+  --wait:#d97706; --wait-bg:#fdf3e3;
+
+  --radius:14px; --radius-sm:9px;
+  --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:74px}
+body{margin:0;color:var(--ink);background:var(--bg);
+  font:15px/1.6 var(--sans);-webkit-font-smoothing:antialiased;
+  background-image:linear-gradient(180deg,var(--bg-grad-a),var(--bg-grad-b) 420px);}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px 96px}
+
+/* ---- sticky nav ---- */
+nav.bar{position:sticky;top:0;z-index:50;backdrop-filter:saturate(1.4) blur(10px);
+  background:rgba(251,252,254,.82);border-bottom:1px solid var(--line);}
+nav.bar .in{max-width:1080px;margin:0 auto;padding:11px 24px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+nav.bar .brand{font-weight:800;letter-spacing:-.01em;font-size:15px;display:flex;align-items:center;gap:9px}
+nav.bar .brand .sq{width:18px;height:18px;border-radius:5px;
+  background:linear-gradient(135deg,var(--rust),#ea7a45);box-shadow:var(--shadow-sm)}
+nav.bar a{color:var(--muted);text-decoration:none;font-size:13px;font-weight:600;padding:4px 2px;border-bottom:2px solid transparent}
+nav.bar a:hover{color:var(--ink)}
+nav.bar .spacer{flex:1}
+
+/* ---- hero ---- */
+header.hero{padding:54px 0 30px;border-bottom:1px solid var(--line)}
+.eyebrow{display:inline-flex;align-items:center;gap:8px;font-size:12px;font-weight:700;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--rust);background:var(--rust-bg);border:1px solid var(--rust-bd);
+  padding:5px 12px;border-radius:30px}
+h1{font-size:38px;line-height:1.12;letter-spacing:-.02em;margin:18px 0 10px;font-weight:800}
+.lede{font-size:17px;color:var(--ink-soft);max-width:760px;margin:0}
+.lede b{color:var(--ink)}
+
+/* ---- section headers ---- */
+.sec{margin-top:64px}
+.sec-tag{font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+h2{font-size:27px;letter-spacing:-.015em;margin:6px 0 6px;font-weight:800}
+h2 .accent{background:linear-gradient(90deg,var(--rust),#e0703e);-webkit-background-clip:text;background-clip:text;color:transparent}
+.sec-intro{color:var(--muted);max-width:780px;margin:6px 0 0}
+h3{font-size:18px;letter-spacing:-.01em;margin:0 0 3px;font-weight:700}
+h4{font-size:12px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:20px 0 8px}
+
+p{margin:9px 0}
+code{font:12.5px/1.45 var(--mono);background:var(--line-soft);color:#384657;padding:1.5px 6px;border-radius:5px;border:1px solid var(--line)}
+.kbd{font:12px var(--mono);background:#1b2533;color:#eef3f8;padding:3px 8px;border-radius:6px;border:1px solid #2c3a4d}
+
+/* ---- callouts ---- */
+.call{border-radius:var(--radius);padding:16px 20px;margin:18px 0;font-size:14.5px;border:1px solid var(--line);background:var(--card);box-shadow:var(--shadow-sm)}
+.call .h{font-weight:800;letter-spacing:-.01em;margin-bottom:3px;display:flex;align-items:center;gap:9px}
+.call .ic{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;font-size:13px;flex:none;color:#fff}
+.call.key{border-left:4px solid var(--py)} .call.key .ic{background:var(--py)}
+.call.warn{border-left:4px solid var(--wait);background:var(--wait-bg)} .call.warn .ic{background:var(--wait)}
+.call.danger{border-left:4px solid var(--held);background:var(--held-bg)} .call.danger .ic{background:var(--held)}
+.call.win{border-left:4px solid var(--free);background:var(--free-bg)} .call.win .ic{background:var(--free)}
+
+/* ---- legend ---- */
+.legend{display:flex;flex-wrap:wrap;gap:12px 20px;background:var(--card);border:1px solid var(--line);
+  border-radius:var(--radius);padding:15px 20px;margin:20px 0;box-shadow:var(--shadow-sm)}
+.legend .grp{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);align-self:center}
+.legend .it{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink-soft)}
+.sw{width:15px;height:15px;border-radius:5px;border:1px solid rgba(0,0,0,.08);flex:none}
+.sw.rust{background:var(--rust-bg);border-color:var(--rust-bd)} .sw.py{background:var(--py-bg);border-color:var(--py-bd)}
+.sw.ext{background:var(--ext-bg);border-color:var(--ext-bd)}
+.dot{width:12px;height:12px;border-radius:50%;flex:none;box-shadow:0 0 0 3px rgba(0,0,0,.03)}
+.dot.held{background:var(--held)} .dot.free{background:var(--free)} .dot.wait{background:var(--wait)}
+
+/* ---- scenario card ---- */
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:22px 24px;margin:20px 0;box-shadow:var(--shadow)}
+.card-hd{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:3px}
+.num{font-size:12px;font-weight:800;color:#fff;background:var(--ink);width:22px;height:22px;border-radius:7px;
+  display:grid;place-items:center;flex:none;align-self:center}
+.badge{font-size:11px;font-weight:700;padding:2.5px 9px;border-radius:20px;border:1px solid}
+.badge.rust{color:var(--rust);background:var(--rust-bg);border-color:var(--rust-bd)}
+.badge.py{color:var(--py);background:var(--py-bg);border-color:var(--py-bd)}
+.meta{font-size:13px;color:var(--muted);margin:4px 0 16px}
+.meta b{color:var(--ink-soft)}
+
+/* ---- flow stepper ---- */
+.flow{display:flex;flex-wrap:wrap;align-items:stretch;gap:0;margin:4px 0}
+.step{position:relative;flex:1 1 132px;min-width:124px;border-radius:var(--radius-sm);padding:11px 13px 32px;
+  border:1px solid;margin:0 7px 14px;transition:transform .12s ease}
+.step:hover{transform:translateY(-2px)}
+.step.rust{background:var(--rust-bg);border-color:var(--rust-bd)}
+.step.py{background:var(--py-bg);border-color:var(--py-bd)}
+.step.ext{background:var(--ext-bg);border-color:var(--ext-bd)}
+.step .lyr{font-size:9.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;opacity:.85}
+.step.rust .lyr{color:var(--rust)} .step.py .lyr{color:var(--py)} .step.ext .lyr{color:var(--ext)}
+.step .t{font-size:13px;font-weight:700;margin-top:3px;letter-spacing:-.01em}
+.step .d{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.45}
+.step .gil{position:absolute;left:13px;bottom:9px;font-size:10px;font-weight:700;display:flex;align-items:center;gap:5px;color:var(--ink-soft)}
+.step .gil .dot{width:9px;height:9px;box-shadow:none}
+.arrow{align-self:center;color:var(--faint);font-size:18px;flex:0 0 14px;text-align:center;margin:0 -3px 14px}
+.arrow.back{color:var(--rust);font-weight:700}
+
+/* ---- gil timeline ---- */
+.tl-cap{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);margin:14px 0 5px}
+.gilbar{display:flex;height:30px;border-radius:8px;overflow:hidden;border:1px solid var(--line);box-shadow:inset 0 1px 2px rgba(0,0,0,.03)}
+.gilbar div{display:flex;align-items:center;justify-content:center;color:#fff;font-size:10.5px;font-weight:700;letter-spacing:.02em}
+.seg.held{background:linear-gradient(180deg,#ef4444,#dc2626)}
+.seg.free{background:linear-gradient(180deg,#22c55e,#16a34a)}
+.seg.wait{background:linear-gradient(180deg,#f59e0b,#d97706)}
+
+/* ---- verdict strip ---- */
+.verdict{margin-top:16px;padding:13px 16px;border-radius:var(--radius-sm);font-size:13.5px;display:flex;gap:11px;align-items:flex-start}
+.verdict .vt{font-weight:800;flex:none}
+.verdict.bad{background:var(--held-bg);border:1px solid #f6cfcf} .verdict.bad .vt{color:var(--held)}
+.verdict.mid{background:var(--wait-bg);border:1px solid #f4e0ba} .verdict.mid .vt{color:var(--wait)}
+.verdict.ok{background:var(--free-bg);border:1px solid #c2e9cf} .verdict.ok .vt{color:var(--free)}
+
+/* ---- tables ---- */
+table{border-collapse:separate;border-spacing:0;width:100%;margin:18px 0;font-size:13px;
+  background:var(--card);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow-sm)}
+th,td{padding:10px 13px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line-soft)}
+th{background:#f4f7fb;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:#fafcfe}
+td.c,th.c{text-align:center}
+.tag{font-size:11px;font-weight:700;padding:2.5px 8px;border-radius:6px;white-space:nowrap;display:inline-block}
+.tag.bad{background:var(--held-bg);color:#b3261e} .tag.ok{background:var(--free-bg);color:#15803d} .tag.mid{background:var(--wait-bg);color:#92600a}
+
+/* ---- arch lanes ---- */
+.arch{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px 22px;margin:18px 0;box-shadow:var(--shadow-sm)}
+.lanebox{display:grid;grid-template-columns:repeat(4,1fr);gap:11px;margin:10px 0 4px}
+@media(max-width:640px){.lanebox{grid-template-columns:repeat(2,1fr)}}
+.core{border:1px solid var(--line);border-radius:var(--radius-sm);padding:11px;background:#fcfdff;text-align:center}
+.core .ttl{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.core .h{margin-top:8px;border-radius:7px;padding:9px 6px;font-size:12px;font-weight:600}
+.core.go{border-color:var(--go-bd)} .core.go .ttl{color:var(--go)} .core.go .h{background:var(--go-bg);border:1px solid var(--go-bd);color:#0e7490}
+.core.busy .h{background:var(--held-bg);border:1px solid #f3c9c9;color:#b3261e}
+.core.idle .h{background:var(--line-soft);border:1px dashed var(--line);color:var(--faint)}
+.lane-cap{font-size:12px;color:var(--muted);margin:8px 0 0}
+
+/* ---- option cards ---- */
+.opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:16px;margin:18px 0}
+.opt{border:1px solid var(--line);border-radius:var(--radius);padding:0;background:var(--card);overflow:hidden;box-shadow:var(--shadow-sm);display:flex;flex-direction:column}
+.opt .top{padding:16px 18px 12px}
+.opt .rank{font-size:10.5px;font-weight:800;letter-spacing:.06em;text-transform:uppercase}
+.opt h3{margin:5px 0 2px;font-size:17px}
+.opt .sub{font-size:12.5px;color:var(--muted);margin:6px 0 0}
+.opt ul{list-style:none;padding:0 18px 4px;margin:10px 0 0}
+.opt li{position:relative;padding:5px 0 5px 24px;font-size:12.7px;color:var(--ink-soft);border-top:1px solid var(--line-soft)}
+.opt li:first-child{border-top:none}
+.opt li.pro::before{content:"✔";position:absolute;left:2px;color:var(--free);font-weight:800}
+.opt li.con::before{content:"✕";position:absolute;left:2px;color:var(--held);font-weight:800}
+.opt .foot{margin-top:auto;padding:12px 18px;background:#f7fafd;border-top:1px solid var(--line);font-size:12px;color:var(--ink-soft)}
+.opt.a{border-top:4px solid var(--free)} .opt.a .rank{color:var(--free)}
+.opt.b{border-top:4px solid var(--py)}   .opt.b .rank{color:var(--py)}
+.opt.c{border-top:4px solid var(--faint)} .opt.c .rank{color:var(--muted)}
+
+/* ---- ordered steps ---- */
+ol.steps{counter-reset:s;list-style:none;padding:0;margin:14px 0}
+ol.steps li{position:relative;padding:11px 0 11px 44px;border-top:1px solid var(--line-soft);font-size:14px;color:var(--ink-soft)}
+ol.steps li:first-child{border-top:none}
+ol.steps li::before{counter-increment:s;content:counter(s);position:absolute;left:0;top:9px;width:28px;height:28px;
+  border-radius:9px;background:var(--py-bg);color:var(--py);border:1px solid var(--py-bd);font-weight:800;font-size:13px;display:grid;place-items:center}
+ol.steps li b{color:var(--ink)}
+
+ul.clean{margin:10px 0;padding-left:0;list-style:none}
+ul.clean li{position:relative;padding:6px 0 6px 22px;font-size:14px;color:var(--ink-soft);border-top:1px solid var(--line-soft)}
+ul.clean li:first-child{border-top:none}
+ul.clean li::before{content:"";position:absolute;left:4px;top:13px;width:6px;height:6px;border-radius:50%;background:var(--rust)}
+
+.reclaim{display:flex;align-items:center;gap:14px;background:linear-gradient(90deg,var(--free-bg),#fff);
+  border:1px solid #c2e9cf;border-radius:var(--radius);padding:14px 20px;margin:6px 0 18px}
+.reclaim .big{font-size:30px;font-weight:800;color:var(--free);letter-spacing:-.02em;flex:none}
+.reclaim .lbl{font-size:13.5px;color:var(--ink-soft)}
+
+.src{font:11px var(--mono);color:var(--faint)}
+footer{margin-top:60px;border-top:1px solid var(--line);padding-top:18px;color:var(--muted);font-size:12.5px}
+footer b{color:var(--ink-soft)}
+.divider{height:1px;background:var(--line);margin:26px 0}
+
+/* ---- before/after shared-state plane ---- */
+.ba-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:18px 0}
+@media(max-width:780px){.ba-grid{grid-template-columns:1fr}}
+.ba{border:1px solid var(--line);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow-sm);overflow:hidden;display:flex;flex-direction:column}
+.ba .hd{padding:12px 16px;font-weight:800;font-size:14px;display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--line);letter-spacing:-.01em}
+.ba.today .hd{background:var(--held-bg);color:#b3261e}
+.ba.prop  .hd{background:var(--free-bg);color:#15803d}
+.ba .hd .pin{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;padding:2px 8px;border-radius:20px;margin-left:auto}
+.ba.today .hd .pin{background:#fff;color:#b3261e;border:1px solid #f3c9c9}
+.ba.prop  .hd .pin{background:#fff;color:#15803d;border:1px solid #c2e9cf}
+.ba .body{padding:15px 16px;flex:1;display:flex;flex-direction:column}
+.workers{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.wk{border-radius:8px;padding:7px 5px 8px;text-align:center;border:1px solid}
+.wk .wn{font-size:8.5px;font-weight:800;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}
+.wk .chip{margin-top:4px;border-radius:4px;padding:2.5px 2px;font-size:8.5px;font-weight:700;line-height:1.25}
+/* today: each worker carries its own isolated state */
+.wk.iso{background:#fff;border-color:#f1cccc}
+.wk.iso .chip{background:var(--held-bg);color:#b3261e;border:1px solid #f3d2d2}
+/* proposed: thin stateless python worker */
+.wk.thin{background:var(--py-bg);border-color:var(--py-bd)}
+.wk.thin .role{font-size:9.5px;font-weight:700;color:var(--py);margin-top:4px}
+.bridge{display:flex;align-items:center;justify-content:center;gap:7px;color:var(--free);font-size:10.5px;font-weight:700;margin:9px 0 7px;letter-spacing:.01em}
+.bridge::before,.bridge::after{content:"";height:1px;flex:1;background:linear-gradient(90deg,transparent,var(--free-bd),transparent)}
+.plane{border:1.5px solid var(--rust-bd);border-radius:9px;background:linear-gradient(180deg,var(--rust-bg),#fff);padding:11px 12px}
+.plane .pt{font-size:9.5px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:var(--rust);display:flex;align-items:center;gap:6px}
+.plane .cells{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
+.plane .cell{background:#fff;border:1px solid var(--rust-bd);border-radius:6px;padding:6px 8px;font-size:10px;font-weight:600;color:#9a3a12}
+.plane .cell b{color:var(--rust);font-weight:800}
+.ba .foot{margin-top:11px;font-size:11px;line-height:1.5;color:var(--ink-soft)}
+.ba .foot .x{color:var(--held);font-weight:800} .ba .foot .v{color:var(--free);font-weight:800}
+.shared-note{font-size:10px;color:var(--faint);text-align:center;margin-top:8px;font-style:italic}
+</style>
+</head>
+<body>
+
+<nav class="bar">
+  <div class="in">
+    <span class="brand"><span class="sq"></span>fastapi-turbo</span>
+    <span class="spacer"></span>
+    <a href="#v1">V1 · Request flow</a>
+    <a href="#summary">V1 summary</a>
+    <a href="#v2">V2 · Multi-core</a>
+    <a href="#v3">V3 · Shared state</a>
+    <a href="#delete">What to delete</a>
+    <a href="#checklist">Deep-dive</a>
+  </div>
+</nav>
+
+<div class="wrap">
+
+<header class="hero">
+  <span class="eyebrow">◆ Architecture deep-dive · companion to AUDIT.md</span>
+  <h1>How a request travels the<br><span style="color:var(--rust)">Python ⇄ Rust</span> boundary</h1>
+  <p class="lede">A visual map of where every request spends its time, what the <b>GIL</b> is doing at each step, and the concrete path to <b>multi-core, Go-class throughput</b> — without rewriting every layer in Rust, and without breaking drop-in FastAPI compatibility.</p>
+</header>
+
+<div class="call key">
+  <div class="h"><span class="ic">★</span>The one fact that explains everything below</div>
+  The Rust layer owns the <b>network, routing and JSON</b>. Every <b>handler</b> and every <b>database driver</b>
+  (psycopg3, redis-py, SQLAlchemy) is <b>Python</b>. Database I/O never enters Rust — <code>src/db_pool.rs</code> is dead
+  code; <code>db.py</code> imports the real <code>psycopg_pool</code> / <code>redis-py</code> (db.py:40, 235). And <code>db.py</code> ships
+  <b>sync helpers only</b> — the async paths below are the user bringing their own async driver. So performance comes down to
+  <b>one question per request: does the Python code hold or release the GIL, and how many threads can run Python at once?</b>
+</div>
+
+<div class="legend">
+  <span class="grp">Layer</span>
+  <div class="it"><span class="sw rust"></span> Rust · Axum / hyper / tokio</div>
+  <div class="it"><span class="sw py"></span> Python · handler, deps, driver</div>
+  <div class="it"><span class="sw ext"></span> External I/O · socket → DB</div>
+  <span class="grp" style="margin-left:auto">GIL</span>
+  <div class="it"><span class="dot held"></span> held — nothing else runs Python</div>
+  <div class="it"><span class="dot free"></span> free — another thread can run</div>
+  <div class="it"><span class="dot wait"></span> waiting on network — GIL released</div>
+</div>
+
+<!-- ===================== SECTION V1 ===================== -->
+<section class="sec" id="v1">
+  <div class="sec-tag">Section V1</div>
+  <h2>Request flow, <span class="accent">layer by layer</span></h2>
+  <p class="sec-intro">Each card is a left-to-right timeline. Colour = which layer executes; the badge on each step is the GIL state; the bar beneath traces the GIL across the request's life; the strip at the bottom states the real concurrency ceiling.</p>
+</section>
+
+<!-- 1 -->
+<div class="card">
+  <div class="card-hd"><span class="num">1</span><h3>Pure HTTP — <code>def</code> handler returning a dict</h3><span class="badge rust">fast path</span></div>
+  <div class="meta">e.g. <b><code>@app.get("/hello")</code></b> → <code>{"ok": True}</code>. Entry: <code>src/router.rs:1582 handle_request</code>. <b>Exactly one GIL acquisition.</b></div>
+  <div class="flow">
+    <div class="step rust"><div class="lyr">Rust · tokio</div><div class="t">Accept + parse</div><div class="d">hyper reads bytes; no Python</div><div class="gil"><span class="dot free"></span>free</div></div>
+    <div class="arrow">→</div>
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Route match</div><div class="d">matchit radix tree, pure Rust</div><div class="gil"><span class="dot free"></span>free</div></div>
+    <div class="arrow">↓</div>
+    <div class="step py"><div class="lyr">Python</div><div class="t">Run handler</div><div class="d"><code>block_in_place</code> → attach GIL; builds dict</div><div class="gil"><span class="dot held"></span>held</div></div>
+    <div class="arrow back">↑</div>
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Dict → JSON</div><div class="d"><code>write_dict_json</code> reads PyDict (needs GIL)</div><div class="gil"><span class="dot held"></span>held</div></div>
+    <div class="arrow">→</div>
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Write socket</div><div class="d">response bytes out</div><div class="gil"><span class="dot free"></span>free</div></div>
+  </div>
+  <div class="tl-cap">GIL over time</div>
+  <div class="gilbar"><div class="seg free" style="flex:2">free</div><div class="seg held" style="flex:2">HELD · handler</div><div class="seg held" style="flex:1.4">HELD · serialize</div><div class="seg free" style="flex:1.4">free</div></div>
+  <div class="verdict bad"><span class="vt">Ceiling · ~1 core for Python.</span><div>The handler is pure CPU and never releases the GIL, so on N cores you still run <b>one handler at a time</b>. This is why throughput plateaus (~93K req/s at c=32/256 in <code>benchmarks.md</code>) — GIL serialization, not the network. Rust parsing/serialization <i>does</i> parallelize, but it's the cheap part.</div></div>
+</div>
+
+<!-- 2 -->
+<div class="card">
+  <div class="card-hd"><span class="num">2</span><h3>Pure HTTP — <code>async def</code> handler</h3></div>
+  <div class="meta">Driver: <code>src/handler_bridge.rs</code>. Two sub-cases, depending on whether the coroutine actually suspends.</div>
+
+  <h4>2a · Async that never awaits real I/O — the “try-sync” fast path</h4>
+  <div class="flow">
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Accept + route</div><div class="d">hyper + matchit</div><div class="gil"><span class="dot free"></span>free</div></div>
+    <div class="arrow">↓</div>
+    <div class="step py"><div class="lyr">Python</div><div class="t">Build coroutine</div><div class="d">call handler → coro object</div><div class="gil"><span class="dot held"></span>held</div></div>
+    <div class="arrow">→</div>
+    <div class="step py"><div class="lyr">Python</div><div class="t"><code>coro.send(None)</code></div><div class="d">runs to completion on the <b>calling thread</b> — no loop, no hop (handler_bridge.rs:394)</div><div class="gil"><span class="dot held"></span>held</div></div>
+    <div class="arrow back">↑</div>
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Serialize + write</div><div class="d">same as sync</div><div class="gil"><span class="dot held"></span>→<span class="dot free"></span></div></div>
+  </div>
+  <div class="verdict bad"><span class="vt">Same as sync · ~1 Python core.</span><div>No suspension ⇒ behaves exactly like a sync handler — cheap (1 GIL acquisition) but GIL-bound.</div></div>
+
+  <h4>2b · Async that <i>does</i> await — real I/O, <code>asyncio.sleep</code>, async DB…</h4>
+  <div class="flow">
+    <div class="step py"><div class="lyr">Python</div><div class="t"><code>coro.send(None)</code></div><div class="d">suspends at first <code>await</code> → yields a future</div><div class="gil"><span class="dot held"></span>briefly</div></div>
+    <div class="arrow">→</div>
+    <div class="step py"><div class="lyr">Python · 1 thread</div><div class="t">Hand to worker</div><div class="d">re-driven on <b>ONE dedicated loop thread</b> (_async_worker.py:69-78)</div><div class="gil"><span class="dot held"></span>to step</div></div>
+    <div class="arrow">→</div>
+    <div class="step ext"><div class="lyr">External</div><div class="t">await I/O</div><div class="d">loop releases GIL while waiting on the fd</div><div class="gil"><span class="dot wait"></span>free</div></div>
+    <div class="arrow back">↑</div>
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Result → write</div><div class="d">back across the boundary</div><div class="gil"><span class="dot held"></span>→<span class="dot free"></span></div></div>
+  </div>
+  <div class="tl-cap">GIL over time</div>
+  <div class="gilbar"><div class="seg held" style="flex:1">HELD</div><div class="seg wait" style="flex:3">await · GIL free · loop interleaves others</div><div class="seg held" style="flex:1.4">HELD</div></div>
+  <div class="verdict mid"><span class="vt">Good for idle waits · single-threaded for CPU.</span><div>While any request awaits, the <b>one</b> loop interleaves other awaiting requests — so thousands of concurrent <i>idle</i> awaits are fine. But every coroutine's CPU work (pydantic, row→object, JSON-prep) runs on that <b>single loop thread</b>. <span class="src">handler_bridge.rs:308 · the async ceiling, AUDIT.md §3.</span></div></div>
+</div>
+
+<!-- 3 -->
+<div class="card">
+  <div class="card-hd"><span class="num">3</span><h3>PostgreSQL — psycopg3 <b>sync</b></h3><span class="badge py">def handler</span></div>
+  <div class="meta">Sync pool from <code>db.py:44 create_pool</code> (real <code>psycopg_pool.ConnectionPool</code>). Sync handler ⇒ runs under <code>block_in_place</code> on a tokio worker thread. <b>psycopg3 releases the GIL around socket I/O.</b></div>
+  <div class="flow">
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Accept + route</div><div class="d"></div><div class="gil"><span class="dot free"></span>free</div></div>
+    <div class="arrow">↓</div>
+    <div class="step py"><div class="lyr">Python</div><div class="t">Handler + SQL</div><div class="d">checkout conn from pool</div><div class="gil"><span class="dot held"></span>held</div></div>
+    <div class="arrow">→</div>
+    <div class="step ext"><div class="lyr">libpq socket</div><div class="t">execute — DB wait</div><div class="d">psycopg3 <b>releases the GIL</b> during the round-trip</div><div class="gil"><span class="dot wait"></span>free</div></div>
+    <div class="arrow back">↑</div>
+    <div class="step py"><div class="lyr">Python</div><div class="t">Rows → objects</div><div class="d">fetch + (often) pydantic validate</div><div class="gil"><span class="dot held"></span>held</div></div>
+    <div class="arrow back">↑</div>
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Serialize + write</div><div class="d"></div><div class="gil"><span class="dot held"></span>→<span class="dot free"></span></div></div>
+  </div>
+  <div class="tl-cap">GIL over time</div>
+  <div class="gilbar"><div class="seg held" style="flex:1.2">HELD</div><div class="seg wait" style="flex:3">DB wait · GIL FREE → other threads run</div><div class="seg held" style="flex:1.4">HELD · parse</div><div class="seg held" style="flex:1">HELD · ser</div></div>
+  <div class="verdict mid"><span class="vt">Real overlap during DB waits; CPU still serializes.</span><div>Because the GIL is released while waiting on Postgres, request B can grab it and run while A waits — so I/O concurrency ≈ number of <code>block_in_place</code> threads. But the CPU portions (build SQL, row→object, pydantic, JSON) re-bind the GIL. Acceptable for DB-bound endpoints; the GIL bites on cheap-query / heavy-CPU ones.</div></div>
+</div>
+
+<!-- 4 -->
+<div class="card">
+  <div class="card-hd"><span class="num">4</span><h3>PostgreSQL — psycopg3 <b>async</b></h3><span class="badge py">async def</span></div>
+  <div class="meta">User-supplied <code>psycopg.AsyncConnectionPool</code> (not from <code>db.py</code>, which is sync-only). <code>async def</code> ⇒ suspends on <code>await conn.execute</code> ⇒ <b>driven on the single shared worker loop</b> (case 2b).</div>
+  <div class="flow">
+    <div class="step py"><div class="lyr">Python · 1 loop</div><div class="t">Handler → await</div><div class="d">suspends; registered on the one event loop</div><div class="gil"><span class="dot held"></span>held→</div></div>
+    <div class="arrow">→</div>
+    <div class="step ext"><div class="lyr">socket</div><div class="t">DB round-trip</div><div class="d">loop awaits fd; GIL free; other coroutines on the same loop interleave</div><div class="gil"><span class="dot wait"></span>free</div></div>
+    <div class="arrow back">↑</div>
+    <div class="step py"><div class="lyr">Python · 1 loop</div><div class="t">Rows → objects</div><div class="d">+ pydantic — on <b>that one loop thread</b></div><div class="gil"><span class="dot held"></span>held</div></div>
+    <div class="arrow back">↑</div>
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Serialize + write</div><div class="d"></div><div class="gil"><span class="dot held"></span>→<span class="dot free"></span></div></div>
+  </div>
+  <div class="tl-cap">GIL over time</div>
+  <div class="gilbar"><div class="seg wait" style="flex:3">many awaits interleave on 1 loop · GIL free per fd wait</div><div class="seg held" style="flex:2">HELD · all CPU on 1 thread</div></div>
+  <div class="verdict bad"><span class="vt">Excellent for idle awaits — but ALL post-query CPU funnels through one thread.</span><div>10,000 connections each awaiting Postgres is fine; but the moment results return, row decoding + validation + JSON-prep for every request queues on the single loop. <b>This is the canonical “async Python is single-core” wall</b> — and the main reason async-DB throughput trails Go, which spreads identical work across every core.</div></div>
+</div>
+
+<!-- 5 -->
+<div class="card">
+  <div class="card-hd"><span class="num">5</span><h3>Redis — redis-py <b>sync</b> &amp; <b>async</b></h3></div>
+  <div class="meta">Sync via <code>db.py:202 create_redis</code> (real <code>redis.Redis</code> + hiredis). <b>Topologically identical to Postgres</b> — only the driver differs. redis-py (sync) releases the GIL on socket ops; <code>redis.asyncio</code> (user-supplied) rides the single shared loop.</div>
+  <table>
+    <tr><th>Mode</th><th>Handler</th><th>Runs on</th><th class="c">GIL during network</th><th>Same shape as</th></tr>
+    <tr><td><b>Sync</b> · <code>cache.get()</code> (db.py)</td><td><code>def</code></td><td>tokio blocking thread (<code>block_in_place</code>)</td><td class="c"><span class="tag ok">released</span></td><td>Card 3 (psycopg sync)</td></tr>
+    <tr><td><b>Async</b> · <code>redis.asyncio</code> (BYO)</td><td><code>async def</code></td><td>single shared event loop</td><td class="c"><span class="tag ok">released / await</span></td><td>Card 4 (psycopg async)</td></tr>
+  </table>
+  <div class="verdict mid"><span class="vt">Same ceilings as Postgres — but it bites sooner.</span><div>Redis round-trips are sub-millisecond, so the GIL-held CPU fraction (command encode/decode) is a <i>larger</i> share of each request than with Postgres — meaning Redis-heavy endpoints hit the GIL wall <b>earlier</b> than slow-query endpoints. The fix is the multi-core story (V2), not a driver change.</div></div>
+</div>
+
+<!-- 6 -->
+<div class="card">
+  <div class="card-hd"><span class="num">6</span><h3>SQLAlchemy — <b>sync</b> &amp; <b>async</b> (ORM / Core)</h3></div>
+  <div class="meta">SQLAlchemy is a pure-Python layer <i>on top of</i> a DBAPI driver (psycopg / asyncpg). It adds its own CPU cost — unit-of-work, identity map, result→ORM hydration — all GIL-held, before the same boundary applies.</div>
+  <div class="flow">
+    <div class="step py"><div class="lyr">Python</div><div class="t">SQLAlchemy compile</div><div class="d">Core/ORM builds SQL, manages session — <b>pure CPU, GIL held</b></div><div class="gil"><span class="dot held"></span>held</div></div>
+    <div class="arrow">→</div>
+    <div class="step ext"><div class="lyr">DBAPI socket</div><div class="t">execute → DB</div><div class="d">sync: GIL released on socket · async: awaits on the 1 loop</div><div class="gil"><span class="dot wait"></span>free</div></div>
+    <div class="arrow back">↑</div>
+    <div class="step py"><div class="lyr">Python</div><div class="t">Result → ORM</div><div class="d">row hydration, relationships, pydantic — <b>heavy GIL-held CPU</b></div><div class="gil"><span class="dot held"></span>held</div></div>
+    <div class="arrow back">↑</div>
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Serialize + write</div><div class="d"></div><div class="gil"><span class="dot held"></span>→<span class="dot free"></span></div></div>
+  </div>
+  <table>
+    <tr><th>Mode</th><th>Underlying driver</th><th>Where the GIL-bound CPU runs</th><th class="c">Effective ceiling</th></tr>
+    <tr><td><b>Sync</b> · <code>Session</code>, <code>create_engine</code></td><td>psycopg / psycopg2 (sync)</td><td>tokio blocking threads, serialized on GIL</td><td class="c"><span class="tag mid">N threads, GIL CPU</span></td></tr>
+    <tr><td><b>Async</b> · <code>AsyncSession</code></td><td>asyncpg / psycopg async</td><td>the single shared event-loop thread</td><td class="c"><span class="tag bad">1 thread, all CPU</span></td></tr>
+  </table>
+  <div class="verdict bad"><span class="vt">SQLAlchemy is the worst case for the GIL.</span><div>It has the <i>highest CPU-per-request</i> of any DB path (compilation + hydration), and that CPU is exactly what the GIL serializes. <b>Async SQLAlchemy pins all of it to one core.</b> Apps that feel “slow under load” with async SQLAlchemy are almost always GIL-bound here, not DB-bound. Again: the answer is V2, not the ORM.</div></div>
+</div>
+
+<!-- V1 SUMMARY -->
+<section class="sec" id="summary" style="margin-top:44px">
+  <h3 style="font-size:20px">V1 summary — where the time goes &amp; what caps it</h3>
+</section>
+<table>
+  <tr><th>Path</th><th>Handler</th><th>Runs Python on</th><th class="c">GIL freed for I/O?</th><th>What still serializes (the cap)</th><th class="c">Verdict</th></tr>
+  <tr><td>Pure HTTP</td><td><code>def</code></td><td>tokio threads</td><td class="c"><span class="tag bad">no I/O</span></td><td>entire handler (pure CPU)</td><td class="c"><span class="tag bad">1 core</span></td></tr>
+  <tr><td>Pure HTTP</td><td><code>async</code></td><td>1 loop (if it awaits)</td><td class="c">n/a</td><td>all CPU on 1 loop thread</td><td class="c"><span class="tag bad">1 core</span></td></tr>
+  <tr><td>Postgres / Redis</td><td><code>def</code></td><td>tokio threads</td><td class="c"><span class="tag ok">yes</span></td><td>SQL build + row decode + pydantic + JSON</td><td class="c"><span class="tag mid">N-thread I/O</span></td></tr>
+  <tr><td>Postgres / Redis</td><td><code>async</code></td><td>1 shared loop</td><td class="c"><span class="tag ok">yes / await</span></td><td><b>every byte of CPU on one thread</b></td><td class="c"><span class="tag bad">1-core CPU</span></td></tr>
+  <tr><td>SQLAlchemy</td><td><code>def</code></td><td>tokio threads</td><td class="c"><span class="tag ok">yes</span></td><td>compile + hydrate + pydantic (large)</td><td class="c"><span class="tag mid">N-thread I/O</span></td></tr>
+  <tr><td>SQLAlchemy</td><td><code>async</code></td><td>1 shared loop</td><td class="c"><span class="tag ok">yes / await</span></td><td><b>large CPU, all on one thread</b></td><td class="c"><span class="tag bad">1-core CPU</span></td></tr>
+</table>
+<div class="call key">
+  <div class="h"><span class="ic">=</span>Read this table as one sentence</div>
+  The Rust layer is already fast and parallel; <b>the ceiling is always “how many threads can execute Python CPU at once,”</b>
+  and today that is <b>1</b> (the GIL) — except the sync paths, which borrow extra threads only for the duration of a network wait. <b>That is the whole performance story, and V2 is how you fix it.</b>
+</div>
+
+<!-- ===================== SECTION V2 ===================== -->
+<section class="sec" id="v2">
+  <div class="sec-tag">Section V2</div>
+  <h2>Making it <span class="accent">multi-core</span> — the deep dive worth doing</h2>
+  <p class="sec-intro">How to get Go-class, multi-core throughput without bloating the Rust layer or rewriting every layer from scratch — while keeping <code>import fastapi_turbo as fastapi</code> the only line a user changes, and dropping a lot of what's there today.</p>
+</section>
+
+<div class="call danger">
+  <div class="h"><span class="ic">!</span>The constraint, stated precisely</div>
+  Go runs your handler on any of N OS threads across N cores with no global lock. fastapi-turbo runs handler / driver / validation in <b>Python</b>, and CPython's GIL allows <b>one thread to execute bytecode at a time</b>. The Rust core already has a multi-threaded tokio runtime (<code>server.rs:434</code>, worker_threads = cores) — <b>so the parallel machine is already there; the GIL is the lock sitting on top of it.</b> You do <u>not</u> need to rewrite layers in Rust. You need to remove or sidestep the single-Python-thread bottleneck.
+</div>
+
+<div class="arch">
+  <h4 style="margin-top:0">Go — what we're chasing</h4>
+  <div class="lanebox">
+    <div class="core go"><div class="ttl">core 1</div><div class="h">goroutine → handler</div></div>
+    <div class="core go"><div class="ttl">core 2</div><div class="h">goroutine → handler</div></div>
+    <div class="core go"><div class="ttl">core 3</div><div class="h">goroutine → handler</div></div>
+    <div class="core go"><div class="ttl">core 4</div><div class="h">goroutine → handler</div></div>
+  </div>
+  <p class="lane-cap">No global lock. CPU scales linearly with cores.</p>
+
+  <h4>fastapi-turbo today — N tokio threads, but one GIL</h4>
+  <div class="lanebox">
+    <div class="core busy"><div class="ttl">core 1</div><div class="h">Python handler 🔒</div></div>
+    <div class="core idle"><div class="ttl">core 2</div><div class="h">idle · waiting for GIL</div></div>
+    <div class="core idle"><div class="ttl">core 3</div><div class="h">idle · waiting for GIL</div></div>
+    <div class="core idle"><div class="ttl">core 4</div><div class="h">idle · waiting for GIL</div></div>
+  </div>
+  <p class="lane-cap">The threads exist; the GIL only lets one run Python CPU at a time.</p>
+</div>
+
+<h3 style="font-size:20px;margin-top:34px">Three ways out — ranked</h3>
+<div class="opts">
+  <div class="opt b">
+    <div class="top">
+      <div class="rank">Option B · ship now</div>
+      <h3>Pre-fork worker processes</h3>
+      <div class="sub">N processes, each its own GIL, sharing one listening socket via <code>SO_REUSEPORT</code>; the kernel load-balances connections.</div>
+    </div>
+    <ul>
+      <li class="pro">True multi-core <b>today</b> — N processes = N cores running Python in parallel.</li>
+      <li class="pro"><b>Zero changes</b> to the request path, the GIL story, or drop-in compat.</li>
+      <li class="pro">How Gunicorn/uvicorn already scale; well-understood ops model.</li>
+      <li class="con">Shared-nothing — no shared in-memory cache/state across workers (use Redis).</li>
+      <li class="con">~N× memory; per-process warmup.</li>
+    </ul>
+    <div class="foot"><b>Surface:</b> <code>app.run(workers=N)</code> → bind with <code>SO_REUSEPORT</code> in <code>server.rs</code> and fork, or document <code>gunicorn -w N</code>. Small Rust change, no rewrite.</div>
+  </div>
+
+  <div class="opt a">
+    <div class="top">
+      <div class="rank">Option A · endgame</div>
+      <h3>Free-threaded Python (3.13t / 3.14t)</h3>
+      <div class="sub">Run on a no-GIL build. <code>attach</code> becomes a cheap per-object lock, not a global one — the N tokio threads finally run Python <b>in parallel on N cores</b>, in one process.</div>
+    </div>
+    <ul>
+      <li class="pro"><b>The only option that truly matches Go</b>: shared memory + linear CPU scaling, single process.</li>
+      <li class="pro">Keeps in-process shared state (caches, pools).</li>
+      <li class="pro"><b>Lets you delete</b> the single async-worker loop → one loop per worker thread.</li>
+      <li class="pro">Minimal new Rust — the runtime changes, not the architecture.</li>
+      <li class="con">Needs C-ext safety: pydantic-core, psycopg, etc. free-threading-ready (landing).</li>
+      <li class="con">Audit global <code>RwLock&lt;Option&lt;Py&gt;&gt;</code> statics (router.rs:29-33) &amp; the <code>HANDLER_CLASS</code> mutex.</li>
+      <li class="con">orjson may be absent → the hand-rolled JSON path must stay byte-identical.</li>
+    </ul>
+    <div class="foot"><b>Surface:</b> build/test on 3.14t; per-thread event loops; concurrency-audit the statics. <span class="src">AUDIT.md §3, §6.</span></div>
+  </div>
+
+  <div class="opt c">
+    <div class="top">
+      <div class="rank">Option C · partial</div>
+      <h3>Event-loop pool (one per thread)</h3>
+      <div class="sub">Replace the single shared <code>_async_worker</code> loop with one loop per tokio worker thread, so async requests spread across threads.</div>
+    </div>
+    <ul>
+      <li class="pro">Removes the “all async CPU on one thread” wall (cards 4 &amp; 6).</li>
+      <li class="pro">Helps even <b>with</b> the GIL by overlapping I/O better.</li>
+      <li class="con"><b>Does not break the GIL</b> — CPU still serializes globally until you also do A.</li>
+      <li class="con">More moving parts; only a partial win alone.</li>
+    </ul>
+    <div class="foot"><b>Best used as:</b> the bridge that makes Option A pay off — under no-GIL, per-thread loops give linear async scaling. <b>Do C as part of A, not instead of it.</b></div>
+  </div>
+</div>
+
+<div class="call win">
+  <div class="h"><span class="ic">▸</span>Recommended sequencing — “drop code, don't rewrite layers”</div>
+  <ol class="steps">
+    <li><b>Now (Option B):</b> add <code>app.run(workers=N)</code> via <code>SO_REUSEPORT</code> pre-fork. Instant multi-core for <i>every</i> path in V1, zero request-path risk, fully drop-in. Ship the “matches Go under load” story today.</li>
+    <li><b>Next (Option A + C together):</b> make the build run on free-threaded 3.14t; replace the single shared loop with per-thread loops; concurrency-audit the global statics. The single-process, shared-memory match to Go.</li>
+    <li><b>Then delete:</b> once B+A exist, large amounts of current code stop carrying weight and can go (below).</li>
+  </ol>
+</div>
+
+<!-- ===================== SECTION V3 ===================== -->
+<section class="sec" id="v3">
+  <div class="sec-tag">Section V3</div>
+  <h2>The <span class="accent">shared-state plane</span> — today vs proposed</h2>
+  <p class="sec-intro">The concrete model. Left = how multi-worker behaves <b>today</b> (shared-nothing — what breaks). Right = the <b>proposed</b> model: <b>Rust owns one in-memory shared-state plane</b>, Python workers become stateless compute over it. No Redis for a single node. Then: how the HTTP + sync-DB hot path streamlines, and how the GIL path shrinks to almost nothing.</p>
+</section>
+
+<div class="ba-grid">
+  <!-- TODAY -->
+  <div class="ba today">
+    <div class="hd">⊘ Today · shared-nothing <span class="pin">the problem</span></div>
+    <div class="body">
+      <div class="workers">
+        <div class="wk iso"><div class="wn">worker 1</div><div class="chip">cache</div><div class="chip">counters</div><div class="chip">model copy</div><div class="chip">ws registry</div></div>
+        <div class="wk iso"><div class="wn">worker 2</div><div class="chip">cache</div><div class="chip">counters</div><div class="chip">model copy</div><div class="chip">ws registry</div></div>
+        <div class="wk iso"><div class="wn">worker 3</div><div class="chip">cache</div><div class="chip">counters</div><div class="chip">model copy</div><div class="chip">ws registry</div></div>
+        <div class="wk iso"><div class="wn">worker 4</div><div class="chip">cache</div><div class="chip">counters</div><div class="chip">model copy</div><div class="chip">ws registry</div></div>
+      </div>
+      <div class="shared-note">each worker is a separate process / interpreter — nothing crosses the wall</div>
+      <div class="foot">
+        <span class="x">✕</span> cache fill on w1 invisible to w2 — duplicated work<br>
+        <span class="x">✕</span> "100 req/s" limit is really <b>4×100</b> — counters are per-worker<br>
+        <span class="x">✕</span> model loaded <b>4×</b> in RAM<br>
+        <span class="x">✕</span> WS publish on w1 <b>never reaches</b> a socket on w2<br>
+        <span class="x">✕</span> fix today = bolt on <b>Redis</b> + serialize everything over the network
+      </div>
+    </div>
+  </div>
+
+  <!-- PROPOSED -->
+  <div class="ba prop">
+    <div class="hd">◉ Proposed · Rust shared-state plane <span class="pin">the fix</span></div>
+    <div class="body">
+      <div class="workers">
+        <div class="wk thin"><div class="wn">py wk 1</div><div class="role">handler<br>+ pydantic</div></div>
+        <div class="wk thin"><div class="wn">py wk 2</div><div class="role">handler<br>+ pydantic</div></div>
+        <div class="wk thin"><div class="wn">py wk 3</div><div class="role">handler<br>+ pydantic</div></div>
+        <div class="wk thin"><div class="wn">py wk 4</div><div class="role">handler<br>+ pydantic</div></div>
+      </div>
+      <div class="bridge">stateless compute · read &amp; write the plane, GIL-free</div>
+      <div class="plane">
+        <div class="pt">▤ Rust shared-state plane · one copy · parallel</div>
+        <div class="cells">
+          <div class="cell"><b>DashMap</b> cache (bytes)</div>
+          <div class="cell"><b>AtomicU64</b> counters</div>
+          <div class="cell"><b>tokio::broadcast</b> pub/sub</div>
+          <div class="cell"><b>model</b> in Rust mem · 1×</div>
+        </div>
+      </div>
+      <div class="foot">
+        <span class="v">✔</span> one cache view — w1's fill is instantly w2's hit<br>
+        <span class="v">✔</span> global counters correct — limit means the limit<br>
+        <span class="v">✔</span> model held <b>once</b> in Rust memory (COW / shared)<br>
+        <span class="v">✔</span> WS publish fans out to <b>every</b> worker's sockets<br>
+        <span class="v">✔</span> <b>no Redis</b> for a single node — it's all in-process Rust
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="call key">
+  <div class="h"><span class="ic">▤</span>The rule that makes it safe</div>
+  The plane stores <b>Rust-owned bytes &amp; atomics — never live Python objects</b> (those can't cross the boundary safely). Each worker pulls from the plane and builds its <i>own</i> per-request Python objects. That single rule is what turns "shared memory" from hand-waving into something sound. <span class="src">Under free-threaded Python (V2 Option A) the plane is direct shared-heap — literally Go's <code>sync.Map</code> / <code>sync/atomic</code> / channels. Under pre-fork it's a shared-memory segment + a tiny in-Rust broker for pub/sub.</span>
+</div>
+
+<h3 style="font-size:20px;margin-top:34px">What doesn't work across workers today — and where it moves</h3>
+<table>
+  <tr><th>Per-request state</th><th>Today (shared-nothing)</th><th>Proposed (Rust plane)</th><th class="c">Hard?</th></tr>
+  <tr><td><b>Routing / OpenAPI / DI plans</b></td><td>replicated, read-only — fine</td><td>already in Rust</td><td class="c"><span class="tag ok">trivial</span></td></tr>
+  <tr><td><b>Request / body / response</b></td><td>per-request — fine</td><td>unchanged (per-request)</td><td class="c"><span class="tag ok">n/a</span></td></tr>
+  <tr><td><b>Big read-only object</b> (ML model, tables)</td><td><span class="tag bad">N× RAM</span></td><td>Rust memory, <b>1 copy</b> (COW pre-fork / shared heap free-threaded)</td><td class="c"><span class="tag ok">easy</span></td></tr>
+  <tr><td><b>Counters</b> (rate-limit, quota, metrics)</td><td><span class="tag bad">per-worker → N× wrong</span></td><td><code>AtomicU64</code> in shared memory — <b>genuinely cross-process</b></td><td class="c"><span class="tag ok">easy</span></td></tr>
+  <tr><td><b>KV cache</b> (shared <code>@lru_cache</code>)</td><td><span class="tag bad">duplicated, inconsistent</span></td><td>Rust <code>DashMap</code> of bytes (A) / shared-mem map (B)</td><td class="c"><span class="tag mid">medium</span></td></tr>
+  <tr><td><b>Sessions / locks / leases / flags</b></td><td><span class="tag bad">inconsistent → needs Redis</span></td><td>Rust structs behind a lock in the plane</td><td class="c"><span class="tag mid">medium</span></td></tr>
+  <tr><td><b>Pub/sub · WebSocket fan-out</b></td><td><span class="tag bad">impossible in-memory</span></td><td><code>tokio::broadcast</code> (A) / in-Rust broker over local IPC (B)</td><td class="c"><span class="tag bad">the hard one</span></td></tr>
+</table>
+<p class="sec-intro" style="margin-top:4px">Everything red on the left is exactly the list people reach for Redis to fix. On the right it's in-process Rust — and only the last row (cross-process pub/sub) is genuinely hard, and only in pre-fork; free-threaded makes even that trivial.</p>
+
+<!-- STREAMLINED HOT PATH -->
+<h3 style="font-size:20px;margin-top:38px">Streamlined hot path — HTTP + sync DB, minimized GIL</h3>
+<p class="sec-intro">The same request as Card 3 (sync <code>def</code> + Postgres), re-drawn under the proposed model. The goal: <b>hold the GIL only for the irreducible Python — the handler body and the DB driver call</b> — and push routing, validation, cache, counters and serialization into Rust, where they run GIL-free and in parallel.</p>
+<div class="card">
+  <div class="card-hd"><span class="num">★</span><h3>Proposed streamlined flow</h3><span class="badge rust">GIL held only twice, briefly</span></div>
+  <div class="meta">Cache hit ⇒ <b>Python is never called</b>. Cache miss ⇒ GIL held only for the handler + DB driver (and the driver releases it during the socket wait).</div>
+  <div class="flow">
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Accept · route · validate</div><div class="d">matchit + pydantic-core <code>validate_json</code> in Rust</div><div class="gil"><span class="dot free"></span>free</div></div>
+    <div class="arrow">→</div>
+    <div class="step rust"><div class="lyr">Rust · plane</div><div class="t">Cache lookup</div><div class="d"><code>DashMap</code> — hit ⇒ return now, no Python</div><div class="gil"><span class="dot free"></span>free</div></div>
+    <div class="arrow">↓</div>
+    <div class="step py"><div class="lyr">Python</div><div class="t">Handler + DB call</div><div class="d">the <b>only</b> Python; psycopg releases GIL on the socket wait</div><div class="gil"><span class="dot held"></span>→<span class="dot wait"></span></div></div>
+    <div class="arrow back">↑</div>
+    <div class="step rust"><div class="lyr">Rust</div><div class="t">Serialize (1 pass)</div><div class="d"><code>__pydantic_serializer__.to_json</code> — no dict round-trip</div><div class="gil"><span class="dot held"></span>brief</div></div>
+    <div class="arrow">→</div>
+    <div class="step rust"><div class="lyr">Rust · plane</div><div class="t">Counters++ · cache fill · write</div><div class="d">atomics + DashMap + socket — all GIL-free</div><div class="gil"><span class="dot free"></span>free</div></div>
+  </div>
+  <div class="tl-cap">GIL over time — proposed (compare Card 3)</div>
+  <div class="gilbar"><div class="seg free" style="flex:2.4">free · route · validate · cache</div><div class="seg held" style="flex:1">HELD · handler</div><div class="seg wait" style="flex:2.2">DB wait · GIL free</div><div class="seg held" style="flex:1">ser</div><div class="seg free" style="flex:1.8">free · counters · write</div></div>
+  <div class="tl-cap" style="margin-top:12px">GIL over time — today (Card 3, for reference)</div>
+  <div class="gilbar"><div class="seg free" style="flex:1.2">free</div><div class="seg held" style="flex:1.6">HELD · handler+SQL</div><div class="seg wait" style="flex:2.2">DB wait</div><div class="seg held" style="flex:1.6">HELD · parse</div><div class="seg held" style="flex:1.4">HELD · serialize</div></div>
+  <div class="verdict ok"><span class="vt">Held shrinks to the irreducible.</span><div>Validation, cache, counters and serialization leave the GIL — so the only held time is the handler body + a brief serialize read. With a const/cached route, Python isn't touched at all (Robyn's “const requests” trick, baked in Rust). <b>This alone lifts the single-worker ceiling; it doesn't yet beat the GIL across cores — that's the next table.</b></div></div>
+</div>
+
+<h3 style="font-size:20px;margin-top:34px">Minimizing the GIL hot path — what moves into Rust</h3>
+<table>
+  <tr><th>Per-request work</th><th>Today</th><th>Proposed</th><th class="c">GIL after</th></tr>
+  <tr><td>Route match</td><td>Rust</td><td>Rust</td><td class="c"><span class="tag ok">free</span></td></tr>
+  <tr><td>Param / body validation</td><td>part Python, part Rust</td><td>Rust · pydantic-core <code>validate_json</code></td><td class="c"><span class="tag ok">≈free</span></td></tr>
+  <tr><td>Cache lookup / fill</td><td>Python dict (per-worker)</td><td>Rust <code>DashMap</code> (shared)</td><td class="c"><span class="tag ok">free</span></td></tr>
+  <tr><td><b>Handler body</b></td><td>Python</td><td>Python — <b>irreducible</b></td><td class="c"><span class="tag mid">held</span></td></tr>
+  <tr><td><b>DB driver call</b></td><td>Python (GIL freed on socket)</td><td>same — <b>irreducible</b> (GIL freed on wait)</td><td class="c"><span class="tag mid">held→free</span></td></tr>
+  <tr><td>Response serialize</td><td>Python <code>model_dump</code>→dict→Rust (2 passes)</td><td>Rust <code>to_json</code> (1 pass)</td><td class="c"><span class="tag ok">≈free</span></td></tr>
+  <tr><td>Counters / rate-limit / metrics</td><td>Python (per-worker, wrong)</td><td>Rust atomics (shared, correct)</td><td class="c"><span class="tag ok">free</span></td></tr>
+  <tr><td>Pub/sub fan-out</td><td>Python (per-worker)</td><td>Rust broadcast (cross-worker)</td><td class="c"><span class="tag ok">free</span></td></tr>
+</table>
+
+<div class="call win">
+  <div class="h"><span class="ic">▸</span>How this reaches Go-level — the two moves together</div>
+  <ol class="steps">
+    <li><b>Shrink the GIL path (this section):</b> push everything except the handler body + DB call into Rust. Now each request holds the GIL only for irreducible Python, and shared state is correct &amp; in-memory. <b>This maximizes per-core throughput</b> and fixes correctness — but CPU still serializes on one GIL.</li>
+    <li><b>Parallelize the remainder (V2 Option A · free-threaded):</b> with the path already this thin, the only thing left under the GIL is the handler + pydantic — and free-threaded Python runs <i>those</i> across all N cores in one address space, reading the same Rust plane with zero IPC. <b>Thin GIL path + true parallelism = Go's model:</b> one process, one shared (Rust) heap, N cores, no Redis.</li>
+  </ol>
+  <p style="margin:10px 0 0;font-size:13px">Until free-threaded is production-ready, <b>pre-fork (V2 Option B/D1) + the shared-memory plane</b> gives you correct shared state and near-linear cores <i>today</i> — and the request path above doesn't change when you flip to free-threaded. You build it once.</p>
+</div>
+
+<!-- DELETE -->
+<section class="sec" id="delete" style="margin-top:46px">
+  <h3 style="font-size:20px">What you get to delete</h3>
+  <p class="sec-intro">The audit's bloat list, re-aimed at this goal. Less code, one request engine, multi-core throughput — and the drop-in promise intact, because the public surface never changes.</p>
+</section>
+<table>
+  <tr><th>Drop</th><th>Why it's safe once V2 lands</th><th class="c">≈ LOC</th></tr>
+  <tr><td><b>Python in-process ASGI dispatcher</b><br><span class="src">_asgi_dispatch_in_process + WS twin</span></td><td>The second engine exists to serve ASGI/uvicorn callers. With pre-fork (B) you serve them through the <b>Rust</b> engine; collapse to one path. <span class="src">Gate behind the Rust-vs-Python diff test first.</span></td><td class="c"><b>~4,200</b></td></tr>
+  <tr><td><b>Single shared async worker</b><br><span class="src">_async_worker.py + crossbeam fallback</span></td><td>Replaced by per-thread loops (A+C); the “one loop” optimization is no longer the architecture.</td><td class="c">~250</td></tr>
+  <tr><td><b><code>src/db_pool.rs</code></b> + <code>tokio-postgres</code> / <code>bb8</code></td><td>Already dead (not imported from Python); never on the request path. Multi-core doesn't need it.</td><td class="c">~321 + crates</td></tr>
+  <tr><td><b><code>http.py</code> + <code>http_client.rs</code> + <code>reqwest</code></b></td><td>Not FastAPI; not part of the perf story. Out-of-scope add-on.</td><td class="c">~2,100 + crates</td></tr>
+  <tr><td><b><code>db.py</code></b> helpers, <b><code>_sentry_compat.py</code></b></td><td>Optional add-ons → move to a contrib package. Sentry also adds per-request GIL-held work (V1) you don't want on the hot path.</td><td class="c">~620</td></tr>
+</table>
+<div class="reclaim">
+  <div class="big">~7,500+</div>
+  <div class="lbl"><b>LOC reclaimable</b> + several heavy Cargo crates (reqwest/rustls/http2, tokio-postgres, bb8). Net effect: fewer lines, one engine, multi-core throughput, drop-in promise intact — only the machinery behind <code>import fastapi_turbo as fastapi</code> gets simpler and parallel.</div>
+</div>
+
+<!-- CHECKLIST -->
+<section class="sec" id="checklist" style="margin-top:46px">
+  <h3 style="font-size:20px">Deep-dive checklist — what to investigate, in order</h3>
+</section>
+<ol class="steps">
+  <li><b>Measure the real gap first.</b> Benchmark the <i>same</i> app under (a) <code>app.run()</code> single process, (b) <code>SO_REUSEPORT</code> ×N processes, (c) a suspending async-DB endpoint vs a sync-DB one. The V1 cards predict the shapes; confirm them. <span class="src">AUDIT.md §8.</span></li>
+  <li><b>Prototype <code>SO_REUSEPORT</code> pre-fork</b> in <code>server.rs</code> behind <code>app.run(workers=N)</code>. Verify linear scaling on the pure-HTTP and async-DB cards. Cheapest multi-core win; de-risks everything else.</li>
+  <li><b>Stand up a free-threaded 3.14t build</b> in CI. Re-measure the old “3.5× slower” no-GIL number on PyO3 0.28 — it predates the current code. Find the orjson-absent JSON penalty.</li>
+  <li><b>Concurrency-audit the Rust globals</b> for real parallel attach: <code>APP_INSTANCE</code> / <code>VALIDATION_HANDLER</code> (router.rs:29-33), the <code>HANDLER_CLASS</code> mutex (poison + pointer-key), per-request <code>OnceLock</code> caches.</li>
+  <li><b>Replace the single loop with per-thread loops</b> (Option C) and re-run the async-DB card — where async SQLAlchemy/psycopg should start scaling.</li>
+  <li><b>Build the Rust-vs-Python engine diff test</b> (AUDIT.md P0) <i>before</i> deleting the in-process dispatcher, so the collapse is provably parity-preserving.</li>
+  <li><b>Confirm C-ext free-threading readiness</b> for your stack: pydantic-core, psycopg(3), redis-py, SQLAlchemy. Where a dep isn't ready, pre-fork (B) is the fallback — B and A coexist, not compete.</li>
+</ol>
+
+<div class="call win">
+  <div class="h"><span class="ic">★</span>One-line strategy</div>
+  <span class="kbd">B now</span> for instant multi-core at zero risk, <span class="kbd">A + C next</span> for the true single-process Go-class model, and use the headroom to <span class="kbd">delete ~7,500 LOC</span> — all while <code>import fastapi_turbo as fastapi</code> stays the only line a user changes.
+</div>
+
+<footer>
+  <b>Sources read for this document:</b> <span class="src">src/router.rs · src/handler_bridge.rs · src/server.rs · python/fastapi_turbo/db.py · python/fastapi_turbo/_async_worker.py · benchmarks.md · AUDIT.md.</span><br>
+  GIL-state annotations reflect CPython semantics + the code paths above. Items tied to numbers (the no-GIL penalty, the uvicorn vs app.run gap) need a benchmark to pin exact figures — see <b>AUDIT.md §8</b>. Self-contained file; no external assets or network calls.
+</footer>
+
+</div>
+</body>
+</html>

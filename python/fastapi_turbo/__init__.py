@@ -1,6 +1,6 @@
 """fastapi-turbo: FastAPI-compatible web framework powered by Rust Axum."""
 
-from fastapi_turbo._fastapi_turbo_core import core_version, rust_hello
+from fastapi_turbo._fastapi_turbo_core import core_version
 from fastapi_turbo.applications import FastAPI
 from fastapi_turbo.background import BackgroundTasks
 from fastapi_turbo.dependencies import Depends, Security
@@ -106,7 +106,6 @@ __all__ = [
     "SecurityScopes",
     "jsonable_encoder",
     "status",
-    "rust_hello",
     "core_version",
     "__version__",
 ]

@@ -3307,42 +3307,6 @@ fn coercion_error_detail_indexed(
     })
 }
 
-/// Build a 422 response for a str→type coercion failure at a specific
-/// list index (loc = [location, field, index]).
-#[allow(dead_code)]
-fn coercion_error_response_indexed(
-    loc: &str,
-    name: &str,
-    index: usize,
-    raw: &str,
-    type_hint: &str,
-) -> Response {
-    let (err_type, msg) = match type_hint {
-        "int" => (
-            "int_parsing",
-            "Input should be a valid integer, unable to parse string as an integer",
-        ),
-        "float" => (
-            "float_parsing",
-            "Input should be a valid number, unable to parse string as a number",
-        ),
-        "bool" => (
-            "bool_parsing",
-            "Input should be a valid boolean, unable to interpret input",
-        ),
-        _ => ("value_error", "Value error"),
-    };
-    let body = serde_json::json!({
-        "detail": [{
-            "type": err_type,
-            "loc": [loc, name, index],
-            "msg": msg,
-            "input": raw,
-        }]
-    });
-    dispatch_validation_error(body)
-}
-
 /// Build a 422 response for a str→type coercion failure (int_parsing, etc.),
 /// in Pydantic-v2 format.
 fn coercion_error_response(loc: &str, name: &str, raw: &str, type_hint: &str) -> Response {
@@ -3370,14 +3334,6 @@ fn coercion_error_response(loc: &str, name: &str, raw: &str, type_hint: &str) ->
         }]
     });
     dispatch_validation_error(body)
-}
-
-/// Convert a Pydantic ValidationError (from body model validation) into a
-/// FastAPI-style 422 response. Prepends `loc_prefix` (e.g. "body") to each
-/// error's location.
-#[allow(dead_code)]
-fn pydantic_error_response(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Response {
-    pydantic_error_response_with_loc_ext(py, err, &[loc_prefix], false)
 }
 
 fn pydantic_error_response_with_body(

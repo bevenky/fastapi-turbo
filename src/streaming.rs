@@ -152,37 +152,6 @@ fn drain_one_sync_chunk(iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
 }
 
 /// Drive a single `__anext__` against an async generator without entering an
-/// event loop. Only safe when the object already has `__anext__` — for true
-/// async generators (`async def gen(): yield x`) this advances the generator
-/// state, and the body task's subsequent `__aiter__()` returns `self`, so we
-/// continue from chunk 2 without duplicating chunk 1. If the coroutine
-/// suspends we return None WITHOUT closing the coro — closing would propagate
-/// GeneratorExit to the async generator, destroying it.
-#[allow(dead_code)] // Unused fast-path — kept for a future TTFB optimization.
-fn drain_one_async_chunk_sync(
-    py: Python<'_>,
-    iter_bound: &Bound<'_, PyAny>,
-) -> Option<bytes::Bytes> {
-    let anext_name = pyo3::intern!(py, "__anext__");
-    if !iter_bound.hasattr(anext_name).unwrap_or(false) {
-        return None;
-    }
-    let coro = iter_bound.call_method0(anext_name).ok()?;
-    match coro.call_method1("send", (py.None(),)) {
-        Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
-            let v = e.value(py);
-            v.getattr("value").ok().map(|val| python_val_to_bytes(&val))
-        }
-        Err(_) => None,
-        Ok(_) => {
-            // Coroutine suspended — do NOT close it (closing propagates
-            // GeneratorExit to the async generator). Just return None and
-            // let iterate_async_generator handle it via run_until_complete.
-            None
-        }
-    }
-}
-
 /// Iterate a synchronous Python iterator, sending each chunk through `tx`.
 fn iterate_sync_generator(
     _py: Python<'_>,
