@@ -92,9 +92,18 @@ adopt + extend.
   unavailable (`applications.py:7210-7232`, `try/except: pass`, str starts `None`).
   Happy-path parity gate can't cover the degraded path → keep the fallback.
   STRATEGY §4 corrected. (Lesson: verify "dead default" claims before cutting.)
-- ⬜ **L3 CachedServeDir → tower-http `ServeDir`** (server.rs:15-237, −210) — next
-  candidate; FIRST add static-file parity coverage (parity_app has none yet), then
-  swap. Output should be identical; the in-memory mtime cache has no spec'd behavior.
+- 🟡 **L3 CachedServeDir → tower-http `ServeDir`** (server.rs:15-237, −210) —
+  static-file parity coverage ADDED (`TestStaticFiles` P120-P124, committed next).
+  **It caught a REAL BUG:** `server.rs:49 mime_for` hardcodes
+  `application/javascript` for `.js`, but Starlette uses Python `mimetypes` →
+  `text/javascript` on py3.12+ (`application/javascript` on 3.10/3.11). A
+  hardcoded Rust table is wrong-by-construction across Python versions — exactly
+  the audit's point. P123 is `xfail` pending the fix. **Proper fix options:**
+  (a) derive static content-type from Python `mimetypes` at mount setup (matches
+  Starlette on ANY version — preferred, on-thesis), or (b) ServeDir+mime_guess
+  (verify mime_guess actually returns `text/javascript` first — it may not, so
+  (a) is safer). Do (a) as the L3 work; it also lets the 222-line CachedServeDir
+  shrink. Behind the green parity gate.
 - 🟡 **L4 collapse 15-variant 422 shaper** (router.rs:3158-3624) — **safety net
   READY** (committed 5e7e887: `TestValidation422`, 10 byte-for-byte 422 cases, all
   green → Rust 422 == upstream). On reading the code, the 15 functions are mostly

@@ -190,6 +190,21 @@ app = FastAPI()
 app.include_router(dep_router)
 app.include_router(include_dep_router, dependencies=[Depends(side_effect_dep)])
 
+# ── StaticFiles mount (parity gate for the L3 ServeDir lever) ─────
+# A small mount so the byte-for-byte gate covers static-file serving
+# (content-type by extension, body bytes). Uses ONLY stock imports.
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+_PARITY_STATIC_DIR = tempfile.mkdtemp(prefix="parity_static_")
+with open(os.path.join(_PARITY_STATIC_DIR, "data.txt"), "w") as _f:
+    _f.write("static data here")
+with open(os.path.join(_PARITY_STATIC_DIR, "style.css"), "w") as _f:
+    _f.write("body { color: red; }")
+with open(os.path.join(_PARITY_STATIC_DIR, "app.js"), "w") as _f:
+    _f.write("console.log('hello');")
+app.mount("/static", StaticFiles(directory=_PARITY_STATIC_DIR), name="static")
+
+
 # ── Health check ─────────────────────────────────────────────────
 
 @app.get("/health")

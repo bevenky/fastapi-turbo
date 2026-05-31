@@ -687,3 +687,64 @@ class TestValidation422:
         fa, rs = hit(client, dual_servers, "post", "/p055-nested-validation",
                      json={"child": {"value": "not_int"}, "label": "x"})
         assert_422_body_match(fa, rs)
+
+
+# ══════════════════════════════════════════════════════════════════
+# STATIC FILES (P120-P124) — corpus expansion (P1)
+#
+# Safety net for the P2 'L3' lever (replace the hand-rolled 222-line
+# CachedServeDir with tower-http's ServeDir): static file serving must
+# stay byte-identical, with the same content-type-by-extension and the
+# same 404 for missing files.
+# ══════════════════════════════════════════════════════════════════
+
+
+def _ct_base(resp):
+    return resp.headers.get("content-type", "").split(";")[0].strip().lower()
+
+
+class TestStaticFiles:
+    def test_P120_static_txt_body(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/static/data.txt")
+        assert_status_match(fa, rs)
+        assert fa.status_code == 200, fa.text
+        assert fa.content == rs.content, (
+            f"static body differs:\n  FA={fa.content!r}\n  RS={rs.content!r}"
+        )
+
+    def test_P121_static_txt_content_type(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/static/data.txt")
+        assert _ct_base(fa) == _ct_base(rs), (
+            f"content-type differs: FA={_ct_base(fa)} RS={_ct_base(rs)}"
+        )
+
+    def test_P122_static_css_content_type(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/static/style.css")
+        assert_status_match(fa, rs)
+        assert fa.content == rs.content
+        assert _ct_base(fa) == _ct_base(rs), (
+            f"css content-type differs: FA={_ct_base(fa)} RS={_ct_base(rs)}"
+        )
+
+    @pytest.mark.xfail(
+        reason="KNOWN BUG (found by this corpus): server.rs::mime_for hardcodes "
+        "'application/javascript' for .js, but Starlette delegates to Python "
+        "mimetypes which returns 'text/javascript' on py3.12+ (and "
+        "'application/javascript' on 3.10/3.11). A hardcoded Rust table can't "
+        "match across Python versions — the real fix is the L3 lever (derive "
+        "content-type from Python mimetypes, or tower-http ServeDir). Tracked in "
+        "TRACKER.md P2/L3.",
+        strict=False,
+    )
+    def test_P123_static_js_content_type(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/static/app.js")
+        assert_status_match(fa, rs)
+        assert fa.content == rs.content
+        assert _ct_base(fa) == _ct_base(rs), (
+            f"js content-type differs: FA={_ct_base(fa)} RS={_ct_base(rs)}"
+        )
+
+    def test_P124_static_missing_404(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/static/does-not-exist.txt")
+        assert_status_match(fa, rs)
+        assert fa.status_code == 404, fa.text
