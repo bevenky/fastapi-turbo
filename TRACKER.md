@@ -59,15 +59,28 @@ Deferred (cosmetic, non-blocking — fold into a later cleanup commit):
 
 ---
 
-## P1 — The differential test gate ⬜  ← prerequisite for all destructive work
+## P1 — The differential test gate 🔄  ← prerequisite for all destructive work
 
-- ⬜ Pick/curate a request corpus (the existing `tests/parity/*` apps are a
-  starting set; dedupe the `_r2/_3/_4` variants)
-- ⬜ Harness: same app, replay corpus through (a) Rust `app.run()` and (b) real
-  FastAPI via uvicorn/ASGITransport; assert **byte-identical** status/headers/body
-- ⬜ Wire into CI as a blocking gate
-- ⬜ Baseline report: quantify current Rust-engine vs Python-engine divergence
-  (this is the first real measurement of it)
+**KEY FINDING: the gate already exists.** `tests/parity/` is exactly the P1 gate —
+`conftest.py::DualServers` runs ONE shared stock-FastAPI app (`parity_app.py`,
+"uses ONLY stock FastAPI imports") under BOTH real FastAPI+uvicorn AND turbo's
+**Rust `app.run()`** on live loopback ports, and `test_parity.py` diffs
+status/headers/JSON/text byte-for-byte. So this isn't build-from-scratch; it's
+adopt + extend.
+
+- ✅ **Verified green on the P0 branch: `107 passed` (0.5s)** — Rust `app.run()`
+  engine is byte-identical to FastAPI+uvicorn across all 107 cases. The Rust path
+  IS driven (not the Python dispatcher). User chose corpus = "reuse now, expand later".
+- ⬜ Reduce flake/perf: it spawns 2 subprocess servers per session; fine locally,
+  needs the loopback-bind guard in CI (already present in conftest).
+- ⬜ EXPAND coverage toward audit-flagged edges before P2 deletions: custom
+  `APIRoute` deep nested `Depends`, multipart byte-parity, WS, streaming/file-range,
+  exception-handler resolution, middleware ordering. (Per "expand later".)
+- ⬜ Wire `tests/parity` as a BLOCKING gate (CI already runs it — `ci.yml:65`
+  `pytest tests/parity -x -q`; make its green a hard merge requirement for P2+).
+- ⬜ Baseline divergence report: the deeper `run_deep_*_parity.py` runners are the
+  real stress corpus — run them on the branch to quantify any Rust-vs-FastAPI gaps
+  before deleting the Python dispatcher.
 
 ---
 
