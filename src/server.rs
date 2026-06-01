@@ -485,11 +485,39 @@ pub fn run_server(
         rt.block_on(async move {
 
             let addr = format!("{host}:{port}");
-            let listener = TcpListener::bind(&addr).await.map_err(|e| {
-                pyo3::exceptions::PyOSError::new_err(format!(
-                    "Failed to bind to {addr}: {e}"
-                ))
-            })?;
+            // Build the listener with SO_REUSEPORT so multiple worker
+            // PROCESSES can share one port (the kernel load-balances accepts)
+            // — the standard way Python servers scale past the single-process
+            // GIL ceiling across cores (à la `gunicorn -w N`). Plain
+            // `TcpListener::bind` for non-IP hosts (preserves DNS resolution).
+            let listener = match addr.parse::<std::net::SocketAddr>() {
+                Ok(sock_addr) => {
+                    let socket = if sock_addr.is_ipv4() {
+                        tokio::net::TcpSocket::new_v4()
+                    } else {
+                        tokio::net::TcpSocket::new_v6()
+                    }
+                    .map_err(|e| {
+                        pyo3::exceptions::PyOSError::new_err(format!("socket(): {e}"))
+                    })?;
+                    let _ = socket.set_reuseaddr(true);
+                    #[cfg(unix)]
+                    let _ = socket.set_reuseport(true);
+                    socket.bind(sock_addr).map_err(|e| {
+                        pyo3::exceptions::PyOSError::new_err(format!(
+                            "Failed to bind to {addr}: {e}"
+                        ))
+                    })?;
+                    socket.listen(1024).map_err(|e| {
+                        pyo3::exceptions::PyOSError::new_err(format!("listen(): {e}"))
+                    })?
+                }
+                Err(_) => TcpListener::bind(&addr).await.map_err(|e| {
+                    pyo3::exceptions::PyOSError::new_err(format!(
+                        "Failed to bind to {addr}: {e}"
+                    ))
+                })?,
+            };
 
             // Publish the bound address so request scopes can populate
             // `scope["server"] = (host, port)` / `.scheme` — FastAPI fills
