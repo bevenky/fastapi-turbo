@@ -19,7 +19,14 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 dependencies = [
-    "pydantic>=2.0",
+    # The pivot: fastapi-turbo WRAPS real FastAPI/Starlette (fastapi_turbo.FastAPI
+    # subclasses fastapi.FastAPI) and accelerates the hot path in Rust. Pin to the
+    # tested API surface — route.dependant / pydantic ModelField internals the Rust
+    # adapter reads are semi-private; the drift sensor
+    # (tests/stress/test_fastapi_internals_drift.py) fails loudly on a breaking bump.
+    "fastapi>=0.136.0,<0.137.0",
+    "starlette>=1.0.0,<1.1.0",
+    "pydantic>=2.0,<3.0",
     # Core runtime deps that are NOT optional:
     # - httpx powers ``fastapi_turbo.testclient.TestClient`` (real-HTTP
     #   client) and the Sentry/ASGI transport fallback path.
