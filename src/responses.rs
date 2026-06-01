@@ -543,6 +543,22 @@ pub fn pyerr_to_response(py: Python<'_>, err: &PyErr) -> Response {
         }
     }
 
+    // worker_timeout: a ``TimeoutError`` (the async worker-loop submit timeout
+    // backing ``FastAPI(worker_timeout=…)``) is an EXPECTED timeout, not an
+    // unhandled server error. The Python dispatcher maps it to a 504 via
+    // ``except asyncio.TimeoutError`` (applications.py) — text/plain
+    // "Gateway Timeout". Mirror that and DO NOT capture it: capturing would
+    // make the in-process door re-raise the timeout out of ``__call__``
+    // instead of returning a non-200 response.
+    if err.is_instance_of::<pyo3::exceptions::PyTimeoutError>(py) {
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            [("content-type", "text/plain; charset=utf-8")],
+            "Gateway Timeout",
+        )
+            .into_response();
+    }
+
     // Unhandled exception → capture onto ``app._captured_server_exceptions``
     // so the in-process oneshot door can re-raise it out of ``__call__``
     // (matching the Python dispatcher's ``_asgi_emit_exception`` which
