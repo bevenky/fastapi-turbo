@@ -6,6 +6,25 @@ use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyNone, PyString};
 use std::path::Path;
 use std::sync::OnceLock;
 
+/// Extract a `(name, value)` header pair from a Python tuple, accepting BOTH the
+/// clone `Response`'s `(str, str)` raw_headers AND real Starlette's `(bytes, bytes)`.
+/// Real Starlette stores `raw_headers: list[tuple[bytes, bytes]]`; without the bytes
+/// arm a plain `extract::<(String, String)>()` SILENTLY returns Err and the header
+/// (e.g. a Set-Cookie) vanishes with no error. Required before re-pointing the door
+/// to real Starlette responses.
+pub(crate) fn extract_header_pair(item: &Bound<'_, PyAny>) -> Option<(String, String)> {
+    if let Ok((k, v)) = item.extract::<(String, String)>() {
+        return Some((k, v));
+    }
+    if let Ok((k, v)) = item.extract::<(Vec<u8>, Vec<u8>)>() {
+        return Some((
+            String::from_utf8_lossy(&k).into_owned(),
+            String::from_utf8_lossy(&v).into_owned(),
+        ));
+    }
+    None
+}
+
 // ── Cached Python-side references — looked up once, reused forever ──────
 //
 // These OnceLocks store GIL-free pointers we can reacquire cheaply. Each
@@ -350,7 +369,7 @@ fn response_object_to_response(
     if let Ok(raw_attr) = obj.getattr("raw_headers") {
         if let Ok(list) = raw_attr.cast::<PyList>() {
             for item in list.iter() {
-                if let Ok(tup) = item.extract::<(String, String)>() {
+                if let Some(tup) = extract_header_pair(&item) {
                     raw_header_keys.insert(tup.0.to_ascii_lowercase());
                 }
             }
@@ -378,7 +397,7 @@ fn response_object_to_response(
         } else if let Ok(items_list) = hdr_obj.call_method0("items") {
             if let Ok(list) = items_list.cast::<pyo3::types::PyList>() {
                 for item in list.iter() {
-                    if let Ok((key, val)) = item.extract::<(String, String)>() {
+                    if let Some((key, val)) = extract_header_pair(&item) {
                         if raw_header_keys.contains(&key.to_ascii_lowercase()) {
                             continue;
                         }
@@ -398,7 +417,7 @@ fn response_object_to_response(
         if let Ok(list) = raw_attr.cast::<PyList>() {
             if !list.is_empty() {
                 for item in list.iter() {
-                    if let Ok(tup) = item.extract::<(String, String)>() {
+                    if let Some(tup) = extract_header_pair(&item) {
                         if let (Ok(hname), Ok(hval)) =
                             (HeaderName::try_from(tup.0), HeaderValue::from_str(&tup.1))
                         {
@@ -978,7 +997,7 @@ fn extract_response_headers(obj: &Bound<'_, PyAny>) -> Vec<(String, String)> {
         } else if let Ok(items_list) = hdr.call_method0("items") {
             if let Ok(list) = items_list.cast::<PyList>() {
                 for item in list.iter() {
-                    if let Ok((ks, vs)) = item.extract::<(String, String)>() {
+                    if let Some((ks, vs)) = extract_header_pair(&item) {
                         out.push((ks, vs));
                     }
                 }
@@ -988,7 +1007,7 @@ fn extract_response_headers(obj: &Bound<'_, PyAny>) -> Vec<(String, String)> {
     if let Ok(raw) = obj.getattr("raw_headers") {
         if let Ok(list) = raw.cast::<PyList>() {
             for item in list.iter() {
-                if let Ok((k, v)) = item.extract::<(String, String)>() {
+                if let Some((k, v)) = extract_header_pair(&item) {
                     out.push((k, v));
                 }
             }

@@ -453,7 +453,7 @@ fn apply_injected_response(
         if let Ok(raw) = obj.getattr("raw_headers") {
             if let Ok(list) = raw.cast::<pyo3::types::PyList>() {
                 for item in list.iter() {
-                    if let Ok((ks, _)) = item.extract::<(String, String)>() {
+                    if let Some((ks, _)) = crate::responses::extract_header_pair(&item) {
                         raw_keys.insert(ks.to_ascii_lowercase());
                     }
                 }
@@ -484,7 +484,7 @@ fn apply_injected_response(
         if let Ok(raw) = obj.getattr("raw_headers") {
             if let Ok(list) = raw.cast::<pyo3::types::PyList>() {
                 for item in list.iter() {
-                    if let Ok((ks, vs)) = item.extract::<(String, String)>() {
+                    if let Some((ks, vs)) = crate::responses::extract_header_pair(&item) {
                         if let (Ok(hn), Ok(hv)) = (
                             HeaderName::try_from(ks.as_str()),
                             HeaderValue::from_str(&vs),
