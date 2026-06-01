@@ -15,23 +15,29 @@ carries ``dep_input_names=[(call_arg, source_key)]`` wiring its inputs from the
 ``resolved`` dict, and ``dep_callable_id`` (when ``use_cache``) so the engine
 dedups shared deps.
 
-Coverage maps the common hot-path surface onto the Rust ``kind`` vocabulary the
-door already implements:
+Coverage maps the hot-path surface onto the Rust ``kind`` vocabulary the door
+implements:
 
 * scalar path/query/header/cookie params (constraints included — the validator is
   real FastAPI's own ``ModelField._type_adapter``);
-* a single Pydantic/scalar JSON body;
-* ``Form`` / ``File`` multipart & urlencoded bodies (``form`` / ``file`` kinds);
+* a single Pydantic/scalar JSON body, ``Body(embed=True)``, and multiple JSON
+  bodies (validated against real FastAPI's combined ``route.body_field`` then
+  scattered to handler params by getter deps);
+* ``Form`` / ``File`` multipart & urlencoded bodies, incl. ``Form`` model-expansion;
+* query/header/cookie parameter-models (``Annotated[Model, Query()]``) — expanded
+  per-field with a synthetic builder dependency;
 * special params — ``Request``/``HTTPConnection`` → ``inject_request``,
   ``Response`` → ``inject_response``, ``BackgroundTasks`` →
   ``inject_background_tasks``, ``SecurityScopes`` → ``inject_security_scopes``;
 * ``response_model`` filtering — :func:`build_handler` wraps the endpoint so the
-  result is run through real FastAPI's own ``ModelField.validate``/``.serialize``.
-* (sync or async) NON-generator dependencies whose own params are scalars.
+  result is run through real FastAPI's own ``ModelField.validate``/``.serialize``;
+* dependencies — sync, async, nested, cached, and sync ``yield`` (entered on the
+  door with teardown after the response); deps that themselves take a Request /
+  Response / BackgroundTasks / SecurityScopes (incl. security schemes).
 
-Anything outside that — ``yield`` dependencies, deps that take a body or a special
-param, ``Form`` model-expansion, multiple/embedded JSON bodies — raises
-:class:`Undelegable`, and the caller delegates to real FastAPI.
+The remaining delegation to real FastAPI is the narrow tail that needs the
+event-loop exit stack: **async-generator** ``yield`` dependencies. Those raise
+:class:`Undelegable` and the caller falls back to real FastAPI.
 ``kind`` strings are the SHORT form the Rust extractor matches.
 """
 
