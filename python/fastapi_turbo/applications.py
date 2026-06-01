@@ -6834,7 +6834,7 @@ class FastAPI:
 
     def run(self, host: str = "127.0.0.1", port: int = 8000, **kwargs: Any) -> None:
         """Collect routes, hand them to the Rust core, and start serving."""
-        from fastapi_turbo._fastapi_turbo_core import ParamInfo, RouteInfo, run_server
+        from fastapi_turbo._fastapi_turbo_core import run_server
 
         # Soft DoS-footgun warning: a public-bind (0.0.0.0 / all-zeros
         # IPv6) with no body-size cap means a single client can stream
@@ -6875,6 +6875,18 @@ class FastAPI:
             self._run_startup_handlers()
             if self._collect_shutdown_handlers():
                 atexit.register(self._run_shutdown_handlers)
+
+        run_server(*self._build_server_args(host, port))
+
+    def _build_server_args(self, host: str, port: int) -> tuple:
+        """Build the full positional argument tuple for ``run_server`` and
+        ``register_app_router`` from the app's routes + config, so BOTH
+        request doors (the ``app.run()`` socket server and the in-process
+        ASGI ``oneshot`` door) drive a byte-identical router. Registers the
+        dynamic ``/openapi.json`` route and renders docs HTML, but runs NO
+        lifespan/startup handlers — those stay in ``run()`` / the ASGI
+        lifespan protocol."""
+        from fastapi_turbo._fastapi_turbo_core import ParamInfo, RouteInfo
 
         # Register ``/openapi.json`` as a Python handler BEFORE route
         # collection so ``run_server`` hands it to Rust. The handler
@@ -7300,7 +7312,7 @@ class FastAPI:
                 )
             _static_content_types = list(_ct_by_ext.items())
 
-        run_server(
+        return (
             route_infos,
             host,
             port,

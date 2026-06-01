@@ -25,12 +25,7 @@ import fastapi_turbo  # noqa: F401  (installs the `fastapi`/`starlette` compat s
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from fastapi_turbo._fastapi_turbo_core import (
-    ParamInfo,
-    RouteInfo,
-    process_request,
-    register_app_router,
-)
+from fastapi_turbo._fastapi_turbo_core import process_request, register_app_router
 
 
 class Item(BaseModel):
@@ -38,70 +33,11 @@ class Item(BaseModel):
     qty: int = 1
 
 
-def _build_route_infos(app: FastAPI) -> list:
-    """Mirror ``FastAPI.run()``'s RouteInfo construction (applications.py)."""
-    route_dicts = [r for r in app._collect_all_routes() if not r.get("_from_mount")]
-    route_infos = []
-    for rd in route_dicts:
-        param_infos = []
-        for p in rd["params"]:
-            param_infos.append(
-                ParamInfo(
-                    name=p["name"],
-                    kind=p["kind"],
-                    type_hint=p["type_hint"],
-                    required=p["required"],
-                    default_value=p["default_value"],
-                    has_default=p.get("has_default", False),
-                    model_class=p.get("model_class"),
-                    alias=p.get("alias"),
-                    dep_callable=p.get("dep_callable"),
-                    dep_callable_id=p.get("dep_callable_id"),
-                    is_async_dep=p.get("is_async_dep", False),
-                    is_generator_dep=p.get("is_generator_dep", False),
-                    dep_input_names=p.get("dep_input_map", []),
-                    is_handler_param=p.get("_is_handler_param", True),
-                    scalar_validator=p.get("scalar_validator"),
-                )
-            )
-        route_infos.append(
-            RouteInfo(
-                path=rd["path"],
-                methods=rd["methods"],
-                handler=rd["endpoint"],
-                is_async=rd["is_async"],
-                handler_name=rd["handler_name"],
-                params=param_infos,
-                is_websocket=rd.get("is_websocket", False),
-            )
-        )
-    return route_infos
-
-
 def _register(app: FastAPI) -> None:
-    """Assemble + store the app's router for the in-process door."""
-    register_app_router(
-        id(app),
-        _build_route_infos(app),
-        "127.0.0.1",
-        0,
-        app._build_middleware_config(),  # middlewares
-        None,  # openapi_json
-        None,  # docs_url
-        None,  # redoc_url
-        None,  # openapi_url
-        [],    # static_mounts
-        None,  # root_path
-        True,  # redirect_slashes
-        None,  # max_request_size
-        None,  # not_found_handler
-        app,   # app
-        None,  # validation_handler
-        None,  # swagger_ui_oauth2_redirect_url
-        None,  # swagger_ui_html
-        None,  # redoc_html
-        [],    # static_content_types
-    )
+    """Assemble + store the app's router for the in-process door, using the
+    SAME full-fidelity arg-building that ``app.run()`` uses (``_build_server_args``)
+    so both doors drive a byte-identical router."""
+    register_app_router(id(app), *app._build_server_args("127.0.0.1", 0))
 
 
 def _call(app, method, path, query="", headers=None, body=b""):
@@ -202,6 +138,18 @@ def test_unknown_path_returns_404():
     _register(app)
     status, _headers, _body = _call(app, "GET", "/does-not-exist")
     assert status == 404
+
+
+def test_openapi_json_through_door():
+    # _build_server_args registers the dynamic /openapi.json route, so the
+    # in-process door must serve it too (full-fidelity registration).
+    app = _make_app()
+    _register(app)
+    status, headers, body = _call(app, "GET", "/openapi.json")
+    assert status == 200
+    assert "application/json" in headers["content-type"]
+    schema = json.loads(body)
+    assert "openapi" in schema and "/items" in schema["paths"]
 
 
 def test_oneshot_selftest_mechanism():
