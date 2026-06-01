@@ -124,16 +124,14 @@ instead of a bare assert. Revisit with a real traceback if it recurs.
   existing `DualServers` fixture (no fixture change needed — ws:// URLs use the
   same ports). P150 echo, P151 json, P152 scope, P153 close-code+reason, P154
   dep reject/pass = **5 passed**. Full gate now **150 passed**.
-- 🐞 **NEW divergence found by P155 (xfail-strict): WS close-before-accept.**
-  A handler doing `await ws.close(code=...)` BEFORE `accept()` → Starlette refuses
-  the handshake at HTTP layer (client: **HTTP 403 / InvalidStatus**); turbo
-  completes the upgrade then sends a WS close (client: **ConnectionClosedError
-  code 4401**). Verified directly FA vs turbo. Same class as the 422-mw bug (Rust
-  reject path diverges). NORMATIVE reject (`raise WebSocketException` before
-  accept) already matches (P154 green). FIX (hot-path Rust, websocket.rs
-  handle_ws_upgrade): when the handler closes before accept, reject the upgrade
-  with 403 instead of completing it. Lower urgency than 422-mw (close-before-accept
-  is the non-normative reject pattern), but real — pin kept as P155 xfail.
+- ✅ **FIXED (commit 1aaf5c1): WS close-before-accept (P155).** A handler doing
+  `await ws.close()` BEFORE `accept()` now refuses the handshake (HTTP 403) like
+  Starlette, instead of completing the upgrade then sending WS close 4401. Fix was
+  Python-side (`websockets.py close()` routes a pre-accept close through the same
+  `_reject(403)` handshake-refuse path the Rust side already maps via
+  `AcceptAction::Reject`) — no Rust change needed. Verified FA and turbo now both
+  return {InvalidStatus, status:403}; P155 flipped xfail→real assert. WS gate 6/6,
+  test_websocket.py 22/22, full parity gate 151 passed.
 
 ### NOTE on WS + GIL (answered for user): WS is NOT GIL-blocked on I/O wait.
 Each WS connection runs on a DEDICATED OS thread via `spawn_blocking` with its own
