@@ -1162,14 +1162,28 @@ class TestClient:
         # in_process=False: keep the sync path — the Rust server runs
         # handlers on ``_async_worker`` too, so lifespan and handlers
         # stay on the same (worker) loop.
+        # When the oneshot door owns the HTTP path for this app, async
+        # handlers run on the ``_async_worker`` loop (the Rust engine
+        # routes suspending coroutines through ``submit_to_async_worker``
+        # — exactly as under ``app.run()``), NOT on the TestClient's
+        # ``self._loop`` that ASGITransport requests use under the Python
+        # dispatcher. So lifespan must run on the worker loop via the
+        # sync ``_run_*`` helpers; otherwise an asyncio primitive created
+        # at startup (asyncpg pool, ``asyncio.Lock``/``Event``) binds to
+        # ``self._loop`` and the first request that awaits it hits "got
+        # Future attached to a different loop". Issue #1.
+        _door_owns_http = (
+            getattr(self.app, "_oneshot_door_enabled", lambda: False)()
+            and getattr(self.app, "_oneshot_door_can_handle", lambda _s: False)({})
+        )
         if self._in_process and (_has_lifespan or _has_startup_handlers):
             self._ensure_started()
             shim_run = getattr(self._client, "_run", None)
-            if shim_run is None:
-                # Shouldn't happen for the in_process path, but fall
-                # through to the sync helpers if the shim somehow
-                # wasn't installed (e.g. ``hasattr(app, 'run')``
-                # mismatch).
+            if shim_run is None or _door_owns_http:
+                # Either the shim wasn't installed (shouldn't happen for
+                # the in_process path), or the oneshot door owns HTTP —
+                # in both cases drive lifespan on the worker loop via the
+                # sync helpers (which submit through ``_async_worker``).
                 self.app._run_lifespan_startup()
                 if _has_startup_handlers:
                     self.app._run_startup_handlers()
@@ -1215,13 +1229,24 @@ class TestClient:
         # by R39: a lifespan ``__aexit__`` raising RuntimeError was
         # silently dropped, breaking parity with upstream).
         teardown_exc: BaseException | None = None
+        # Mirror __enter__: when the oneshot door owns the HTTP path,
+        # lifespan was entered on the ``_async_worker`` loop, so shutdown
+        # (and any ctx-manager / yield-dep teardown the lifespan CMs
+        # hold) must run on that same loop via the sync helpers. Issue #1.
+        _door_owns_http = (
+            getattr(self.app, "_oneshot_door_enabled", lambda: False)()
+            and getattr(self.app, "_oneshot_door_can_handle", lambda _s: False)({})
+        )
         try:
             stop_chain = getattr(self.app, "_stop_lifespan_mw_chain", None)
             if stop_chain is not None and stop_chain():
                 pass
-            elif self._in_process and self._client is not None and getattr(
-                self._client, "_run", None
-            ) is not None:
+            elif (
+                not _door_owns_http
+                and self._in_process
+                and self._client is not None
+                and getattr(self._client, "_run", None) is not None
+            ):
                 # Mirror __enter__: drive shutdown on the shim's loop
                 # so ctx-manager teardown sees the same loop the
                 # resources were created on (issue #1).

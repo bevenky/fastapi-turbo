@@ -543,7 +543,22 @@ pub fn pyerr_to_response(py: Python<'_>, err: &PyErr) -> Response {
         }
     }
 
-    // Unhandled exception → print traceback to stderr and return plain-text 500.
+    // Unhandled exception → capture onto ``app._captured_server_exceptions``
+    // so the in-process oneshot door can re-raise it out of ``__call__``
+    // (matching the Python dispatcher's ``_asgi_emit_exception`` which
+    // ALWAYS re-raises a non-HTTP unhandled exception after sending the
+    // 500). Without this the door silently masks a real handler failure
+    // as a successful 500, breaking ``httpx.ASGITransport(raise_app_
+    // exceptions=True)`` / ``TestClient(raise_server_exceptions=True)``.
+    // Same mechanism the streaming path already uses (streaming.rs).
+    if let Ok(app_lock) = crate::router::APP_INSTANCE.read() {
+        if let Some(ref app_obj) = *app_lock {
+            if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+                let _ = lst.call_method1(py, "append", (err.value(py),));
+            }
+        }
+    }
+    // Print traceback to stderr and return plain-text 500.
     err.print(py);
     (
         StatusCode::INTERNAL_SERVER_ERROR,

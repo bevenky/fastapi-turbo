@@ -2502,20 +2502,27 @@ fn extract_params_to_pydict_full<'py>(
                                     .and_then(|v| v.call_method1(py, "validate_json", (py_bytes,)))
                             }
                         } else {
-                            // Non-JSON Content-Type — pass raw string to
-                            // validate_python so Pydantic errors with
-                            // model_attributes_type (FA parity).
-                            let raw_str = std::str::from_utf8(body_bytes).unwrap_or("");
-                            let py_str = pyo3::types::PyString::new(py, raw_str).into_any();
+                            // Non-JSON Content-Type. For a raw-bytes body param
+                            // pass the bytes OBJECT — lossy UTF-8 decoding would
+                            // corrupt a binary payload (a 0xFF byte makes
+                            // from_utf8 fail → unwrap_or("") → handler sees 0
+                            // bytes). For other types pass the decoded string so
+                            // Pydantic errors with model_attributes_type (FA parity).
+                            let py_input = if param.type_hint == "bytes" {
+                                pyo3::types::PyBytes::new(py, body_bytes).into_any()
+                            } else {
+                                let raw_str = std::str::from_utf8(body_bytes).unwrap_or("");
+                                pyo3::types::PyString::new(py, raw_str).into_any()
+                            };
                             if let Some(ref validator) = param.cached_validator {
-                                validator.call_method1(py, "validate_python", (py_str,))
+                                validator.call_method1(py, "validate_python", (py_input,))
                             } else {
                                 param
                                     .model_class
                                     .as_ref()
                                     .unwrap()
                                     .getattr(py, "__pydantic_validator__")
-                                    .and_then(|v| v.call_method1(py, "validate_python", (py_str,)))
+                                    .and_then(|v| v.call_method1(py, "validate_python", (py_input,)))
                             }
                         };
                         match result {

@@ -5145,6 +5145,32 @@ class FastAPI:
             # (via ``super().get_route_handler()``).
             if _has_overridden_get_route_handler(route):
                 custom_ep = _build_custom_route_handler_endpoint(route, self)
+                # Wrap the route-class endpoint in the SAME
+                # ``@app.middleware('http')`` chain the regular compile
+                # path applies at ``_wrap_with_http_middlewares``. Without
+                # this, headers added by ``app.middleware('http')`` (e.g.
+                # ``X-App-Mw``) are dropped on routes registered through a
+                # custom ``route_class`` — the oneshot door would bypass
+                # the app HTTP middleware entirely. Mirrors the Python
+                # dispatcher's ``_asgi_dispatch_in_process`` handling of the
+                # same case. The ``_wrap_with_http_middlewares`` helper
+                # speaks the Rust-synthesised-kwargs calling convention, so
+                # it can't wrap this ``(request) -> response`` adapter; we
+                # compose the ``(request, call_next)`` chain inline instead
+                # (declaration order, last-decorated outermost — same as the
+                # dispatcher).
+                http_mws_for_custom = [
+                    m
+                    for m in (getattr(self, "_http_middlewares", None) or [])
+                    if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
+                ]
+                for _mw in http_mws_for_custom:
+                    _inner_ep = custom_ep
+
+                    async def _wrapped_custom(request, *, _mw=_mw, _inner=_inner_ep):
+                        return await _mw(request, _inner)
+
+                    custom_ep = _wrapped_custom
                 try:
                     custom_ep._fastapi_turbo_route_obj = route  # type: ignore[attr-defined]
                 except (AttributeError, TypeError):
@@ -7364,7 +7390,85 @@ class FastAPI:
             )
             if not is_static:
                 return False
+        # Starlette ``Mount`` routes declared via ``FastAPI(routes=[...])``
+        # / ``APIRouter(routes=[...])`` live in ``router.routes`` (NOT
+        # ``self._mounts`` — that list only tracks ``app.mount(...)``).
+        # They host an arbitrary ASGI sub-app whose own router matches the
+        # PREFIX-STRIPPED path; the Python dispatcher recurses into the
+        # sub-app with ``scope['path']`` stripped of the mount prefix
+        # (``_asgi_dispatch_in_process`` Mount-dispatch block). The
+        # assembled axum router has no such prefix-stripping recursion —
+        # it would serve the mounted endpoint the FULL path (R53:
+        # ``nested:/sub/hi`` instead of ``nested:/hi``), and WebSocketRoute
+        # children aren't hosted at all. Decline so the dispatcher handles
+        # the mount.
+        router = getattr(self, "router", None)
+        for _route in getattr(router, "routes", None) or ():
+            if _looks_like_starlette_mount(_route):
+                return False
+        # ``request.is_disconnected()`` is only meaningful while the
+        # response is actively streaming and a LIVE ASGI ``receive``
+        # channel can deliver ``http.disconnect``. The oneshot door
+        # buffers the entire response in ``process_request`` (the body
+        # is drained up-front and the Rust-built ``Request`` has no
+        # Python receive channel), so a handler polling
+        # ``is_disconnected`` always observes ``False`` and an
+        # SSE/long-poll loop never exits on client drop (R19). This is
+        # irreducible for a buffered door — decline so the streaming
+        # dispatcher with its live receive channel handles it. Cached
+        # (routes are fixed after startup); cheapest signal is a static
+        # scan of each endpoint's source for ``is_disconnected``.
+        _dc = getattr(self, "_oneshot_door_disconnect_decline", None)
+        if _dc is None:
+            _dc = self._oneshot_scan_endpoints_for_disconnect()
+            self._oneshot_door_disconnect_decline = _dc
+        if _dc:
+            return False
         return True
+
+    def _oneshot_scan_endpoints_for_disconnect(self) -> bool:
+        """True when any route endpoint needs the live ASGI path the buffered
+        oneshot door cannot provide, so the whole app declines to the Python
+        dispatcher. Two signals:
+
+          * ``is_disconnected`` in the source — the handler peeks the live
+            receive channel for client drop (the buffered door has none).
+          * the endpoint STREAMS its response — a sync/async generator
+            endpoint (NDJSON auto-wrap), or source that constructs a
+            ``StreamingResponse`` / ``FileResponse`` / ``EventSourceResponse``.
+            The door buffers the whole body (capped at 32MiB) and cannot
+            deliver incrementally or cancel on client drop, so a slow/infinite
+            stream would hang or truncate. Until the response chunk-pump
+            lands, such routes belong on the dispatcher.
+
+        Static, AST-free signature + substring scan; best-effort (returns
+        False on any inspection failure — the door then handles normally).
+        Result is cached after startup (routes are fixed)."""
+        import inspect as _inspect
+
+        _STREAM_MARKERS = (
+            "is_disconnected",
+            "StreamingResponse",
+            "FileResponse",
+            "EventSourceResponse",
+        )
+        router = getattr(self, "router", None)
+        for route in getattr(router, "routes", None) or ():
+            endpoint = getattr(route, "endpoint", None)
+            if endpoint is None:
+                continue
+            # Generator endpoints stream (FastAPI auto-wraps them as NDJSON).
+            if _inspect.isasyncgenfunction(endpoint) or _inspect.isgeneratorfunction(
+                endpoint
+            ):
+                return True
+            try:
+                src = _inspect.getsource(endpoint)
+            except (OSError, TypeError):
+                continue
+            if any(marker in src for marker in _STREAM_MARKERS):
+                return True
+        return False
 
     def _ensure_oneshot_registered(self, scope: dict) -> None:
         """Register the assembled router for this app once, using the same
@@ -7379,6 +7483,65 @@ class FastAPI:
         register_app_router(id(self), *self._build_server_args(host, port))
         self._oneshot_registered = True
 
+    def _oneshot_mutate_outer_scope(self, scope: dict) -> None:
+        """Populate ``scope['route']`` / ``scope['path_params']`` /
+        ``scope['endpoint']`` on the OUTER ASGI scope, mirroring the
+        Python dispatcher (``_asgi_dispatch_in_process``) and Starlette's
+        in-place router mutation. Outer ASGI middleware that wraps the
+        whole app (legacy ``SentryAsgiMiddleware(app)``, OTel, rate-limit)
+        reads ``scope['route'].path`` at response-start time to template
+        the transaction name — without this it records the concrete path
+        (``/message/123456``) instead of the route shape
+        (``/message/{message_id}``). R25 regression: the oneshot door
+        dispatches entirely in Rust and never touched the outer scope.
+
+        Best-effort: a lightweight regex match reusing the per-route
+        ``_fastapi_turbo_asgi_regex`` cache the dispatcher already
+        populates. Any failure is swallowed — the scope decoration is a
+        compatibility nicety, never load-bearing for the response."""
+        import re as _re
+
+        try:
+            method = scope.get("method", "GET").upper()
+            path = scope.get("path", "/")
+            router = getattr(self, "router", None)
+            for route in getattr(router, "routes", None) or ():
+                r_path = getattr(route, "path", None)
+                if not r_path:
+                    continue
+                regex = getattr(route, "_fastapi_turbo_asgi_regex", None)
+                if regex is None:
+                    pattern = "^"
+                    idx = 0
+                    for m in _re.finditer(r"\{([^{}:]+)(?::([^{}]+))?\}", r_path):
+                        pattern += _re.escape(r_path[idx:m.start()])
+                        pname = m.group(1)
+                        if m.group(2) == "path":
+                            pattern += f"(?P<{pname}>.+)"
+                        else:
+                            pattern += f"(?P<{pname}>[^/]+)"
+                        idx = m.end()
+                    pattern += _re.escape(r_path[idx:]) + "$"
+                    regex = _re.compile(pattern)
+                    try:
+                        route._fastapi_turbo_asgi_regex = regex  # type: ignore[attr-defined]
+                    except (AttributeError, TypeError):
+                        pass
+                match = regex.match(path)
+                if match is None:
+                    continue
+                r_methods = {
+                    m.upper() for m in (getattr(route, "methods", None) or ())
+                }
+                if method not in r_methods:
+                    continue
+                scope["route"] = route
+                scope["path_params"] = match.groupdict()
+                scope["endpoint"] = getattr(route, "endpoint", None)
+                return
+        except Exception as _exc:  # noqa: BLE001
+            _log.debug("oneshot outer-scope decoration skipped: %r", _exc)
+
     async def _asgi_oneshot_http(self, scope: dict, receive: Callable, send: Callable) -> bool:
         """Drive one HTTP request through the Rust engine in-process via
         ``process_request`` and emit the ASGI response. Returns True when
@@ -7389,6 +7552,10 @@ class FastAPI:
         from fastapi_turbo._fastapi_turbo_core import process_request
 
         self._ensure_oneshot_registered(scope)
+        # Decorate the outer scope with the matched route shape so
+        # app-wrapping ASGI middleware (Sentry/OTel) sees it — same as
+        # the dispatcher / Starlette's router. R25 parity.
+        self._oneshot_mutate_outer_scope(scope)
 
         # Drain the request body from the ASGI ``receive`` channel.
         body = b""
@@ -7424,14 +7591,49 @@ class FastAPI:
             client_port,
         )
 
+        # Bodiless statuses (1xx, 204 No Content, 304 Not Modified) MUST
+        # NOT carry a Content-Length per RFC 7230 §3.3.2. The assembled
+        # axum router emits ``content-length: 0`` for a bodiless 204
+        # (hyper would strip it at wire-serialize time, but the oneshot
+        # door bypasses hyper and returns headers verbatim). The Python
+        # dispatcher + upstream Starlette omit it, so strip it here to
+        # keep parity. ``GET /no-content`` returned ``content-length: 0``
+        # via the door vs nothing upstream (R55 204-parity finding).
+        out_headers = [[bytes(k), bytes(v)] for k, v in resp_headers]
+        if status < 200 or status in (204, 304):
+            out_headers = [
+                (k, v)
+                for k, v in out_headers
+                if k.lower() != b"content-length"
+            ]
         await send(
             {
                 "type": "http.response.start",
                 "status": status,
-                "headers": [[bytes(k), bytes(v)] for k, v in resp_headers],
+                "headers": out_headers,
             }
         )
         await send({"type": "http.response.body", "body": bytes(resp_body)})
+
+        # Re-raise an unhandled server exception AFTER the 500 response is
+        # sent, exactly like the Python dispatcher's ``_asgi_emit_exception``.
+        # The Rust dispatch core renders the 500 (running any catch-all
+        # ``@app.exception_handler(Exception)``) and records the original
+        # exception on ``_captured_server_exceptions`` — via the compiled
+        # handler wrapper for the with-handler case, and via
+        # ``pyerr_to_response`` (responses.rs) for the no-handler case.
+        # Re-raising it here propagates it out of ``__call__`` so
+        # ``httpx.ASGITransport(raise_app_exceptions=True)`` /
+        # ``TestClient(raise_server_exceptions=True)`` surface the original
+        # exception; under ``raise_app_exceptions=False`` httpx swallows the
+        # raise and the rendered 500 response is what the caller observes.
+        # Drain (pop+clear) so the list is empty for the next request and
+        # TestClient's ``_check_raised`` doesn't double-raise.
+        captured = getattr(self, "_captured_server_exceptions", None)
+        if captured:
+            exc = captured.pop(0)
+            captured.clear()
+            raise exc
         return True
 
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
@@ -7638,22 +7840,48 @@ class FastAPI:
         # the worker thread's loop instead — first request from a
         # handler awaiting that resource then hits "Future attached to
         # a different loop". Issue #1.
+        # When the oneshot door is the active HTTP path for this app,
+        # async handlers run on the ``_async_worker`` loop (the Rust
+        # engine routes a suspending coroutine through
+        # ``submit_to_async_worker`` — exactly as under ``app.run()``).
+        # So lifespan MUST also run on the worker loop, or an asyncio
+        # primitive created at startup (asyncpg pool, ``redis.asyncio``
+        # client, ``asyncio.Lock``/``Event``) binds to the caller's
+        # loop and the first request that awaits it hits "got Future
+        # attached to a different loop". The sync ``_run_*`` helpers
+        # submit through ``_async_worker.submit`` (see
+        # ``_run_lifespan_startup``), giving the worker-loop affinity
+        # the door needs — this mirrors ``app.run()``'s startup path
+        # rather than the async-dispatcher's caller-loop path. Issue #1.
+        _door_owns_http = self._oneshot_door_enabled() and self._oneshot_door_can_handle(
+            scope
+        )
         while True:
             message = await receive()
             if message["type"] == "lifespan.startup":
                 try:
-                    if self._collect_lifespans():
-                        await self._async_run_lifespan_startup()
-                    await self._async_run_startup_handlers()
+                    if _door_owns_http:
+                        if self._collect_lifespans():
+                            self._run_lifespan_startup()
+                        self._run_startup_handlers()
+                    else:
+                        if self._collect_lifespans():
+                            await self._async_run_lifespan_startup()
+                        await self._async_run_startup_handlers()
                     await send({"type": "lifespan.startup.complete"})
                 except Exception as exc:
                     await send({"type": "lifespan.startup.failed", "message": str(exc)})
                     return
             elif message["type"] == "lifespan.shutdown":
                 try:
-                    if getattr(self, "_lifespan_cms", None):
-                        await self._async_run_lifespan_shutdown()
-                    await self._async_run_shutdown_handlers()
+                    if _door_owns_http:
+                        if getattr(self, "_lifespan_cms", None):
+                            self._run_lifespan_shutdown()
+                        self._run_shutdown_handlers()
+                    else:
+                        if getattr(self, "_lifespan_cms", None):
+                            await self._async_run_lifespan_shutdown()
+                        await self._async_run_shutdown_handlers()
                 except Exception as exc:
                     # Surface the failure to the ASGI server (matches
                     # Starlette / upstream FastAPI). Earlier impl
