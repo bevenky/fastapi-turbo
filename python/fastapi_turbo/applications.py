@@ -10,6 +10,13 @@ import logging
 import os
 from typing import Any, Callable, Sequence
 
+# Real pip FastAPI for the "accelerate real FastAPI" pivot. This module is imported
+# by fastapi_turbo/__init__.py BEFORE the compat shim installs (see __init__.py),
+# so `import fastapi` here resolves to the REAL package — captured before any
+# sys.modules shadowing. fastapi_turbo.FastAPI subclasses it; later pivot steps
+# delete the clone overrides so the real base's routing/openapi/deps show through.
+import fastapi as _real_fastapi
+
 # Module logger for the silently-swallowed paths. ``except Exception:
 # pass`` used to be the default; where the swallow is genuinely
 # defensive (optional integrations, best-effort introspection) we now
@@ -2933,8 +2940,15 @@ async def _dispatch_to_subapp_route(subapp, request):
 
 
 
-class FastAPI:
-    """Drop-in replacement for ``fastapi.FastAPI``, backed by Rust Axum."""
+class FastAPI(_real_fastapi.FastAPI):
+    """Drop-in replacement for ``fastapi.FastAPI``, backed by Rust Axum.
+
+    Pivot: now SUBCLASSES real ``fastapi.FastAPI`` (which is a Starlette subclass).
+    During the staged migration the clone's own attributes/methods (set in
+    ``__init__`` and defined below) still shadow the real base; later steps delete
+    those overrides so real FastAPI's routing/OpenAPI/dependency machinery and
+    Starlette's ASGI app (via ``super().__call__()``) take over.
+    """
 
     def __init__(
         self,
@@ -2980,6 +2994,21 @@ class FastAPI:
         routes: Sequence | None = None,
         **kwargs: Any,
     ):
+        # Initialize the real FastAPI base first (its routing/openapi/middleware/
+        # lifespan machinery). The clone's own state set below currently shadows
+        # it during the staged migration; later steps delete the clone overrides.
+        super().__init__(
+            title=title,
+            summary=summary,
+            description=description,
+            version=version,
+            openapi_url=openapi_url,
+            docs_url=docs_url,
+            redoc_url=redoc_url,
+            root_path=root_path,
+            debug=debug,
+            lifespan=lifespan,
+        )
         self.title = title
         self.summary = summary
         self.description = description
