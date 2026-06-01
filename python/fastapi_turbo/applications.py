@@ -2939,6 +2939,38 @@ async def _dispatch_to_subapp_route(subapp, request):
     return _JR(content=result)
 
 
+def _route_uses_clone_markers(endpoint) -> bool:
+    """True if the endpoint signature uses any of the clone's param markers
+    (``Depends``/``Query``/``Header``/``Cookie``/``Path``/``Body``/``Form``/
+    ``File``/``Security``). Real FastAPI's ``get_dependant`` only recognizes its
+    OWN markers, so a clone-marker route can't be introspected for the adapter
+    (Stage D) until the markers are bridged — such routes use the clone path."""
+    import inspect
+    import typing
+
+    try:
+        from fastapi_turbo.dependencies import Depends as _CloneDepends
+        from fastapi_turbo.param_functions import _ParamMarker as _CloneParam
+    except Exception:
+        return True
+
+    def _is_clone_marker(obj) -> bool:
+        return isinstance(obj, (_CloneDepends, _CloneParam))
+
+    try:
+        sig = inspect.signature(endpoint)
+    except (ValueError, TypeError):
+        return True
+    for p in sig.parameters.values():
+        if p.default is not inspect.Parameter.empty and _is_clone_marker(p.default):
+            return True
+        ann = p.annotation
+        if typing.get_origin(ann) is typing.Annotated:
+            for meta in typing.get_args(ann)[1:]:
+                if _is_clone_marker(meta):
+                    return True
+    return False
+
 
 class FastAPI(_real_fastapi.FastAPI):
     """Drop-in replacement for ``fastapi.FastAPI``, backed by Rust Axum.
@@ -5671,6 +5703,11 @@ class FastAPI(_real_fastapi.FastAPI):
                     "tags": extra_tags + route.tags,
                     "params": params,
                     "_all_params": all_params_for_openapi,
+                    # Combined global/include/router/route dependencies — lets the
+                    # pivot adapter rebuild a real FastAPI route with the correct
+                    # effective dependency graph (Stage D).
+                    "_combined_dependencies": merged_deps,
+                    "_route_obj": route,
                     "is_websocket": False,
                     # OpenAPI metadata
                     "status_code": route.status_code or 200,
@@ -7042,6 +7079,135 @@ class FastAPI(_real_fastapi.FastAPI):
             except OSError:
                 pass
 
+    def _adapter_route_info(self, rd: dict):
+        """Stage D (opt-in via ``FASTAPI_TURBO_ADAPTER=1``): drive a route's door
+        params off REAL FastAPI introspection instead of the clone's ``_introspect``.
+
+        Rebuilds a real ``fastapi.routing.APIRoute`` from the route's effective
+        config (full path, original endpoint, combined dependencies, response_model
+        + flags) and maps it through the pivot adapter. Returns
+        ``(params, handler, is_async)`` for the Rust door, or ``None`` to fall back
+        to the clone path — for WebSocket/mounted routes, non-default response
+        classes (the adapter applies response_model but not a custom response_class),
+        or anything the adapter declines (e.g. async-generator deps)."""
+        import os
+
+        if os.environ.get("FASTAPI_TURBO_ADAPTER") != "1":
+            return None
+        if rd.get("is_websocket") or rd.get("_from_mount"):
+            return None
+        route = rd.get("_route_obj")
+        if route is None:
+            return None
+        # The ORIGINAL user endpoint — rd["endpoint"] is the clone-compiled
+        # ``(**kwargs)`` wrapper for dep routes, which real FastAPI would
+        # mis-introspect as a ``kwargs`` query param.
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None:
+            return None
+        # SAFETY: real FastAPI's introspection only recognizes its OWN param
+        # markers. Under the compat shim, endpoints use the CLONE's Depends/Query/
+        # Header/... markers, which real ``get_dependant`` does not recognize (it
+        # would mis-class a ``Depends`` param as a body field). Until the markers
+        # are bridged to real FastAPI's, only delegate routes that use NO clone
+        # marker (plain scalars + a single Pydantic body) — those introspect
+        # identically. Everything else falls back to the clone path.
+        if _route_uses_clone_markers(endpoint):
+            return None
+        # Route/router/global dependencies are clone ``Depends`` markers too — real
+        # FastAPI wouldn't recognize them, so they'd silently NOT run. Never risk
+        # dropping a global dependency: delegate these to the clone path.
+        if rd.get("_combined_dependencies"):
+            return None
+        # A custom status_code isn't carried on RouteInfo yet (the door defaults to
+        # 200), and user HTTP middleware needs request-injection the adapter path
+        # doesn't set up — both fall back for correctness.
+        if rd.get("status_code") not in (None, 200):
+            return None
+        if getattr(self, "_http_middlewares", None) or getattr(
+            self, "_raw_asgi_middlewares", None
+        ):
+            return None
+        # Only default-JSON-response routes — build_handler doesn't apply a custom
+        # response_class.
+        rc = rd.get("response_class")
+        if rc is not None:
+            try:
+                from fastapi_turbo.responses import JSONResponse as _JR
+
+                if rc is not _JR:
+                    return None
+            except Exception:
+                return None
+        try:
+            import inspect as _inspect
+
+            # Must be REAL FastAPI's APIRoute (the shim rebinds ``fastapi.routing``
+            # to the clone) — it builds the real ``dependant`` the adapter reads.
+            _RealRoute = _real_fastapi.routing.APIRoute
+
+            from fastapi_turbo._introspect_from_real_fastapi import (
+                Undelegable,
+                build_handler,
+                extract_params_from_route,
+            )
+        except Exception:
+            return None
+        try:
+            _http_methods = [
+                m
+                for m in rd["methods"]
+                if m in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+            ]
+            real = _RealRoute(
+                rd["path"],
+                endpoint,
+                methods=_http_methods or rd["methods"],
+                dependencies=rd.get("_combined_dependencies") or None,
+                response_model=rd.get("response_model"),
+                status_code=(
+                    rd["status_code"] if rd.get("status_code") not in (None, 200) else None
+                ),
+                response_model_include=getattr(route, "response_model_include", None),
+                response_model_exclude=getattr(route, "response_model_exclude", None),
+                response_model_by_alias=getattr(route, "response_model_by_alias", True),
+                response_model_exclude_unset=getattr(route, "response_model_exclude_unset", False),
+                response_model_exclude_defaults=getattr(
+                    route, "response_model_exclude_defaults", False
+                ),
+                response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
+            )
+            params = extract_params_from_route(real)
+            handler = build_handler(real)
+        except Undelegable:
+            return None
+        except Exception:
+            return None
+        if any(p.kind in ("form", "file") for p in params):
+            return None
+        # GENERIC SAFETY NET: the adapter's classification must match the clone's.
+        # Any divergence means real FastAPI didn't recognize a clone marker/type
+        # (Depends, UploadFile, Request, Response, ...) and silently mis-classified
+        # the param — delegate those routes to the clone path.
+        clone_h = {
+            p["name"]: p["kind"]
+            for p in rd["params"]
+            if p.get("_is_handler_param", True) and not p["name"].startswith("__fastapi_turbo")
+        }
+        adapter_h = {p.name: p.kind for p in params if p.is_handler_param}
+        if clone_h != adapter_h:
+            return None
+        # Match the clone's async contract: async handlers are driven by a SYNC
+        # submit-caller (``_make_sync_wrapper``) that runs the coroutine on a real
+        # worker loop — giving a running loop from the first instruction — rather
+        # than the door's is_async probe path. So the door always sees a sync
+        # callable (is_async=False).
+        if _inspect.iscoroutinefunction(handler):
+            from fastapi_turbo._resolution import _make_sync_wrapper
+
+            handler = _make_sync_wrapper(handler, for_handler=True, app=self)
+        return params, handler, False
+
     def _build_server_args(self, host: str, port: int) -> tuple:
         """Build the full positional argument tuple for ``run_server`` and
         ``register_app_router`` from the app's routes + config, so BOTH
@@ -7118,6 +7284,23 @@ class FastAPI(_real_fastapi.FastAPI):
         route_infos: list[RouteInfo] = []
 
         for rd in route_dicts:
+            # Stage D: when the adapter (opt-in) can drive this route off real
+            # FastAPI introspection, use its ParamInfo + handler directly.
+            _adapted = self._adapter_route_info(rd)
+            if _adapted is not None:
+                _ap, _ah, _aasync = _adapted
+                route_infos.append(
+                    RouteInfo(
+                        path=rd["path"],
+                        methods=rd["methods"],
+                        handler=_ah,
+                        is_async=_aasync,
+                        handler_name=rd["handler_name"],
+                        params=_ap,
+                        is_websocket=False,
+                    )
+                )
+                continue
             param_infos = []
             for p in rd["params"]:
                 pi = ParamInfo(
