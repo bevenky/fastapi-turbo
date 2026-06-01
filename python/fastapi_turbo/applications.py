@@ -2939,6 +2939,53 @@ async def _dispatch_to_subapp_route(subapp, request):
     return _JR(content=result)
 
 
+def _wrap_with_exception_handlers(handler, app):
+    """Wrap a handler so exceptions it raises are dispatched to the app's CUSTOM
+    exception handlers — mirroring the clone's compiled handler. Without this, the
+    adapter's raw handler would hit the door's default handling instead of the
+    user's ``@app.exception_handler``. Returns the handler unchanged when the app
+    has no custom handlers (the door's defaults already apply)."""
+    if not getattr(app, "exception_handlers", None):
+        return handler
+
+    def wrapped(**kwargs):
+        try:
+            return handler(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            result = None
+            raised = False
+            try:
+                result = app._invoke_exception_handler(exc)
+            except Exception:  # noqa: BLE001
+                raised = True
+            # Starlette parity bookkeeping: capture non-HTTPException exceptions
+            # not handled by a SPECIFIC handler (the ``Exception`` catch-all still
+            # re-raises) for raise_server_exceptions / Sentry.
+            handled_specific = False
+            if result is not None and not raised:
+                for exc_cls in app.exception_handlers:
+                    if exc_cls is Exception:
+                        continue
+                    if isinstance(exc_cls, type) and isinstance(exc, exc_cls):
+                        handled_specific = True
+                        break
+            try:
+                from fastapi_turbo.exceptions import HTTPException as _HE
+
+                if not isinstance(exc, _HE) and not handled_specific:
+                    captured = getattr(app, "_captured_server_exceptions", None)
+                    if captured is not None:
+                        captured.append(exc)
+            except Exception:  # noqa: BLE001
+                pass
+            if result is not None and not raised:
+                return result
+            raise
+
+    wrapped.__name__ = getattr(handler, "__name__", "handler")
+    return wrapped
+
+
 def _clone_framework_types() -> tuple:
     """Clone framework types real FastAPI's introspection still can't recognize
     (reimplementations not bridged to real starlette subclasses yet). Request /
@@ -7161,13 +7208,6 @@ class FastAPI(_real_fastapi.FastAPI):
         # registered. Also covers a non-default response class (custom rendering).
         if getattr(self, "dependency_overrides", None):
             return None
-        # Custom exception handlers are dispatched inside the clone's compiled
-        # handler; the adapter registers the raw endpoint, so an exception raised in
-        # it would hit the door's DEFAULT handling instead of the user's handler.
-        # A fresh app has no entries here (framework defaults are handled in Rust),
-        # so this only declines apps that registered their own handler.
-        if getattr(self, "exception_handlers", None):
-            return None
         route = rd.get("_route_obj")
         if route is None:
             return None
@@ -7286,6 +7326,10 @@ class FastAPI(_real_fastapi.FastAPI):
             from fastapi_turbo._resolution import _make_sync_wrapper
 
             handler = _make_sync_wrapper(handler, for_handler=True, app=self)
+        # Dispatch handler-raised exceptions to the app's custom exception handlers
+        # (the clone does this in its compiled handler) — innermost, so middleware
+        # below still wraps the resulting response.
+        handler = _wrap_with_exception_handlers(handler, self)
         http_mws = getattr(self, "_http_middlewares", None)
         if http_mws:
             from fastapi_turbo._middleware_wrap import _wrap_with_http_middlewares
