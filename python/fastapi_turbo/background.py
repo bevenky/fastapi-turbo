@@ -5,6 +5,13 @@ from __future__ import annotations
 import inspect
 from typing import Any, Callable
 
+# Real starlette base — imported before the compat shim installs (resolves to real).
+# Subclassing it (without calling its __init__; we use our own ``_tasks`` and
+# override the public API) makes ``isinstance(bg, starlette.background.BackgroundTasks)``
+# True so REAL FastAPI's get_dependant recognizes a ``tasks: BackgroundTasks`` param
+# (the type bridge), while the clone's own behavior is unchanged.
+import starlette.background as _starlette_background
+
 
 class BackgroundTask:
     """A single background task."""
@@ -21,7 +28,7 @@ class BackgroundTask:
             self.func(*self.args, **self.kwargs)
 
 
-class BackgroundTasks:
+class BackgroundTasks(_starlette_background.BackgroundTasks):
     """Container for multiple background tasks to run after the response.
 
     Compatible with FastAPI's ``BackgroundTasks`` dependency:
@@ -30,6 +37,10 @@ class BackgroundTasks:
         async def send_email(background_tasks: BackgroundTasks):
             background_tasks.add_task(send_email_task, "user@example.com")
             return {"message": "sent"}
+
+    Subclasses real ``starlette.background.BackgroundTasks`` for isinstance parity
+    (the type bridge); manages its own ``_tasks`` and overrides the public API, so
+    real's ``__init__`` is intentionally not called.
     """
 
     def __init__(self) -> None:

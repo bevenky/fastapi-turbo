@@ -2940,14 +2940,15 @@ async def _dispatch_to_subapp_route(subapp, request):
 
 
 def _clone_framework_types() -> tuple:
-    """Clone framework types real FastAPI's introspection can't recognize (they're
-    reimplementations, not real starlette/fastapi subclasses)."""
+    """Clone framework types real FastAPI's introspection still can't recognize
+    (reimplementations not bridged to real starlette subclasses yet). Request /
+    HTTPConnection / BackgroundTasks ARE bridged (they subclass the real types), so
+    they're omitted — real get_dependant recognizes them and the adapter handles
+    them. Response (read-only headers property), UploadFile, and WebSocket are not
+    yet bridged."""
     types = []
     for mod, name in (
-        ("fastapi_turbo.requests", "Request"),
-        ("fastapi_turbo.requests", "HTTPConnection"),
         ("fastapi_turbo.responses", "Response"),
-        ("fastapi_turbo.background", "BackgroundTasks"),
         ("fastapi_turbo.param_functions", "UploadFile"),
         ("fastapi_turbo.websockets", "WebSocket"),
     ):

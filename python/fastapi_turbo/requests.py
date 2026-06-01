@@ -14,6 +14,14 @@ import json as _json
 from http.cookies import SimpleCookie
 from typing import Any
 
+# Real starlette base classes — imported during package init BEFORE the compat
+# shim installs, so this resolves to REAL starlette. Subclassing them (without
+# calling their __init__ — we manage our own scope state and override the public
+# API) makes ``isinstance(req, starlette.requests.Request)`` True so REAL FastAPI's
+# get_dependant recognizes a ``request: Request`` param (the pivot adapter / type
+# bridge), while the clone's own behavior is unchanged.
+import starlette.requests as _starlette_requests
+
 from fastapi_turbo.datastructures import URL, Address, Headers, QueryParams, State
 
 
@@ -27,12 +35,16 @@ class ClientDisconnect(Exception):
     """
 
 
-class HTTPConnection:
+class HTTPConnection(_starlette_requests.HTTPConnection):
     """Starlette-compatible HTTPConnection base class.
 
     Shared base for Request and WebSocket in Starlette — provides the
     URL/header/cookie/client/state scope-derived properties. Many
     third-party middlewares do ``isinstance(conn, HTTPConnection)``.
+
+    Subclasses real ``starlette.requests.HTTPConnection`` for isinstance parity
+    (the type bridge) but does NOT call its ``__init__`` — we manage our own
+    ``_scope`` and override every public property/method below.
     """
 
     def __init__(self, scope: dict[str, Any] | None = None, receive=None, send=None):
@@ -167,7 +179,7 @@ class HTTPConnection:
         return s
 
 
-class Request(HTTPConnection):
+class Request(HTTPConnection, _starlette_requests.Request):
     """Starlette-compatible Request wrapper.
 
     For now, wraps a simple dict-based scope since the Rust side
