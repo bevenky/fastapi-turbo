@@ -113,14 +113,29 @@ async fn serve_one_connection(stream: TcpStream, router: axum::Router) {
 ///
 /// `ready` flips to `true` once connected + looping (test/ops hook). `shutdown`
 /// stops accepting new fds; in-flight connections drain naturally.
-#[allow(dead_code)] // wired into PyO3 + the app.run(workers=N) launcher in Step 8
 pub async fn run_worker(
     acceptor_sock: &Path,
     router: axum::Router,
     ready: Arc<AtomicBool>,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> std::io::Result<()> {
-    let sock = Arc::new(UnixStream::connect(acceptor_sock).await?);
+    // Retry-connect: a freshly-forked worker may reach here before the acceptor
+    // has bound its unix listener. Retry for ~5s before giving up.
+    let sock = {
+        let mut attempt = 0u32;
+        loop {
+            match UnixStream::connect(acceptor_sock).await {
+                Ok(s) => break Arc::new(s),
+                Err(e) => {
+                    if attempt >= 200 {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+    };
     ready.store(true, Ordering::SeqCst);
 
     // Completion notices ride a dedicated task so a finishing connection never
@@ -207,12 +222,15 @@ struct Worker {
 /// Shared acceptor state: the live worker set.
 struct Workers {
     list: std::sync::Mutex<Vec<Worker>>,
+    /// Rotating cursor for round-robin among equally-loaded workers.
+    next: AtomicUsize,
 }
 
 impl Workers {
     fn new() -> Self {
         Workers {
             list: std::sync::Mutex::new(Vec::new()),
+            next: AtomicUsize::new(0),
         }
     }
 
@@ -251,15 +269,34 @@ impl Workers {
         list.push(Worker { sock, outstanding });
     }
 
-    /// Pick the least-loaded worker, optimistically increment its `outstanding`,
-    /// and return its socket. `None` if no workers are connected.
+    /// Pick a worker, optimistically increment its `outstanding`, and return its
+    /// socket. `None` if no workers are connected. Routing is **round-robin among
+    /// the least-loaded** workers: when all workers are idle (the common case for
+    /// short sequential HTTP) every worker ties at the minimum, so the rotating
+    /// cursor spreads connections evenly; when some workers are busy with
+    /// long-lived connections (WS/SSE) only the least-loaded qualify, so it stays
+    /// load-aware. (Pure least-loaded would always pick the first idle worker and
+    /// never spread short requests.)
     fn pick(&self) -> Option<(Arc<UnixStream>, Arc<AtomicUsize>)> {
         let list = self.list.lock().unwrap_or_else(|p| p.into_inner());
-        let chosen = list
+        let n = list.len();
+        if n == 0 {
+            return None;
+        }
+        let min = list
             .iter()
-            .min_by_key(|w| w.outstanding.load(Ordering::SeqCst))?;
-        chosen.outstanding.fetch_add(1, Ordering::SeqCst);
-        Some((chosen.sock.clone(), chosen.outstanding.clone()))
+            .map(|w| w.outstanding.load(Ordering::SeqCst))
+            .min()
+            .unwrap_or(0);
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
+        for k in 0..n {
+            let idx = (start + k) % n;
+            if list[idx].outstanding.load(Ordering::SeqCst) == min {
+                list[idx].outstanding.fetch_add(1, Ordering::SeqCst);
+                return Some((list[idx].sock.clone(), list[idx].outstanding.clone()));
+            }
+        }
+        None
     }
 }
 
@@ -267,7 +304,6 @@ impl Workers {
 /// `workers` (unix), accept TCP connections on `tcp`, and fd-pass each TCP
 /// connection to the least-loaded worker (no byte is read — fully
 /// transport-agnostic). `ready`/`grace`/`shutdown` mirror the server drain.
-#[allow(dead_code)] // wired into PyO3 + the app.run(workers=N) launcher in Step 8
 pub async fn run_acceptor(
     tcp: TcpListener,
     workers: UnixListener,

@@ -57,6 +57,12 @@ import starlette.datastructures  # noqa: F401  # pre-shim capture
 import os
 import socket
 
+# Pin the whole test suite to single-process servers. app.run() now defaults to
+# one worker per CPU (multi-worker fork); test subprocess servers run app.run()
+# in their main thread, so without this each would fork ~CPU-count workers.
+# setdefault → a test that explicitly wants multi-worker can still override.
+os.environ.setdefault("FASTAPI_TURBO_WORKERS", "1")
+
 import pytest
 
 

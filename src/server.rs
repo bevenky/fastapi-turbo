@@ -1038,6 +1038,143 @@ pub fn _oneshot_selftest(py: Python<'_>) -> PyResult<(u16, Vec<u8>)> {
     })
 }
 
+// ── Multi-worker mode: the fd-passing acceptor + worker PyO3 entries ──────
+//
+// `app.run(workers=N)` runs ONE acceptor (this process) + N forked worker
+// processes. The acceptor distributes connections; each worker runs the full
+// assembled router (all transports) on its fd-passed connections. See
+// `crate::cluster`.
+
+/// Run the fd-passing ACCEPTOR in this process: bind the TCP port + the worker
+/// registration unix socket and distribute accepted connections to the
+/// least-loaded worker. Blocks until Ctrl-C, then drains within `grace_secs`.
+#[pyfunction]
+#[pyo3(signature = (host, port, worker_sock_path, grace_secs = 10.0))]
+pub fn run_acceptor(
+    py: Python<'_>,
+    host: String,
+    port: u16,
+    worker_sock_path: String,
+    grace_secs: f64,
+) -> PyResult<()> {
+    py.detach(|| {
+        let rt = Runtime::new().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime: {e}"))
+        })?;
+        rt.block_on(async move {
+            let addr = format!("{host}:{port}");
+            let tcp = TcpListener::bind(&addr).await.map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!("Failed to bind to {addr}: {e}"))
+            })?;
+            let _ = crate::router::set_server_addr(host.clone(), port);
+            let _ = std::fs::remove_file(&worker_sock_path);
+            let unix = tokio::net::UnixListener::bind(&worker_sock_path).map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!(
+                    "Failed to bind worker socket {worker_sock_path}: {e}"
+                ))
+            })?;
+            println!("fastapi-turbo acceptor on http://{addr} (workers via {worker_sock_path})");
+            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            crate::cluster::run_acceptor(
+                tcp,
+                unix,
+                ready,
+                std::time::Duration::from_secs_f64(grace_secs),
+                async {
+                    let _ = tokio::signal::ctrl_c().await;
+                },
+            )
+            .await
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("acceptor: {e}")))
+        })
+    })
+}
+
+/// Run one WORKER in this (forked child) process: build the assembled router
+/// from the same args as `run_server`, connect to the acceptor's unix socket,
+/// and serve each fd-passed connection (all transports) with that router.
+#[pyfunction]
+#[pyo3(signature = (
+    acceptor_sock_path, routes, host, port, middlewares, openapi_json, docs_url,
+    redoc_url, openapi_url, static_mounts, root_path, redirect_slashes,
+    max_request_size, not_found_handler, app, validation_handler,
+    swagger_ui_oauth2_redirect_url, swagger_ui_html, redoc_html, static_content_types,
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker(
+    py: Python<'_>,
+    acceptor_sock_path: String,
+    routes: Vec<RouteInfo>,
+    host: String,
+    port: u16,
+    middlewares: Vec<Py<PyAny>>,
+    openapi_json: Option<String>,
+    docs_url: Option<String>,
+    redoc_url: Option<String>,
+    openapi_url: Option<String>,
+    static_mounts: Vec<(String, String)>,
+    root_path: Option<String>,
+    redirect_slashes: bool,
+    max_request_size: Option<usize>,
+    not_found_handler: Option<Py<PyAny>>,
+    app: Option<Py<PyAny>>,
+    validation_handler: Option<Py<PyAny>>,
+    swagger_ui_oauth2_redirect_url: Option<String>,
+    swagger_ui_html: Option<String>,
+    redoc_html: Option<String>,
+    static_content_types: Vec<(String, String)>,
+) -> PyResult<()> {
+    // Per-worker process globals (mirror run_server — each worker is independent).
+    if !static_content_types.is_empty() {
+        set_static_mime_map(static_content_types);
+    }
+    if let Ok(mut slot) = crate::router::NOT_FOUND_HANDLER.write() {
+        *slot = not_found_handler;
+    }
+    if let Ok(mut slot) = crate::router::APP_INSTANCE.write() {
+        *slot = app;
+    }
+    if let Ok(mut slot) = crate::router::VALIDATION_HANDLER.write() {
+        *slot = validation_handler;
+    }
+    let _ = crate::router::set_server_addr(host, port);
+    let mw_configs = parse_middleware_configs(py, &middlewares)?;
+    let _ = &root_path; // metadata only
+
+    py.detach(|| {
+        let rt = Runtime::new().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime: {e}"))
+        })?;
+        let router = assemble_app_router(
+            routes,
+            &mw_configs,
+            openapi_json,
+            docs_url,
+            redoc_url,
+            openapi_url,
+            &static_mounts,
+            redirect_slashes,
+            max_request_size,
+            swagger_ui_oauth2_redirect_url,
+            swagger_ui_html,
+            redoc_html,
+        );
+        rt.block_on(async move {
+            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            crate::cluster::run_worker(
+                std::path::Path::new(&acceptor_sock_path),
+                router,
+                ready,
+                async {
+                    let _ = tokio::signal::ctrl_c().await;
+                },
+            )
+            .await
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("worker: {e}")))
+        })
+    })
+}
+
 /// Set of *declared* paths (verbatim) from the user's routes. Used by the
 /// redirect_slashes middleware to decide whether the alternate form of a
 /// requested URL is an actual registered route before redirecting.

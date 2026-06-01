@@ -6858,8 +6858,23 @@ class FastAPI:
 
         self._in_process_dynamic_routes_installed = True
 
-    def run(self, host: str = "127.0.0.1", port: int = 8000, **kwargs: Any) -> None:
-        """Collect routes, hand them to the Rust core, and start serving."""
+    def run(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        workers: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Collect routes, hand them to the Rust core, and start serving.
+
+        ``workers`` defaults to one process per CPU (``os.cpu_count()``); pass
+        ``workers=1`` for a single process. Multi-worker forks an fd-passing
+        acceptor (this process) + N worker processes — each runs the full
+        router on fd-passed connections, covering every transport (HTTP/1,
+        HTTP/2, WebSocket, SSE). Auto-falls-back to a single process when
+        forking isn't safe (called off the main thread, e.g. ``TestClient``;
+        or a platform without ``os.fork``). ``FASTAPI_TURBO_WORKERS`` overrides.
+        """
         from fastapi_turbo._fastapi_turbo_core import run_server
 
         # Soft DoS-footgun warning: a public-bind (0.0.0.0 / all-zeros
@@ -6885,6 +6900,15 @@ class FastAPI:
                 stacklevel=2,
             )
 
+        # Multi-worker (default = one per CPU): fork the fd-passing acceptor
+        # (this process) + N workers. Workers run their own startup/lifespan
+        # post-fork so loop-bound resources bind per-worker. Falls back to the
+        # single-process path below when forking isn't safe.
+        _effective_workers = self._resolve_worker_count(workers)
+        if _effective_workers > 1:
+            self._run_multiworker(host, port, _effective_workers)
+            return
+
         # Prefer the ASGI-middleware-chained path when raw ASGI middleware
         # is registered — that way Sentry/OTel-style MW that hooks
         # ``scope['type'] == 'lifespan'`` sees startup/shutdown events.
@@ -6903,6 +6927,91 @@ class FastAPI:
                 atexit.register(self._run_shutdown_handlers)
 
         run_server(*self._build_server_args(host, port))
+
+    def _resolve_worker_count(self, workers: int | None) -> int:
+        """Resolve the effective worker count. Default = one process per CPU;
+        ``FASTAPI_TURBO_WORKERS`` overrides. Falls back to 1 when forking isn't
+        safe: no ``os.fork`` (e.g. Windows), or not on the main thread (e.g.
+        ``TestClient`` runs ``app.run()`` in a background thread — forking from
+        a non-main thread is unsafe)."""
+        import threading
+
+        env = os.environ.get("FASTAPI_TURBO_WORKERS")
+        if env is not None:
+            try:
+                workers = int(env)
+            except ValueError:
+                pass
+        if workers is None:
+            workers = os.cpu_count() or 1
+        try:
+            workers = max(1, int(workers))
+        except (TypeError, ValueError):
+            workers = 1
+        if workers > 1:
+            if not hasattr(os, "fork"):
+                workers = 1
+            elif threading.current_thread() is not threading.main_thread():
+                workers = 1
+        return workers
+
+    def _run_multiworker(self, host: str, port: int, n: int) -> None:
+        """Fork the fd-passing acceptor (this process) + ``n`` worker processes.
+        Each worker runs its own startup/lifespan, then serves fd-passed
+        connections via the Rust ``run_worker`` (all transports). The acceptor
+        binds the port and routes each connection to the least-loaded worker.
+        Ctrl-C drains the acceptor, then terminates + reaps the workers."""
+        import signal
+        import sys as _sys
+        import tempfile
+
+        from fastapi_turbo._fastapi_turbo_core import run_acceptor, run_worker
+
+        sock_path = os.path.join(
+            tempfile.gettempdir(), f"fastapi-turbo-{os.getpid()}-{port}.sock"
+        )
+        children: list[int] = []
+        for i in range(n):
+            pid = os.fork()
+            if pid == 0:
+                # ── child: one worker process ──
+                exit_code = 0
+                try:
+                    # Per-worker startup so loop-bound resources (asyncpg/redis
+                    # pools, asyncio primitives) are created in THIS process on
+                    # the handler loop — same ordering as single-process run().
+                    if self._collect_lifespans():
+                        self._run_lifespan_startup()
+                    self._run_startup_handlers()
+                    run_worker(sock_path, *self._build_server_args(host, port))
+                except BaseException as exc:  # noqa: BLE001
+                    _sys.stderr.write(f"fastapi-turbo worker {i} exited: {exc!r}\n")
+                    exit_code = 1
+                finally:
+                    os._exit(exit_code)
+            children.append(pid)
+
+        # ── parent: the acceptor ──
+        def _terminate_children(*_a: object) -> None:
+            for cpid in children:
+                try:
+                    os.kill(cpid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+        try:
+            run_acceptor(host, port, sock_path)
+        finally:
+            _terminate_children()
+            for cpid in children:
+                try:
+                    os.waitpid(cpid, 0)
+                except (ChildProcessError, OSError):
+                    pass
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
 
     def _build_server_args(self, host: str, port: int) -> tuple:
         """Build the full positional argument tuple for ``run_server`` and
