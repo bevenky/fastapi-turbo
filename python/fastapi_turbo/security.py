@@ -26,6 +26,33 @@ from fastapi_turbo.param_functions import (
 )
 from fastapi_turbo.requests import Request
 
+import inspect as _inspect
+
+# Real FastAPI's get_dependant introspects a security scheme via
+# inspect.signature(scheme). Our schemes' __call__ is (request, *args, **kwargs)
+# for runtime flexibility, which leaks a phantom kwargs/args param into the pivot
+# adapter (real FastAPI then mis-classifies it). Pin every scheme INSTANCE's
+# introspected signature to a single ``request: Request`` param — the real schemes'
+# shape — so the adapter sees a clean inject_request. The actual __call__ runtime
+# is unchanged, and Request is now a real starlette subclass (the type bridge), so
+# real get_dependant recognizes it.
+_REQUEST_ONLY_SIGNATURE = _inspect.Signature(
+    [_inspect.Parameter("request", _inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Request)]
+)
+
+
+def _request_sig(cls):
+    """Class decorator: after ``__init__``, pin ``__signature__`` to ``(request: Request)``."""
+    _orig_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        self.__signature__ = _REQUEST_ONLY_SIGNATURE
+
+    __init__.__wrapped__ = _orig_init
+    cls.__init__ = __init__
+    return cls
+
 
 # ── Credential models ──────────────────────────────────────────────
 
@@ -131,6 +158,7 @@ def _get_authorization(request_or_str=None, **kwargs) -> str | None:
 # ── OAuth2 base class ────────────────────────────────────────────
 
 
+@_request_sig
 class OAuth2:
     """Base OAuth2 security scheme (matches FastAPI's OAuth2 base class).
 
@@ -169,6 +197,7 @@ class OAuth2:
 # ── Security schemes ───────────────────────────────────────────────
 
 
+@_request_sig
 class OAuth2PasswordBearer:
     """OAuth2 password bearer scheme.
 
@@ -214,6 +243,7 @@ class OAuth2PasswordBearer:
         return None
 
 
+@_request_sig
 class HTTPBase:
     """Base class for HTTP-scheme security dependencies (``HTTPBearer``,
     ``HTTPDigest``, ``HTTPBasic``). FastAPI exports this as
@@ -267,6 +297,7 @@ class HTTPBase:
         return None
 
 
+@_request_sig
 class HTTPBearer(HTTPBase):
     """HTTP Bearer scheme.
 
@@ -316,6 +347,7 @@ class HTTPBearer(HTTPBase):
         return None
 
 
+@_request_sig
 class HTTPDigest:
     """HTTP Digest authentication scheme.
 
@@ -357,6 +389,7 @@ class HTTPDigest:
         return None
 
 
+@_request_sig
 class HTTPBasic:
     """HTTP Basic authentication scheme."""
 
@@ -490,6 +523,7 @@ class SecurityScopes:
 # ── OAuth2 additional flows ─────────────────────────────────────────
 
 
+@_request_sig
 class OAuth2ClientCredentials:
     """OAuth2 client-credentials flow (server-to-server auth).
 
@@ -544,6 +578,7 @@ class OAuth2ClientCredentials:
         return None
 
 
+@_request_sig
 class OAuth2AuthorizationCodeBearer:
     """OAuth2 authorization-code flow (user-delegated auth)."""
 
