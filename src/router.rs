@@ -2148,28 +2148,90 @@ async fn handle_request(
                         }
                     }
                     _ => {
-                        // Extract non-dep params
-                        if let Err(resp) = extract_single_param(
-                            py,
-                            param,
-                            &path_map,
-                            &query_params,
-                            &headers,
-                            &body_json,
-                            &mut resolved,
-                        ) {
-                            return resp;
+                        // Only extract dependency-INPUT params here (into `resolved`
+                        // for dep wiring). Handler-facing params — incl. form/file and
+                        // body — are produced by the full extractor below so the deps
+                        // path reaches parity with the no-dep fast paths.
+                        if !param.is_handler_param {
+                            if let Err(resp) = extract_single_param(
+                                py,
+                                param,
+                                &path_map,
+                                &query_params,
+                                &headers,
+                                &body_json,
+                                &mut resolved,
+                            ) {
+                                return resp;
+                            }
                         }
                     }
                 }
             }
 
-            // Build handler kwargs
-            let kwargs = PyDict::new(py);
+            // Build handler kwargs via the full extractor (scalars/body/form/file,
+            // skipping deps + dep-inputs through is_handler_param), then overlay the
+            // resolved dependency results and inject framework objects. This brings
+            // the deps path to parity with the no-dep fast paths for special params
+            // (Request/Response/BackgroundTasks/SecurityScopes) and Form/File.
+            let body_json_opt = if state.has_body_params {
+                body_json.as_ref()
+            } else {
+                None
+            };
+            let kwargs = match extract_params_to_pydict_full(
+                py,
+                &state.params,
+                &path_map,
+                &query_params,
+                &query_multi,
+                &headers,
+                &body_json_opt,
+                &body_bytes,
+                &mut multipart_fields,
+                state.defers_extraction_errors,
+                state.lax_content_type,
+            ) {
+                Ok(kw) => kw,
+                Err(resp) => return resp,
+            };
             for param in &state.params {
-                if param.is_handler_param {
+                if param.is_handler_param && param.kind == "dependency" {
                     if let Some(val) = resolved.get(&param.name) {
                         let _ = kwargs.set_item(&param.name, val.bind(py));
+                    }
+                }
+            }
+            if let Err(e) = inject_framework_objects(
+                py,
+                &kwargs,
+                &state,
+                &scope_method,
+                &scope_path,
+                &scope_query,
+                &headers,
+                &path_map,
+                &query_params,
+                &body_bytes,
+                &client_addr,
+            ) {
+                return pyerr_to_response(py, &e);
+            }
+            if state.has_http_middleware {
+                inject_request_metadata(
+                    py,
+                    &kwargs,
+                    &scope_method,
+                    &scope_path,
+                    &scope_query,
+                    &headers,
+                );
+                if let Some(ref raw) = raw_body_for_mw {
+                    if !raw.is_empty() {
+                        let _ = kwargs.set_item(
+                            "__fastapi_turbo_raw_body_bytes__",
+                            pyo3::types::PyBytes::new(py, raw),
+                        );
                     }
                 }
             }
@@ -2193,12 +2255,16 @@ async fn handle_request(
             };
 
             match result {
-                Ok(py_result) => py_to_response_with_request(
-                    py,
-                    py_result.bind(py),
-                    range_header.as_deref(),
-                    if_range_header.as_deref(),
-                ),
+                Ok(py_result) => {
+                    // Run any BackgroundTasks the handler received (deferred).
+                    drain_background_tasks(py, &kwargs, &state.params);
+                    py_to_response_with_request(
+                        py,
+                        py_result.bind(py),
+                        range_header.as_deref(),
+                        if_range_header.as_deref(),
+                    )
+                }
                 Err(ref py_err) => {
                     // Check if this is "needs event loop" — signal for fallback
                     let msg = py_err
