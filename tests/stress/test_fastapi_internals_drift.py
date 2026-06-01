@@ -30,15 +30,24 @@ assert issubclass(fastapi.FastAPI, starlette.applications.Starlette), \
 class Item(BaseModel):
     name: str
 
+class Out(BaseModel):
+    name: str
+
 def dep(x: str = "z"):
     return x
 
 app = FastAPI()
 
-@app.post("/u/{uid}")
+from fastapi import Request, Response, BackgroundTasks, Query
+
+@app.post("/u/{uid}", response_model=Out)
 def h(uid: int, q: str = "z",
       h1: str = Header(default="hh"), c1: str = Cookie(default="cc"),
       item: Item | None = None, d: str = Depends(dep)):
+    return {}
+
+@app.get("/special")
+def special(request: Request, response: Response, tasks: BackgroundTasks):
     return {}
 
 route = next(r for r in app.routes if isinstance(r, APIRoute) and r.path == "/u/{uid}")
@@ -52,6 +61,17 @@ assert dep_.path_params and dep_.query_params, "path/query params not populated"
 assert dep_.dependencies and hasattr(dep_.dependencies[0], "call"), \
     "Dependant.dependencies is not recursive Dependant list"
 
+# (2b) Dependant special-param slots the adapter maps to inject_* kinds.
+sdep = next(r for r in app.routes
+            if isinstance(r, APIRoute) and r.path == "/special").dependant
+for attr in ("request_param_name", "http_connection_param_name", "response_param_name",
+             "background_tasks_param_name", "security_scopes_param_name",
+             "websocket_param_name"):
+    assert hasattr(sdep, attr), f"Dependant.{attr} missing"
+assert sdep.request_param_name == "request", "request_param_name not populated"
+assert sdep.response_param_name == "response", "response_param_name not populated"
+assert sdep.background_tasks_param_name == "tasks", "background_tasks_param_name not populated"
+
 # (3) pydantic-v2 ModelField.field_info exposes what the adapter reads.
 mf = dep_.path_params[0]
 fi = mf.field_info
@@ -60,6 +80,27 @@ assert hasattr(fi, "annotation"), "FieldInfo.annotation missing"
 assert callable(getattr(fi, "is_required", None)), "FieldInfo.is_required not callable"
 for attr in ("alias", "default"):
     assert hasattr(fi, attr), f"FieldInfo.{attr} missing"
+
+# (3b) ModelField._type_adapter is the constraint-bearing validator the door calls.
+qmf = next(r for r in app.routes if isinstance(r, APIRoute)
+           and r.path == "/u/{uid}").dependant.query_params[0]
+assert hasattr(qmf, "_type_adapter") and hasattr(qmf._type_adapter, "validate_python"), \
+    "ModelField._type_adapter / validate_python missing"
+# Field(metadata) carries constraints (Query(gt=...)) → drives validation.
+assert hasattr(fi, "metadata"), "FieldInfo.metadata missing"
+
+# (4) APIRoute.response_field + flags + ModelField.validate/serialize (response_model).
+assert route.response_field is not None, "APIRoute.response_field missing for response_model"
+for attr in ("response_model_include", "response_model_exclude", "response_model_by_alias",
+             "response_model_exclude_unset", "response_model_exclude_defaults",
+             "response_model_exclude_none"):
+    assert hasattr(route, attr), f"APIRoute.{attr} missing"
+rf = route.response_field
+assert callable(getattr(rf, "validate", None)), "ModelField.validate not callable"
+assert callable(getattr(rf, "serialize", None)), "ModelField.serialize not callable"
+_val, _errs = rf.validate({"name": "x"}, {}, loc=("response",))
+assert not _errs and rf.serialize(_val, by_alias=True) == {"name": "x"}, \
+    "ModelField.validate/serialize core changed"
 
 print("DRIFT_OK", fastapi.__version__, starlette.__version__)
 '''
