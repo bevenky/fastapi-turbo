@@ -2939,37 +2939,95 @@ async def _dispatch_to_subapp_route(subapp, request):
     return _JR(content=result)
 
 
-def _route_uses_clone_markers(endpoint) -> bool:
-    """True if the endpoint signature uses any of the clone's param markers
-    (``Depends``/``Query``/``Header``/``Cookie``/``Path``/``Body``/``Form``/
-    ``File``/``Security``). Real FastAPI's ``get_dependant`` only recognizes its
-    OWN markers, so a clone-marker route can't be introspected for the adapter
-    (Stage D) until the markers are bridged — such routes use the clone path."""
+def _clone_framework_types() -> tuple:
+    """Clone framework types real FastAPI's introspection can't recognize (they're
+    reimplementations, not real starlette/fastapi subclasses)."""
+    types = []
+    for mod, name in (
+        ("fastapi_turbo.requests", "Request"),
+        ("fastapi_turbo.requests", "HTTPConnection"),
+        ("fastapi_turbo.responses", "Response"),
+        ("fastapi_turbo.background", "BackgroundTasks"),
+        ("fastapi_turbo.param_functions", "UploadFile"),
+        ("fastapi_turbo.websockets", "WebSocket"),
+    ):
+        try:
+            types.append(getattr(__import__(mod, fromlist=[name]), name))
+        except Exception:
+            pass
+    return tuple(types)
+
+
+def _resolved_hints(endpoint) -> dict | None:
+    """Resolved type hints (``include_extras=True``) for the endpoint, handling
+    ``from __future__ import annotations`` (string annotations). Returns None if
+    they can't be resolved — callers then conservatively decline."""
+    import typing
+
+    try:
+        hints = dict(typing.get_type_hints(endpoint, include_extras=True))
+        hints.pop("return", None)
+        return hints
+    except Exception:
+        return None
+
+
+def _signature_uses_form_file_marker(endpoint) -> bool:
+    """True if the endpoint uses a Form/File marker. Form/File routes always take
+    the clone path (the door's multipart handling), and building a real route for
+    them runs get_dependant which mutates the shared marker — so decline pre-build."""
     import inspect
     import typing
 
     try:
-        from fastapi_turbo.dependencies import Depends as _CloneDepends
-        from fastapi_turbo.param_functions import _ParamMarker as _CloneParam
+        from fastapi_turbo.param_functions import File as _F, Form as _Fm
     except Exception:
         return True
-
-    def _is_clone_marker(obj) -> bool:
-        return isinstance(obj, (_CloneDepends, _CloneParam))
-
+    # Marker DEFAULTS are not stringified by ``from __future__ import annotations``.
     try:
         sig = inspect.signature(endpoint)
     except (ValueError, TypeError):
         return True
-    for p in sig.parameters.values():
-        if p.default is not inspect.Parameter.empty and _is_clone_marker(p.default):
-            return True
-        ann = p.annotation
+    if any(isinstance(p.default, (_F, _Fm)) for p in sig.parameters.values()):
+        return True
+    # Annotated[..., Form()/File()] metadata — resolve string annotations.
+    hints = _resolved_hints(endpoint)
+    if hints is None:
+        return True
+    for ann in hints.values():
         if typing.get_origin(ann) is typing.Annotated:
-            for meta in typing.get_args(ann)[1:]:
-                if _is_clone_marker(meta):
-                    return True
+            if any(isinstance(meta, (_F, _Fm)) for meta in typing.get_args(ann)[1:]):
+                return True
     return False
+
+
+def _signature_uses_clone_framework_type(endpoint) -> bool:
+    """True if the endpoint signature annotates a param with a clone framework type
+    (Request/Response/BackgroundTasks/UploadFile/WebSocket/HTTPConnection). Real
+    FastAPI can't introspect those clone reimplementations, so such routes stay on
+    the clone path (until the types are bridged to real starlette subclasses)."""
+    import typing
+
+    fw = _clone_framework_types()
+    if not fw:
+        return True
+    hints = _resolved_hints(endpoint)
+    if hints is None:
+        return True
+
+    def _bare(ann):
+        if typing.get_origin(ann) is typing.Annotated:
+            ann = typing.get_args(ann)[0]
+        origin = typing.get_origin(ann)
+        # Recurse through Union/Optional and container generics (list[UploadFile],
+        # Optional[UploadFile], etc.) — any framework type anywhere disqualifies.
+        if origin is not None:
+            return any(
+                a is not type(None) and _bare(a) for a in typing.get_args(ann)
+            )
+        return isinstance(ann, type) and issubclass(ann, fw)
+
+    return any(_bare(h) for h in hints.values())
 
 
 class FastAPI(_real_fastapi.FastAPI):
@@ -7096,6 +7154,19 @@ class FastAPI(_real_fastapi.FastAPI):
             return None
         if rd.get("is_websocket") or rd.get("_from_mount"):
             return None
+        # dependency_overrides (a testing feature) is resolved at request time by
+        # the clone path; the adapter bakes the real callable into ParamInfo and
+        # can't honor a runtime override. Delegate everything while any override is
+        # registered. Also covers a non-default response class (custom rendering).
+        if getattr(self, "dependency_overrides", None):
+            return None
+        # Custom exception handlers are dispatched inside the clone's compiled
+        # handler; the adapter registers the raw endpoint, so an exception raised in
+        # it would hit the door's DEFAULT handling instead of the user's handler.
+        # A fresh app has no entries here (framework defaults are handled in Rust),
+        # so this only declines apps that registered their own handler.
+        if getattr(self, "exception_handlers", None):
+            return None
         route = rd.get("_route_obj")
         if route is None:
             return None
@@ -7105,28 +7176,18 @@ class FastAPI(_real_fastapi.FastAPI):
         endpoint = getattr(route, "endpoint", None)
         if endpoint is None:
             return None
-        # SAFETY: real FastAPI's introspection only recognizes its OWN param
-        # markers. Under the compat shim, endpoints use the CLONE's Depends/Query/
-        # Header/... markers, which real ``get_dependant`` does not recognize (it
-        # would mis-class a ``Depends`` param as a body field). Until the markers
-        # are bridged to real FastAPI's, only delegate routes that use NO clone
-        # marker (plain scalars + a single Pydantic body) — those introspect
-        # identically. Everything else falls back to the clone path.
-        if _route_uses_clone_markers(endpoint):
-            return None
-        # Route/router/global dependencies are clone ``Depends`` markers too — real
-        # FastAPI wouldn't recognize them, so they'd silently NOT run. Never risk
-        # dropping a global dependency: delegate these to the clone path.
+        # Param markers (Depends/Query/Header/...) are now bridged to real FastAPI's
+        # (see param_functions / dependencies), so real introspection recognizes
+        # them. The generic name->kind net below still catches any clone TYPE real
+        # FastAPI can't see yet (UploadFile/Request/Response/BackgroundTasks), so a
+        # mis-introspected route delegates rather than mis-serves.
+        # Route/router/global dependencies stay on the clone path for now — their
+        # combined-dep wiring is security-sensitive and validated separately.
         if rd.get("_combined_dependencies"):
             return None
         # A custom status_code isn't carried on RouteInfo yet (the door defaults to
-        # 200), and user HTTP middleware needs request-injection the adapter path
-        # doesn't set up — both fall back for correctness.
+        # 200) — fall back for correctness.
         if rd.get("status_code") not in (None, 200):
-            return None
-        if getattr(self, "_http_middlewares", None) or getattr(
-            self, "_raw_asgi_middlewares", None
-        ):
             return None
         # Only default-JSON-response routes — build_handler doesn't apply a custom
         # response_class.
@@ -7139,6 +7200,16 @@ class FastAPI(_real_fastapi.FastAPI):
                     return None
             except Exception:
                 return None
+        # Clone framework TYPES (Request/Response/BackgroundTasks/UploadFile/
+        # WebSocket) are reimplementations, NOT real starlette subclasses, so real
+        # FastAPI's introspection can't see them. Check the SIGNATURE and decline
+        # BEFORE building the real route — building it runs real get_dependant which
+        # can mutate the shared endpoint/markers, corrupting the clone path even for
+        # a route that ultimately declines.
+        if _signature_uses_clone_framework_type(endpoint):
+            return None
+        if _signature_uses_form_file_marker(endpoint):
+            return None
         try:
             import inspect as _inspect
 
@@ -7185,27 +7256,44 @@ class FastAPI(_real_fastapi.FastAPI):
             return None
         if any(p.kind in ("form", "file") for p in params):
             return None
-        # GENERIC SAFETY NET: the adapter's classification must match the clone's.
-        # Any divergence means real FastAPI didn't recognize a clone marker/type
-        # (Depends, UploadFile, Request, Response, ...) and silently mis-classified
-        # the param — delegate those routes to the clone path.
-        clone_h = {
-            p["name"]: p["kind"]
-            for p in rd["params"]
-            if p.get("_is_handler_param", True) and not p["name"].startswith("__fastapi_turbo")
-        }
-        adapter_h = {p.name: p.kind for p in params if p.is_handler_param}
-        if clone_h != adapter_h:
+        # A leaked ``**kwargs``/``*args`` dep-input means real FastAPI couldn't
+        # introspect a callable — e.g. a clone security scheme whose ``__call__`` is
+        # ``(self, *args, **kwargs)`` and which isn't a real ``SecurityBase``.
+        # Delegate those routes to the clone path.
+        if any(p.name.endswith("__kwargs") or p.name.endswith("__args") for p in params):
             return None
-        # Match the clone's async contract: async handlers are driven by a SYNC
-        # submit-caller (``_make_sync_wrapper``) that runs the coroutine on a real
-        # worker loop — giving a running loop from the first instruction — rather
-        # than the door's is_async probe path. So the door always sees a sync
-        # callable (is_async=False).
+        # The adapter's handler-facing params must exactly cover the endpoint's own
+        # signature (a dep contributes its result name; its extracted inputs are
+        # is_handler_param=False). A divergence means something was dropped or
+        # mis-mapped — delegate.
+        try:
+            sig_names = {
+                name
+                for name, p in _inspect.signature(endpoint).parameters.items()
+                if p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+            }
+        except (TypeError, ValueError):
+            return None
+        adapter_names = {p.name for p in params if p.is_handler_param}
+        if adapter_names != sig_names:
+            return None
+        # Match the clone's compile order so the door drives the adapter handler
+        # identically: async → SYNC submit-caller (running loop from the first
+        # instruction), then wrap in the ``@app.middleware("http")`` chain so those
+        # middlewares (which the clone applies by wrapping the handler) still run.
         if _inspect.iscoroutinefunction(handler):
             from fastapi_turbo._resolution import _make_sync_wrapper
 
             handler = _make_sync_wrapper(handler, for_handler=True, app=self)
+        http_mws = getattr(self, "_http_middlewares", None)
+        if http_mws:
+            from fastapi_turbo._middleware_wrap import _wrap_with_http_middlewares
+
+            handler = _wrap_with_http_middlewares(handler, http_mws, self)
+            try:
+                handler._has_http_middleware = True  # door → inject metadata kwargs
+            except (AttributeError, TypeError):
+                pass
         return params, handler, False
 
     def _build_server_args(self, host: str, port: int) -> tuple:
