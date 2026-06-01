@@ -146,6 +146,12 @@ def _param_from_field(
     """
     fi = mf.field_info
     ann = fi.annotation
+    # FastAPI 0.115+ query/header/cookie parameter-MODELS (``f:
+    # Annotated[Model, Query()]``) arrive as a single BaseModel-typed scalar
+    # field that real FastAPI expands into one param per model field. The door
+    # has no expansion, so delegate.
+    if kind in _SCALAR_BUCKETS and _is_basemodel(_unwrap_optional(ann)):
+        raise Undelegable(f"{kind} parameter-model expansion → real FastAPI")
     required = fi.is_required()
     is_body_model = kind == "body" and _is_basemodel(ann)
     explicit_alias = _alias_of(fi)
@@ -217,7 +223,12 @@ def _emit_body(dep: Any, out: list[ParamInfo]) -> None:
                 raise Undelegable("Form model expansion → real FastAPI")
             out.append(_param_from_field(bf, kind))
     elif len(body_fields) == 1 and fi_names <= {"Body"}:
-        out.append(_param_from_field(body_fields[0], "body"))
+        bf = body_fields[0]
+        # Body(embed=True): the wire shape is ``{"<name>": <value>}``, not the
+        # bare value — real FastAPI builds a synthetic combined model for it.
+        if getattr(bf.field_info, "embed", None) is True:
+            raise Undelegable("Body(embed=True) → real FastAPI")
+        out.append(_param_from_field(bf, "body"))
     else:
         raise Undelegable("multiple/embedded JSON body params → real FastAPI")
 

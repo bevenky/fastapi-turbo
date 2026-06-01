@@ -18,6 +18,7 @@ import sys
 
 _SCRIPT = r'''
 import asyncio, inspect, json, sys
+from typing import Annotated as typing_Annotated
 import httpx
 import fastapi                       # REAL fastapi (no shim)
 from fastapi import (FastAPI, Header, Cookie, Depends, Form, File, UploadFile,
@@ -244,6 +245,8 @@ def main():
         return request.method
     class FModel(BaseModel):
         a: int
+    class QFilters(BaseModel):
+        limit: int = 10
     def plain(q: str = "z"):
         return q
     @dec_app.get("/y")
@@ -252,12 +255,18 @@ def main():
     def rd(m: str = Depends(reqdep_inner)): return {"m": m}
     @dec_app.post("/fm")
     def fm(model: FModel = Form()): return {"a": model.a}
+    @dec_app.post("/embed1")
+    def embed1(a: Item = fastapi.Body(embed=True)): return {"a": a.name}
+    @dec_app.post("/multi")
+    def multi(a: Item, b: Out): return {}
+    @dec_app.get("/pm")
+    def pm(f: typing_Annotated[QFilters, Query()]): return {}
     @dec_app.get("/ok")
     def okr(v: str = Depends(plain)): return {"v": v}
     for r in dec_app.routes:
         if not isinstance(r, APIRoute):
             continue
-        if r.path in ("/y", "/rd", "/fm"):
+        if r.path in ("/y", "/rd", "/fm", "/embed1", "/multi", "/pm"):
             try:
                 extract_params_from_route(r); fails.append(f"{r.path} should be Undelegable")
             except Undelegable:
