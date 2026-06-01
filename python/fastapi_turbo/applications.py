@@ -7186,8 +7186,9 @@ class FastAPI(_real_fastapi.FastAPI):
                 pass
 
     def _adapter_route_info(self, rd: dict):
-        """Stage D (opt-in via ``FASTAPI_TURBO_ADAPTER=1``): drive a route's door
-        params off REAL FastAPI introspection instead of the clone's ``_introspect``.
+        """Stage D (DEFAULT-ON; opt OUT via ``FASTAPI_TURBO_ADAPTER=0``): drive a
+        route's door params off REAL FastAPI introspection instead of the clone's
+        ``_introspect``.
 
         Rebuilds a real ``fastapi.routing.APIRoute`` from the route's effective
         config (full path, original endpoint, combined dependencies, response_model
@@ -7198,7 +7199,7 @@ class FastAPI(_real_fastapi.FastAPI):
         or anything the adapter declines (e.g. async-generator deps)."""
         import os
 
-        if os.environ.get("FASTAPI_TURBO_ADAPTER") != "1":
+        if os.environ.get("FASTAPI_TURBO_ADAPTER") == "0":
             return None
         if rd.get("is_websocket") or rd.get("_from_mount"):
             return None
