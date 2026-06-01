@@ -7338,6 +7338,102 @@ class FastAPI:
     # ASGI __call__ — enables ``uvicorn myapp:app`` compatibility
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # In-process ASGI door (door B): drive the SAME assembled axum::Router
+    # via tower::Service::oneshot — no socket, no double-hop. Opt-in while
+    # it's proven against the Python dispatcher; will become the default
+    # once the efficiency gate passes and the dispatcher is deleted.
+    # ------------------------------------------------------------------
+
+    def _oneshot_door_enabled(self) -> bool:
+        """The oneshot door is opt-in via ``FASTAPI_TURBO_ONESHOT_DOOR=1``
+        (default OFF) until the efficiency gate + parity bucket prove it."""
+        return os.environ.get("FASTAPI_TURBO_ONESHOT_DOOR") == "1"
+
+    def _oneshot_door_can_handle(self, scope: dict) -> bool:
+        """True when the request can be served by driving the assembled
+        router in-process. Declines (→ Python dispatcher) for surface the
+        router does NOT host: raw ASGI middleware that wraps the whole app
+        (Sentry/OTel/Session — outside the router) and arbitrary ASGI
+        sub-app mounts (StaticFiles mounts ARE in the router and stay)."""
+        if getattr(self, "_raw_asgi_middlewares", None):
+            return False
+        for _prefix, mounted_app, _name in getattr(self, "_mounts", []):
+            is_static = hasattr(mounted_app, "directory") and getattr(
+                mounted_app, "directory", None
+            )
+            if not is_static:
+                return False
+        return True
+
+    def _ensure_oneshot_registered(self, scope: dict) -> None:
+        """Register the assembled router for this app once, using the same
+        full-fidelity args as ``app.run()``."""
+        if getattr(self, "_oneshot_registered", False):
+            return
+        from fastapi_turbo._fastapi_turbo_core import register_app_router
+
+        server = scope.get("server") or ("127.0.0.1", 0)
+        host = str(server[0] or "127.0.0.1")
+        port = int(server[1] or 0)
+        register_app_router(id(self), *self._build_server_args(host, port))
+        self._oneshot_registered = True
+
+    async def _asgi_oneshot_http(self, scope: dict, receive: Callable, send: Callable) -> bool:
+        """Drive one HTTP request through the Rust engine in-process via
+        ``process_request`` and emit the ASGI response. Returns True when
+        handled. The blocking dispatch runs in a thread so the asyncio loop
+        is not blocked (the GIL is released inside ``process_request``)."""
+        import asyncio
+
+        from fastapi_turbo._fastapi_turbo_core import process_request
+
+        self._ensure_oneshot_registered(scope)
+
+        # Drain the request body from the ASGI ``receive`` channel.
+        body = b""
+        more_body = True
+        while more_body:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return True  # client gone before we could respond
+            body += message.get("body", b"") or b""
+            more_body = message.get("more_body", False)
+
+        method = scope.get("method", "GET")
+        path = scope.get("path", "/")
+        query_string = scope.get("query_string", b"") or b""
+        if isinstance(query_string, (bytes, bytearray)):
+            query_string = bytes(query_string).decode("latin-1")
+        headers = [(bytes(k), bytes(v)) for k, v in scope.get("headers", [])]
+        client = scope.get("client") or ("127.0.0.1", 0)
+        client_host = str(client[0] or "127.0.0.1")
+        client_port = int(client[1] or 0)
+
+        loop = asyncio.get_running_loop()
+        status, resp_headers, resp_body = await loop.run_in_executor(
+            None,
+            process_request,
+            id(self),
+            method,
+            path,
+            query_string,
+            headers,
+            body,
+            client_host,
+            client_port,
+        )
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [[bytes(k), bytes(v)] for k, v in resp_headers],
+            }
+        )
+        await send({"type": "http.response.body", "body": bytes(resp_body)})
+        return True
+
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
         """ASGI entry point.
 
@@ -7402,6 +7498,17 @@ class FastAPI:
 
             if not getattr(self, "_in_process_dynamic_routes_installed", False):
                 self._install_in_process_dynamic_routes()
+
+            # In-process oneshot door (the one Rust engine, second door).
+            # Opt-in (FASTAPI_TURBO_ONESHOT_DOOR=1) while it's proven against
+            # the Python dispatcher. Declines to the dispatcher for surface
+            # the assembled router can't host (raw ASGI MW, ASGI sub-app
+            # mounts). On decline the body is untouched, so the dispatcher
+            # still drains it cleanly.
+            if self._oneshot_door_enabled() and self._oneshot_door_can_handle(scope):
+                if await self._asgi_oneshot_http(scope, receive, send):
+                    return
+
             # Honour an explicit opt-out for the (rare) cases where the
             # caller wants the proxy path (existing regression workflows,
             # tests that specifically validate the proxy code path).
