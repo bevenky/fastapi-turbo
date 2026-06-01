@@ -1892,7 +1892,11 @@ async fn handle_request(
     // For async handlers (with or without deps), run via loop.run_until_complete()
     // on a thread-local event loop. This eliminates the ~100-150μs cross-thread
     // overhead of run_coroutine_threadsafe. All DB awaits resolve on THIS thread.
-    if state.is_async {
+    // Async handlers WITHOUT dependencies use the dedicated local-loop path here.
+    // Async handlers WITH dependencies fall through to the unified deps loop below,
+    // which resolves the dependency graph AND drives the async handler — block C's
+    // extract-only path never resolved deps.
+    if state.is_async && !state.has_dep_params {
         return tokio::task::block_in_place(|| {
             Python::attach(|py| {
                 set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
@@ -2064,7 +2068,20 @@ async fn handle_request(
                             }
                         }
                     }
-                    match state.handler.call(py, (), Some(&kwargs)) {
+                    // ASYNC handler WITH dependencies — must be DRIVEN, not just
+                    // called (a bare .call returns the un-awaited coroutine). We're
+                    // inside `if state.is_async`, so always drive on the local loop,
+                    // exactly like the no-dep async branches above.
+                    let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
+                        .read()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
+                    match crate::handler_bridge::call_async_on_local_loop_with_app(
+                        py,
+                        &state.handler,
+                        &kwargs,
+                        app_for_submit.as_ref(),
+                    ) {
                         Ok(r) => {
                             drain_background_tasks(py, &kwargs, &state.params);
                             py_to_response_with_request(
@@ -2157,9 +2174,20 @@ async fn handle_request(
                 }
             }
 
-            // Call handler — try sync completion for async handlers too
+            // Call handler. Deps are already resolved into `kwargs` above, so an
+            // async handler is driven on the local loop (handles suspension) — the
+            // 599 fallback below can't re-resolve deps, so we must not rely on it.
             let result = if state.is_async {
-                try_call_async_sync(py, &state.handler, &kwargs)
+                let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
+                    .read()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
+                crate::handler_bridge::call_async_on_local_loop_with_app(
+                    py,
+                    &state.handler,
+                    &kwargs,
+                    app_for_submit.as_ref(),
+                )
             } else {
                 state.handler.call(py, (), Some(&kwargs))
             };

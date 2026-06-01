@@ -17,7 +17,7 @@ import subprocess
 import sys
 
 _SCRIPT = r'''
-import asyncio, json, sys
+import asyncio, inspect, json, sys
 import httpx
 import fastapi                       # REAL fastapi (no shim)
 from fastapi import FastAPI, Header, Cookie, Depends, Form
@@ -30,6 +30,18 @@ from fastapi_turbo._introspect_from_real_fastapi import extract_params_from_rout
 class Item(BaseModel):
     name: str
     qty: int = 1
+
+def common_dep(q: str = "z"):
+    return {"q": q}
+
+def sub_dep(region: str = Header(default="us")):
+    return region.upper()
+
+def outer_dep(reg: str = Depends(sub_dep), n: int = 1):
+    return {"reg": reg, "n": n}
+
+async def adep(x: int = 0):
+    return x * 10
 
 def build_app():
     app = FastAPI()
@@ -45,6 +57,15 @@ def build_app():
     @app.get("/opt")
     def opt(maybe: int | None = None):
         return {"maybe": maybe}
+    @app.get("/dep1")                                  # simple dep + handler param
+    def dep1(d: dict = Depends(common_dep), top: int = 5):
+        return {"d": d, "top": top}
+    @app.get("/dep2")                                  # NESTED dep (outer→sub) + header inject
+    def dep2(o: dict = Depends(outer_dep)):
+        return {"o": o}
+    @app.get("/dep3")                                  # ASYNC dep
+    async def dep3(v: int = Depends(adep)):
+        return {"v": v}
     return app
 
 def register(app):
@@ -58,7 +79,8 @@ def register(app):
         except Undelegable:
             declined.append(r.path); continue
         infos.append(RouteInfo(path=r.path, methods=list(r.methods), handler=r.endpoint,
-                               is_async=False, handler_name=r.endpoint.__name__,
+                               is_async=inspect.iscoroutinefunction(r.endpoint),
+                               handler_name=r.endpoint.__name__,
                                params=params, is_websocket=False))
     register_app_router(id(app), infos, "127.0.0.1", 0, [], None, None, None, None, [],
                         None, True, None, None, app, None, None, None, None, [])
@@ -90,6 +112,9 @@ def main():
             json.dumps({"name": "w", "qty": 4}).encode(), {"json": {"name": "w", "qty": 4}}),
         ("POST", "/body", "", {"content-type": "application/json"},
             json.dumps({"name": "w", "qty": "bad"}).encode(), {"json": {"name": "w", "qty": "bad"}}),  # 422
+        ("GET", "/dep1", "q=hi&top=9", None, b"", {}),                    # dep + handler param
+        ("GET", "/dep2", "n=3", {"region": "eu"}, b"", {}),               # nested dep + header inject
+        ("GET", "/dep3", "x=4", None, b"", {}),                          # async dep
     ]
     fails = []
     for method, path, qs, hdrs, body, realkw in cases:
@@ -102,19 +127,31 @@ def main():
             ok = ok and (d_body == r_body)
         if not ok:
             fails.append(f"{method} {rurl}: door={d_st}/{d_body!r} real={r_st}/{r_body!r}")
-    # decline coverage: a dep route + a Form route must raise Undelegable.
+    # decline coverage: yield-dep + Form must raise Undelegable; a simple dep must NOT.
     dec_app = FastAPI()
-    def dep(x: str = "z"): return x
-    @dec_app.get("/d")
-    def d(v: str = Depends(dep)): return {"v": v}
+    def ydep():
+        yield "x"
+    def plain(q: str = "z"):
+        return q
+    @dec_app.get("/y")
+    def y(v: str = Depends(ydep)): return {"v": v}
     @dec_app.post("/f")
     def f(name: str = Form()): return {"name": name}
+    @dec_app.get("/ok")
+    def okr(v: str = Depends(plain)): return {"v": v}
     for r in dec_app.routes:
-        if isinstance(r, APIRoute):
+        if not isinstance(r, APIRoute):
+            continue
+        if r.path in ("/y", "/f"):
             try:
                 extract_params_from_route(r); fails.append(f"{r.path} should be Undelegable")
             except Undelegable:
                 pass
+        elif r.path == "/ok":
+            try:
+                extract_params_from_route(r)  # simple dep must be HANDLED
+            except Undelegable as e:
+                fails.append(f"/ok simple dep should be handled, got Undelegable: {e}")
     if fails:
         print("FAIL\n" + "\n".join(fails)); sys.exit(1)
     print("PIVOT_ADAPTER_OK")
