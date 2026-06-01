@@ -60,6 +60,15 @@ async def adep(x: int = 0):
 def auth_dep(token: str = Header(default="anon")):
     return token
 
+_TEARDOWN = []
+def yield_dep(q: str = "z"):
+    db = {"q": q, "open": True}
+    try:
+        yield db
+    finally:
+        db["open"] = False
+        _TEARDOWN.append(q)
+
 def build_app():
     app = FastAPI()
     @app.get("/scalars/{pid}")
@@ -83,6 +92,9 @@ def build_app():
     @app.get("/dep3")                                  # ASYNC dep
     async def dep3(v: int = Depends(adep)):
         return {"v": v}
+    @app.get("/ydep")                                  # sync yield dep (db-session)
+    def ydep_route(db: dict = Depends(yield_dep)):
+        return {"q": db["q"], "open": db["open"]}
     # --- constraints ---
     @app.get("/con")
     def con(n: int = Query(gt=5, le=10)):
@@ -207,6 +219,7 @@ def main():
         ("GET", "/dep1", "q=hi&top=9", None, b"", {}),
         ("GET", "/dep2", "n=3", {"region": "eu"}, b"", {}),
         ("GET", "/dep3", "x=4", None, b"", {}),
+        ("GET", "/ydep", "q=hi", None, b"", {}),                     # sync yield dep
         ("GET", "/con", "n=7", None, b"", {}),                       # constraint pass
         ("GET", "/con", "n=3", None, b"", {}),                       # constraint fail → 422
         ("GET", "/con", "n=99", None, b"", {}),                      # constraint fail → 422
@@ -229,6 +242,12 @@ def main():
             ok = ok and (d_body == r_body)
         if not ok:
             fails.append(f"{method} {rurl}: door={d_st}/{d_body!r} real={r_st}/{r_body!r}")
+
+    # yield-dep teardown must run AFTER the response (db.close() semantics).
+    _TEARDOWN.clear()
+    d_st, d_body = door(app, "GET", "/ydep", "q=tcheck")
+    if not (d_st == 200 and d_body == {"q": "tcheck", "open": True} and _TEARDOWN == ["tcheck"]):
+        fails.append(f"/ydep teardown: st={d_st} body={d_body!r} teardown={_TEARDOWN}")
 
     # Response inject: assert the temporal status_code + header merge (door
     # returns raw headers; real FastAPI applies them to the actual response).
@@ -280,9 +299,9 @@ def main():
     if not (d_st == r_st == 200 and d_body == r_body):
         fails.append(f"/multi: door={d_st}/{d_body!r} real={r_st}/{r_body!r}")
 
-    # decline coverage: yield-dep, dep-with-special-param, Form model-expansion.
+    # decline coverage: async-generator dep, dep-with-special-param, Form model-expansion.
     dec_app = FastAPI()
-    def ydep():
+    async def aydep():
         yield "x"
     def reqdep_inner(request: Request):                  # dep takes Request → decline
         return request.method
@@ -291,7 +310,7 @@ def main():
     def plain(q: str = "z"):
         return q
     @dec_app.get("/y")
-    def y(v: str = Depends(ydep)): return {"v": v}
+    def y(v: str = Depends(aydep)): return {"v": v}
     @dec_app.get("/rd")
     def rd(m: str = Depends(reqdep_inner)): return {"m": m}
     @dec_app.post("/fm")

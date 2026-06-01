@@ -398,8 +398,11 @@ def _emit_dep(dep: Any, out: list[ParamInfo], uid: str, *, is_handler_param: boo
     holding the dep's result, so a parent can wire it as an input."""
     _check_special(dep)
     call = dep.call
-    if inspect.isgeneratorfunction(call) or inspect.isasyncgenfunction(call):
-        raise Undelegable("yield/generator dependency → real FastAPI")
+    # Sync ``yield`` deps run on the door (the engine enters them and runs teardown
+    # after the response). Async generators still need the event-loop exit stack.
+    if inspect.isasyncgenfunction(call):
+        raise Undelegable("async generator dependency → real FastAPI")
+    is_gen = inspect.isgeneratorfunction(call)
     if _bucket_fields(dep, "body"):
         raise Undelegable("dependency with a body param → real FastAPI")
 
@@ -433,7 +436,7 @@ def _emit_dep(dep: Any, out: list[ParamInfo], uid: str, *, is_handler_param: boo
             dep_callable=call,
             dep_callable_id=(id(call) if getattr(dep, "use_cache", True) else None),
             is_async_dep=inspect.iscoroutinefunction(call),
-            is_generator_dep=False,
+            is_generator_dep=is_gen,
             dep_input_names=input_wiring,
             is_handler_param=is_handler_param,
             scalar_validator=None,

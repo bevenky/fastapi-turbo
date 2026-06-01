@@ -2104,6 +2104,8 @@ async fn handle_request(
             set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
             let mut resolved: HashMap<String, Py<PyAny>> = HashMap::new();
             let mut dep_cache: HashMap<u64, String> = HashMap::new();
+            // Live ``yield`` dependency generators awaiting teardown.
+            let mut gen_deps: Vec<Py<PyAny>> = Vec::new();
 
             for param in &state.params {
                 match param.kind.as_str() {
@@ -2130,8 +2132,11 @@ async fn handle_request(
                             }
                         }
 
-                        // Call the dep — try synchronous completion via send(None)
-                        let result = if param.is_async_dep {
+                        // Call the dep. A ``yield`` dep is entered (and stashed for
+                        // teardown); async via send(None); plain sync directly.
+                        let result = if param.is_generator_dep {
+                            enter_sync_generator_dep(py, dep_callable, &dep_kwargs, &mut gen_deps)
+                        } else if param.is_async_dep {
                             try_call_async_sync(py, dep_callable, &dep_kwargs)
                         } else {
                             dep_callable.call(py, (), Some(&dep_kwargs))
@@ -2144,7 +2149,10 @@ async fn handle_request(
                                 }
                                 resolved.insert(param.name.clone(), val);
                             }
-                            Err(py_err) => return pyerr_to_response(py, &py_err),
+                            Err(py_err) => {
+                                teardown_generator_deps(py, &gen_deps, true);
+                                return pyerr_to_response(py, &py_err);
+                            }
                         }
                     }
                     _ => {
@@ -2163,6 +2171,7 @@ async fn handle_request(
                                 &body_bytes,
                                 &mut resolved,
                             ) {
+                                teardown_generator_deps(py, &gen_deps, true);
                                 return resp;
                             }
                         }
@@ -2194,7 +2203,10 @@ async fn handle_request(
                 state.lax_content_type,
             ) {
                 Ok(kw) => kw,
-                Err(resp) => return resp,
+                Err(resp) => {
+                    teardown_generator_deps(py, &gen_deps, true);
+                    return resp;
+                }
             };
             for param in &state.params {
                 if param.is_handler_param && param.kind == "dependency" {
@@ -2216,6 +2228,7 @@ async fn handle_request(
                 &body_bytes,
                 &client_addr,
             ) {
+                teardown_generator_deps(py, &gen_deps, true);
                 return pyerr_to_response(py, &e);
             }
             if state.has_http_middleware {
@@ -2259,12 +2272,17 @@ async fn handle_request(
                 Ok(py_result) => {
                     // Run any BackgroundTasks the handler received (deferred).
                     drain_background_tasks(py, &kwargs, &state.params);
-                    py_to_response_with_request(
+                    // Build the response BEFORE yield-dep teardown so lazily
+                    // serialized objects (e.g. ORM rows) materialize while the
+                    // session is still open — matches FastAPI's exit-stack order.
+                    let resp = py_to_response_with_request(
                         py,
                         py_result.bind(py),
                         range_header.as_deref(),
                         if_range_header.as_deref(),
-                    )
+                    );
+                    teardown_generator_deps(py, &gen_deps, false);
+                    resp
                 }
                 Err(ref py_err) => {
                     // Check if this is "needs event loop" — signal for fallback
@@ -2274,9 +2292,13 @@ async fn handle_request(
                         .map(|s| s.to_string())
                         .unwrap_or_default();
                     if msg.contains("event loop") {
+                        // Fallback re-runs the handler — tear down THIS attempt's
+                        // generators (the fallback re-enters its own).
+                        teardown_generator_deps(py, &gen_deps, true);
                         // Return a sentinel status to signal fallback needed
                         (StatusCode::from_u16(599).unwrap(), "NEEDS_EVENT_LOOP").into_response()
                     } else {
+                        teardown_generator_deps(py, &gen_deps, true);
                         pyerr_to_response(py, py_err)
                     }
                 }
@@ -2333,6 +2355,51 @@ async fn handle_request(
     }
 
     resp
+}
+
+// ── yield (generator) dependency helpers ─────────────────────────────
+
+/// Enter a sync ``yield`` dependency: call it to get the generator, advance to
+/// the first yield (``send(None)``) to obtain the dependency value, and stash the
+/// live generator so its teardown runs after the response is built.
+fn enter_sync_generator_dep(
+    py: Python<'_>,
+    dep_callable: &Py<PyAny>,
+    dep_kwargs: &pyo3::Bound<'_, PyDict>,
+    gen_deps: &mut Vec<Py<PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let gen = dep_callable.call(py, (), Some(dep_kwargs))?;
+    match gen.call_method1(py, "send", (py.None(),)) {
+        Ok(v) => {
+            gen_deps.push(gen);
+            Ok(v)
+        }
+        // A generator that returns without yielding has no value and nothing to
+        // tear down — surface its StopIteration ``value`` (usually None).
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => Ok(e
+            .value(py)
+            .getattr("value")
+            .map(|v| v.unbind())
+            .unwrap_or_else(|_| py.None())),
+        Err(e) => Err(e),
+    }
+}
+
+/// Run teardown for every entered ``yield`` dependency, in reverse order. On the
+/// success path we advance past the yield (running post-yield cleanup, e.g.
+/// ``db.close()``); on the error path we ``close()`` the generator (raising
+/// ``GeneratorExit`` so ``try/finally`` cleanup still runs). Teardown errors are
+/// swallowed — the response has already been produced.
+fn teardown_generator_deps(py: Python<'_>, gen_deps: &[Py<PyAny>], errored: bool) {
+    for gen in gen_deps.iter().rev() {
+        if errored {
+            let _ = gen.call_method0(py, "close");
+        } else if gen.call_method1(py, "send", (py.None(),)).is_ok() {
+            // Yielded again (multi-yield dep) — close out the remainder.
+            // (StopIteration / teardown error means it's already done.)
+            let _ = gen.call_method0(py, "close");
+        }
+    }
 }
 
 // ── Async try-sync helper ────────────────────────────────────────────
