@@ -458,247 +458,31 @@ pub fn run_server(
             ))
         })?;
 
-        // Build per-server declared-paths Arcs for the redirect_slashes
-        // and non_preflight_options middlewares. Each server owns its
-        // own view — sharing a global static across concurrent test apps
-        // caused later-starting servers to overwrite an earlier server's
-        // set (→ 404s on the earlier app's routes).
-        let declared_paths_arc: std::sync::Arc<std::collections::HashSet<String>> = {
-            let set: std::collections::HashSet<String> =
-                routes.iter().map(|r| r.path.clone()).collect();
-            std::sync::Arc::new(set)
-        };
-        let declared_options_paths_arc: std::sync::Arc<std::collections::HashSet<String>> = {
-            let opts: std::collections::HashSet<String> = routes
-                .iter()
-                .filter(|r| r.methods.iter().any(|m| m.eq_ignore_ascii_case("OPTIONS")))
-                .map(|r| r.path.clone())
-                .collect();
-            std::sync::Arc::new(opts)
-        };
-        // Per-path declared-method map AND a registration-ordered
-        // ``Vec<(template, methods)>`` for the OPTIONS middleware.
-        // First-match-wins parity with upstream FastAPI requires
-        // walking templates in REGISTRATION order; the HashMap's
-        // iteration order is non-deterministic. Earlier code used
-        // "most specific" tiebreak (fewest ``{}`` segments) which
-        // matched matchit's behaviour but diverged from Starlette
-        // for overlapping literal/param routes (R27).
-        let allow_methods_by_path_arc: std::sync::Arc<
-            std::collections::HashMap<String, Vec<String>>,
-        > = {
-            let mut map: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            for r in &routes {
-                let entry = map.entry(r.path.clone()).or_default();
-                for m in &r.methods {
-                    let up = m.to_ascii_uppercase();
-                    if !entry.iter().any(|x| x == &up) {
-                        entry.push(up);
-                    }
-                }
-            }
-            std::sync::Arc::new(map)
-        };
-        let allow_methods_in_order_arc: std::sync::Arc<Vec<(String, Vec<String>)>> = {
-            let mut order: Vec<(String, Vec<String>)> = Vec::with_capacity(routes.len());
-            for r in &routes {
-                let methods: Vec<String> = r
-                    .methods
-                    .iter()
-                    .map(|m| m.to_ascii_uppercase())
-                    .collect();
-                if let Some(existing) =
-                    order.iter_mut().find(|(p, _)| p == &r.path)
-                {
-                    for m in methods {
-                        if !existing.1.iter().any(|x| x == &m) {
-                            existing.1.push(m);
-                        }
-                    }
-                } else {
-                    order.push((r.path.clone(), methods));
-                }
-            }
-            std::sync::Arc::new(order)
-        };
-        // Also populate the legacy globals for any single-app code paths
-        // (best-effort; authoritative is the per-server Arc).
-        if let Ok(mut slot) = DECLARED_PATHS.write() {
-            *slot = Some((*declared_paths_arc).clone());
-        }
-        if let Ok(mut slot) = DECLARED_OPTIONS_PATHS.write() {
-            *slot = Some((*declared_options_paths_arc).clone());
-        }
+        // Assemble the complete Axum application router: user routes +
+        // the pure-Rust baseline endpoints + OpenAPI/docs + static mounts
+        // + the full Tower layer stack (CORS / compression /
+        // redirect_slashes / non-preflight-OPTIONS / body-limit). Pure,
+        // synchronous, and socket-free — so the SAME router is both served
+        // here over a TcpListener (the ``app.run()`` door) and can be
+        // driven in-process per request via ``tower::Service::oneshot``
+        // (the ASGI door). One engine, one router, two doors.
+        let _ = &root_path; // metadata only; never consulted by Rust routing
+        let app = assemble_app_router(
+            routes,
+            &mw_configs,
+            openapi_json,
+            docs_url,
+            redoc_url,
+            openapi_url,
+            &static_mounts,
+            redirect_slashes,
+            max_request_size,
+            swagger_ui_oauth2_redirect_url,
+            swagger_ui_html,
+            redoc_html,
+        );
 
         rt.block_on(async move {
-            let (mut router, ws_router) = build_router(routes);
-
-            // Pure Rust baseline endpoints — zero Python
-            router = router.route("/_ping", get(|| async {
-                (
-                    axum::http::StatusCode::OK,
-                    [("content-type", "application/json")],
-                    r#"{"ping":"pong"}"#,
-                )
-            }));
-
-            // Pure Rust WebSocket echo — measures Axum WS baseline (no Python)
-            router = router.route("/_ws-echo", axum::routing::any(
-                |ws: axum::extract::ws::WebSocketUpgrade| async {
-                    ws.on_upgrade(crate::websocket::handle_ws_echo_rust)
-                }
-            ));
-
-            // Add OpenAPI / documentation routes if enabled. An empty
-            // ``openapi_url`` means "disable OpenAPI + docs entirely" —
-            // FA behavior tested by ``test_conditional_openapi``.
-            // Docs UI is set up as long as ``openapi_url`` is set;
-            // JSON endpoint is auto-registered only when
-            // ``openapi_json`` is also provided (else Python handles it).
-            if openapi_url.is_some() {
-                let oa_url = openapi_url.as_deref().unwrap_or("/openapi.json");
-                if oa_url.is_empty() {
-                    // Skip openapi + docs routes; ``/openapi.json`` / ``/docs``
-                    // simply return 404.
-                } else {
-
-                if let Some(ref schema_json) = openapi_json {
-                    let json_clone = schema_json.clone();
-                    router = router.route(
-                        oa_url,
-                        get(move || async move {
-                            (
-                                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                                json_clone.clone(),
-                            )
-                        }),
-                    );
-                }
-
-                // Swagger UI — prefer Python-rendered HTML
-                // (``get_swagger_ui_html``) when supplied by the
-                // application; fall back to the embedded default
-                // template. Python rendering honours FA kwargs like
-                // ``swagger_ui_parameters`` and ``swagger_ui_init_oauth``.
-                if let Some(ref docs_path) = docs_url {
-                    let swagger_final = if let Some(s) = swagger_ui_html.clone() {
-                        s
-                    } else if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
-                        SWAGGER_UI_HTML
-                            .replace("__OPENAPI_URL__", oa_url)
-                            .replace("__OAUTH2_REDIRECT_URL__", oauth_redirect)
-                    } else {
-                        SWAGGER_UI_HTML
-                            .replace("__OPENAPI_URL__", oa_url)
-                            .lines()
-                            .filter(|l| !l.contains("oauth2RedirectUrl"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    };
-                    router = router.route(
-                        docs_path,
-                        get(move || async move {
-                            axum::response::Html(swagger_final.clone())
-                        }),
-                    );
-                    if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
-                        router = router.route(
-                            oauth_redirect,
-                            get(|| async {
-                                axum::response::Html(SWAGGER_OAUTH2_REDIRECT_HTML)
-                            }),
-                        );
-                    }
-                }
-
-                // ReDoc — similarly prefer Python-rendered HTML.
-                if let Some(ref redoc_path) = redoc_url {
-                    let redoc_final = redoc_html.clone().unwrap_or_else(|| {
-                        REDOC_HTML.replace("__OPENAPI_URL__", oa_url)
-                    });
-                    router = router.route(
-                        redoc_path,
-                        get(move || async move {
-                            axum::response::Html(redoc_final.clone())
-                        }),
-                    );
-                }
-                } // end: oa_url non-empty
-            }
-
-            // Register prefixes so the redirect_slashes middleware can
-            // short-circuit for static file requests.
-            let prefix_list: Vec<String> = static_mounts
-                .iter()
-                .map(|(p, _)| p.trim_end_matches('/').to_string())
-                .collect();
-            let _ = STATIC_PREFIXES.set(prefix_list.clone());
-
-            // FastAPI/Starlette semantics: root_path is metadata only — it is
-            // advertised in OpenAPI `servers` and used by `url_for`, but the
-            // routing layer always matches paths as-written. The ASGI server or
-            // reverse proxy is responsible for stripping the prefix before the
-            // request reaches us. vLLM relies on this behaviour.
-            let _ = &root_path;
-
-            // Apply app-level middleware (CORS, GZip, etc.) to the MAIN
-            // (HTTP) router. WebSocket routes are merged in AFTER middleware
-            // so they bypass the CORS/compression stack — tower-http's
-            // CorsLayer mutates the 101 Switching Protocols upgrade response
-            // and breaks the WS handshake when applied to WS routes.
-            let main_with_mw = apply_middlewares(router, &mw_configs);
-            // Merge WS routes in at the top level (no CORS). Then attach the
-            // FastAPI-style 404 fallback so it only fires when neither the
-            // HTTP nor WS branches matched.
-            let main_with_mw = crate::router::with_not_found_fallback(
-                ws_router.merge(main_with_mw)
-            );
-            let mut app = axum::Router::new();
-            for (prefix, directory) in &static_mounts {
-                let svc = CachedServeDir::new(prefix, std::path::PathBuf::from(directory));
-                app = app.nest_service(prefix, svc);
-            }
-            let mut app = app.fallback_service(main_with_mw);
-
-            // redirect_slashes: trailing-slash redirect middleware.
-            // Matches Starlette's `redirect_slashes=True` default.
-            if redirect_slashes {
-                let paths_arc = declared_paths_arc.clone();
-                app = app.layer(axum::middleware::from_fn(
-                    move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-                        let paths = paths_arc.clone();
-                        async move { slashes_redirect_middleware_with_paths(req, next, paths).await }
-                    },
-                ));
-            }
-
-            // Non-preflight OPTIONS: FastAPI/Starlette's CORS intercepts
-            // only actual cross-origin preflights (request has both
-            // `Origin` AND `Access-Control-Request-Method`). tower-http's
-            // CorsLayer is more lenient and returns 200 for any OPTIONS.
-            // We add a pre-middleware that lets OPTIONS *without* those
-            // headers fall through to method routing (→ 405 as expected).
-            let opts_paths_arc = declared_options_paths_arc.clone();
-            let allow_by_path_arc = allow_methods_by_path_arc.clone();
-            let allow_in_order_arc = allow_methods_in_order_arc.clone();
-            app = app.layer(axum::middleware::from_fn(
-                move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-                    let paths = opts_paths_arc.clone();
-                    let allow = allow_by_path_arc.clone();
-                    let order = allow_in_order_arc.clone();
-                    async move {
-                        non_preflight_options_middleware_with_paths(
-                            req, next, paths, allow, order,
-                        ).await
-                    }
-                },
-            ));
-
-            // max_request_size: 413 Payload Too Large on oversized bodies.
-            if let Some(limit) = max_request_size {
-                app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(limit));
-            }
 
             let addr = format!("{host}:{port}");
             let listener = TcpListener::bind(&addr).await.map_err(|e| {
@@ -730,6 +514,268 @@ pub fn run_server(
             Ok(())
         })
     })
+}
+
+/// Assemble the complete Axum application router used by BOTH request doors.
+///
+/// Pure and synchronous: it builds the per-server declared-path/method Arcs,
+/// the user routes, the pure-Rust baseline endpoints, the OpenAPI/docs routes,
+/// the static-file mounts, and the full Tower layer stack
+/// (CORS / compression / redirect_slashes / non-preflight-OPTIONS / body-limit),
+/// then returns the finished `axum::Router`. It binds no socket, so the returned
+/// router can be either served via `axum::serve` (the `app.run()` door) or driven
+/// in-process per request via `tower::Service::oneshot` (the ASGI door) — keeping
+/// the two doors byte-identical: one engine, one router.
+#[allow(clippy::too_many_arguments)]
+fn assemble_app_router(
+    routes: Vec<RouteInfo>,
+    mw_configs: &[MiddlewareConfig],
+    openapi_json: Option<String>,
+    docs_url: Option<String>,
+    redoc_url: Option<String>,
+    openapi_url: Option<String>,
+    static_mounts: &[(String, String)],
+    redirect_slashes: bool,
+    max_request_size: Option<usize>,
+    swagger_ui_oauth2_redirect_url: Option<String>,
+    swagger_ui_html: Option<String>,
+    redoc_html: Option<String>,
+) -> axum::Router {
+    // Build per-server declared-paths Arcs for the redirect_slashes
+    // and non_preflight_options middlewares. Each server owns its
+    // own view — sharing a global static across concurrent test apps
+    // caused later-starting servers to overwrite an earlier server's
+    // set (→ 404s on the earlier app's routes).
+    let declared_paths_arc: std::sync::Arc<std::collections::HashSet<String>> = {
+        let set: std::collections::HashSet<String> =
+            routes.iter().map(|r| r.path.clone()).collect();
+        std::sync::Arc::new(set)
+    };
+    let declared_options_paths_arc: std::sync::Arc<std::collections::HashSet<String>> = {
+        let opts: std::collections::HashSet<String> = routes
+            .iter()
+            .filter(|r| r.methods.iter().any(|m| m.eq_ignore_ascii_case("OPTIONS")))
+            .map(|r| r.path.clone())
+            .collect();
+        std::sync::Arc::new(opts)
+    };
+    // Per-path declared-method map AND a registration-ordered
+    // ``Vec<(template, methods)>`` for the OPTIONS middleware.
+    // First-match-wins parity with upstream FastAPI requires
+    // walking templates in REGISTRATION order; the HashMap's
+    // iteration order is non-deterministic. Earlier code used
+    // "most specific" tiebreak (fewest ``{}`` segments) which
+    // matched matchit's behaviour but diverged from Starlette
+    // for overlapping literal/param routes (R27).
+    let allow_methods_by_path_arc: std::sync::Arc<
+        std::collections::HashMap<String, Vec<String>>,
+    > = {
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in &routes {
+            let entry = map.entry(r.path.clone()).or_default();
+            for m in &r.methods {
+                let up = m.to_ascii_uppercase();
+                if !entry.iter().any(|x| x == &up) {
+                    entry.push(up);
+                }
+            }
+        }
+        std::sync::Arc::new(map)
+    };
+    let allow_methods_in_order_arc: std::sync::Arc<Vec<(String, Vec<String>)>> = {
+        let mut order: Vec<(String, Vec<String>)> = Vec::with_capacity(routes.len());
+        for r in &routes {
+            let methods: Vec<String> = r
+                .methods
+                .iter()
+                .map(|m| m.to_ascii_uppercase())
+                .collect();
+            if let Some(existing) =
+                order.iter_mut().find(|(p, _)| p == &r.path)
+            {
+                for m in methods {
+                    if !existing.1.iter().any(|x| x == &m) {
+                        existing.1.push(m);
+                    }
+                }
+            } else {
+                order.push((r.path.clone(), methods));
+            }
+        }
+        std::sync::Arc::new(order)
+    };
+    // Also populate the legacy globals for any single-app code paths
+    // (best-effort; authoritative is the per-server Arc).
+    if let Ok(mut slot) = DECLARED_PATHS.write() {
+        *slot = Some((*declared_paths_arc).clone());
+    }
+    if let Ok(mut slot) = DECLARED_OPTIONS_PATHS.write() {
+        *slot = Some((*declared_options_paths_arc).clone());
+    }
+
+    let (mut router, ws_router) = build_router(routes);
+
+    // Pure Rust baseline endpoints — zero Python
+    router = router.route("/_ping", get(|| async {
+        (
+            axum::http::StatusCode::OK,
+            [("content-type", "application/json")],
+            r#"{"ping":"pong"}"#,
+        )
+    }));
+
+    // Pure Rust WebSocket echo — measures Axum WS baseline (no Python)
+    router = router.route("/_ws-echo", axum::routing::any(
+        |ws: axum::extract::ws::WebSocketUpgrade| async {
+            ws.on_upgrade(crate::websocket::handle_ws_echo_rust)
+        }
+    ));
+
+    // Add OpenAPI / documentation routes if enabled. An empty
+    // ``openapi_url`` means "disable OpenAPI + docs entirely" —
+    // FA behavior tested by ``test_conditional_openapi``.
+    // Docs UI is set up as long as ``openapi_url`` is set;
+    // JSON endpoint is auto-registered only when
+    // ``openapi_json`` is also provided (else Python handles it).
+    if openapi_url.is_some() {
+        let oa_url = openapi_url.as_deref().unwrap_or("/openapi.json");
+        if oa_url.is_empty() {
+            // Skip openapi + docs routes; ``/openapi.json`` / ``/docs``
+            // simply return 404.
+        } else {
+
+        if let Some(ref schema_json) = openapi_json {
+            let json_clone = schema_json.clone();
+            router = router.route(
+                oa_url,
+                get(move || async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        json_clone.clone(),
+                    )
+                }),
+            );
+        }
+
+        // Swagger UI — prefer Python-rendered HTML
+        // (``get_swagger_ui_html``) when supplied by the
+        // application; fall back to the embedded default
+        // template. Python rendering honours FA kwargs like
+        // ``swagger_ui_parameters`` and ``swagger_ui_init_oauth``.
+        if let Some(ref docs_path) = docs_url {
+            let swagger_final = if let Some(s) = swagger_ui_html.clone() {
+                s
+            } else if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
+                SWAGGER_UI_HTML
+                    .replace("__OPENAPI_URL__", oa_url)
+                    .replace("__OAUTH2_REDIRECT_URL__", oauth_redirect)
+            } else {
+                SWAGGER_UI_HTML
+                    .replace("__OPENAPI_URL__", oa_url)
+                    .lines()
+                    .filter(|l| !l.contains("oauth2RedirectUrl"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            router = router.route(
+                docs_path,
+                get(move || async move {
+                    axum::response::Html(swagger_final.clone())
+                }),
+            );
+            if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
+                router = router.route(
+                    oauth_redirect,
+                    get(|| async {
+                        axum::response::Html(SWAGGER_OAUTH2_REDIRECT_HTML)
+                    }),
+                );
+            }
+        }
+
+        // ReDoc — similarly prefer Python-rendered HTML.
+        if let Some(ref redoc_path) = redoc_url {
+            let redoc_final = redoc_html.clone().unwrap_or_else(|| {
+                REDOC_HTML.replace("__OPENAPI_URL__", oa_url)
+            });
+            router = router.route(
+                redoc_path,
+                get(move || async move {
+                    axum::response::Html(redoc_final.clone())
+                }),
+            );
+        }
+        } // end: oa_url non-empty
+    }
+
+    // Register prefixes so the redirect_slashes middleware can
+    // short-circuit for static file requests.
+    let prefix_list: Vec<String> = static_mounts
+        .iter()
+        .map(|(p, _)| p.trim_end_matches('/').to_string())
+        .collect();
+    let _ = STATIC_PREFIXES.set(prefix_list.clone());
+
+    // Apply app-level middleware (CORS, GZip, etc.) to the MAIN
+    // (HTTP) router. WebSocket routes are merged in AFTER middleware
+    // so they bypass the CORS/compression stack — tower-http's
+    // CorsLayer mutates the 101 Switching Protocols upgrade response
+    // and breaks the WS handshake when applied to WS routes.
+    let main_with_mw = apply_middlewares(router, mw_configs);
+    // Merge WS routes in at the top level (no CORS). Then attach the
+    // FastAPI-style 404 fallback so it only fires when neither the
+    // HTTP nor WS branches matched.
+    let main_with_mw = crate::router::with_not_found_fallback(
+        ws_router.merge(main_with_mw)
+    );
+    let mut app = axum::Router::new();
+    for (prefix, directory) in static_mounts {
+        let svc = CachedServeDir::new(prefix, std::path::PathBuf::from(directory));
+        app = app.nest_service(prefix, svc);
+    }
+    let mut app = app.fallback_service(main_with_mw);
+
+    // redirect_slashes: trailing-slash redirect middleware.
+    // Matches Starlette's `redirect_slashes=True` default.
+    if redirect_slashes {
+        let paths_arc = declared_paths_arc.clone();
+        app = app.layer(axum::middleware::from_fn(
+            move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                let paths = paths_arc.clone();
+                async move { slashes_redirect_middleware_with_paths(req, next, paths).await }
+            },
+        ));
+    }
+
+    // Non-preflight OPTIONS: FastAPI/Starlette's CORS intercepts
+    // only actual cross-origin preflights (request has both
+    // `Origin` AND `Access-Control-Request-Method`). tower-http's
+    // CorsLayer is more lenient and returns 200 for any OPTIONS.
+    // We add a pre-middleware that lets OPTIONS *without* those
+    // headers fall through to method routing (→ 405 as expected).
+    let opts_paths_arc = declared_options_paths_arc.clone();
+    let allow_by_path_arc = allow_methods_by_path_arc.clone();
+    let allow_in_order_arc = allow_methods_in_order_arc.clone();
+    app = app.layer(axum::middleware::from_fn(
+        move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+            let paths = opts_paths_arc.clone();
+            let allow = allow_by_path_arc.clone();
+            let order = allow_in_order_arc.clone();
+            async move {
+                non_preflight_options_middleware_with_paths(
+                    req, next, paths, allow, order,
+                ).await
+            }
+        },
+    ));
+
+    // max_request_size: 413 Payload Too Large on oversized bodies.
+    if let Some(limit) = max_request_size {
+        app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(limit));
+    }
+
+    app
 }
 
 /// Set of *declared* paths (verbatim) from the user's routes. Used by the
