@@ -406,8 +406,12 @@ def test_testclient_stream_early_exit_cancels_server():
             it = r.iter_bytes()
             # Pull one chunk then exit early.
             next(it)
-        # Give the server a beat to observe the disconnect / cancel.
-        time.sleep(0.1)
+        # Poll for the server to observe the disconnect / cancel. A fixed sleep is
+        # flaky under full-suite load (prior tests' servers/threads add scheduling
+        # jitter); poll up to 2s so we still assert cancellation but tolerate delay.
+        _deadline = time.time() + 2.0
+        while not cancellation_observed["v"] and time.time() < _deadline:
+            time.sleep(0.02)
     assert cancellation_observed["v"] is True, (
         "server-side generator did not see cancellation — "
         "early-exit leaks the ASGI task"
