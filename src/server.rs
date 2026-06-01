@@ -956,9 +956,22 @@ pub fn process_request(
                     .iter()
                     .map(|(k, v)| (k.as_str().as_bytes().to_vec(), v.as_bytes().to_vec()))
                     .collect();
-                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                    .await
-                    .map_err(|e| format!("body read error: {e}"))?;
+                // Bounded buffer. The oneshot door buffers the whole response
+                // (the streaming chunk-pump is a later step), so cap it to
+                // avoid unbounded memory on streaming / infinite-SSE bodies —
+                // those must route through the Python fallback until the pump
+                // lands. Fail fast with a clear, catchable error instead of
+                // OOM-ing the worker.
+                const MAX_INPROCESS_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+                let bytes =
+                    axum::body::to_bytes(response.into_body(), MAX_INPROCESS_RESPONSE_BYTES)
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "oneshot door cannot buffer this response \
+                                 (streaming/oversized > 32MiB, not yet supported): {e}"
+                            )
+                        })?;
                 Ok::<_, String>((status, resp_headers, bytes.to_vec()))
             });
             join.await.map_err(|e| format!("dispatch task error: {e}"))?
