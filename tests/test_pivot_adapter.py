@@ -145,6 +145,10 @@ def build_app():
     @app.post("/formdep")
     def formdep(name: str = Form(), who: str = Depends(auth_dep)):
         return {"name": name, "who": who}
+    # --- Form model-expansion ---
+    @app.post("/formmodel")
+    def formmodel(data: typing_Annotated[Filters, Form()]):
+        return {"limit": data.limit, "q": data.q}
     # --- response_model ---
     @app.get("/rm", response_model=Out, response_model_exclude_unset=True)
     def rm():
@@ -300,6 +304,14 @@ def main():
     if not (d_st == r_st == 200 and d_body == r_body):
         fails.append(f"/formdep: door={d_st}/{d_body!r} real={r_st}/{r_body!r}")
 
+    # Form model-expansion: urlencoded fields → model
+    ct, b = urlencoded({"limit": "5", "q": "hey"})
+    d_st, d_body = door(app, "POST", "/formmodel", "", {"content-type": ct}, b)
+    r_st, r_body = asyncio.run(real_response(app, "POST", "/formmodel",
+                                             data={"limit": "5", "q": "hey"}))
+    if not (d_st == r_st == 200 and d_body == r_body):
+        fails.append(f"/formmodel: door={d_st}/{d_body!r} real={r_st}/{r_body!r}")
+
     # Body(embed=True): {"item": {...}}
     eb = json.dumps({"item": {"name": "w", "qty": 4}}).encode()
     d_st, d_body = door(app, "POST", "/embed", "", {"content-type": "application/json"}, eb)
@@ -316,24 +328,20 @@ def main():
     if not (d_st == r_st == 200 and d_body == r_body):
         fails.append(f"/multi: door={d_st}/{d_body!r} real={r_st}/{r_body!r}")
 
-    # decline coverage: async-generator dep + Form model-expansion (still delegate).
+    # decline coverage: async-generator deps still delegate to real FastAPI.
     dec_app = FastAPI()
     async def aydep():
         yield "x"
-    class FModel(BaseModel):
-        a: int
     def plain(q: str = "z"):
         return q
     @dec_app.get("/y")
     def y(v: str = Depends(aydep)): return {"v": v}
-    @dec_app.post("/fm")
-    def fm(model: FModel = Form()): return {"a": model.a}
     @dec_app.get("/ok")
     def okr(v: str = Depends(plain)): return {"v": v}
     for r in dec_app.routes:
         if not isinstance(r, APIRoute):
             continue
-        if r.path in ("/y", "/fm"):
+        if r.path in ("/y",):
             try:
                 extract_params_from_route(r); fails.append(f"{r.path} should be Undelegable")
             except Undelegable:

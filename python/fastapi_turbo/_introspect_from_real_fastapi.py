@@ -391,10 +391,11 @@ def _emit_body(route: Any, dep: Any, out: list[ParamInfo]) -> None:
             kind = "file" if type(bf.field_info).__name__ == "File" else "form"
             ann = _unwrap_optional(bf.field_info.annotation)
             if kind == "form" and _is_basemodel(ann):
-                # Form model-expansion needs form-aware dep-input extraction in the
-                # door (extract_single_param) — landed with the door-change batch.
-                raise Undelegable("Form model expansion → real FastAPI")
-            out.append(_param_from_field(bf, kind))
+                _expand_param_model(
+                    ann, "form", out, f"_fm_{bf.name}", bf.name, is_handler_param=True
+                )
+            else:
+                out.append(_param_from_field(bf, kind))
     elif len(body_fields) == 1 and fi_names <= {"Body"}:
         bf = body_fields[0]
         # Body(embed=True): wire shape is {"<name>": value}, not the bare value —

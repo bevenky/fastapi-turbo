@@ -2249,6 +2249,7 @@ async fn handle_request(
                                 &headers,
                                 &body_json,
                                 &body_bytes,
+                                &mut multipart_fields,
                                 &mut resolved,
                             ) {
                                 teardown_generator_deps(py, &gen_deps, true);
@@ -2404,6 +2405,7 @@ async fn handle_request(
                         &headers,
                         &body_json,
                         &body_bytes,
+                        &mut multipart_fields,
                         &mut resolved,
                     );
                 }
@@ -3268,6 +3270,7 @@ fn extract_params_to_pydict_full<'py>(
 }
 
 /// Extract a single param into the resolved HashMap (slow path for dep handlers).
+#[allow(clippy::too_many_arguments)]
 fn extract_single_param(
     py: Python<'_>,
     param: &ParamInfo,
@@ -3276,6 +3279,7 @@ fn extract_single_param(
     headers: &Option<HeaderMap>,
     body_json: &Option<serde_json::Value>,
     body_bytes: &[u8],
+    multipart_fields: &mut Option<HashMap<String, Vec<ParsedField>>>,
     resolved: &mut HashMap<String, Py<PyAny>>,
 ) -> Result<(), Response> {
     match param.kind.as_str() {
@@ -3407,6 +3411,60 @@ fn extract_single_param(
                     &param.name,
                     "field required",
                 ));
+            }
+        }
+        "form" | "file" => {
+            // Dependency-input form/file fields (Form model-expansion). Values are
+            // re-validated by the model builder, so plain strings / UploadFiles
+            // suffice here; absent fields fall back to the default (e.g.
+            // _PM_MISSING) so the model applies its own default/missing logic.
+            let alias_name = param.alias.as_deref().unwrap_or(&param.name);
+            let wants_list = param.type_hint.starts_with("list_");
+            let wants_raw_bytes = param.type_hint == "bytes" || param.type_hint == "list_bytes";
+            let fields = multipart_fields.as_mut().and_then(|m| m.remove(alias_name));
+            match fields {
+                Some(mut fs) if !fs.is_empty() => {
+                    if wants_list {
+                        let list = pyo3::types::PyList::empty(py);
+                        for f in fs.drain(..) {
+                            if f.filename.is_some() && !wants_raw_bytes {
+                                if let Ok(uf) = make_upload_file(py, f) {
+                                    let _ = list.append(uf);
+                                }
+                            } else if wants_raw_bytes {
+                                let _ = list.append(pyo3::types::PyBytes::new(py, &f.data));
+                            } else {
+                                let text = String::from_utf8_lossy(&f.data).into_owned();
+                                let _ = list.append(pyo3::types::PyString::new(py, &text));
+                            }
+                        }
+                        resolved.insert(param.name.clone(), list.into_any().unbind());
+                    } else {
+                        let f = fs.remove(0);
+                        let val = if f.filename.is_some() && !wants_raw_bytes {
+                            make_upload_file(py, f)
+                                .map(|uf| uf.unbind())
+                                .unwrap_or_else(|_| py.None())
+                        } else if wants_raw_bytes {
+                            pyo3::types::PyBytes::new(py, &f.data).into_any().unbind()
+                        } else {
+                            let text = String::from_utf8_lossy(&f.data).into_owned();
+                            coerce_str_to_py(py, &text, &param.type_hint)
+                        };
+                        resolved.insert(param.name.clone(), val);
+                    }
+                }
+                _ => {
+                    if param.has_default {
+                        let v = match &param.default_value {
+                            Some(d) => d.clone_ref(py),
+                            None => py.None(),
+                        };
+                        resolved.insert(param.name.clone(), v);
+                    } else if param.required {
+                        return Err(validation_error_response("body", alias_name, "field required"));
+                    }
+                }
             }
         }
         _ => {}
