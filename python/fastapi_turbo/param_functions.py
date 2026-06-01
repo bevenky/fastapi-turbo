@@ -13,6 +13,13 @@ from __future__ import annotations
 
 from abc import ABCMeta
 
+# Real FastAPI's param classes. Imported during package init BEFORE the compat
+# shim installs, so this resolves to the REAL module; the bound reference stays
+# real after the shim rebinds ``sys.modules['fastapi']``. Each marker below
+# multiply-inherits from the matching ``_real_params.*`` so REAL FastAPI
+# introspection (the pivot adapter) recognizes it (correct ``in_`` / Body class),
+# while the clone's ``_introspect`` keeps reading our custom attrs (``_kind`` …).
+import fastapi.params as _real_params
 from pydantic.fields import FieldInfo
 
 
@@ -62,9 +69,6 @@ class _ParamMarker(FieldInfo):
         json_schema_extra=None,
         **extra,
     ):
-        # Store custom attrs that FieldInfo doesn't natively keep
-        self.include_in_schema = include_in_schema
-        self.example = example
         # FA emits ``FastAPIDeprecationWarning`` when ``example=`` is
         # supplied — tests
         # (e.g. ``test_schema_extra_examples::test_openapi_schema``)
@@ -93,9 +97,6 @@ class _ParamMarker(FieldInfo):
                 _FADeprecationWarning,
                 stacklevel=4,
             )
-        self.regex = pattern or regex
-        self.pattern = self.regex
-        self.openapi_examples = openapi_examples
 
         # Build kwargs for FieldInfo.__init__. Pydantic's ``Field(...)``
         # implicitly propagates ``alias`` to ``validation_alias`` and
@@ -145,6 +146,16 @@ class _ParamMarker(FieldInfo):
 
         super().__init__(default=default, **fi_kwargs, **extra)
 
+        # Store the clone's custom attrs AFTER super().__init__ — real FastAPI's
+        # marker __init__ (now a base class) sets ``example``/``openapi_examples``
+        # to DefaultPlaceholder/Undefined sentinels that the clone's OpenAPI
+        # serializer chokes on, so our plain values must win.
+        self.include_in_schema = include_in_schema
+        self.example = example
+        self.regex = pattern or regex
+        self.pattern = self.regex
+        self.openapi_examples = openapi_examples
+
     def __repr__(self) -> str:
         # FastAPI's param classes use a minimal repr that just shows
         # the default value. Tests (and some user debug output) assert
@@ -158,19 +169,19 @@ class _ParamMarker(FieldInfo):
         return f"{type(self).__name__}({default_repr})"
 
 
-class Param(_ParamMarker):
+class Param(_ParamMarker, _real_params.Param):
     pass
 
 
-class Query(_ParamMarker):
+class Query(_ParamMarker, _real_params.Query):
     _kind = "query"
 
 
-class Path(_ParamMarker):
+class Path(_ParamMarker, _real_params.Path):
     _kind = "path"
 
 
-class Header(_ParamMarker):
+class Header(_ParamMarker, _real_params.Header):
     _kind = "header"
 
     def __init__(self, default=..., *, convert_underscores: bool = True, **kwargs):
@@ -178,11 +189,11 @@ class Header(_ParamMarker):
         self.convert_underscores = convert_underscores
 
 
-class Cookie(_ParamMarker):
+class Cookie(_ParamMarker, _real_params.Cookie):
     _kind = "cookie"
 
 
-class Body(_ParamMarker):
+class Body(_ParamMarker, _real_params.Body):
     _kind = "body"
 
     def __init__(self, default=..., *, embed: bool | None = None, media_type: str = "application/json", **kwargs):
@@ -193,7 +204,7 @@ class Body(_ParamMarker):
         self.media_type = media_type
 
 
-class Form(_ParamMarker):
+class Form(_ParamMarker, _real_params.Form):
     _kind = "form"
 
     def __init__(self, default=..., *, media_type: str = "application/x-www-form-urlencoded", **kw):
@@ -201,7 +212,7 @@ class Form(_ParamMarker):
         self.media_type = media_type
 
 
-class File(_ParamMarker):
+class File(_ParamMarker, _real_params.File):
     _kind = "file"
 
 
