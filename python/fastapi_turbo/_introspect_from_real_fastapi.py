@@ -176,6 +176,159 @@ def _param_from_field(
     )
 
 
+# Sentinel for "this expanded field was absent from the request" — the model
+# builder drops it so Pydantic applies the field's own default / missing logic.
+# Identity survives the Rust round-trip (clone_ref keeps the same object).
+class _PMMissing:
+    __slots__ = ()
+
+
+_PM_MISSING = _PMMissing()
+
+
+def _http_422_from_validation(exc, loc_prefix: str):
+    """Wrap a Pydantic ValidationError as ``HTTPException(422)`` whose detail
+    prepends the source ``loc`` segment — the door maps status_code → response,
+    so this surfaces as a 422 just like real FastAPI's request validation."""
+    from fastapi import HTTPException
+
+    detail = []
+    for e in exc.errors(include_url=False):
+        detail.append(
+            {
+                "type": e.get("type"),
+                "loc": [loc_prefix, *tuple(e.get("loc", ()))],
+                "msg": e.get("msg"),
+                "input": e.get("input"),
+            }
+        )
+    return HTTPException(status_code=422, detail=detail)
+
+
+def _make_model_builder(model_cls, loc_prefix: str):
+    """Synthetic dependency: rebuild a parameter-/form-model from its extracted
+    fields. Absent fields (``_PM_MISSING``) are dropped so model defaults apply."""
+    from pydantic import ValidationError
+
+    def _build(**fields):
+        supplied = {k: v for k, v in fields.items() if v is not _PM_MISSING}
+        try:
+            return model_cls.model_validate(supplied)
+        except ValidationError as exc:
+            raise _http_422_from_validation(exc, loc_prefix) from None
+
+    _build.__name__ = f"_build_{getattr(model_cls, '__name__', 'model')}"
+    return _build
+
+
+def _make_getter(attr: str):
+    """Synthetic dependency: pull one field off a validated combined-body model."""
+
+    def _get(cb):
+        return getattr(cb, attr)
+
+    _get.__name__ = f"_get_{attr}"
+    return _get
+
+
+def _expand_param_model(
+    model_cls, kind: str, out: list[ParamInfo], uid: str, result_key: str, *, is_handler_param: bool
+) -> str:
+    """Expand a query/header/cookie/form parameter-MODEL into one extraction param
+    per model field plus a synthetic builder dependency that reconstructs it — the
+    same shape real FastAPI flattens these into, mapped onto the door's deps."""
+    convert_underscores = kind == "header"
+    loc_prefix = "body" if kind == "form" else kind
+    wiring: list[tuple[str, str]] = []
+    for fname, finfo in model_cls.model_fields.items():
+        alias = finfo.validation_alias or finfo.alias or fname
+        if not isinstance(alias, str):
+            alias = fname
+        wire = alias
+        if kind == "header" and convert_underscores and alias == fname and "_" in wire:
+            wire = wire.replace("_", "-")
+        src_key = f"_pm{uid}__{fname}"
+        out.append(
+            ParamInfo(
+                name=src_key,
+                kind=kind,
+                type_hint=_get_type_name(finfo.annotation),
+                required=False,
+                default_value=_PM_MISSING,
+                has_default=True,
+                model_class=None,
+                alias=wire,
+                scalar_validator=None,
+                is_handler_param=False,
+            )
+        )
+        wiring.append((alias, src_key))
+    out.append(
+        ParamInfo(
+            name=result_key,
+            kind="dependency",
+            type_hint="any",
+            required=True,
+            default_value=None,
+            has_default=False,
+            model_class=None,
+            alias=None,
+            dep_callable=_make_model_builder(model_cls, loc_prefix),
+            dep_callable_id=None,
+            is_async_dep=False,
+            is_generator_dep=False,
+            dep_input_names=wiring,
+            is_handler_param=is_handler_param,
+            scalar_validator=None,
+        )
+    )
+    return result_key
+
+
+def _emit_combined_body(route: Any, dep: Any, out: list[ParamInfo]) -> None:
+    """Embed / multiple JSON bodies: validate the whole body against real FastAPI's
+    own combined ``route.body_field`` model (extracted as a hidden ``_combined_body``
+    input), then scatter each handler body param off it via a getter dependency."""
+    bf = getattr(route, "body_field", None)
+    combined_model = bf.field_info.annotation if bf is not None else None
+    if combined_model is None or not _is_basemodel(combined_model):
+        raise Undelegable("no combined body_field → real FastAPI")
+    out.append(
+        ParamInfo(
+            name="_combined_body",
+            kind="body",
+            type_hint="model",
+            required=True,
+            default_value=None,
+            has_default=False,
+            model_class=combined_model,
+            alias=None,
+            scalar_validator=None,
+            is_handler_param=False,
+        )
+    )
+    for mf in _bucket_fields(dep, "body"):
+        out.append(
+            ParamInfo(
+                name=mf.name,
+                kind="dependency",
+                type_hint="any",
+                required=True,
+                default_value=None,
+                has_default=False,
+                model_class=None,
+                alias=None,
+                dep_callable=_make_getter(mf.name),
+                dep_callable_id=None,
+                is_async_dep=False,
+                is_generator_dep=False,
+                dep_input_names=[("cb", "_combined_body")],
+                is_handler_param=True,
+                scalar_validator=None,
+            )
+        )
+
+
 def _check_special(dep: Any) -> None:
     """Decline a DEPENDENCY that uses a special param. The door injects framework
     objects into the handler's kwargs only — it cannot wire a Request/Response/etc.
@@ -209,9 +362,10 @@ def _emit_special_params(dep: Any, out: list[ParamInfo]) -> None:
             )
 
 
-def _emit_body(dep: Any, out: list[ParamInfo]) -> None:
+def _emit_body(route: Any, dep: Any, out: list[ParamInfo]) -> None:
     """Map the handler's body params. A single ``Body`` → JSON body; ``Form``/
-    ``File`` fields → form/file kinds (multipart & urlencoded both parse in Rust)."""
+    ``File`` fields → form/file kinds (a ``Form`` model expands per-field); embed /
+    multiple JSON bodies → real FastAPI's combined body model + per-field getters."""
     body_fields = _bucket_fields(dep, "body")
     if not body_fields:
         return
@@ -219,18 +373,23 @@ def _emit_body(dep: Any, out: list[ParamInfo]) -> None:
     if fi_names <= {"Form", "File"}:
         for bf in body_fields:
             kind = "file" if type(bf.field_info).__name__ == "File" else "form"
-            if kind == "form" and _is_basemodel(_unwrap_optional(bf.field_info.annotation)):
+            ann = _unwrap_optional(bf.field_info.annotation)
+            if kind == "form" and _is_basemodel(ann):
+                # Form model-expansion needs form-aware dep-input extraction in the
+                # door (extract_single_param) — landed with the door-change batch.
                 raise Undelegable("Form model expansion → real FastAPI")
             out.append(_param_from_field(bf, kind))
     elif len(body_fields) == 1 and fi_names <= {"Body"}:
         bf = body_fields[0]
-        # Body(embed=True): the wire shape is ``{"<name>": <value>}``, not the
-        # bare value — real FastAPI builds a synthetic combined model for it.
+        # Body(embed=True): wire shape is {"<name>": value}, not the bare value —
+        # real FastAPI builds a synthetic combined model, so go through it.
         if getattr(bf.field_info, "embed", None) is True:
-            raise Undelegable("Body(embed=True) → real FastAPI")
-        out.append(_param_from_field(bf, "body"))
+            _emit_combined_body(route, dep, out)
+        else:
+            out.append(_param_from_field(bf, "body"))
     else:
-        raise Undelegable("multiple/embedded JSON body params → real FastAPI")
+        # multiple JSON bodies — combined model + getters.
+        _emit_combined_body(route, dep, out)
 
 
 def _emit_dep(dep: Any, out: list[ParamInfo], uid: str, *, is_handler_param: bool) -> str:
@@ -291,13 +450,20 @@ def extract_params_from_route(route: Any) -> list[ParamInfo]:
 
     params: list[ParamInfo] = []
 
-    # Handler's own scalar params.
+    # Handler's own scalar params — a BaseModel-typed one is a parameter-model
+    # (FastAPI 0.115+), expanded per-field + a builder dep.
     for kind in _SCALAR_BUCKETS:
-        for mf in _bucket_fields(dep, kind):
-            params.append(_param_from_field(mf, kind))
+        for idx, mf in enumerate(_bucket_fields(dep, kind)):
+            ann = _unwrap_optional(mf.field_info.annotation)
+            if _is_basemodel(ann):
+                _expand_param_model(
+                    ann, kind, params, f"_{kind}{idx}_{mf.name}", mf.name, is_handler_param=True
+                )
+            else:
+                params.append(_param_from_field(mf, kind))
 
-    # Handler's body (single JSON body, or Form/File fields).
-    _emit_body(dep, params)
+    # Handler's body (single JSON body, Form/File, or embed/multiple bodies).
+    _emit_body(route, dep, params)
 
     # Handler's special params (Request / Response / BackgroundTasks / SecurityScopes).
     _emit_special_params(dep, params)

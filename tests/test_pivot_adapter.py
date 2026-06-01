@@ -38,6 +38,13 @@ class Out(BaseModel):
     name: str
     qty: int = 7
 
+class Filters(BaseModel):
+    limit: int = 10
+    q: str = ""
+
+class HFilters(BaseModel):
+    x_tok: str = "none"
+
 def common_dep(q: str = "z"):
     return {"q": q}
 
@@ -119,6 +126,22 @@ def build_app():
     @app.get("/rm2", response_model=Out)
     def rm2():
         return {"name": "z", "extra": "drop"}           # extra key filtered out
+    # --- query parameter-model (FastAPI 0.115+) ---
+    @app.get("/pm")
+    def pm(f: typing_Annotated[Filters, Query()]):
+        return {"limit": f.limit, "q": f.q}
+    # --- header parameter-model ---
+    @app.get("/hpm")
+    def hpm(h: typing_Annotated[HFilters, Header()]):
+        return {"x_tok": h.x_tok}
+    # --- Body(embed=True) ---
+    @app.post("/embed")
+    def embed(item: Item = fastapi.Body(embed=True)):
+        return {"name": item.name, "qty": item.qty}
+    # --- multiple JSON bodies ---
+    @app.post("/multi")
+    def multi(item: Item, out: Out):
+        return {"i": item.name, "o": out.name}
     return app
 
 def register(app):
@@ -192,6 +215,10 @@ def main():
         ("GET", "/reqdep", "", {"token": "abc"}, b"", {}),           # Request + dep
         ("GET", "/rm", "", None, b"", {}),                           # response_model exclude_unset
         ("GET", "/rm2", "", None, b"", {}),                          # response_model filter extra
+        ("GET", "/pm", "limit=3&q=hi", None, b"", {}),               # query parameter-model
+        ("GET", "/pm", "", None, b"", {}),                           # param-model defaults
+        ("GET", "/pm", "limit=notint", None, b"", {}),               # param-model bad → 422
+        ("GET", "/hpm", "", {"x-tok": "T"}, b"", {}),                # header parameter-model
     ]
     for method, path, qs, hdrs, body, realkw in cases:
         d_st, d_body = door(app, method, path, qs, hdrs, body)
@@ -237,6 +264,22 @@ def main():
     if not (d_st == r_st == 200 and d_body == r_body):
         fails.append(f"/formdep: door={d_st}/{d_body!r} real={r_st}/{r_body!r}")
 
+    # Body(embed=True): {"item": {...}}
+    eb = json.dumps({"item": {"name": "w", "qty": 4}}).encode()
+    d_st, d_body = door(app, "POST", "/embed", "", {"content-type": "application/json"}, eb)
+    r_st, r_body = asyncio.run(real_response(app, "POST", "/embed",
+                                             json={"item": {"name": "w", "qty": 4}}))
+    if not (d_st == r_st == 200 and d_body == r_body):
+        fails.append(f"/embed: door={d_st}/{d_body!r} real={r_st}/{r_body!r}")
+
+    # Multiple JSON bodies: {"item": {...}, "out": {...}}
+    mb = json.dumps({"item": {"name": "i"}, "out": {"name": "o"}}).encode()
+    d_st, d_body = door(app, "POST", "/multi", "", {"content-type": "application/json"}, mb)
+    r_st, r_body = asyncio.run(real_response(app, "POST", "/multi",
+                                             json={"item": {"name": "i"}, "out": {"name": "o"}}))
+    if not (d_st == r_st == 200 and d_body == r_body):
+        fails.append(f"/multi: door={d_st}/{d_body!r} real={r_st}/{r_body!r}")
+
     # decline coverage: yield-dep, dep-with-special-param, Form model-expansion.
     dec_app = FastAPI()
     def ydep():
@@ -245,8 +288,6 @@ def main():
         return request.method
     class FModel(BaseModel):
         a: int
-    class QFilters(BaseModel):
-        limit: int = 10
     def plain(q: str = "z"):
         return q
     @dec_app.get("/y")
@@ -255,18 +296,12 @@ def main():
     def rd(m: str = Depends(reqdep_inner)): return {"m": m}
     @dec_app.post("/fm")
     def fm(model: FModel = Form()): return {"a": model.a}
-    @dec_app.post("/embed1")
-    def embed1(a: Item = fastapi.Body(embed=True)): return {"a": a.name}
-    @dec_app.post("/multi")
-    def multi(a: Item, b: Out): return {}
-    @dec_app.get("/pm")
-    def pm(f: typing_Annotated[QFilters, Query()]): return {}
     @dec_app.get("/ok")
     def okr(v: str = Depends(plain)): return {"v": v}
     for r in dec_app.routes:
         if not isinstance(r, APIRoute):
             continue
-        if r.path in ("/y", "/rd", "/fm", "/embed1", "/multi", "/pm"):
+        if r.path in ("/y", "/rd", "/fm"):
             try:
                 extract_params_from_route(r); fails.append(f"{r.path} should be Undelegable")
             except Undelegable:

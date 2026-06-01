@@ -2160,6 +2160,7 @@ async fn handle_request(
                                 &query_params,
                                 &headers,
                                 &body_json,
+                                &body_bytes,
                                 &mut resolved,
                             ) {
                                 return resp;
@@ -2300,6 +2301,7 @@ async fn handle_request(
                         &query_params,
                         &headers,
                         &body_json,
+                        &body_bytes,
                         &mut resolved,
                     );
                 }
@@ -3126,6 +3128,7 @@ fn extract_single_param(
     query_params: &HashMap<String, String>,
     headers: &Option<HeaderMap>,
     body_json: &Option<serde_json::Value>,
+    body_bytes: &[u8],
     resolved: &mut HashMap<String, Py<PyAny>>,
 ) -> Result<(), Response> {
     match param.kind.as_str() {
@@ -3182,6 +3185,18 @@ fn extract_single_param(
                 } else {
                     raw_dict
                 };
+                resolved.insert(param.name.clone(), val);
+            } else if let Some(model_cls) =
+                param.model_class.as_ref().filter(|_| !body_bytes.is_empty())
+            {
+                // body_json is None when every body param has a model (the door
+                // validates raw bytes directly). Mirror that here for dep-input /
+                // combined-body params via __pydantic_validator__.validate_json.
+                let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
+                let val = model_cls
+                    .getattr(py, "__pydantic_validator__")
+                    .and_then(|v| v.call_method1(py, "validate_json", (py_bytes,)))
+                    .map_err(|e| crate::responses::pyerr_to_response(py, &e))?;
                 resolved.insert(param.name.clone(), val);
             } else if param.has_default {
                 let v = match &param.default_value {
