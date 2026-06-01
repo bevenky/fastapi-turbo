@@ -295,10 +295,14 @@ class WebSocket:
         Uses the Rust-side close_and_wait() so the caller is guaranteed the
         close frame has been handed to the underlying sink before returning.
 
-        Starlette parity: ``close()`` called BEFORE ``accept()`` accepts
-        the handshake first, then sends the close frame with the given
-        code — otherwise the queued close message would never flush
-        because the writer task isn't running yet.
+        Starlette parity: ``close()`` called BEFORE ``accept()`` does NOT
+        accept — Starlette sends ``websocket.close`` while still CONNECTING,
+        which the server maps to refusing the handshake (the client sees an
+        HTTP 403, not a completed upgrade + WS close frame). So we route a
+        pre-accept close through the same handshake-refuse path as
+        ``_reject()`` rather than accepting first. (Previously we accepted
+        then closed, which made the client see WS close code 4401 instead of
+        HTTP 403 — a real divergence caught by parity test P155.)
         """
         if self._app_state == WebSocketState.DISCONNECTED:
             return
@@ -307,13 +311,12 @@ class WebSocket:
         self._last_close_code = code
         self._last_close_reason = reason or ""
         pre_accept = self._app_state == WebSocketState.CONNECTING
-        if pre_accept and self._ws is not None:
-            # Accept the upgrade first so the writer task starts.
-            try:
-                self._ws.accept(None, None)
-                self._app_state = WebSocketState.CONNECTED
-            except Exception:  # noqa: BLE001
-                pass
+        if pre_accept:
+            # Refuse the handshake (HTTP 403) — matches Starlette: a close
+            # sent before accept never completes the upgrade. The writer
+            # task never starts, so there's no WS frame to flush.
+            self._reject(403)
+            return
         self._app_state = WebSocketState.DISCONNECTED
         if self._ws is not None:
             try:

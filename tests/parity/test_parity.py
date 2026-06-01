@@ -955,19 +955,12 @@ class TestWebSocketParity:
         fa_p, rs_p = _ws_both(dual_servers, "/pws/dep?token=secret", scen_pass)
         assert fa_p == rs_p == "authed:secret", f"pass: FA={fa_p} RS={rs_p}"
 
-    @pytest.mark.xfail(
-        reason="REAL PARITY DIVERGENCE (found by this corpus): a WS handler that "
-        "does `await ws.close()` BEFORE `accept()` is rejected by Starlette at the "
-        "HTTP layer (client sees HTTP 403 / InvalidStatus), but turbo completes the "
-        "upgrade and then sends a WS close (client sees close code 4401). Verified "
-        "FA={kind:InvalidStatus,status:403} vs turbo={kind:ConnectionClosedError,"
-        "code:4401}. Same class as the 422-middleware bug (Rust path diverges on a "
-        "reject path). The normative reject (raise WebSocketException before accept, "
-        "P154) already matches. Fix = make close-before-accept refuse the handshake "
-        "(403) like Starlette. Tracked in TRACKER.md P2 (ws-close-before-accept).",
-        strict=True,
-    )
     def test_P155_ws_close_before_accept(self, dual_servers):
+        # A WS handler that does `await ws.close()` BEFORE accept() must refuse
+        # the handshake (HTTP 403), matching Starlette — NOT complete the upgrade
+        # then send a WS close. Was a real divergence (turbo returned WS close
+        # 4401); fixed by routing pre-accept close through the handshake-refuse
+        # path (websockets.py close()).
         def scen(connect, url):
             try:
                 with connect(url) as ws:
@@ -980,3 +973,4 @@ class TestWebSocketParity:
             return {"kind": "connected", "status": None}
         fa, rs = _ws_both(dual_servers, "/pws/close-before-accept", scen)
         assert fa == rs, f"FA={fa} RS={rs}"
+        assert fa["status"] == 403, f"expected HTTP 403 handshake refusal, got {fa}"
