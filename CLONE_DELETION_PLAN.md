@@ -184,3 +184,7 @@ Ship Phase 0 as the first PR, but lead with its single highest-confidence deleti
 
 ## Status
 - Phase 0: STARTED — deleted `_ws_pipe_bridge.py`, `encoders.py`→real (commit debf76b). Remaining Phase 0: `status.py`, `datastructures.py` need dependent re-pointing (not clean drops).
+
+## Execution log
+- **Phase 0 (started, commit debf76b):** deleted `_ws_pipe_bridge.py` (dead); `encoders.py` → re-export real `fastapi.encoders`. parity 151 / full 1122 / WS 22 green. Remaining Phase 0 items (`status.py`, `datastructures.py`) are NOT clean drops — they have live dependents in modules that stay (requests.py, websockets.py, applications.py), so they need dependent re-pointing (fold into Phase 5/6).
+- **Phase 2 finding:** the door-glue symbols to relocate (`_get_type_name`, `_make_fa_body_validator`, `_FABodyValidator`, `_TypeAdapterProxy`) are NOT self-contained — they transitively call ~14 other `_introspect` helpers (`_is_union_origin`, `_get_container_type`, `_build_field_info`, `_make_type_adapter_proxy`, `_maybe_embed_body_params`, `_needs_scalar_validator`, `_special_injection_kind`, `_unwrap_optional`, …). Phase 2 must move the door-needed **dependency closure** into `_door_support.py` (or split _introspect into door-support vs clone-only), then re-point src/router.rs:1191 + `_introspect_from_real_fastapi.py:51` + `_openapi.py:1507`. Needs a dedicated pass.
