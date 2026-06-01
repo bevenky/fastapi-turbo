@@ -11,6 +11,7 @@
 
 use pyo3::prelude::*;
 
+mod cluster;
 mod config;
 mod handler_bridge;
 mod multipart;
