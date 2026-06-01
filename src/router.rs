@@ -1187,7 +1187,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
             // matches stock FastAPI's error shape (`model_attributes_type`
             // instead of `model_type`, FA-style messages, no ctx).
             let fa_factory = py
-                .import("fastapi_turbo._introspect")
+                .import("fastapi_turbo._door_support")
                 .and_then(|m| m.getattr("_make_fa_body_validator"))
                 .ok();
             for param in &mut params {

@@ -48,7 +48,7 @@ import typing
 from typing import Any
 
 from fastapi_turbo._fastapi_turbo_core import ParamInfo
-from fastapi_turbo._introspect import _get_type_name
+from fastapi_turbo._door_support import _get_type_name
 
 try:  # pydantic v2 sentinel for "no default"
     from pydantic_core import PydanticUndefined
