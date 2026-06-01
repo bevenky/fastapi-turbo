@@ -72,6 +72,21 @@ assert sdep.request_param_name == "request", "request_param_name not populated"
 assert sdep.response_param_name == "response", "response_param_name not populated"
 assert sdep.background_tasks_param_name == "tasks", "background_tasks_param_name not populated"
 
+# (2c) Dependant callable-classification properties the adapter reads to set
+# is_async_dep / is_generator_dep (must handle callable instances, gens).
+for attr in ("is_coroutine_callable", "is_gen_callable", "is_async_gen_callable"):
+    assert hasattr(dep_, attr), f"Dependant.{attr} missing"
+def _g_dep():
+    yield 1
+gdep_app = FastAPI()
+@gdep_app.get("/g")
+def gh(v=Depends(_g_dep)):
+    return {}
+gdep = next(r for r in gdep_app.routes
+            if isinstance(r, APIRoute) and r.path == "/g").dependant.dependencies[0]
+assert gdep.is_gen_callable and not gdep.is_coroutine_callable, \
+    "is_gen_callable classification changed"
+
 # (3) pydantic-v2 ModelField.field_info exposes what the adapter reads.
 mf = dep_.path_params[0]
 fi = mf.field_info

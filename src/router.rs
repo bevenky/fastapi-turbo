@@ -173,8 +173,152 @@ fn inject_request_metadata(
     }
 }
 
+/// Build one framework-provided object for an ``inject_*`` kind (Request /
+/// BackgroundTasks / Response / SecurityScopes). Shared by handler-kwarg
+/// injection and dependency-input resolution (a dep that takes ``request:
+/// Request`` etc.), so both produce the same object shape.
+#[allow(clippy::too_many_arguments)]
+fn build_injected_object(
+    py: Python<'_>,
+    kind: &str,
+    state: &RouteState,
+    scope_method: &Option<String>,
+    scope_path: &Option<String>,
+    scope_query: &Option<String>,
+    headers: &Option<HeaderMap>,
+    path_map: &HashMap<String, String>,
+    query_params: &HashMap<String, String>,
+    body_bytes: &[u8],
+    client_addr: &Option<SocketAddr>,
+) -> PyResult<Py<PyAny>> {
+    match kind {
+        "inject_request" => {
+            // Build an ASGI-ish scope dict
+            let scope = PyDict::new(py);
+            scope.set_item("type", "http")?;
+            scope.set_item("method", scope_method.as_deref().unwrap_or("GET"))?;
+            scope.set_item("path", scope_path.as_deref().unwrap_or("/"))?;
+            let qs_bytes: &[u8] = scope_query.as_deref().map(|s| s.as_bytes()).unwrap_or(b"");
+            scope.set_item("query_string", pyo3::types::PyBytes::new(py, qs_bytes))?;
+            // Headers as list of (bytes, bytes)
+            let hdrs_list = pyo3::types::PyList::empty(py);
+            if let Some(h) = headers {
+                for (k, v) in h.iter() {
+                    let k_b = pyo3::types::PyBytes::new(py, k.as_str().as_bytes());
+                    let v_b = pyo3::types::PyBytes::new(py, v.as_bytes());
+                    hdrs_list.append((k_b, v_b))?;
+                }
+            }
+            scope.set_item("headers", hdrs_list)?;
+            // Path params
+            let pp = PyDict::new(py);
+            for (k, v) in path_map.iter() {
+                pp.set_item(k, v)?;
+            }
+            scope.set_item("path_params", pp)?;
+            // Query params as a dict too (convenience)
+            let qp = PyDict::new(py);
+            for (k, v) in query_params.iter() {
+                qp.set_item(k, v)?;
+            }
+            scope.set_item("query_params", qp)?;
+            // ASGI scope fields: scheme + server + http_version.
+            // FastAPI reads `request.url.hostname` / `.port` off
+            // these, and many apps reflect the original Host back.
+            scope.set_item("scheme", "http")?;
+            scope.set_item("http_version", "1.1")?;
+            if let Some((host, port)) = SERVER_ADDR.get() {
+                // Starlette uses the Host header as the authoritative
+                // source when present, falling back to the bound
+                // address. Match that behavior so apps behind a
+                // proxy see the external host.
+                let (effective_host, effective_port) = headers
+                    .as_ref()
+                    .and_then(|h| h.get("host"))
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| {
+                        if let Some((h, p)) = s.rsplit_once(':') {
+                            let p = p.parse::<u16>().unwrap_or(*port);
+                            (h.to_string(), p)
+                        } else {
+                            (s.to_string(), *port)
+                        }
+                    })
+                    .unwrap_or_else(|| (host.clone(), *port));
+                scope.set_item("server", (effective_host, effective_port))?;
+            }
+            // Starlette/FastAPI: request.app -> scope["app"]. vLLM and
+            // SGLang read `request.app.state.<field>` on every request.
+            if let Ok(guard) = APP_INSTANCE.read() {
+                if let Some(app) = guard.as_ref() {
+                    scope.set_item("app", app.bind(py))?;
+                }
+            }
+            // Pre-populate the body so `await request.body()` / .json()
+            // / .form() return the already-buffered bytes without needing
+            // a real ASGI receive() callable. vLLM parses bodies this way.
+            if !body_bytes.is_empty() {
+                scope.set_item("_body", pyo3::types::PyBytes::new(py, body_bytes))?;
+            }
+            // Client address (host, port) tuple for request.client.
+            // Starlette TestClient parity: when ``User-Agent:
+            // testclient``, use ``("testclient", 50000)`` so
+            // ``request.client.host == "testclient"`` matches
+            // Starlette's fake ASGI client.
+            let is_testclient = headers
+                .as_ref()
+                .and_then(|h| h.get("user-agent"))
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s == "testclient")
+                .unwrap_or(false);
+            if is_testclient {
+                scope.set_item("client", ("testclient", 50000u16))?;
+            } else if let Some(addr) = client_addr {
+                let client_tuple = (addr.ip().to_string(), addr.port());
+                scope.set_item("client", client_tuple)?;
+            }
+            // Starlette/FA: ``request.scope["route"]`` exposes
+            // the matched APIRoute. Some handlers read it to
+            // pull route metadata (path template, methods).
+            if let Some(ref route) = state.route_obj {
+                scope.set_item("route", route.bind(py))?;
+            }
+
+            Ok(request_cls(py)?.bind(py).call1((scope,))?.unbind())
+        }
+        "inject_background_tasks" => {
+            let bg = bg_tasks_cls(py)?.bind(py).call0()?;
+            // Stash the current app on the BackgroundTasks instance
+            // so ``run_sync`` can pass ``app=`` when submitting async
+            // tasks to the worker loop — preserves per-app timeout
+            // isolation for work that runs *after* the response.
+            if let Ok(app_slot) = APP_INSTANCE.read() {
+                if let Some(app) = app_slot.as_ref() {
+                    let _ = bg.setattr("_app", app.bind(py));
+                }
+            }
+            Ok(bg.unbind())
+        }
+        "inject_response" => Ok(response_cls(py)?.bind(py).call0()?.unbind()),
+        "inject_security_scopes" => {
+            // Empty SecurityScopes — real scope collection from
+            // nested Security() dep chain happens in the resolver.
+            let ss_mod = py.import("fastapi_turbo.security")?;
+            let ss_cls = ss_mod.getattr("SecurityScopes")?;
+            let scopes_list = pyo3::types::PyList::empty(py);
+            let kw = PyDict::new(py);
+            kw.set_item("scopes", scopes_list)?;
+            Ok(ss_cls.call((), Some(&kw))?.unbind())
+        }
+        _ => Ok(py.None()),
+    }
+}
+
 /// Inject framework-provided objects (Request / BackgroundTasks / Response)
 /// as handler kwargs right before dispatch. Handlers ask for them by type.
+/// Dependency-input inject params (``is_handler_param == false``) are built into
+/// the resolver's `resolved` map instead, so they're skipped here.
+#[allow(clippy::too_many_arguments)]
 fn inject_framework_objects(
     py: Python<'_>,
     kwargs: &Bound<'_, PyDict>,
@@ -189,6 +333,9 @@ fn inject_framework_objects(
     client_addr: &Option<SocketAddr>,
 ) -> PyResult<()> {
     for param in &state.params {
+        if !param.is_handler_param {
+            continue;
+        }
         match param.kind.as_str() {
             "inject_request" => {
                 // Reuse the middleware's Request object if present — this ensures
@@ -196,129 +343,37 @@ fn inject_framework_objects(
                 if let Ok(Some(mw_req)) = kwargs.get_item("_middleware_request") {
                     kwargs.set_item(&param.name, mw_req)?;
                 } else {
-                    // Build an ASGI-ish scope dict
-                    let scope = PyDict::new(py);
-                    scope.set_item("type", "http")?;
-                    scope.set_item("method", scope_method.as_deref().unwrap_or("GET"))?;
-                    scope.set_item("path", scope_path.as_deref().unwrap_or("/"))?;
-                    let qs_bytes: &[u8] =
-                        scope_query.as_deref().map(|s| s.as_bytes()).unwrap_or(b"");
-                    scope.set_item("query_string", pyo3::types::PyBytes::new(py, qs_bytes))?;
-                    // Headers as list of (bytes, bytes)
-                    let hdrs_list = pyo3::types::PyList::empty(py);
-                    if let Some(h) = headers {
-                        for (k, v) in h.iter() {
-                            let k_b = pyo3::types::PyBytes::new(py, k.as_str().as_bytes());
-                            let v_b = pyo3::types::PyBytes::new(py, v.as_bytes());
-                            hdrs_list.append((k_b, v_b))?;
-                        }
-                    }
-                    scope.set_item("headers", hdrs_list)?;
-                    // Path params
-                    let pp = PyDict::new(py);
-                    for (k, v) in path_map.iter() {
-                        pp.set_item(k, v)?;
-                    }
-                    scope.set_item("path_params", pp)?;
-                    // Query params as a dict too (convenience)
-                    let qp = PyDict::new(py);
-                    for (k, v) in query_params.iter() {
-                        qp.set_item(k, v)?;
-                    }
-                    scope.set_item("query_params", qp)?;
-                    // ASGI scope fields: scheme + server + http_version.
-                    // FastAPI reads `request.url.hostname` / `.port` off
-                    // these, and many apps reflect the original Host back.
-                    scope.set_item("scheme", "http")?;
-                    scope.set_item("http_version", "1.1")?;
-                    if let Some((host, port)) = SERVER_ADDR.get() {
-                        // Starlette uses the Host header as the authoritative
-                        // source when present, falling back to the bound
-                        // address. Match that behavior so apps behind a
-                        // proxy see the external host.
-                        let (effective_host, effective_port) = headers
-                            .as_ref()
-                            .and_then(|h| h.get("host"))
-                            .and_then(|v| v.to_str().ok())
-                            .map(|s| {
-                                if let Some((h, p)) = s.rsplit_once(':') {
-                                    let p = p.parse::<u16>().unwrap_or(*port);
-                                    (h.to_string(), p)
-                                } else {
-                                    (s.to_string(), *port)
-                                }
-                            })
-                            .unwrap_or_else(|| (host.clone(), *port));
-                        scope.set_item("server", (effective_host, effective_port))?;
-                    }
-                    // Starlette/FastAPI: request.app -> scope["app"]. vLLM and
-                    // SGLang read `request.app.state.<field>` on every request.
-                    if let Ok(guard) = APP_INSTANCE.read() {
-                        if let Some(app) = guard.as_ref() {
-                            scope.set_item("app", app.bind(py))?;
-                        }
-                    }
-                    // Pre-populate the body so `await request.body()` / .json()
-                    // / .form() return the already-buffered bytes without needing
-                    // a real ASGI receive() callable. vLLM parses bodies this way.
-                    if !body_bytes.is_empty() {
-                        scope.set_item("_body", pyo3::types::PyBytes::new(py, body_bytes))?;
-                    }
-                    // Client address (host, port) tuple for request.client.
-                    // Starlette TestClient parity: when ``User-Agent:
-                    // testclient``, use ``("testclient", 50000)`` so
-                    // ``request.client.host == "testclient"`` matches
-                    // Starlette's fake ASGI client.
-                    let is_testclient = headers
-                        .as_ref()
-                        .and_then(|h| h.get("user-agent"))
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s == "testclient")
-                        .unwrap_or(false);
-                    if is_testclient {
-                        scope.set_item("client", ("testclient", 50000u16))?;
-                    } else if let Some(addr) = client_addr {
-                        let client_tuple = (addr.ip().to_string(), addr.port());
-                        scope.set_item("client", client_tuple)?;
-                    }
-                    // Starlette/FA: ``request.scope["route"]`` exposes
-                    // the matched APIRoute. Some handlers read it to
-                    // pull route metadata (path template, methods).
-                    if let Some(ref route) = state.route_obj {
-                        scope.set_item("route", route.bind(py))?;
-                    }
-
-                    let req = request_cls(py)?.bind(py).call1((scope,))?;
-                    kwargs.set_item(&param.name, req)?;
+                    let req = build_injected_object(
+                        py,
+                        "inject_request",
+                        state,
+                        scope_method,
+                        scope_path,
+                        scope_query,
+                        headers,
+                        path_map,
+                        query_params,
+                        body_bytes,
+                        client_addr,
+                    )?;
+                    kwargs.set_item(&param.name, req.bind(py))?;
                 }
             }
-            "inject_background_tasks" => {
-                let bg = bg_tasks_cls(py)?.bind(py).call0()?;
-                // Stash the current app on the BackgroundTasks instance
-                // so ``run_sync`` can pass ``app=`` when submitting async
-                // tasks to the worker loop — preserves per-app timeout
-                // isolation for work that runs *after* the response.
-                if let Ok(app_slot) = APP_INSTANCE.read() {
-                    if let Some(app) = app_slot.as_ref() {
-                        let _ = bg.setattr("_app", app.bind(py));
-                    }
-                }
-                kwargs.set_item(&param.name, bg)?;
-            }
-            "inject_response" => {
-                let resp = response_cls(py)?.bind(py).call0()?;
-                kwargs.set_item(&param.name, resp)?;
-            }
-            "inject_security_scopes" => {
-                // Empty SecurityScopes — real scope collection from
-                // nested Security() dep chain happens in the resolver.
-                let ss_mod = py.import("fastapi_turbo.security")?;
-                let ss_cls = ss_mod.getattr("SecurityScopes")?;
-                let scopes_list = pyo3::types::PyList::empty(py);
-                let kw = PyDict::new(py);
-                kw.set_item("scopes", scopes_list)?;
-                let obj = ss_cls.call((), Some(&kw))?;
-                kwargs.set_item(&param.name, obj)?;
+            "inject_background_tasks" | "inject_response" | "inject_security_scopes" => {
+                let obj = build_injected_object(
+                    py,
+                    param.kind.as_str(),
+                    state,
+                    scope_method,
+                    scope_path,
+                    scope_query,
+                    headers,
+                    path_map,
+                    query_params,
+                    body_bytes,
+                    client_addr,
+                )?;
+                kwargs.set_item(&param.name, obj.bind(py))?;
             }
             _ => {}
         }
@@ -2161,7 +2216,32 @@ async fn handle_request(
                         // body — are produced by the full extractor below so the deps
                         // path reaches parity with the no-dep fast paths.
                         if !param.is_handler_param {
-                            if let Err(resp) = extract_single_param(
+                            if param.kind.starts_with("inject_") {
+                                // A dependency that takes a Request/Response/etc. —
+                                // build the framework object into `resolved` so the
+                                // dep wiring can feed it as an input.
+                                match build_injected_object(
+                                    py,
+                                    param.kind.as_str(),
+                                    &state,
+                                    &scope_method,
+                                    &scope_path,
+                                    &scope_query,
+                                    &headers,
+                                    &path_map,
+                                    &query_params,
+                                    &body_bytes,
+                                    &client_addr,
+                                ) {
+                                    Ok(obj) => {
+                                        resolved.insert(param.name.clone(), obj);
+                                    }
+                                    Err(e) => {
+                                        teardown_generator_deps(py, &gen_deps, true);
+                                        return pyerr_to_response(py, &e);
+                                    }
+                                }
+                            } else if let Err(resp) = extract_single_param(
                                 py,
                                 param,
                                 &path_map,

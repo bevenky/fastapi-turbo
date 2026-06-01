@@ -24,7 +24,10 @@ import fastapi                       # REAL fastapi (no shim)
 from fastapi import (FastAPI, Header, Cookie, Depends, Form, File, UploadFile,
                      Query, Request, Response, BackgroundTasks)
 from fastapi.routing import APIRoute
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
+
+_api_key_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
 import fastapi_turbo                 # NO_SHIM=1 → no shim installed
 from fastapi_turbo._fastapi_turbo_core import RouteInfo, register_app_router, process_request
 from fastapi_turbo._introspect_from_real_fastapi import (
@@ -59,6 +62,9 @@ async def adep(x: int = 0):
 
 def auth_dep(token: str = Header(default="anon")):
     return token
+
+def req_auth(request: Request):                          # dep takes Request
+    return request.headers.get("authorization", "none")
 
 _TEARDOWN = []
 def yield_dep(q: str = "z"):
@@ -117,6 +123,14 @@ def build_app():
     @app.get("/reqdep")
     def reqdep(request: Request, who: str = Depends(auth_dep)):
         return {"who": who, "method": request.method}
+    # --- dependency that itself takes a Request ---
+    @app.get("/depreq")
+    def depreq(auth: str = Depends(req_auth)):
+        return {"auth": auth}
+    # --- security scheme (callable dep that reads the Request) ---
+    @app.get("/sec")
+    def sec(key: str = Depends(_api_key_scheme)):
+        return {"key": key}
     # --- form / file ---
     @app.post("/form")
     def form(name: str = Form(), age: int = Form()):
@@ -226,6 +240,9 @@ def main():
         ("GET", "/req", "q=hey", None, b"", {}),                     # Request inject
         ("GET", "/bg", "q=yo", None, b"", {}),                       # BackgroundTasks inject
         ("GET", "/reqdep", "", {"token": "abc"}, b"", {}),           # Request + dep
+        ("GET", "/depreq", "", {"authorization": "Bearer xyz"}, b"", {}),  # dep takes Request
+        ("GET", "/sec", "", {"x-api-key": "secret"}, b"", {}),       # security scheme dep
+        ("GET", "/sec", "", None, b"", {}),                          # missing key → None
         ("GET", "/rm", "", None, b"", {}),                           # response_model exclude_unset
         ("GET", "/rm2", "", None, b"", {}),                          # response_model filter extra
         ("GET", "/pm", "limit=3&q=hi", None, b"", {}),               # query parameter-model
@@ -299,20 +316,16 @@ def main():
     if not (d_st == r_st == 200 and d_body == r_body):
         fails.append(f"/multi: door={d_st}/{d_body!r} real={r_st}/{r_body!r}")
 
-    # decline coverage: async-generator dep, dep-with-special-param, Form model-expansion.
+    # decline coverage: async-generator dep + Form model-expansion (still delegate).
     dec_app = FastAPI()
     async def aydep():
         yield "x"
-    def reqdep_inner(request: Request):                  # dep takes Request → decline
-        return request.method
     class FModel(BaseModel):
         a: int
     def plain(q: str = "z"):
         return q
     @dec_app.get("/y")
     def y(v: str = Depends(aydep)): return {"v": v}
-    @dec_app.get("/rd")
-    def rd(m: str = Depends(reqdep_inner)): return {"m": m}
     @dec_app.post("/fm")
     def fm(model: FModel = Form()): return {"a": model.a}
     @dec_app.get("/ok")
@@ -320,7 +333,7 @@ def main():
     for r in dec_app.routes:
         if not isinstance(r, APIRoute):
             continue
-        if r.path in ("/y", "/rd", "/fm"):
+        if r.path in ("/y", "/fm"):
             try:
                 extract_params_from_route(r); fails.append(f"{r.path} should be Undelegable")
             except Undelegable:

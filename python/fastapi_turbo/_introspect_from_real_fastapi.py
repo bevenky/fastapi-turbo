@@ -329,15 +329,31 @@ def _emit_combined_body(route: Any, dep: Any, out: list[ParamInfo]) -> None:
         )
 
 
-def _check_special(dep: Any) -> None:
-    """Decline a DEPENDENCY that uses a special param. The door injects framework
-    objects into the handler's kwargs only — it cannot wire a Request/Response/etc.
-    into a dependency's inputs — so such deps fall back to real FastAPI."""
-    for attr, _kind in _SPECIAL_PARAM_KINDS:
-        if getattr(dep, attr, None) is not None:
-            raise Undelegable(f"dependency uses {attr} → real FastAPI")
-    if getattr(dep, "websocket_param_name", None) is not None:
-        raise Undelegable("dependency uses websocket_param_name → real FastAPI")
+def _emit_dep_special_params(dep: Any, out: list[ParamInfo], uid: str) -> list[tuple[str, str]]:
+    """A dependency that takes Request/Response/BackgroundTasks/SecurityScopes:
+    emit each as an ``inject_*`` dep-input (the door builds it into ``resolved``)
+    and return the wiring so the dep receives it by its own param name."""
+    wiring: list[tuple[str, str]] = []
+    for attr, kind in _SPECIAL_PARAM_KINDS:
+        pname = getattr(dep, attr, None)
+        if pname:
+            src_key = f"_dep{uid}__{pname}"
+            out.append(
+                ParamInfo(
+                    name=src_key,
+                    kind=kind,
+                    type_hint="any",
+                    required=False,
+                    default_value=None,
+                    has_default=False,
+                    model_class=None,
+                    alias=None,
+                    is_handler_param=False,
+                    scalar_validator=None,
+                )
+            )
+            wiring.append((pname, src_key))
+    return wiring
 
 
 def _emit_special_params(dep: Any, out: list[ParamInfo]) -> None:
@@ -396,17 +412,20 @@ def _emit_dep(dep: Any, out: list[ParamInfo], uid: str, *, is_handler_param: boo
     """Emit the flat params for one dependency (post-order: its own inputs +
     sub-deps first, then the ``"dependency"`` entry). Returns the ``resolved`` key
     holding the dep's result, so a parent can wire it as an input."""
-    _check_special(dep)
     call = dep.call
-    # Sync ``yield`` deps run on the door (the engine enters them and runs teardown
-    # after the response). Async generators still need the event-loop exit stack.
-    if inspect.isasyncgenfunction(call):
+    # Use FastAPI's own callable classification (handles callable instances with an
+    # async/gen ``__call__``, e.g. security schemes). Sync ``yield`` deps run on the
+    # door; async generators still need the event-loop exit stack.
+    if dep.is_async_gen_callable:
         raise Undelegable("async generator dependency → real FastAPI")
-    is_gen = inspect.isgeneratorfunction(call)
+    is_gen = dep.is_gen_callable
     if _bucket_fields(dep, "body"):
         raise Undelegable("dependency with a body param → real FastAPI")
+    if getattr(dep, "websocket_param_name", None) is not None:
+        raise Undelegable("dependency uses websocket_param_name → real FastAPI")
 
-    input_wiring: list[tuple[str, str]] = []
+    # 0. special params the dep takes (Request/Response/BackgroundTasks/Scopes).
+    input_wiring: list[tuple[str, str]] = _emit_dep_special_params(dep, out, uid)
 
     # 1. the dependency's own scalar params — extracted, fed to the dep by name.
     for kind in _SCALAR_BUCKETS:
@@ -435,7 +454,7 @@ def _emit_dep(dep: Any, out: list[ParamInfo], uid: str, *, is_handler_param: boo
             alias=None,
             dep_callable=call,
             dep_callable_id=(id(call) if getattr(dep, "use_cache", True) else None),
-            is_async_dep=inspect.iscoroutinefunction(call),
+            is_async_dep=dep.is_coroutine_callable,
             is_generator_dep=is_gen,
             dep_input_names=input_wiring,
             is_handler_param=is_handler_param,
