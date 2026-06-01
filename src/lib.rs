@@ -32,6 +32,10 @@ fn _fastapi_turbo_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(core_version, m)?)?;
     m.add_function(wrap_pyfunction!(server::run_server, m)?)?;
     m.add_function(wrap_pyfunction!(server::request_server_shutdown, m)?)?;
+    // The in-process ASGI door (second door into the one engine).
+    m.add_function(wrap_pyfunction!(server::register_app_router, m)?)?;
+    m.add_function(wrap_pyfunction!(server::process_request, m)?)?;
+    m.add_function(wrap_pyfunction!(server::_oneshot_selftest, m)?)?;
     m.add_class::<config::ServerConfig>()?;
     m.add_class::<router::RouteInfo>()?;
     m.add_class::<router::ParamInfo>()?;

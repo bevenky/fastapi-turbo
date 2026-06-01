@@ -778,6 +778,225 @@ fn assemble_app_router(
     app
 }
 
+// ── The in-process ASGI door (the second door into the one engine) ──────
+//
+// `run_server` serves the assembled router over a TcpListener. The ASGI
+// door instead drives the SAME assembled router in-process, per request,
+// via `tower::Service::oneshot` — no socket, no double-hop. uvicorn /
+// serverless / TestClient(in_process) feed requests here.
+
+/// Process-global multi-threaded tokio runtime that drives the in-process
+/// ASGI door. Multi-threaded on purpose: the dispatch core's sync-handler
+/// arms call `tokio::task::block_in_place`, which is only legal on a
+/// multi-thread runtime. Created once, lazily, on first ASGI request.
+static ONESHOT_RT: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+
+fn oneshot_runtime() -> &'static Runtime {
+    ONESHOT_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build the in-process ASGI tokio runtime")
+    })
+}
+
+/// Per-app assembled routers, keyed by Python `id(app)`. A `Router` clone is
+/// cheap (Arc-backed), so each request clones the stored router and consumes
+/// the clone via `oneshot`. Keyed per app so that an `app.run()` server for
+/// app A and an in-process door for app B coexist without cross-routing.
+static APP_ROUTERS: std::sync::RwLock<
+    Option<std::collections::HashMap<u64, axum::Router>>,
+> = std::sync::RwLock::new(None);
+
+/// Build and store the assembled router for an app so the in-process ASGI
+/// door can drive it. Mirrors `run_server`'s setup (handler globals, MIME
+/// map, server addr, middleware parse, router assembly) but binds NO socket
+/// and does NOT serve — it stashes the finished router in `APP_ROUTERS`.
+#[pyfunction]
+#[pyo3(signature = (
+    app_id, routes, host, port, middlewares, openapi_json, docs_url, redoc_url,
+    openapi_url, static_mounts, root_path, redirect_slashes, max_request_size,
+    not_found_handler, app, validation_handler, swagger_ui_oauth2_redirect_url,
+    swagger_ui_html, redoc_html, static_content_types,
+))]
+pub fn register_app_router(
+    py: Python<'_>,
+    app_id: u64,
+    routes: Vec<RouteInfo>,
+    host: String,
+    port: u16,
+    middlewares: Vec<Py<PyAny>>,
+    openapi_json: Option<String>,
+    docs_url: Option<String>,
+    redoc_url: Option<String>,
+    openapi_url: Option<String>,
+    static_mounts: Vec<(String, String)>,
+    root_path: Option<String>,
+    redirect_slashes: bool,
+    max_request_size: Option<usize>,
+    not_found_handler: Option<Py<PyAny>>,
+    app: Option<Py<PyAny>>,
+    validation_handler: Option<Py<PyAny>>,
+    swagger_ui_oauth2_redirect_url: Option<String>,
+    swagger_ui_html: Option<String>,
+    redoc_html: Option<String>,
+    static_content_types: Vec<(String, String)>,
+) -> PyResult<()> {
+    if !static_content_types.is_empty() {
+        set_static_mime_map(static_content_types);
+    }
+    if let Ok(mut slot) = crate::router::NOT_FOUND_HANDLER.write() {
+        *slot = not_found_handler;
+    }
+    if let Ok(mut slot) = crate::router::APP_INSTANCE.write() {
+        *slot = app;
+    }
+    if let Ok(mut slot) = crate::router::VALIDATION_HANDLER.write() {
+        *slot = validation_handler;
+    }
+    let _ = crate::router::set_server_addr(host, port);
+    let mw_configs = parse_middleware_configs(py, &middlewares)?;
+    let _ = &root_path; // metadata only; not consulted by Rust routing
+    let router = assemble_app_router(
+        routes,
+        &mw_configs,
+        openapi_json,
+        docs_url,
+        redoc_url,
+        openapi_url,
+        &static_mounts,
+        redirect_slashes,
+        max_request_size,
+        swagger_ui_oauth2_redirect_url,
+        swagger_ui_html,
+        redoc_html,
+    );
+    let mut guard = APP_ROUTERS
+        .write()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("APP_ROUTERS lock poisoned"))?;
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(app_id, router);
+    Ok(())
+}
+
+/// Drive one HTTP request through a registered app's router in-process and
+/// return `(status, headers, body)`. The GIL is released while the runtime
+/// drives the dispatch; the Python handler re-acquires it inside the engine,
+/// exactly as under `app.run()`. Non-streaming for now — the body is
+/// buffered; streaming responses route through the Python fallback until the
+/// chunk-pump lands.
+#[pyfunction]
+#[pyo3(signature = (
+    app_id, method, path, query_string, headers, body, client_host, client_port,
+))]
+pub fn process_request(
+    py: Python<'_>,
+    app_id: u64,
+    method: String,
+    path: String,
+    query_string: String,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    body: Vec<u8>,
+    client_host: String,
+    client_port: u16,
+) -> PyResult<(u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
+    // Clone the per-app router (cheap, Arc-backed).
+    let router = {
+        let guard = APP_ROUTERS
+            .read()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("APP_ROUTERS lock poisoned"))?;
+        match guard.as_ref().and_then(|m| m.get(&app_id)) {
+            Some(r) => r.clone(),
+            None => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "process_request: app not registered (call register_app_router first)",
+                ))
+            }
+        }
+    };
+
+    // Rebuild the http::Request from the ASGI scope parts.
+    let uri = if query_string.is_empty() {
+        path
+    } else {
+        format!("{path}?{query_string}")
+    };
+    let mut builder = axum::http::Request::builder().method(method.as_str()).uri(uri);
+    for (k, v) in &headers {
+        builder = builder.header(k.as_slice(), v.as_slice());
+    }
+    let mut request = builder
+        .body(axum::body::Body::from(body))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("bad request: {e}")))?;
+    // ConnectInfo so `scope["client"]` can be populated. ASGI hosts that pass
+    // a non-IP client (e.g. TestClient's "testclient") simply get no
+    // ConnectInfo — request.client threading is refined in a later step.
+    if let Ok(addr) = format!("{client_host}:{client_port}").parse::<std::net::SocketAddr>() {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+    }
+
+    // Drive the router off-socket on the shared runtime with the GIL RELEASED.
+    // The oneshot future is SPAWNED onto a worker thread (not the block_on
+    // thread) so the dispatch core's `block_in_place` is always legal.
+    let result: Result<(u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>), String> = py.detach(|| {
+        oneshot_runtime().block_on(async move {
+            let join = tokio::spawn(async move {
+                use tower::ServiceExt;
+                // Router<()> is an Infallible Service, so oneshot cannot Err.
+                let response = router
+                    .oneshot(request)
+                    .await
+                    .expect("axum Router service is Infallible");
+                let status = response.status().as_u16();
+                let resp_headers: Vec<(Vec<u8>, Vec<u8>)> = response
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str().as_bytes().to_vec(), v.as_bytes().to_vec()))
+                    .collect();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .map_err(|e| format!("body read error: {e}"))?;
+                Ok::<_, String>((status, resp_headers, bytes.to_vec()))
+            });
+            join.await.map_err(|e| format!("dispatch task error: {e}"))?
+        })
+    });
+    result.map_err(pyo3::exceptions::PyRuntimeError::new_err)
+}
+
+/// Self-test for the in-process oneshot mechanism: build a trivial pure-Rust
+/// router, drive one request through it via `oneshot` on the shared runtime,
+/// and return `(status, body)`. Proves the runtime + Service::oneshot + body
+/// collection work in the built extension, independent of any Python handler.
+#[pyfunction]
+pub fn _oneshot_selftest(py: Python<'_>) -> PyResult<(u16, Vec<u8>)> {
+    py.detach(|| {
+        oneshot_runtime().block_on(async {
+            use tower::ServiceExt;
+            let app = axum::Router::new().route(
+                "/_oneshot",
+                get(|| async { axum::response::Json(serde_json::json!({"oneshot": "ok"})) }),
+            );
+            let request = axum::http::Request::builder()
+                .uri("/_oneshot")
+                .body(axum::body::Body::empty())
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+            let response = app
+                .oneshot(request)
+                .await
+                .expect("axum Router service is Infallible");
+            let status = response.status().as_u16();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+            Ok((status, bytes.to_vec()))
+        })
+    })
+}
+
 /// Set of *declared* paths (verbatim) from the user's routes. Used by the
 /// redirect_slashes middleware to decide whether the alternate form of a
 /// requested URL is an actual registered route before redirecting.
