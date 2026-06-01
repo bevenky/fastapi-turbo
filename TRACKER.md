@@ -96,13 +96,19 @@ isolation, both in timing-sensitive I/O code I did NOT modify:
    — failed once in the B full-suite run, PASSES in isolation; `websocket.rs` is
    untouched by any of my commits, so NOT a regression. Same flake class as R30's
    "ws_iter_text flake" stress note.
-PATTERN: the full ~1100-test suite under load surfaces pre-existing timing
-flakiness in the WS-close + file-streaming subprocess paths. NOT caused by the
-rewrite work. The B WS additions add WS load to the suite, which can raise the
-odds of surfacing the pre-existing WS-close flake. Real (don't dismiss), but
-pre-existing and isolation-green. Revisit with the dispatcher collapse (which
-removes a whole class of in-process/subprocess timing surface) or by hardening
-the WS-close drain. Detail on #1:
+REPRODUCTION VERDICT (2026-06-01, ~90+ attempts, evidence-based — NOT dismissed):
+investigated both hard; NEITHER reproduces. r29 WS-close: 0/30 under N-thread CPU
+load, 0/6 in a WS-heavy multi-file churn context (~50 subprocess servers/round).
+multi-range: 0 in 8× isolation + 12× standalone (varying payloads) + 12× pytest-
+file loop + full stress dir (520 passed). BOTH: 0/3 in back-to-back FULL `tests/`
+runs (1110 passed each) — the only context either ever failed. Each has failed
+EXACTLY ONCE, ever. CONCLUSION: no reproducible defect to root-cause; a speculative
+hot-path "fix" against a phantom would be unverifiable churn, so the correct action
+is test-hardening (done: `_range_diag()` on #1 captures cause-on-next-failure; r29
+already asserts with a message). NOT a rewrite regression (neither touches code my
+commits changed). The dispatcher collapse removes the in-process subprocess/
+TestClient path both live in — structural resolution, not a spot-fix. Does NOT gate
+the collapse. Detail on #1:
 `tests/stress/test_multi_range_no_full_file_buffer.py::test_multi_range_correct_slices_on_large_file`
 failed ONCE in a full `tests/` run (during the 422-mw verification). NOT a
 regression from that change (touches no middleware/range code). Could NOT
