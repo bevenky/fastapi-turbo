@@ -12,6 +12,16 @@ import types
 import typing
 from typing import Any, get_type_hints
 
+# Real starlette framework types — imported during package init BEFORE the compat
+# shim installs (so these resolve to REAL starlette, not the shim). Special-param
+# detection below checks BOTH clone and real types so a `request: Request` /
+# `response: Response` handler param is recognized whether it carries a clone class
+# OR a real one (e.g. after the shim points `from fastapi import` at real).
+import starlette.background as _real_starlette_background
+import starlette.requests as _real_starlette_requests
+import starlette.responses as _real_starlette_responses
+import starlette.websockets as _real_starlette_websockets
+
 from fastapi_turbo.dependencies import Depends
 from fastapi_turbo.param_functions import _ParamMarker, Body, Header
 
@@ -1403,50 +1413,59 @@ def _is_upload_file_type(annotation) -> bool:
     return False
 
 
+def _special_injection_type_map():
+    """``kind -> tuple of (clone + real) types`` for special-param detection.
+
+    Clone ``Request``/``HTTPConnection``/``BackgroundTasks`` subclass the real
+    starlette types, but ``Response``/``WebSocket`` do not, so we check BOTH the
+    clone and the real class for each — detection works whether the handler param
+    carries a clone class (current) or a real one (after the compat shim points
+    ``from fastapi import`` at real). ``SecurityScopes`` is already real.
+    Checked in this ORDER (BackgroundTasks/WebSocket before Request, since real
+    WebSocket subclasses real HTTPConnection)."""
+    from fastapi_turbo.requests import Request as _CReq, HTTPConnection as _CConn
+    from fastapi_turbo.websockets import WebSocket as _CWS
+    from fastapi_turbo.background import BackgroundTasks as _CBG
+    from fastapi_turbo.responses import Response as _CResp
+    from fastapi_turbo.security import SecurityScopes as _CSS
+
+    return (
+        ("inject_background_tasks", (_CBG, _real_starlette_background.BackgroundTasks)),
+        ("inject_websocket", (_CWS, _real_starlette_websockets.WebSocket)),
+        ("inject_response", (_CResp, _real_starlette_responses.Response)),
+        ("inject_security_scopes", (_CSS,)),
+        ("inject_request", (_CReq, _CConn,
+                            _real_starlette_requests.Request,
+                            _real_starlette_requests.HTTPConnection)),
+    )
+
+
 def _is_special_injection_type(annotation) -> bool:
     """Framework-provided objects that FastAPI auto-injects based on type:
-
-    * ``Request`` / ``HTTPConnection`` — the incoming request
-    * ``WebSocket`` — the WebSocket wrapper
-    * ``Response`` — the outgoing response shell (user can mutate headers)
-    * ``BackgroundTasks`` — a BackgroundTasks holder
-    * ``SecurityScopes`` — the scopes declared by enclosing ``Security(...)`` calls
-    """
+    ``Request``/``HTTPConnection``, ``WebSocket``, ``Response``, ``BackgroundTasks``,
+    ``SecurityScopes`` — matching clone OR real classes."""
     if annotation is inspect.Parameter.empty or annotation is None:
-        return False
-    try:
-        from fastapi_turbo.requests import Request, HTTPConnection
-        from fastapi_turbo.websockets import WebSocket
-        from fastapi_turbo.background import BackgroundTasks
-        from fastapi_turbo.responses import Response as _Response
-        from fastapi_turbo.security import SecurityScopes
-    except ImportError:
         return False
     if not isinstance(annotation, type):
         return False
-    return issubclass(annotation, (
-        Request, HTTPConnection, WebSocket, BackgroundTasks, _Response, SecurityScopes,
-    ))
+    try:
+        all_types = tuple(t for _, ts in _special_injection_type_map() for t in ts)
+    except ImportError:
+        return False
+    return issubclass(annotation, all_types)
 
 
 def _special_injection_kind(annotation) -> str:
     """Return a short string tag the router uses to dispatch injection."""
-    from fastapi_turbo.requests import Request, HTTPConnection
-    from fastapi_turbo.websockets import WebSocket
-    from fastapi_turbo.background import BackgroundTasks
-    from fastapi_turbo.responses import Response as _Response
-    from fastapi_turbo.security import SecurityScopes
-    if isinstance(annotation, type):
-        if issubclass(annotation, BackgroundTasks):
-            return "inject_background_tasks"
-        if issubclass(annotation, WebSocket):
-            return "inject_websocket"
-        if issubclass(annotation, _Response):
-            return "inject_response"
-        if issubclass(annotation, SecurityScopes):
-            return "inject_security_scopes"
-        if issubclass(annotation, (Request, HTTPConnection)):
-            return "inject_request"
+    if not isinstance(annotation, type):
+        return "query"
+    try:
+        type_map = _special_injection_type_map()
+    except ImportError:
+        return "query"
+    for kind, types_for_kind in type_map:
+        if issubclass(annotation, types_for_kind):
+            return kind
     return "query"
 
 
