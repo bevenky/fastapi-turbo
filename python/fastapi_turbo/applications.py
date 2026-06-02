@@ -3020,35 +3020,6 @@ def _resolved_hints(endpoint) -> dict | None:
         return None
 
 
-def _signature_uses_form_file_marker(endpoint) -> bool:
-    """True if the endpoint uses a Form/File marker. Form/File routes always take
-    the clone path (the door's multipart handling), and building a real route for
-    them runs get_dependant which mutates the shared marker — so decline pre-build."""
-    import inspect
-    import typing
-
-    try:
-        from fastapi_turbo.param_functions import File as _F, Form as _Fm
-    except Exception:
-        return True
-    # Marker DEFAULTS are not stringified by ``from __future__ import annotations``.
-    try:
-        sig = inspect.signature(endpoint)
-    except (ValueError, TypeError):
-        return True
-    if any(isinstance(p.default, (_F, _Fm)) for p in sig.parameters.values()):
-        return True
-    # Annotated[..., Form()/File()] metadata — resolve string annotations.
-    hints = _resolved_hints(endpoint)
-    if hints is None:
-        return True
-    for ann in hints.values():
-        if typing.get_origin(ann) is typing.Annotated:
-            if any(isinstance(meta, (_F, _Fm)) for meta in typing.get_args(ann)[1:]):
-                return True
-    return False
-
-
 def _signature_uses_clone_framework_type(endpoint) -> bool:
     """True if the endpoint signature annotates a param with a clone framework type
     (Request/Response/BackgroundTasks/UploadFile/WebSocket/HTTPConnection). Real
@@ -7250,8 +7221,6 @@ class FastAPI(_real_fastapi.FastAPI):
         # a route that ultimately declines.
         if _signature_uses_clone_framework_type(endpoint):
             return None
-        if _signature_uses_form_file_marker(endpoint):
-            return None
         try:
             import inspect as _inspect
 
@@ -7295,8 +7264,6 @@ class FastAPI(_real_fastapi.FastAPI):
         except Undelegable:
             return None
         except Exception:
-            return None
-        if any(p.kind in ("form", "file") for p in params):
             return None
         # A leaked ``**kwargs``/``*args`` dep-input means real FastAPI couldn't
         # introspect a callable — e.g. a clone security scheme whose ``__call__`` is

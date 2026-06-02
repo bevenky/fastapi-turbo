@@ -860,6 +860,20 @@ def _build() -> dict[str, types.ModuleType]:
     # ── fastapi.types ──────────────────────────────────────────────
     import typing as _typing
     fastapi_types = _mod("fastapi.types")
+    # Copy real fastapi.types wholesale. Real FastAPI internals (e.g.
+    # _should_embed_body_fields -> is_union_of_base_models) do lazy
+    # `from fastapi.types import UnionType` at runtime, which resolves to THIS shim
+    # module — an incomplete shim breaks real-route building (the pivot adapter)
+    # for body/Form/File routes. _build() runs before the sys.modules swap, so this
+    # import resolves to the REAL module.
+    try:
+        import importlib as _il
+        _real_types = _il.import_module("fastapi.types")
+        for _n in dir(_real_types):
+            if not _n.startswith("__"):
+                setattr(fastapi_types, _n, getattr(_real_types, _n))
+    except Exception:
+        pass
     fastapi_types.DecoratedCallable = _typing.TypeVar("DecoratedCallable", bound=_typing.Callable)  # type: ignore[attr-defined]
     fastapi_types.IncEx = _typing.Union[_typing.Set[int], _typing.Set[str], _typing.Dict[int, _typing.Any], _typing.Dict[str, _typing.Any], None]  # type: ignore[attr-defined]
     modules["fastapi.types"] = fastapi_types
