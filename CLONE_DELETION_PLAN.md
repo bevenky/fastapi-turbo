@@ -231,12 +231,29 @@ currently OPT-IN (`FASTAPI_TURBO_ONESHOT_DOOR=1`); default-OFF means ASGI mode u
 the Python dispatcher (`_asgi_dispatch_in_process`, ~5.1K LOC, the 2nd engine).
 
 **Flipping it default-on is the move that (a) makes ASGI mode run on Rust and (b)
-makes the Python dispatcher deletable.** Tested the flip: **1110/1122** pass; **12
-edge-case gaps** where the oneshot door (Rust + adapter) diverges from the dispatcher
-— these are the gate (reverted to keep main green):
-- `test_query_parameter_model_pep604_optional_list_collects_repeated_values` — param-model **list** field doesn't collect repeated query values (dep-input path `extract_single_param` uses single-value query map, not the multi-value map).
-- `test_response_validation_error_carries_endpoint_function` + `test_request_validation_error_carries_endpoint_function` — RVE/RequestValidationError **endpoint_ctx/endpoint_function** not wired on the door path.
-- `test_body_alias_in_missing_loc`, `test_body_validation_alias_in_missing_loc`, `test_top_level_missing_input_is_none`, `test_body_embed_true_missing_emits_body_field_loc`, `test_multiple_extra_dep_missing_errors_accumulate` — 422 **validation-error detail/loc shapes** differ from the dispatcher.
-- `test_async_dep_resolves_in_process`, `test_yield_dep_swallow_raises_fastapi_error`, `test_background_task_can_use_lifespan_async_resource_in_process` — async/yield-dep + BG-loop-affinity edge cases on the oneshot door.
+makes the Python dispatcher deletable.** The flip previously hit **12 edge-case
+gaps** where the oneshot door (Rust + adapter) diverged from the dispatcher. **ALL
+12 ARE NOW CLOSED** — door-ON full suite is **1122/1122** (was 1110/1122), door-OFF
+1122/1122, parity 151 (both modes), WS 22.
 
-These 12 are the focused next pass: close them → flip the oneshot door default-on → ASGI mode on Rust → delete the Python dispatcher.
+GAPS CLOSED (still OPT-IN — flip not yet flipped; this was the gate):
+- `test_query_parameter_model_pep604_optional_list_collects_repeated_values` — **#1 list**: `extract_single_param` now takes `query_multi` and collects repeated values for `list_*` dep-input params (router.rs).
+- `test_response_validation_error_carries_endpoint_function` (#2) + `test_request_validation_error_carries_endpoint_function` (#3) — **endpoint_ctx wired**: R46 via `_serialize_via_field(..., endpoint_ctx)` in `_introspect_from_real_fastapi.build_handler` (new `endpoint_ctx_for` helper); R42 via `_rust_validation_handler` reading `_current_request_scope`'s endpoint. `_make_sync_wrapper` now stamps `__name__` + `_fastapi_turbo_original_endpoint` so the scope ctxvar sees the real handler, not the wrapper.
+- `test_body_alias_in_missing_loc`, `test_body_validation_alias_in_missing_loc`, `test_top_level_missing_input_is_none`, `test_body_embed_true_missing_emits_body_field_loc` (#4–#7) — **422 body shapes**: `extract_single_param`'s body arm now uses `cached_validator` + `pydantic_error_response_combined[_with_body]` / `missing_body_error` (mirrors `extract_params_to_pydict_full`), giving alias-aware loc + top-level `input=None`.
+- `test_multiple_extra_dep_missing_errors_accumulate` (#8) — **accumulate**: deps loop collects `dep_extraction_errors` across all extra deps (alias loc names), skips deps whose inputs failed, emits one combined 422.
+- `test_async_dep_resolves_in_process` (#9) — async dep now routes a suspending coroutine to the worker loop (`call_async_on_local_loop_with_app`); removed `try_call_async_sync`.
+- `test_yield_dep_swallow_raises_fastapi_error` (#10) — error-path teardown now `gen.throw(exc)` per FA's exit-stack protocol; a swallowing yield-dep → `FastAPIError` (`teardown_generator_deps_error` + `fastapi_error` in router.rs).
+- `test_background_task_can_use_lifespan_async_resource_in_process` (#11) — `_make_sync_wrapper` detects loop-affinity calls (`get_running_loop`/`create_task`/…) via `_uses_running_loop`, routing no-await handlers that read the loop to the worker loop (same loop as lifespan + BG).
+
+**FLIPPED DEFAULT-ON (2026-06-02):** `_oneshot_door_enabled` now returns
+`os.environ.get("FASTAPI_TURBO_ONESHOT_DOOR", "1") != "0"` — ASGI/uvicorn mode runs
+on the Rust door by default; opt OUT with `FASTAPI_TURBO_ONESHOT_DOOR=0`. Gates after
+the flip: default (door) full suite **1122**, opt-out (dispatcher) full suite **1122**,
+parity **151**, WS **22**. The 12th gap the prose had omitted —
+`test_r40_regressions.py::test_parameter_model_query_builds_via_in_process_dispatcher`
+— was a sibling of #1 (param-model query expansion) and closed by the same
+`query_multi` fix; verified by reconstructing the original 1110/1122 failure set.
+
+NEXT: Phase 7 — delete the ~5.1K-line Python dispatcher (`_asgi_dispatch_in_process`
++ `_asgi_dispatch_ws_in_process` + `_wrap_websocket_endpoint` + group-C overrides)
+now that the Rust door is the default ASGI engine and the full suite rides it.

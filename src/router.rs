@@ -2161,10 +2161,36 @@ async fn handle_request(
             let mut dep_cache: HashMap<u64, String> = HashMap::new();
             // Live ``yield`` dependency generators awaiting teardown.
             let mut gen_deps: Vec<Py<PyAny>> = Vec::new();
+            // Accumulate missing/coercion errors from extra-dep INPUT params so
+            // a route with several ``Depends`` each missing a required param
+            // surfaces ALL of them in one 422 (FA parity), and skip any dep
+            // whose own inputs failed to extract.
+            let mut dep_extraction_errors: Vec<serde_json::Value> = Vec::new();
+            let mut failed_sources: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            // App handle for routing a suspending async dep to the shared
+            // worker loop (the same loop lifespan + handlers run on) so
+            // loop-affinity / configured timeouts hold. Issue: async deps
+            // that actually ``await`` (asyncio.sleep, async DB I/O) used to
+            // raise "Coroutine suspended" via the try-sync-only path.
+            let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
+                .read()
+                .ok()
+                .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
 
             for param in &state.params {
                 match param.kind.as_str() {
                     "dependency" => {
+                        // Skip a dep whose input(s) failed extraction — its
+                        // error is already accumulated; calling it would raise
+                        // on the missing kwarg and mask the real 422.
+                        if param
+                            .dep_input_names
+                            .iter()
+                            .any(|(_, src)| failed_sources.contains(src))
+                        {
+                            continue;
+                        }
                         // Check cache first
                         if let Some(func_id) = param.dep_callable_id {
                             if let Some(cached_key) = dep_cache.get(&func_id) {
@@ -2192,7 +2218,15 @@ async fn handle_request(
                         let result = if param.is_generator_dep {
                             enter_sync_generator_dep(py, dep_callable, &dep_kwargs, &mut gen_deps)
                         } else if param.is_async_dep {
-                            try_call_async_sync(py, dep_callable, &dep_kwargs)
+                            // Try-sync first; a suspending coroutine routes to the
+                            // shared worker loop (run_coroutine_threadsafe) so deps
+                            // that genuinely ``await`` resolve instead of erroring.
+                            crate::handler_bridge::call_async_on_local_loop_with_app(
+                                py,
+                                dep_callable,
+                                &dep_kwargs,
+                                app_for_submit.as_ref(),
+                            )
                         } else {
                             dep_callable.call(py, (), Some(&dep_kwargs))
                         };
@@ -2241,23 +2275,46 @@ async fn handle_request(
                                         return pyerr_to_response(py, &e);
                                     }
                                 }
-                            } else if let Err(resp) = extract_single_param(
-                                py,
-                                param,
-                                &path_map,
-                                &query_params,
-                                &headers,
-                                &body_json,
-                                &body_bytes,
-                                &mut multipart_fields,
-                                &mut resolved,
-                            ) {
-                                teardown_generator_deps(py, &gen_deps, true);
-                                return resp;
+                            } else {
+                                let before = dep_extraction_errors.len();
+                                if let Err(resp) = extract_single_param(
+                                    py,
+                                    param,
+                                    &path_map,
+                                    &query_params,
+                                    &query_multi,
+                                    &headers,
+                                    &body_json,
+                                    &body_bytes,
+                                    &mut multipart_fields,
+                                    &mut resolved,
+                                    &mut dep_extraction_errors,
+                                ) {
+                                    // Body-level error short-circuits with a
+                                    // complete combined 422.
+                                    teardown_generator_deps(py, &gen_deps, true);
+                                    return resp;
+                                }
+                                // A scalar that failed extraction was pushed to
+                                // the accumulator (not ``resolved``) — mark it so
+                                // dependent deps skip rather than raise.
+                                if dep_extraction_errors.len() > before {
+                                    failed_sources.insert(param.name.clone());
+                                }
                             }
                         }
                     }
                 }
+            }
+
+            // Extra-dep input params that were missing/invalid surface as one
+            // combined 422 across ALL deps (FA accumulates them) before the
+            // handler-param extractor runs.
+            if !dep_extraction_errors.is_empty() {
+                teardown_generator_deps(py, &gen_deps, true);
+                return dispatch_validation_error(serde_json::json!({
+                    "detail": dep_extraction_errors,
+                }));
             }
 
             // Build handler kwargs via the full extractor (scalars/body/form/file,
@@ -2379,8 +2436,14 @@ async fn handle_request(
                         // Return a sentinel status to signal fallback needed
                         (StatusCode::from_u16(599).unwrap(), "NEEDS_EVENT_LOOP").into_response()
                     } else {
-                        teardown_generator_deps(py, &gen_deps, true);
-                        pyerr_to_response(py, py_err)
+                        // FA exit-stack parity: throw the handler error into the
+                        // yield-deps; a dep that swallows it surfaces FastAPIError.
+                        let final_err = teardown_generator_deps_error(
+                            py,
+                            &gen_deps,
+                            py_err.clone_ref(py),
+                        );
+                        pyerr_to_response(py, &final_err)
                     }
                 }
             }
@@ -2395,6 +2458,7 @@ async fn handle_request(
             // Re-extract all params (we lost them in the unified path)
             // This is the slow path — only triggers for truly async handlers (asyncio.sleep etc.)
             let mut resolved: HashMap<String, Py<PyAny>> = HashMap::new();
+            let mut _fallback_errs: Vec<serde_json::Value> = Vec::new();
             for param in &state.params {
                 if param.kind != "dependency" {
                     let _ = extract_single_param(
@@ -2402,11 +2466,13 @@ async fn handle_request(
                         param,
                         &path_map,
                         &query_params,
+                        &query_multi,
                         &headers,
                         &body_json,
                         &body_bytes,
                         &mut multipart_fields,
                         &mut resolved,
+                        &mut _fallback_errs,
                     );
                 }
             }
@@ -2484,45 +2550,73 @@ fn teardown_generator_deps(py: Python<'_>, gen_deps: &[Py<PyAny>], errored: bool
     }
 }
 
-// ── Async try-sync helper ────────────────────────────────────────────
+/// Construct a ``fastapi_turbo.exceptions.FastAPIError`` (re-exports the real
+/// ``fastapi.exceptions.FastAPIError``). Falls back to the import/construction
+/// error so the caller always gets *some* PyErr to surface.
+fn fastapi_error(py: Python<'_>, msg: &str) -> PyErr {
+    match py
+        .import("fastapi_turbo.exceptions")
+        .and_then(|m| m.getattr("FastAPIError"))
+        .and_then(|cls| cls.call1((msg,)))
+    {
+        Ok(inst) => PyErr::from_value(inst),
+        Err(e) => e,
+    }
+}
 
-/// Try to call an async Python function synchronously via coro.send(None).
-/// If the coroutine completes immediately (StopIteration), returns the value.
-/// If it suspends or needs an event loop, returns an error.
-fn try_call_async_sync(
+/// Error-path teardown that mirrors FastAPI's exit-stack protocol: the live
+/// exception is thrown into each ``yield`` dependency (reverse / LIFO order).
+/// A dependency that catches the exception WITHOUT re-raising (its generator
+/// returns via ``StopIteration``) *suppresses* it — FA forbids this and raises
+/// ``FastAPIError``. A dependency that re-raises (the same or a different
+/// exception) propagates it. Returns the error to surface to the client.
+fn teardown_generator_deps_error(
     py: Python<'_>,
-    handler: &Py<PyAny>,
-    kwargs: &pyo3::Bound<'_, PyDict>,
-) -> PyResult<Py<PyAny>> {
-    let coro = handler.call(py, (), Some(kwargs))?;
-    match coro.call_method1(py, "send", (py.None(),)) {
-        Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
-            // Completed synchronously — extract value
-            match e.value(py).getattr("value") {
-                Ok(val) => Ok(val.unbind()),
-                Err(_) => Ok(py.None()),
+    gen_deps: &[Py<PyAny>],
+    original: PyErr,
+) -> PyErr {
+    let mut live: Option<PyErr> = Some(original);
+    for gen in gen_deps.iter().rev() {
+        match live.take() {
+            Some(err) => {
+                let exc = err.value(py).clone();
+                match gen.call_method1(py, "throw", (exc,)) {
+                    // Generator returned without re-raising → swallowed the error.
+                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                        live = None;
+                    }
+                    // Generator re-raised (same or different exception) → propagate.
+                    Err(e) => {
+                        live = Some(e);
+                    }
+                    // Generator yielded again after throw — a misbehaving dep;
+                    // close it and keep the original error live.
+                    Ok(_) => {
+                        let _ = gen.call_method0(py, "close");
+                        live = Some(err);
+                    }
+                }
+            }
+            None => {
+                // Exception already suppressed by an inner dep — this outer dep
+                // exits normally (advance past its yield, then close).
+                if gen.call_method1(py, "send", (py.None(),)).is_ok() {
+                    let _ = gen.call_method0(py, "close");
+                }
             }
         }
-        Err(e) => {
-            // Check if it's a "no running event loop" error — treat same as suspension
-            let is_runtime = e.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py);
-            let msg = e.value(py).str().map(|s| s.to_string()).unwrap_or_default();
-            if is_runtime && msg.contains("event loop") {
-                let _ = coro.call_method0(py, "close");
-                // TODO: fall back to event loop bridge for truly async handlers
-                Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "Handler requires a running event loop (asyncio.sleep, etc.). Use sync deps for best performance.",
-                ))
-            } else {
-                Err(e)
-            }
-        }
-        Ok(_) => {
-            let _ = coro.call_method0(py, "close");
-            Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Coroutine suspended — requires event loop",
-            ))
-        }
+    }
+    match live {
+        Some(e) => e,
+        // The exception was swallowed by a yield-dep that didn't re-raise.
+        None => fastapi_error(
+            py,
+            "Response not awaited. There's a high chance that the \
+             application code is raising an exception and a dependency with yield \
+             has a block with a bare except, or a block with except Exception, \
+             and is not raising the exception again. Read more about it in the \
+             docs: https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/#dependencies-with-yield-and-except",
+        ),
     }
 }
 
@@ -3276,14 +3370,22 @@ fn extract_single_param(
     param: &ParamInfo,
     path_map: &HashMap<String, String>,
     query_params: &HashMap<String, String>,
+    query_multi: &HashMap<String, Vec<String>>,
     headers: &Option<HeaderMap>,
     body_json: &Option<serde_json::Value>,
     body_bytes: &[u8],
     multipart_fields: &mut Option<HashMap<String, Vec<ParsedField>>>,
     resolved: &mut HashMap<String, Py<PyAny>>,
+    accum: &mut Vec<serde_json::Value>,
 ) -> Result<(), Response> {
+    // Scalar (path/query/header/cookie) missing/coercion errors are PUSHED
+    // into ``accum`` (the caller emits one combined 422 across all extra
+    // deps — FA accumulates every missing required dep-input, not just the
+    // first). Body-level errors still short-circuit with ``Err(Response)``
+    // (a combined-body 422 already lists every missing body field).
     match param.kind.as_str() {
         "path" => {
+            let p_lookup: &str = param.alias.as_deref().unwrap_or(&param.name);
             if let Some(raw) = path_map.get(&param.name) {
                 resolved.insert(
                     param.name.clone(),
@@ -3296,16 +3398,36 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response(
-                    "path",
-                    &param.name,
-                    "field required",
-                ));
+                accum.push(missing_error_detail("path", p_lookup));
             }
         }
         "query" => {
             let q_lookup: &str = param.alias.as_deref().unwrap_or(&param.name);
-            if let Some(raw) = query_params.get(q_lookup) {
+            // List types collect ALL values for repeated ``?k=a&k=b`` — a
+            // param-model field typed ``list[str]`` must see both, not the
+            // single last-wins value from ``query_params``.
+            if param.type_hint.starts_with("list_") {
+                let values = query_multi.get(q_lookup).cloned().unwrap_or_default();
+                if values.is_empty() {
+                    if param.has_default {
+                        let v = match &param.default_value {
+                            Some(d) => d.clone_ref(py),
+                            None => py.None(),
+                        };
+                        resolved.insert(param.name.clone(), v);
+                    } else if param.required {
+                        accum.push(missing_error_detail("query", q_lookup));
+                    }
+                } else {
+                    let inner = &param.type_hint[5..]; // strip "list_"
+                    let list = pyo3::types::PyList::empty(py);
+                    for v in &values {
+                        let coerced = coerce_str_to_py(py, v, inner);
+                        let _ = list.append(coerced.bind(py));
+                    }
+                    resolved.insert(param.name.clone(), list.into_any().unbind());
+                }
+            } else if let Some(raw) = query_params.get(q_lookup) {
                 resolved.insert(
                     param.name.clone(),
                     coerce_str_to_py(py, raw, &param.type_hint),
@@ -3317,38 +3439,54 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response(
-                    "query",
-                    &param.name,
-                    "field required",
-                ));
+                accum.push(missing_error_detail("query", q_lookup));
             }
         }
         "body" => {
-            if let Some(ref json_val) = body_json {
-                let raw_dict = serde_to_pyobj(py, json_val);
-                let val = if let Some(ref model_cls) = param.model_class {
-                    model_cls
-                        .call_method1(py, "model_validate", (raw_dict.bind(py),))
-                        .map_err(|e| {
-                            validation_error_response("body", &param.name, &format!("{e}"))
-                        })?
+            let is_combined = param.name == "_combined_body";
+            if !body_bytes.is_empty() {
+                if param.cached_validator.is_some() || param.model_class.is_some() {
+                    // Validate raw bytes directly (FA shapes). On error,
+                    // remap to FA's combined/with-body 422 (alias-aware loc,
+                    // top-level ``input=None``) instead of a raw 500.
+                    let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
+                    let result = if let Some(ref validator) = param.cached_validator {
+                        validator.call_method1(py, "validate_json", (py_bytes,))
+                    } else {
+                        param
+                            .model_class
+                            .as_ref()
+                            .unwrap()
+                            .getattr(py, "__pydantic_validator__")
+                            .and_then(|v| v.call_method1(py, "validate_json", (py_bytes,)))
+                    };
+                    match result {
+                        Ok(v) => {
+                            resolved.insert(param.name.clone(), v);
+                        }
+                        Err(e) => {
+                            // FA body-parse errors (HTTPException) win as-is.
+                            if e.value(py).getattr("status_code").is_ok() {
+                                return Err(crate::responses::pyerr_to_response(py, &e));
+                            }
+                            if is_combined {
+                                return Err(pydantic_error_response_combined_with_body(
+                                    py, &e, "body", body_bytes,
+                                ));
+                            }
+                            return Err(pydantic_error_response_with_body(
+                                py, &e, "body", body_bytes,
+                            ));
+                        }
+                    }
+                } else if let Some(ref json_val) = body_json {
+                    // No Pydantic model — pass the parsed dict through.
+                    resolved.insert(param.name.clone(), serde_to_pyobj(py, json_val));
                 } else {
-                    raw_dict
-                };
-                resolved.insert(param.name.clone(), val);
-            } else if let Some(model_cls) =
-                param.model_class.as_ref().filter(|_| !body_bytes.is_empty())
-            {
-                // body_json is None when every body param has a model (the door
-                // validates raw bytes directly). Mirror that here for dep-input /
-                // combined-body params via __pydantic_validator__.validate_json.
-                let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
-                let val = model_cls
-                    .getattr(py, "__pydantic_validator__")
-                    .and_then(|v| v.call_method1(py, "validate_json", (py_bytes,)))
-                    .map_err(|e| crate::responses::pyerr_to_response(py, &e))?;
-                resolved.insert(param.name.clone(), val);
+                    // Raw bytes couldn't be parsed as JSON — hand them on.
+                    let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
+                    resolved.insert(param.name.clone(), py_bytes.into_any().unbind());
+                }
             } else if param.has_default {
                 let v = match &param.default_value {
                     Some(d) => d.clone_ref(py),
@@ -3356,15 +3494,26 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response(
-                    "body",
-                    &param.name,
-                    "field required",
-                ));
+                // Empty body + required combined body: feed ``{}`` so the
+                // validator emits per-field missing errors (loc=["body",<field>]).
+                if is_combined {
+                    if let Some(ref validator) = param.cached_validator {
+                        let empty = pyo3::types::PyBytes::new(py, b"{}");
+                        if let Err(e) = validator.call_method1(py, "validate_json", (empty,)) {
+                            if e.value(py).getattr("status_code").is_ok() {
+                                return Err(crate::responses::pyerr_to_response(py, &e));
+                            }
+                            return Err(pydantic_error_response_combined(py, &e, "body"));
+                        }
+                    }
+                    return Err(missing_body_error());
+                }
+                return Err(validation_error_response("body", &param.name, "field required"));
             }
         }
         "header" => {
-            let lookup = param.alias.as_deref().unwrap_or(&param.name).to_lowercase();
+            let loc_name = param.alias.as_deref().unwrap_or(&param.name);
+            let lookup = loc_name.to_lowercase();
             let header_val = headers
                 .as_ref()
                 .and_then(|h| h.get(lookup.as_str()))
@@ -3381,14 +3530,11 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response(
-                    "header",
-                    &param.name,
-                    "field required",
-                ));
+                accum.push(missing_error_detail("header", loc_name));
             }
         }
         "cookie" => {
+            let loc_name = param.alias.as_deref().unwrap_or(&param.name);
             let cookie_val = headers
                 .as_ref()
                 .and_then(|h| h.get("cookie"))
@@ -3406,11 +3552,7 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response(
-                    "cookie",
-                    &param.name,
-                    "field required",
-                ));
+                accum.push(missing_error_detail("cookie", loc_name));
             }
         }
         "form" | "file" => {

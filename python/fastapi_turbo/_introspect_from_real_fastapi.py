@@ -507,7 +507,7 @@ def extract_params_from_route(route: Any) -> list[ParamInfo]:
     return params
 
 
-def _serialize_via_field(content, field, flags):
+def _serialize_via_field(content, field, flags, endpoint_ctx=None):
     """Run a handler result through real FastAPI's response ``ModelField`` — the
     same ``validate`` + ``serialize`` sync core as ``serialize_response``."""
     # Pass real Response objects (StreamingResponse/FileResponse/…) straight through.
@@ -531,7 +531,12 @@ def _serialize_via_field(content, field, flags):
             errs = _normalize_errors(errors)
         except Exception:
             errs = errors
-        raise ResponseValidationError(errors=errs, body=content)
+        # endpoint_ctx (function/file/line/path) lets a user
+        # @app.exception_handler(ResponseValidationError) log which handler
+        # produced the bad response — parity with the dispatcher path.
+        raise ResponseValidationError(
+            errors=errs, body=content, endpoint_ctx=endpoint_ctx
+        )
     inc, exc, by_alias, eu, ed, en = flags
     return field.serialize(
         value,
@@ -542,6 +547,23 @@ def _serialize_via_field(content, field, flags):
         exclude_defaults=ed,
         exclude_none=en,
     )
+
+
+def endpoint_ctx_for(endpoint, path=None) -> dict:
+    """Build the ``endpoint_ctx`` dict (function/file/line/path) that
+    Request/ResponseValidationError carry so user exception handlers can log
+    which handler produced the error — and so ``str(exc)`` renders ``in
+    <function>`` (which needs function AND file AND line). Mirrors the
+    dispatcher's ``_endpoint_ctx``."""
+    ctx = {"function": getattr(endpoint, "__name__", "endpoint")}
+    try:
+        ctx["file"] = inspect.getsourcefile(endpoint)
+        ctx["line"] = inspect.getsourcelines(endpoint)[1]
+    except (TypeError, OSError):
+        pass
+    if path is not None:
+        ctx["path"] = path
+    return ctx
 
 
 def build_handler(route: Any):
@@ -562,18 +584,19 @@ def build_handler(route: Any):
         getattr(route, "response_model_exclude_none", False),
     )
     name = getattr(endpoint, "__name__", "endpoint")
+    _ctx = endpoint_ctx_for(endpoint, getattr(route, "path", None))
 
     if inspect.iscoroutinefunction(endpoint):
 
         async def wrapper(**kwargs):
             result = await endpoint(**kwargs)
-            return _serialize_via_field(result, field, flags)
+            return _serialize_via_field(result, field, flags, _ctx)
 
     else:
 
         def wrapper(**kwargs):
             result = endpoint(**kwargs)
-            return _serialize_via_field(result, field, flags)
+            return _serialize_via_field(result, field, flags, _ctx)
 
     wrapper.__name__ = name
     return wrapper

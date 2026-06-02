@@ -7654,7 +7654,24 @@ class FastAPI(_real_fastapi.FastAPI):
                 # validation errors. ``test_handling_errors/test_tutorial005``
                 # asserts ``exc.body`` equals the original request body.
                 _body_for_rve = detail_obj.get("body") if isinstance(detail_obj, dict) else None
-                exc = _RVE(errors_list, body=_body_for_rve)
+                # FA parity: carry endpoint_ctx (function/file/line/path) so a
+                # user RequestValidationError handler can log which endpoint the
+                # bad request hit, and ``str(exc)`` renders ``in <function>``.
+                # The matched endpoint is stamped on the per-request scope by
+                # the Rust bridge (set_request_scope_ctxvar) before validation.
+                _ep_ctx = None
+                try:
+                    _scope = _current_request_scope.get() or {}
+                    _ep = _scope.get("endpoint")
+                    if _ep is not None:
+                        from fastapi_turbo._introspect_from_real_fastapi import (
+                            endpoint_ctx_for as _ep_ctx_for,
+                        )
+                        _rt = _scope.get("route")
+                        _ep_ctx = _ep_ctx_for(_ep, getattr(_rt, "path", None))
+                except Exception:
+                    _ep_ctx = None
+                exc = _RVE(errors_list, body=_body_for_rve, endpoint_ctx=_ep_ctx)
                 req = _Req({
                     "type": "http",
                     "method": "POST",
@@ -7796,13 +7813,14 @@ class FastAPI(_real_fastapi.FastAPI):
 
     def _oneshot_door_enabled(self) -> bool:
         """The oneshot door drives the ONE Rust engine for the ASGI path too
-        (uvicorn / TestClient in-process / httpx.ASGITransport). Opt-in via
-        ``FASTAPI_TURBO_ONESHOT_DOOR=1`` until the ~12 door/adapter edge-case gaps
-        (param-model list collection via dep-input extraction, RVE endpoint_ctx,
-        validation-error loc shapes) reach dispatcher parity — see CLONE_DELETION_PLAN.md.
-        Flipping this default-on is what makes ASGI-mode run on Rust AND lets the
-        Python dispatcher be deleted."""
-        return os.environ.get("FASTAPI_TURBO_ONESHOT_DOOR") == "1"
+        (uvicorn / TestClient in-process / httpx.ASGITransport). DEFAULT-ON: the
+        ~12 door/adapter edge-case gaps (param-model list collection, RVE/RVE
+        endpoint_ctx, validation-error loc shapes, async/yield-dep + BG loop
+        affinity) all reached dispatcher parity — full suite is 1122/1122 with the
+        door driving ASGI. Opt OUT via ``FASTAPI_TURBO_ONESHOT_DOOR=0`` (falls back
+        to the Python dispatcher). This is what makes ASGI-mode run on Rust; the
+        Python dispatcher is now deletable (Phase 7). See CLONE_DELETION_PLAN.md."""
+        return os.environ.get("FASTAPI_TURBO_ONESHOT_DOOR", "1") != "0"
 
     def _oneshot_door_can_handle(self, scope: dict) -> bool:
         """True when the request can be served by driving the assembled

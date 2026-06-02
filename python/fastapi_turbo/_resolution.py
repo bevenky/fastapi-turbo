@@ -43,6 +43,58 @@ def _has_await_in_source(func) -> bool:
         return True
 
 
+# asyncio primitives that REQUIRE a running loop bound to the *calling*
+# thread. A function naming one of these needs a loop even if it never
+# ``await``s.
+_LOOP_AFFINITY_NAMES = frozenset(
+    {
+        "get_running_loop",
+        "get_event_loop",
+        "current_task",
+        "all_tasks",
+        "create_task",
+        "ensure_future",
+        "run_coroutine_threadsafe",
+        "call_soon",
+        "call_soon_threadsafe",
+        "call_later",
+        "call_at",
+    }
+)
+
+
+def _uses_running_loop(func) -> bool:
+    """Best-effort static check: does this function reference an asyncio
+    primitive that needs a running event loop on the calling thread
+    (``asyncio.get_running_loop()``, ``loop.create_task(...)``, ...)?
+
+    Such a function can be ``async def`` with NO ``await`` — the no-await
+    fast path would drive it via ``send(None)`` on the calling thread,
+    which (under the oneshot door / app.run worker pool) has no running
+    loop, so ``asyncio.get_running_loop()`` raises ``RuntimeError``.
+    Routing these to the shared worker loop instead also preserves loop
+    affinity with lifespan-created resources (asyncio.Event, pools). A
+    handler that schedules a BackgroundTask AND reads the running loop is
+    the canonical case. Returns False on any detection failure (the
+    ``await`` scan already errs safe by returning True).
+    """
+    try:
+        import ast
+        import inspect as _inspect
+        import textwrap
+
+        src = _inspect.getsource(func)
+        tree = ast.parse(textwrap.dedent(src))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in _LOOP_AFFINITY_NAMES:
+                return True
+            if isinstance(node, ast.Name) and node.id in _LOOP_AFFINITY_NAMES:
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
     """Wrap an async function so it can be called from sync code.
 
@@ -71,11 +123,28 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
       risks a greenlet thread-switch error on the first await.
     """
     func_id = id(async_func)
+    _orig_name = getattr(async_func, "__name__", None)
+    _orig_qual = getattr(async_func, "__qualname__", None)
+
+    def _stamp(w):
+        # Preserve the wrapped endpoint's identity so the Rust bridge's
+        # per-request scope (``set_request_scope_ctxvar`` reads
+        # ``_fastapi_turbo_original_endpoint``) and validation-error
+        # endpoint_ctx report the real handler name, not the wrapper's.
+        w._fastapi_turbo_wrapped_id = func_id
+        w._fastapi_turbo_original_endpoint = async_func
+        if _orig_name:
+            w.__name__ = _orig_name
+        if _orig_qual:
+            w.__qualname__ = _orig_qual
+        return w
 
     # If the function never awaits, both deps AND handlers can run on
     # the calling thread with a single send(None) — 0.5µs vs 30µs for
-    # the worker-loop round-trip.
-    if not _has_await_in_source(async_func):
+    # the worker-loop round-trip. EXCEPT when it reads the running loop
+    # (get_running_loop / create_task / ...) — those need a loop on the
+    # calling thread, so route them to the worker loop instead.
+    if not _has_await_in_source(async_func) and not _uses_running_loop(async_func):
         def _noawait_caller(**kwargs):
             coro = async_func(**kwargs)
             try:
@@ -96,15 +165,13 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
                 pass
             from fastapi_turbo._async_worker import submit
             return submit(async_func(**kwargs), app=app)
-        _noawait_caller._fastapi_turbo_wrapped_id = func_id
-        return _noawait_caller
+        return _stamp(_noawait_caller)
 
     if for_handler:
         def _submit_caller(**kwargs):
             from fastapi_turbo._async_worker import submit
             return submit(async_func(**kwargs), app=app)
-        _submit_caller._fastapi_turbo_wrapped_id = func_id
-        return _submit_caller
+        return _stamp(_submit_caller)
 
     needs_loop = [False]
 
@@ -136,8 +203,7 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
         needs_loop[0] = True
         return _submit_partial(coro)
 
-    _sync_caller._fastapi_turbo_wrapped_id = func_id
-    return _sync_caller
+    return _stamp(_sync_caller)
 
 
 def _callable_uses_scopes(
