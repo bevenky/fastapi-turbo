@@ -7194,10 +7194,11 @@ class FastAPI(_real_fastapi.FastAPI):
         # them. The generic name->kind net below still catches any clone TYPE real
         # FastAPI can't see yet (UploadFile/Request/Response/BackgroundTasks), so a
         # mis-introspected route delegates rather than mis-serves.
-        # Route/router/global dependencies stay on the clone path for now — their
-        # combined-dep wiring is security-sensitive and validated separately.
-        if rd.get("_combined_dependencies"):
-            return None
+        # Route/router/global dependencies are now ENGAGED: rd["_combined_dependencies"]
+        # is the full effective set (app + include + router + route via
+        # _get_all_dependencies_for_route) and is passed to the real APIRoute below;
+        # the adapter emits route-level deps (name=None) as non-handler-params so they
+        # run for side effects (auth) without being passed to the handler.
         # A custom status_code isn't carried on RouteInfo yet (the door defaults to
         # 200) — fall back for correctness.
         if rd.get("status_code") not in (None, 200):

@@ -497,9 +497,12 @@ def extract_params_from_route(route: Any) -> list[ParamInfo]:
     # Handler's special params (Request / Response / BackgroundTasks / SecurityScopes).
     _emit_special_params(dep, params)
 
-    # Handler's dependencies (top-level → handler params).
+    # Handler's dependencies. Parameter deps (``d = Depends(...)``) have a name and
+    # their result is passed to the handler; route/router/global deps
+    # (``dependencies=[...]``) have name=None and run for their side effects only
+    # (auth checks etc.) without being passed to the handler.
     for i, sub in enumerate(dep.dependencies):
-        _emit_dep(sub, params, str(i), is_handler_param=True)
+        _emit_dep(sub, params, str(i), is_handler_param=(sub.name is not None))
 
     return params
 
