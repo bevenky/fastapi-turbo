@@ -221,3 +221,22 @@ Incremental engagement is largely banked: markers, types (Request/HTTPConnection
 - **(A) door real-Starlette fallback** (the pivot's original vision): for routes the adapter declines, the door delegates to real Starlette ASGI instead of clone introspection → `_introspect` + clone path deletable WITHOUT bridging every type. One bigger Rust+Python change.
 - **(B) shim flip + delete-and-replace** responses/requests/upload (door `request_cls`/`response_cls` retarget) + routing/OpenAPI→real + drive remaining declines. Many coupled changes.
 Recommend (A) — it matches the pivot vision, unblocks `_introspect` deletion in one move, and sidesteps the UploadFile/Response property walls.
+
+## ASGI-path on Rust (oneshot door) — the "backdoor" for uvicorn/ASGI mode
+CORRECTION to an earlier note: uvicorn/ASGI mode is NOT inherently Python. The
+**oneshot door** drives the SAME Rust engine in-process for the ASGI path
+(`app(scope,receive,send)` → `process_request` → Rust router via tower oneshot), so
+uvicorn / TestClient-in-process / httpx.ASGITransport can ALSO run on Rust. It is
+currently OPT-IN (`FASTAPI_TURBO_ONESHOT_DOOR=1`); default-OFF means ASGI mode uses
+the Python dispatcher (`_asgi_dispatch_in_process`, ~5.1K LOC, the 2nd engine).
+
+**Flipping it default-on is the move that (a) makes ASGI mode run on Rust and (b)
+makes the Python dispatcher deletable.** Tested the flip: **1110/1122** pass; **12
+edge-case gaps** where the oneshot door (Rust + adapter) diverges from the dispatcher
+— these are the gate (reverted to keep main green):
+- `test_query_parameter_model_pep604_optional_list_collects_repeated_values` — param-model **list** field doesn't collect repeated query values (dep-input path `extract_single_param` uses single-value query map, not the multi-value map).
+- `test_response_validation_error_carries_endpoint_function` + `test_request_validation_error_carries_endpoint_function` — RVE/RequestValidationError **endpoint_ctx/endpoint_function** not wired on the door path.
+- `test_body_alias_in_missing_loc`, `test_body_validation_alias_in_missing_loc`, `test_top_level_missing_input_is_none`, `test_body_embed_true_missing_emits_body_field_loc`, `test_multiple_extra_dep_missing_errors_accumulate` — 422 **validation-error detail/loc shapes** differ from the dispatcher.
+- `test_async_dep_resolves_in_process`, `test_yield_dep_swallow_raises_fastapi_error`, `test_background_task_can_use_lifespan_async_resource_in_process` — async/yield-dep + BG-loop-affinity edge cases on the oneshot door.
+
+These 12 are the focused next pass: close them → flip the oneshot door default-on → ASGI mode on Rust → delete the Python dispatcher.

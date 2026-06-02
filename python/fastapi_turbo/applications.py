@@ -7795,8 +7795,13 @@ class FastAPI(_real_fastapi.FastAPI):
     # ------------------------------------------------------------------
 
     def _oneshot_door_enabled(self) -> bool:
-        """The oneshot door is opt-in via ``FASTAPI_TURBO_ONESHOT_DOOR=1``
-        (default OFF) until the efficiency gate + parity bucket prove it."""
+        """The oneshot door drives the ONE Rust engine for the ASGI path too
+        (uvicorn / TestClient in-process / httpx.ASGITransport). Opt-in via
+        ``FASTAPI_TURBO_ONESHOT_DOOR=1`` until the ~12 door/adapter edge-case gaps
+        (param-model list collection via dep-input extraction, RVE endpoint_ctx,
+        validation-error loc shapes) reach dispatcher parity — see CLONE_DELETION_PLAN.md.
+        Flipping this default-on is what makes ASGI-mode run on Rust AND lets the
+        Python dispatcher be deleted."""
         return os.environ.get("FASTAPI_TURBO_ONESHOT_DOOR") == "1"
 
     def _oneshot_door_can_handle(self, scope: dict) -> bool:
