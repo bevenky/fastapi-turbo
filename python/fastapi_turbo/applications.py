@@ -7391,6 +7391,18 @@ class FastAPI(_real_fastapi.FastAPI):
             _adapted = self._adapter_route_info(rd)
             if _adapted is not None:
                 _ap, _ah, _aasync = _adapted
+                # Stamp the real FastAPI route so the Rust bridge can expose
+                # ``request.scope["route"]`` (handler route introspection) AND
+                # resolve the route pattern for the per-request scope — which
+                # refines the Sentry transaction name from URL- to route-source
+                # on the door path (route_obj is otherwise None for adapter
+                # routes). See set_request_scope_ctxvar (router.rs).
+                _rt_obj = rd.get("_route_obj")
+                if _rt_obj is not None:
+                    try:
+                        _ah._fastapi_turbo_route_obj = _rt_obj
+                    except (AttributeError, TypeError):
+                        pass
                 route_infos.append(
                     RouteInfo(
                         path=rd["path"],
@@ -7828,8 +7840,23 @@ class FastAPI(_real_fastapi.FastAPI):
         router does NOT host: raw ASGI middleware that wraps the whole app
         (Sentry/OTel/Session — outside the router) and arbitrary ASGI
         sub-app mounts (StaticFiles mounts ARE in the router and stay)."""
+        # Raw-ASGI middleware is applied by the assembled router via the Rust
+        # middleware bridge (``_build_middleware_config`` from
+        # ``_middleware_stack``), so ``process_request`` runs the full
+        # Sentry/Session/custom ASGI MW chain in-process (verified: the chain
+        # runs inside ``_asgi_oneshot_http``). EXCEPTION: when raw ASGI MW is
+        # MIXED with Tower markers (CORS/GZip/HTTPSRedirect), the door applies
+        # Tower as Rust layers and raw MW via the bridge — their relative
+        # registration order isn't preserved (a raw MW added AFTER an
+        # HTTPSRedirect must wrap its 307). Decline that mix to the dispatcher,
+        # which composes both in one ordered chain. Pure-raw apps ride the door.
         if getattr(self, "_raw_asgi_middlewares", None):
-            return False
+            _has_tower = any(
+                _k == "tower"
+                for (_k, *_rest) in (getattr(self, "_mw_registration_log", None) or [])
+            )
+            if _has_tower:
+                return False
         # NOTE: HTTP mounts (``app.mount(...)`` non-static + Starlette
         # ``Mount`` routes) are no longer a decline reason — ``__call__``
         # routes them in-process via ``_asgi_try_http_mount`` (prefix-stripped

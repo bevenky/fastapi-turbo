@@ -96,6 +96,14 @@ def set_current_request_scope(
     if route_path is not None:
         scope["route"] = _RouteScope(route_path, endpoint=endpoint)
     _current_request_scope.set(scope)
+    # Door path: the Rust bridge calls this with BOTH endpoint and route_path
+    # right before invoking the handler (after the middleware bridge has run),
+    # so the matched route is final — refine the Sentry transaction name from
+    # URL-source to route-source here. The dispatcher's bare call (no endpoint)
+    # skips this; it refines via ``refine_request_scope_for_route`` in its
+    # compiled handler wrappers. No-op when Sentry isn't active.
+    if endpoint is not None and route_path is not None:
+        refine_sentry_transaction(endpoint, route_path)
 
 
 def refine_request_scope_for_route(endpoint, route_path: str | None) -> None:
