@@ -7830,28 +7830,12 @@ class FastAPI(_real_fastapi.FastAPI):
         sub-app mounts (StaticFiles mounts ARE in the router and stay)."""
         if getattr(self, "_raw_asgi_middlewares", None):
             return False
-        for _prefix, mounted_app, _name in getattr(self, "_mounts", []):
-            is_static = hasattr(mounted_app, "directory") and getattr(
-                mounted_app, "directory", None
-            )
-            if not is_static:
-                return False
-        # Starlette ``Mount`` routes declared via ``FastAPI(routes=[...])``
-        # / ``APIRouter(routes=[...])`` live in ``router.routes`` (NOT
-        # ``self._mounts`` — that list only tracks ``app.mount(...)``).
-        # They host an arbitrary ASGI sub-app whose own router matches the
-        # PREFIX-STRIPPED path; the Python dispatcher recurses into the
-        # sub-app with ``scope['path']`` stripped of the mount prefix
-        # (``_asgi_dispatch_in_process`` Mount-dispatch block). The
-        # assembled axum router has no such prefix-stripping recursion —
-        # it would serve the mounted endpoint the FULL path (R53:
-        # ``nested:/sub/hi`` instead of ``nested:/hi``), and WebSocketRoute
-        # children aren't hosted at all. Decline so the dispatcher handles
-        # the mount.
-        router = getattr(self, "router", None)
-        for _route in getattr(router, "routes", None) or ():
-            if _looks_like_starlette_mount(_route):
-                return False
+        # NOTE: HTTP mounts (``app.mount(...)`` non-static + Starlette
+        # ``Mount`` routes) are no longer a decline reason — ``__call__``
+        # routes them in-process via ``_asgi_try_http_mount`` (prefix-stripped
+        # recursion into the sub-app) BEFORE the door runs, so a mount-having
+        # app's own routes can still ride the door. Static-files mounts are in
+        # the assembled router and the door serves them directly.
         # ``request.is_disconnected()`` is only meaningful while the
         # response is actively streaming and a LIVE ASGI ``receive``
         # channel can deliver ``http.disconnect``. The oneshot door
@@ -7987,6 +7971,86 @@ class FastAPI(_real_fastapi.FastAPI):
                 return
         except Exception as _exc:  # noqa: BLE001
             _log.debug("oneshot outer-scope decoration skipped: %r", _exc)
+
+    async def _asgi_try_http_mount(
+        self, scope: dict, receive: Callable, send: Callable
+    ) -> bool:
+        """In-process HTTP mount dispatch for the door path. If the request
+        path falls under a registered ``app.mount(prefix, subapp)`` or a
+        Starlette ``Mount`` route (and no top-level literal route shadows it),
+        strip the prefix and recurse into the sub-app's ASGI ``__call__`` —
+        all in-process, no dispatcher and no loopback socket. Returns True
+        when a mount handled the request. Mirrors the (now-legacy) dispatcher
+        Mount-dispatch block so mounts keep working once the door is the only
+        ASGI engine."""
+        path = scope.get("path", "/")
+        method = scope.get("method", "GET")
+        # app.mount(prefix, subapp)
+        for mount_path, mounted_app, _mname in getattr(self, "_mounts", []) or []:
+            prefix = (mount_path or "").rstrip("/")
+            if not prefix:
+                continue  # root mount: defer to the normal matcher
+            if path == prefix or path.startswith(prefix + "/"):
+                top_level_hit = any(
+                    getattr(r, "path", None) == path
+                    and method in {m.upper() for m in (getattr(r, "methods", None) or ())}
+                    for r in self.router.routes
+                )
+                if top_level_hit:
+                    continue
+                sub_path = path[len(prefix):] or "/"
+                sub_scope = dict(scope)
+                sub_scope["path"] = sub_path
+                sub_scope["raw_path"] = sub_path.encode("latin-1")
+                sub_scope["root_path"] = scope.get("root_path", "") + prefix
+                if callable(mounted_app):
+                    await mounted_app(sub_scope, receive, send)
+                    return True
+                from fastapi_turbo.routing import APIRouter as _APIRouter
+                if isinstance(mounted_app, _APIRouter):
+                    sub_app = type(self)()
+                    try:
+                        sub_app.include_router(mounted_app)
+                    except Exception as _exc:  # noqa: BLE001
+                        _log.debug("in-process APIRouter mount: %r", _exc)
+                    await sub_app(sub_scope, receive, send)
+                    return True
+        # Starlette Mount routes declared via FastAPI(routes=[Mount(...)])
+        for route in getattr(self.router, "routes", []) or []:
+            if not _looks_like_starlette_mount(route):
+                continue
+            prefix = (getattr(route, "path", "") or "").rstrip("/")
+            if not prefix:
+                continue
+            if not (path == prefix or path.startswith(prefix + "/")):
+                continue
+            top_level_hit = any(
+                r is not route
+                and not _looks_like_starlette_mount(r)
+                and getattr(r, "path", None) == path
+                and method in {m.upper() for m in (getattr(r, "methods", None) or ())}
+                for r in self.router.routes
+            )
+            if top_level_hit:
+                continue
+            mounted_app = _mounted_route_asgi_app(type(self), route)
+            if mounted_app is None:
+                continue
+            sub_path = path[len(prefix):] or "/"
+            sub_scope = dict(scope)
+            sub_scope["path"] = sub_path
+            sub_scope["raw_path"] = sub_path.encode("latin-1")
+            sub_scope["root_path"] = scope.get("root_path", "") + prefix
+            if callable(mounted_app):
+                await mounted_app(sub_scope, receive, send)
+                return True
+            from fastapi_turbo.routing import APIRouter as _APIRouter
+            if isinstance(mounted_app, _APIRouter):
+                sub_app = type(self)(docs_url=None, redoc_url=None, openapi_url=None)
+                sub_app.include_router(mounted_app)
+                await sub_app(sub_scope, receive, send)
+                return True
+        return False
 
     async def _asgi_oneshot_http(self, scope: dict, receive: Callable, send: Callable) -> bool:
         """Drive one HTTP request through the Rust engine in-process via
@@ -8146,6 +8210,13 @@ class FastAPI(_real_fastapi.FastAPI):
 
             if not getattr(self, "_in_process_dynamic_routes_installed", False):
                 self._install_in_process_dynamic_routes()
+
+            # In-process HTTP mount dispatch (door path): recurse into mounted
+            # sub-apps with the prefix stripped, before the door tries the
+            # assembled router (which doesn't host mounts). Keeps mounts on the
+            # in-process path — no dispatcher, no loopback socket.
+            if await self._asgi_try_http_mount(scope, receive, send):
+                return
 
             # In-process oneshot door (the one Rust engine, second door).
             # Opt-in (FASTAPI_TURBO_ONESHOT_DOOR=1) while it's proven against
