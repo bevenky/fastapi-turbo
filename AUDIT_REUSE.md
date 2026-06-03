@@ -48,6 +48,18 @@ wins alone: ~900–1,000 LOC.
 
 ## Prioritized plan
 
+### Tier-0 EXECUTION STATUS (2026-06-03)
+- DONE (commit 2c9d21b): handler_bridge Machine-1 + Machine-2 dead fns; router
+  599 fallback + dead extract_params_to_pydict; websocket 3 sync receive methods
+  + handle_ws_connection stub; server shutdown_signal; **multer dep**; config.rs
+  ServerConfig. ~500 LOC net. Gated full 1125 / parity 151 / WS 22.
+- DONE (commit db017cd): the 2 audit BUGS (big-int JSON + dep-raised exception
+  handlers) with regression tests.
+- DEFERRED: **collapse WS awaitables** → fold into 7.4 (WS door rewrites
+  websocket.rs anyway); **embedded docs HTML** → moderate follow-up (needs the
+  swagger oauth2-redirect HTML wired from Python via
+  fastapi.openapi.docs.get_swagger_ui_oauth2_redirect_html; app.run()-only path).
+
 ### Tier 0 — quick, low-risk, no parity risk (~900–1,000 LOC)
 - **Dead code:** handler_bridge.rs 2nd event-loop machine + dead fns + dummy channel
   (~220); websocket.rs 3 dead sync receive methods + `handle_ws_connection` stub
