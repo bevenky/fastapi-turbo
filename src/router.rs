@@ -64,6 +64,35 @@ fn request_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     Ok(REQUEST_CLS.get().unwrap())
 }
 
+/// In-process disconnect flag for the streaming door: carried on the request's
+/// Axum extensions from `process_request_streaming` through the router to
+/// `handle_request`, then stashed in the Python ``Request`` scope so
+/// ``request.is_disconnected()`` can observe a client drop (the door's
+/// receive-poller sets it). The inner object is a Python ``threading.Event``.
+/// ``Arc`` so it satisfies the ``Clone + Send + Sync`` extension bound.
+#[derive(Clone)]
+pub struct DisconnectFlag(pub std::sync::Arc<Py<PyAny>>);
+
+thread_local! {
+    /// Per-request disconnect flag, set by `handle_request` (from the extension)
+    /// and read where the Python ``Request`` scope is built. Thread-local because
+    /// `handle_request` and `build_injected_object` run on the same worker thread
+    /// (the latter inside `block_in_place`).
+    static REQUEST_DISCONNECT_FLAG: std::cell::RefCell<Option<Py<PyAny>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard: clears the per-request disconnect-flag thread-local on drop so it
+/// never leaks to the next request served on the same worker thread.
+struct DisconnectFlagGuard;
+impl Drop for DisconnectFlagGuard {
+    fn drop(&mut self) {
+        REQUEST_DISCONNECT_FLAG.with(|f| {
+            *f.borrow_mut() = None;
+        });
+    }
+}
+
 fn response_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     if let Some(c) = RESPONSE_CLS.get() {
         return Ok(c);
@@ -282,6 +311,14 @@ fn build_injected_object(
             if let Some(ref route) = state.route_obj {
                 scope.set_item("route", route.bind(py))?;
             }
+            // In-process disconnect flag (streaming door): expose it on the scope
+            // so ``request.is_disconnected()`` can observe a client drop. Only
+            // present for apps with is_disconnected endpoints (the door sets it).
+            REQUEST_DISCONNECT_FLAG.with(|f| {
+                if let Some(flag) = f.borrow().as_ref() {
+                    let _ = scope.set_item("_fastapi_turbo_disconnect", flag.bind(py));
+                }
+            });
 
             Ok(request_cls(py)?.bind(py).call1((scope,))?.unbind())
         }
@@ -1648,6 +1685,14 @@ async fn handle_request(
         }
         m
     };
+    // In-process disconnect flag (streaming door) — read off the request's Axum
+    // extension BEFORE the body is consumed; stashed in the thread-local below
+    // (after the body await, on the dispatch thread) so the Request scope picks
+    // it up. None for the socket path and for apps without is_disconnected.
+    let disconnect_flag: Option<Py<PyAny>> = request
+        .extensions()
+        .get::<DisconnectFlag>()
+        .map(|f| Python::attach(|py| f.0.clone_ref(py)));
     // === Pure Rust work — no GIL needed ===
 
     // For file/form params inspect Content-Type once. We support three body
@@ -1808,6 +1853,15 @@ async fn handle_request(
         drop(request);
         (bytes::Bytes::new(), None, None, None)
     };
+
+    // Publish the disconnect flag to the per-request thread-local NOW — after the
+    // body await, so we're on the same worker thread the dispatch (and the
+    // Request-scope build) runs on. The guard clears it when handle_request
+    // returns, so it never leaks to the next request on this thread.
+    let _disc_guard = DisconnectFlagGuard;
+    if let Some(flag) = disconnect_flag {
+        REQUEST_DISCONNECT_FLAG.with(|f| *f.borrow_mut() = Some(flag));
+    }
 
     let path_map = path_params.map(|Path(m)| m).unwrap_or_default();
 

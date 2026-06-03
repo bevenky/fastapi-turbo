@@ -302,6 +302,19 @@ class Request(HTTPConnection, _starlette_requests.Request):
         no Python receive bound)."""
         if getattr(self, "_disconnected", False):
             return True
+        # In-process oneshot door: the Rust-built request has no live ASGI
+        # receive channel, so the door stashes a ``threading.Event`` in the
+        # scope which its receive-poller sets on client disconnect. Check it
+        # here (cheap, no event-loop round-trip). Set on the socket/dispatcher
+        # path only when present.
+        _disc = (getattr(self, "scope", None) or {}).get("_fastapi_turbo_disconnect")
+        if _disc is not None:
+            try:
+                if _disc.is_set():
+                    self._disconnected = True
+                    return True
+            except AttributeError:
+                pass
         recv = self._receive
         if recv is None:
             return False

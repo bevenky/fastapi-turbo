@@ -7901,69 +7901,69 @@ class FastAPI(_real_fastapi.FastAPI):
         # recursion into the sub-app) BEFORE the door runs, so a mount-having
         # app's own routes can still ride the door. Static-files mounts are in
         # the assembled router and the door serves them directly.
-        # ``request.is_disconnected()`` is only meaningful while the
-        # response is actively streaming and a LIVE ASGI ``receive``
-        # channel can deliver ``http.disconnect``. The oneshot door
-        # buffers the entire response in ``process_request`` (the body
-        # is drained up-front and the Rust-built ``Request`` has no
-        # Python receive channel), so a handler polling
-        # ``is_disconnected`` always observes ``False`` and an
-        # SSE/long-poll loop never exits on client drop (R19). This is
-        # irreducible for a buffered door — decline so the streaming
-        # dispatcher with its live receive channel handles it. Cached
-        # (routes are fixed after startup); cheapest signal is a static
-        # scan of each endpoint's source for ``is_disconnected``.
-        _dc = getattr(self, "_oneshot_door_disconnect_decline", None)
-        if _dc is None:
-            _dc = self._oneshot_scan_endpoints_for_disconnect()
-            self._oneshot_door_disconnect_decline = _dc
-        if _dc:
+        # The door now streams responses (7.3a, Axum BodyDataStream) and
+        # observes client disconnect via a ``threading.Event`` (7.3b), so
+        # explicit ``StreamingResponse``/``FileResponse`` + ``is_disconnected``
+        # routes ride the door. The ONE thing it can't do yet is auto-wrap a
+        # BARE generator endpoint into an NDJSON ``StreamingResponse`` (a
+        # fastapi-turbo extension done in the Python dispatcher) — decline those.
+        if self._oneshot_scan_streaming()[0]:
             return False
         return True
 
-    def _oneshot_scan_endpoints_for_disconnect(self) -> bool:
-        """True when any route endpoint needs the live ASGI path the buffered
-        oneshot door cannot provide, so the whole app declines to the Python
-        dispatcher. Two signals:
+    def _oneshot_needs_disconnect_watch(self) -> bool:
+        """True when any route endpoint polls ``request.is_disconnected()`` (SSE
+        / long-poll), so ``_asgi_oneshot_http`` wires a disconnect ``Event`` +
+        receive-poller. Cached (routes are fixed after startup)."""
+        return self._oneshot_scan_streaming()[1]
 
-          * ``is_disconnected`` in the source — the handler peeks the live
-            receive channel for client drop (the buffered door has none).
-          * the endpoint STREAMS its response — a sync/async generator
-            endpoint (NDJSON auto-wrap), or source that constructs a
-            ``StreamingResponse`` / ``FileResponse`` / ``EventSourceResponse``.
-            The door buffers the whole body (capped at 32MiB) and cannot
-            deliver incrementally or cancel on client drop, so a slow/infinite
-            stream would hang or truncate. Until the response chunk-pump
-            lands, such routes belong on the dispatcher.
+    def _oneshot_scan_streaming(self) -> tuple[bool, bool]:
+        """Scan route endpoints once and return
+        ``(has_bare_generator, needs_disconnect_watch)``:
 
-        Static, AST-free signature + substring scan; best-effort (returns
-        False on any inspection failure — the door then handles normally).
-        Result is cached after startup (routes are fixed)."""
+          * ``has_bare_generator`` — any sync/async generator endpoint. The door
+            can stream a ``StreamingResponse`` but does NOT auto-wrap a bare
+            generator into NDJSON, so such apps decline to the dispatcher.
+          * ``needs_disconnect_watch`` — any endpoint streams (constructs a
+            ``StreamingResponse`` / ``FileResponse`` / ``EventSourceResponse``)
+            or polls ``request.is_disconnected()``. The door wires a disconnect
+            ``Event`` + receive-poller so an SSE poll observes the drop AND an
+            otherwise-infinite stream is cancelled (the door drops the body
+            stream → the generator's GeneratorExit cleanup runs).
+
+        Static, AST-free; best-effort (False on inspection failure). Cached."""
+        cached = getattr(self, "_oneshot_streaming_scan", None)
+        if cached is not None:
+            return cached
         import inspect as _inspect
 
-        _STREAM_MARKERS = (
+        _WATCH_MARKERS = (
             "is_disconnected",
             "StreamingResponse",
             "FileResponse",
             "EventSourceResponse",
         )
+        has_bare_gen = False
+        needs_watch = False
         router = getattr(self, "router", None)
         for route in getattr(router, "routes", None) or ():
             endpoint = getattr(route, "endpoint", None)
             if endpoint is None:
                 continue
-            # Generator endpoints stream (FastAPI auto-wraps them as NDJSON).
             if _inspect.isasyncgenfunction(endpoint) or _inspect.isgeneratorfunction(
                 endpoint
             ):
-                return True
+                has_bare_gen = True
+                continue
             try:
                 src = _inspect.getsource(endpoint)
             except (OSError, TypeError):
                 continue
-            if any(marker in src for marker in _STREAM_MARKERS):
-                return True
-        return False
+            if any(m in src for m in _WATCH_MARKERS):
+                needs_watch = True
+        result = (has_bare_gen, needs_watch)
+        self._oneshot_streaming_scan = result
+        return result
 
     def _ensure_oneshot_registered(self, scope: dict) -> None:
         """Register the assembled router for this app once, using the same
@@ -8152,6 +8152,29 @@ class FastAPI(_real_fastapi.FastAPI):
         client_host = str(client[0] or "127.0.0.1")
         client_port = int(client[1] or 0)
 
+        # Disconnect signal for handlers that poll ``request.is_disconnected()``
+        # (SSE / long-poll). The Rust request has no live ASGI receive, so hand
+        # it a ``threading.Event`` and set it from a background receive-poller —
+        # only for apps that actually poll (no per-request overhead otherwise).
+        disconnect_event = None
+        disconnect_task = None
+        if self._oneshot_needs_disconnect_watch():
+            import threading
+
+            disconnect_event = threading.Event()
+
+            async def _watch_disconnect():
+                try:
+                    while True:
+                        m = await receive()
+                        if m.get("type") == "http.disconnect":
+                            disconnect_event.set()
+                            return
+                except Exception:  # noqa: BLE001
+                    pass
+
+            disconnect_task = asyncio.ensure_future(_watch_disconnect())
+
         loop = asyncio.get_running_loop()
         status, resp_headers, body_stream = await loop.run_in_executor(
             None,
@@ -8164,6 +8187,7 @@ class FastAPI(_real_fastapi.FastAPI):
             body,
             client_host,
             client_port,
+            disconnect_event,
         )
 
         # Bodiless statuses (1xx, 204 No Content, 304 Not Modified) MUST
@@ -8193,18 +8217,37 @@ class FastAPI(_real_fastapi.FastAPI):
         # streams frame-by-frame with no 32 MiB cap and no hang on large or
         # infinite bodies. ``next_chunk`` blocks on the shared oneshot runtime
         # inside the executor so the asyncio loop stays free.
-        while True:
-            chunk = await loop.run_in_executor(None, body_stream.next_chunk)
-            if chunk is None:
-                break
-            await send(
-                {
-                    "type": "http.response.body",
-                    "body": bytes(chunk),
-                    "more_body": True,
-                }
-            )
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        disconnected = False
+        try:
+            while True:
+                # Client gone? Stop draining and DROP the body stream so the
+                # server-side generator is cancelled (GeneratorExit) — otherwise
+                # an infinite stream would run forever.
+                if disconnect_event is not None and disconnect_event.is_set():
+                    await loop.run_in_executor(None, body_stream.close)
+                    disconnected = True
+                    break
+                chunk = await loop.run_in_executor(None, body_stream.next_chunk)
+                if chunk is None:
+                    break
+                try:
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": bytes(chunk),
+                            "more_body": True,
+                        }
+                    )
+                except Exception:  # noqa: BLE001
+                    # Send failed mid-stream (client dropped) — cancel the generator.
+                    await loop.run_in_executor(None, body_stream.close)
+                    disconnected = True
+                    break
+            if not disconnected:
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            if disconnect_task is not None:
+                disconnect_task.cancel()
 
         # Re-raise an unhandled server exception AFTER the 500 response is
         # sent, exactly like the Python dispatcher's ``_asgi_emit_exception``.

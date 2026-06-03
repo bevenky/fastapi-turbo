@@ -1063,6 +1063,7 @@ fn build_inproc_request(
 /// already produces.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (app_id, method, path, query_string, headers, body, client_host, client_port, disconnect_flag=None))]
 pub fn process_request_streaming(
     py: Python<'_>,
     app_id: u64,
@@ -1073,9 +1074,10 @@ pub fn process_request_streaming(
     body: Vec<u8>,
     client_host: String,
     client_port: u16,
+    disconnect_flag: Option<Py<PyAny>>,
 ) -> PyResult<(u16, Vec<(Vec<u8>, Vec<u8>)>, PyResponseStream)> {
     let router = get_app_router(app_id).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-    let request = build_inproc_request(
+    let mut request = build_inproc_request(
         &method,
         path,
         query_string,
@@ -1085,6 +1087,13 @@ pub fn process_request_streaming(
         client_port,
     )
     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    // Carry the disconnect flag (a Python threading.Event) on the request so
+    // handle_request can stash it in the Request scope for is_disconnected().
+    if let Some(flag) = disconnect_flag {
+        request
+            .extensions_mut()
+            .insert(crate::router::DisconnectFlag(std::sync::Arc::new(flag)));
+    }
 
     let result: Result<(u16, Vec<(Vec<u8>, Vec<u8>)>, axum::body::Body), String> = py.detach(|| {
         oneshot_runtime().block_on(async move {
@@ -1150,6 +1159,14 @@ impl PyResponseStream {
                 Ok(None)
             }
         }
+    }
+
+    /// Drop the underlying body stream (and its channel receiver) so the
+    /// streaming task in `streaming.rs` observes the receiver-drop and runs the
+    /// generator's GeneratorExit cleanup. Called by the door when the client
+    /// disconnects mid-stream (cancels an otherwise-infinite generator).
+    fn close(&self) {
+        *self.stream.lock().unwrap() = None;
     }
 }
 

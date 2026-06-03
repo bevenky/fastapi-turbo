@@ -179,7 +179,12 @@ fn iterate_sync_generator(
                 // the interpreter for seconds.
                 let send_err = py.detach(|| tx.blocking_send(Ok(chunk)).is_err());
                 if send_err {
-                    break; // Client disconnected
+                    // Receiver dropped (client disconnected / door closed the
+                    // stream) — run the generator's GeneratorExit cleanup so
+                    // its try/finally + ``except GeneratorExit`` fire (parity
+                    // with the dispatcher's streaming-cancellation).
+                    let _ = py_iter.call_method0("close");
+                    break;
                 }
             }
             Err(e) => {
@@ -280,6 +285,13 @@ fn iterate_async_generator(
                 // block on backpressure — see sync path for rationale.
                 let send_err = py.detach(|| tx.blocking_send(Ok(chunk)).is_err());
                 if send_err {
+                    // Receiver dropped — drive the async generator's GeneratorExit
+                    // cleanup (``aclose``) so try/finally + ``except
+                    // GeneratorExit`` fire (streaming-cancellation parity).
+                    if let Ok(aclose_coro) = aiter.call_method0(py, "aclose") {
+                        let _ = loop_obj
+                            .call_method1(py, "run_until_complete", (aclose_coro.bind(py),));
+                    }
                     break;
                 }
             }
