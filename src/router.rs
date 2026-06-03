@@ -2240,6 +2240,11 @@ async fn handle_request(
                             }
                             Err(py_err) => {
                                 teardown_generator_deps(py, &gen_deps, true);
+                                if let Some(resp) =
+                                    try_user_dep_exception_handler(py, &py_err)
+                                {
+                                    return resp;
+                                }
                                 return pyerr_to_response(py, &py_err);
                             }
                         }
@@ -2272,6 +2277,11 @@ async fn handle_request(
                                     }
                                     Err(e) => {
                                         teardown_generator_deps(py, &gen_deps, true);
+                                        if let Some(resp) =
+                                            try_user_dep_exception_handler(py, &e)
+                                        {
+                                            return resp;
+                                        }
                                         return pyerr_to_response(py, &e);
                                     }
                                 }
@@ -2548,6 +2558,29 @@ fn teardown_generator_deps(py: Python<'_>, gen_deps: &[Py<PyAny>], errored: bool
             let _ = gen.call_method0(py, "close");
         }
     }
+}
+
+/// Door dep-resolution error path: route a dependency-raised exception through
+/// the app's user ``@app.exception_handler`` handlers (FA parity — the Python
+/// dispatcher does this; the door previously rendered the default 500 directly,
+/// ignoring user handlers for exceptions raised INSIDE a dependency). Returns
+/// the handler's response when one matched, else ``None`` (caller falls back to
+/// ``pyerr_to_response``, which renders the default + captures for re-raise).
+fn try_user_dep_exception_handler(py: Python<'_>, py_err: &PyErr) -> Option<Response> {
+    let app = APP_INSTANCE
+        .read()
+        .ok()?
+        .as_ref()
+        .map(|p| p.clone_ref(py))?;
+    let exc = py_err.value(py);
+    let result = app
+        .bind(py)
+        .call_method1("_door_handle_dep_exception", (exc,))
+        .ok()?;
+    if result.is_none() {
+        return None;
+    }
+    Some(py_to_response_with_request(py, &result, None, None))
 }
 
 /// Construct a ``fastapi_turbo.exceptions.FastAPIError`` (re-exports the real

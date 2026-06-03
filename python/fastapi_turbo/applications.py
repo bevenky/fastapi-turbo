@@ -4114,6 +4114,44 @@ class FastAPI(_real_fastapi.FastAPI):
         except Exception:
             return None
 
+    def _door_handle_dep_exception(self, exc: BaseException):
+        """Door dep-resolution error path: route a dependency-raised exception
+        through user ``@app.exception_handler`` handlers, mirroring the Python
+        dispatcher (which calls ``_invoke_exception_handler`` for dep raises).
+        The Rust door previously rendered the default 500 directly via
+        ``pyerr_to_response``, silently bypassing user handlers for exceptions
+        raised INSIDE a dependency (handler-body raises already go through the
+        compiled exception wrapper).
+
+        Returns a Response-like object to send, or None to let Rust render the
+        default (``pyerr_to_response`` — which also captures the exception for
+        TestClient re-raise). HTTPException keeps Rust's fast path.
+        """
+        from fastapi_turbo.exceptions import HTTPException as _HE
+
+        if isinstance(exc, _HE):
+            return None  # Rust pyerr_to_response renders HTTPException (parity)
+        if not self.exception_handlers:
+            return None
+        result = self._invoke_exception_handler(exc)
+        if result is None:
+            return None  # no matching handler → Rust default 500 (+ captures)
+        # A handler produced a response. Capture for TestClient re-raise UNLESS
+        # a SPECIFIC (non-Exception) handler matched — FA semantics: a specific
+        # handler means "handled, don't re-raise", while the bare
+        # ``Exception`` catch-all still re-raises (Starlette
+        # ServerErrorMiddleware parity). When we return None above, Rust's
+        # pyerr_to_response does the capture, so capture happens exactly once.
+        handled_by_specific = any(
+            isinstance(cls, type) and cls is not Exception and isinstance(exc, cls)
+            for cls in self.exception_handlers
+        )
+        if not handled_by_specific:
+            captured = getattr(self, "_captured_server_exceptions", None)
+            if captured is not None:
+                captured.append(exc)
+        return result
+
     # ------------------------------------------------------------------
     # Route collection & introspection
     # ------------------------------------------------------------------

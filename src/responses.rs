@@ -728,6 +728,20 @@ fn write_any_json(py: Python<'_>, obj: &Bound<'_, PyAny>, buf: &mut String) {
         let _ = write!(buf, "{i}");
         return;
     }
+    // Big integer (> i64::MAX or < i64::MIN): emit the EXACT digits. A Python
+    // int's str() is always a valid JSON number literal, so splice it verbatim
+    // instead of falling through to the lossy f64 path below — matches Python
+    // json.dumps, which never rounds an int. Cold path only (in-range ints take
+    // the i64 fast write above). PyBool + Decimal are handled earlier, so this
+    // only fires for true large ints.
+    if obj.is_instance_of::<PyInt>() {
+        if let Ok(s) = obj.str() {
+            if let Ok(st) = s.to_str() {
+                buf.push_str(st);
+                return;
+            }
+        }
+    }
     if let Ok(f) = obj.extract::<f64>() {
         use std::fmt::Write;
         if f.is_finite() {
