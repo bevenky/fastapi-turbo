@@ -5553,7 +5553,7 @@ class FastAPI(_real_fastapi.FastAPI):
                             try:
                                 async for item in _orig(**kwargs):
                                     validated = _check(item)
-                                    yield (_json.dumps(_je(validated)) + "\n").encode("utf-8")
+                                    yield (_json.dumps(_je(validated), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
                             except _RVE as exc:
                                 # FA parity: surface streaming-body
                                 # validation errors through
@@ -5569,7 +5569,7 @@ class FastAPI(_real_fastapi.FastAPI):
                             try:
                                 for item in _orig(**kwargs):
                                     validated = _check(item)
-                                    yield (_json.dumps(_je(validated)) + "\n").encode("utf-8")
+                                    yield (_json.dumps(_je(validated), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
                             except _RVE as exc:
                                 if _app is not None:
                                     _app._captured_server_exceptions.append(exc)
@@ -7227,6 +7227,16 @@ class FastAPI(_real_fastapi.FastAPI):
         endpoint = getattr(route, "endpoint", None)
         if endpoint is None:
             return None
+        # Bare generator endpoints (sync/async) are auto-wrapped into an NDJSON
+        # StreamingResponse by the CLONE-compiled handler (rd["endpoint"]) — the
+        # adapter's build_handler doesn't apply that wrap. Decline so the door
+        # runs the clone-compiled handler (which the door now streams, 7.3a).
+        import inspect as _insp_gen
+
+        if _insp_gen.isgeneratorfunction(endpoint) or _insp_gen.isasyncgenfunction(
+            endpoint
+        ):
+            return None
         # Param markers (Depends/Query/Header/...) are now bridged to real FastAPI's
         # (see param_functions / dependencies), so real introspection recognizes
         # them. The generic name->kind net below still catches any clone TYPE real
@@ -7901,14 +7911,11 @@ class FastAPI(_real_fastapi.FastAPI):
         # recursion into the sub-app) BEFORE the door runs, so a mount-having
         # app's own routes can still ride the door. Static-files mounts are in
         # the assembled router and the door serves them directly.
-        # The door now streams responses (7.3a, Axum BodyDataStream) and
-        # observes client disconnect via a ``threading.Event`` (7.3b), so
-        # explicit ``StreamingResponse``/``FileResponse`` + ``is_disconnected``
-        # routes ride the door. The ONE thing it can't do yet is auto-wrap a
-        # BARE generator endpoint into an NDJSON ``StreamingResponse`` (a
-        # fastapi-turbo extension done in the Python dispatcher) — decline those.
-        if self._oneshot_scan_streaming()[0]:
-            return False
+        # The door now streams responses (7.3a, Axum BodyDataStream), observes
+        # client disconnect via a ``threading.Event`` (7.3b), and serves bare
+        # generator endpoints through the clone-compiled NDJSON wrapper (the
+        # adapter declines those so rd["endpoint"] is used). Nothing left to
+        # decline on the HTTP path.
         return True
 
     def _oneshot_needs_disconnect_watch(self) -> bool:
