@@ -4330,6 +4330,33 @@ class FastAPI(_real_fastapi.FastAPI):
             for m in _re.finditer(r"\{([^{}:]+)(?::[^{}]+)?\}", route_path):
                 path_params_names.add(m.group(1))
 
+        # Identify the WebSocket parameter. Prefer a ``WebSocket``-annotated
+        # param; otherwise fall back to the FIRST positional param (FastAPI
+        # tutorial style ``async def ws(websocket, ...)`` where the connection
+        # arg is often untyped). Mirrors the in-process dispatcher the door
+        # replaced — without this, an untyped ``websocket`` would be
+        # misclassified as a required Query param and close the socket 1008.
+        _ws_fallback_name = None
+        if sig is not None:
+            _has_annotated_ws = any(
+                _is_websocket_annotation(n, p.annotation)
+                for n, p in sig.parameters.items()
+            )
+            if not _has_annotated_ws:
+                for n, p in sig.parameters.items():
+                    if p.kind not in (
+                        _inspect.Parameter.POSITIONAL_ONLY,
+                        _inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    ):
+                        continue
+                    _r_ann = type_hints.get(n, p.annotation)
+                    if _extract_depends(_r_ann, p.default) is not None:
+                        continue
+                    if _extract_marker(_r_ann, p.default)[0] is not None:
+                        continue
+                    _ws_fallback_name = n
+                    break
+
         # Classify every handler parameter up-front.
         # Each entry: ("dep"|"scalar"|"ws"|"path"|"skip", name, meta)
         param_spec: list[tuple] = []
@@ -4348,7 +4375,7 @@ class FastAPI(_real_fastapi.FastAPI):
                     param_spec.append(("dep", name, dep_marker))
                     continue
 
-                if _is_websocket_annotation(name, raw_ann):
+                if _is_websocket_annotation(name, raw_ann) or name == _ws_fallback_name:
                     param_spec.append(("ws", name, None))
                     continue
 
@@ -4642,6 +4669,13 @@ class FastAPI(_real_fastapi.FastAPI):
                 app_ref._ws_server_exceptions.append(_WD(code=code, reason=reason))
             except Exception as _exc:  # noqa: BLE001
                 _log.debug("silent catch in applications: %r", _exc)
+            if getattr(ws, "_ws", None) is None:
+                # In-process ASGI door: emit the WS close with the REAL code
+                # regardless of accept state (a pre-accept close IS the
+                # handshake rejection here, and the TestClient reads this
+                # frame's code — so it must be 1008 etc., not the HTTP 403).
+                ws._asgi_queue_close(code, reason)
+                return
             if ws.application_state == _WSState.CONNECTING:
                 ws._reject(403)
                 return
@@ -4943,7 +4977,9 @@ class FastAPI(_real_fastapi.FastAPI):
                         )
                     except Exception as _exc:  # noqa: BLE001
                         _log.debug("silent catch in applications: %r", _exc)
-                    if ws.application_state == _WSState.CONNECTING:
+                    if getattr(ws, "_ws", None) is None:
+                        ws._asgi_queue_close(1008, "validation error")
+                    elif ws.application_state == _WSState.CONNECTING:
                         ws._reject(403)
                     else:
                         try:
@@ -5003,7 +5039,12 @@ class FastAPI(_real_fastapi.FastAPI):
                 if not handled:
                     # Abort the handshake cleanly if still pre-accept so the
                     # client sees an HTTP 500 instead of hanging.
-                    if ws.application_state == _WSState.CONNECTING:
+                    if getattr(ws, "_ws", None) is None:
+                        # In-process ASGI door: close with 1011 (internal
+                        # error) regardless of accept state — matches the
+                        # generic-error close code the dispatcher emitted.
+                        ws._asgi_queue_close(1011, "")
+                    elif ws.application_state == _WSState.CONNECTING:
                         ws._reject(500)
                     else:
                         # Post-accept unhandled exception — close cleanly so
@@ -8534,59 +8575,105 @@ class FastAPI(_real_fastapi.FastAPI):
                 await _ma(sub_ws_scope, receive, send)
                 return
 
-            # WS middleware: Starlette-style ASGI middleware
-            # registered via ``Middleware(websocket_middleware)`` /
-            # ``add_middleware(callable)`` wraps the dispatch chain
-            # so user middleware can ``try/except`` errors raised by
-            # WS deps. Mirrors FA's
-            # ``test_ws_router::test_depend_err_middleware``.
-            ws_mw_factories = []
-            try:
-                for _cls, _kw in getattr(self, "_middleware_stack", []) or []:
-                    # Function-style middleware (callable but not a
-                    # type) — Starlette accepts these as factory:
-                    # ``cls(app) -> wrapped_app``.
-                    if callable(_cls) and not isinstance(_cls, type):
-                        ws_mw_factories.append((_cls, _kw))
-            except Exception:  # noqa: BLE001
-                pass
-
-            # Try in-process WS dispatch first (sandbox-friendly),
-            # fall back to the loopback proxy when the in-process
-            # path can't satisfy the request.
+            # In-process WebSocket door: route-match against the app's WS
+            # routes and drive the SAME wrapped endpoint ``app.run()`` uses
+            # (``_wrap_websocket_endpoint`` — deps / validation / WS- and
+            # raw-ASGI-middleware / exception routing) over a Python
+            # ``WebSocket`` backed by the ASGI receive/send channels. The
+            # caller's event loop already drives everything, so no loopback
+            # socket and no Rust channel bridge are needed. WS middleware and
+            # raw-ASGI middleware are applied INSIDE the wrapped endpoint, so
+            # we don't wrap them here. ``_fastapi_turbo_force_proxy`` (or
+            # ``FASTAPI_TURBO_ONESHOT_DOOR=0``) opts OUT to the loopback Rust
+            # WS server.
             force_proxy = bool(scope.get("_fastapi_turbo_force_proxy"))
-            if not force_proxy:
-                if ws_mw_factories:
-                    async def _ws_inner_app(_s, _r, _sd):
-                        # Mark scope so the dispatcher knows a
-                        # middleware will catch errors — skip the
-                        # default 1011 close so the middleware's
-                        # ``websocket.close(code=…, reason=…)`` is
-                        # the one delivered to the client.
-                        _ms = dict(_s) if not _s.get(
-                            "_fastapi_turbo_ws_in_mw"
-                        ) else _s
-                        _ms["_fastapi_turbo_ws_in_mw"] = True
-                        await self._asgi_dispatch_ws_in_process(_ms, _r, _sd)
-                    _ws_app = _ws_inner_app
-                    for _mc, _mk in reversed(ws_mw_factories):
-                        try:
-                            _ws_app = _mc(_ws_app, **_mk)
-                        except TypeError:
-                            try:
-                                _ws_app = _mc(_ws_app)
-                            except Exception:  # noqa: BLE001
-                                pass
-                    await _ws_app(scope, receive, send)
-                    return
-                dispatched = await self._asgi_dispatch_ws_in_process(
-                    scope, receive, send
-                )
-                if dispatched:
+            if not force_proxy and self._oneshot_door_enabled():
+                if await self._asgi_ws_door(scope, receive, send):
                     return
             await self._asgi_ensure_server()
             await self._asgi_proxy_websocket(scope, receive, send)
             return
+
+    def _ws_door_table(self) -> list:
+        """Cached ``[(regex, wrapped_endpoint, route_path, route_obj), ...]``
+        for the app's WebSocket routes. ``wrapped_endpoint`` is the SAME
+        ``_wrap_websocket_endpoint`` output the Rust ``app.run()`` door
+        registers (built by ``_collect_all_routes`` with the full effective
+        dependency set), so the in-process door applies identical
+        deps/validation/middleware/exception handling. Routes are fixed after
+        startup, so the table is built once."""
+        cached = getattr(self, "_ws_door_route_table", None)
+        if cached is not None:
+            return cached
+        import re as _re
+        table: list = []
+        for rd in self._collect_all_routes():
+            if not rd.get("is_websocket"):
+                continue
+            r_path = rd.get("path") or ""
+            if not r_path:
+                continue
+            pattern = "^"
+            idx = 0
+            for m in _re.finditer(r"\{([^{}:]+)(?::([^{}]+))?\}", r_path):
+                pattern += _re.escape(r_path[idx:m.start()])
+                pname = m.group(1)
+                pattern += (
+                    f"(?P<{pname}>.+)" if m.group(2) == "path"
+                    else f"(?P<{pname}>[^/]+)"
+                )
+                idx = m.end()
+            pattern += _re.escape(r_path[idx:]) + "$"
+            table.append(
+                (_re.compile(pattern), rd["endpoint"], r_path, rd.get("_route_obj"))
+            )
+        self._ws_door_route_table = table
+        return table
+
+    async def _asgi_ws_door(
+        self, scope: dict, receive: Callable, send: Callable
+    ) -> bool:
+        """Serve an ASGI ``websocket`` scope in-process: match a WS route,
+        build a Python ``WebSocket`` over the ASGI receive/send channels, and
+        drive the shared wrapped endpoint on the caller's event loop. Always
+        returns True (handled): on no match it closes with 1000, matching
+        Starlette. Replaces the deleted ~900-line Python WS dispatcher."""
+        from fastapi_turbo.websockets import WebSocket as _WS
+
+        path = scope.get("path", "/")
+        wrapped = None
+        route_obj = None
+        path_params: dict = {}
+        for regex, _wrapped, _route_path, _route_obj in self._ws_door_table():
+            m = regex.match(path)
+            if m is None:
+                continue
+            wrapped = _wrapped
+            route_obj = _route_obj
+            path_params = m.groupdict()
+            break
+
+        if wrapped is None:
+            # No matching WS route — Starlette closes with 1000 (normal).
+            try:
+                await send({"type": "websocket.close", "code": 1000})
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        if route_obj is not None:
+            scope["route"] = route_obj
+        scope["path_params"] = path_params
+        scope["app"] = self
+        ws = _WS(scope, receive=receive, send=send)
+        ws._app = self
+        await wrapped(ws, **path_params)
+        # Flush a terminal close queued from a SYNC code path (``_reject`` /
+        # ``_handle_ws_exc`` can't await); no-ops if already closed.
+        pc = getattr(ws, "_asgi_pending_close", None)
+        if pc is not None:
+            await ws._asgi_send_close(*pc)
+        return True
 
     # ── lifespan ──────────────────────────────────────────────────────
 
@@ -8670,906 +8757,6 @@ class FastAPI(_real_fastapi.FastAPI):
                     return
                 await send({"type": "lifespan.shutdown.complete"})
                 return
-
-    # ── in-process WebSocket dispatch ────────────────────────────────
-
-    async def _asgi_dispatch_ws_in_process(
-        self, scope: dict, receive: Callable, send: Callable
-    ) -> bool:
-        """Route an ASGI ``websocket`` scope to a matching @app.websocket
-        endpoint without binding a loopback socket.
-
-        Builds a minimal ``WebSocket`` object that bridges the user
-        endpoint's ``accept / receive_text / send_text / close`` calls
-        to the ASGI ``receive`` / ``send`` channels. Supports the
-        common user-facing API (accept headers/subprotocol, text/bytes
-        send+receive, receive_json, close codes).
-
-        Returns True when dispatched (the user endpoint ran); False
-        when we couldn't match a WS route — caller falls back to the
-        loopback proxy.
-        """
-        import re as _re_ws
-        import inspect as _insp_ws
-
-        path = scope.get("path", "/")
-
-        # Route match — scan router routes for websocket entries.
-        # Our APIRouter marks WS routes with ``_is_websocket = True``.
-        matched_route = None
-        path_params: dict = {}
-        for route in getattr(self.router, "routes", []) or []:
-            if not (
-                getattr(route, "_is_websocket", False)
-                or _looks_like_starlette_websocket_route(route)
-            ):
-                continue
-            r_path = getattr(route, "path", None)
-            if not r_path:
-                continue
-            regex = getattr(route, "_fastapi_turbo_asgi_ws_regex", None)
-            if regex is None:
-                pattern = "^"
-                idx = 0
-                for m in _re_ws.finditer(r"\{([^{}:]+)(?::([^{}]+))?\}", r_path):
-                    pattern += _re_ws.escape(r_path[idx:m.start()])
-                    pname = m.group(1)
-                    if m.group(2) == "path":
-                        pattern += f"(?P<{pname}>.+)"
-                    else:
-                        pattern += f"(?P<{pname}>[^/]+)"
-                    idx = m.end()
-                pattern += _re_ws.escape(r_path[idx:]) + "$"
-                regex = _re_ws.compile(pattern)
-                try:
-                    route._fastapi_turbo_asgi_ws_regex = regex  # type: ignore[attr-defined]
-                except (AttributeError, TypeError):
-                    pass
-            match = regex.match(path)
-            if match is None:
-                continue
-            matched_route = route
-            path_params = match.groupdict()
-            break
-
-        if matched_route is None:
-            # No matching WS route — Starlette closes with 1000
-            # (normal closure) when no matching endpoint accepts.
-            # Probe-confirmed against
-            # ``test_route_scope::test_websocket_invalid_path_doesnt_match``
-            # AND ``test_ws_router::test_no_router``.
-            try:
-                await send({"type": "websocket.close", "code": 1000})
-            except Exception:  # noqa: BLE001
-                pass
-            return True
-
-        endpoint = getattr(matched_route, "endpoint", None)
-        if endpoint is None:
-            return False
-        endpoint = _adapt_websocket_endpoint_class(endpoint)
-        # Surface the matched route on the WS scope so handlers can
-        # read ``websocket.scope["route"].path`` (FA contract — used
-        # by Sentry tracing and ``test_route_scope::test_websocket``).
-        scope["route"] = matched_route
-
-        # WebSocket shim built on the ASGI receive/send channels. Now
-        # supports:
-        #   * ``state`` backed by ``scope['state']`` (so middleware /
-        #     endpoint share state, matching Starlette).
-        #   * ``query_params`` parsed from the scope query_string.
-        #   * ``iter_text`` / ``iter_bytes`` / ``iter_json`` async
-        #     generators that yield until the client disconnects.
-        #   * ``url`` exposed as ``URL`` so ``websocket.url.path``
-        #     works (FA tests use that).
-        # The user endpoint dispatch path now goes through a minimal
-        # introspection-driven param resolver that handles
-        # ``Depends(...)``, ``Query(...)``, ``Header(...)``, ``Cookie(...)``,
-        # path params, and the WebSocket-typed param itself. That
-        # closes the gap with FA where ``websocket: WebSocket, room:
-        # str, token=Depends(get_token)`` is a common pattern.
-        from fastapi_turbo.exceptions import (
-            WebSocketDisconnect as _WSD,
-            WebSocketException as _WSE,
-        )
-
-        class _InProcessWS:
-            def __init__(ws_self):
-                ws_self._asgi_receive = receive
-                ws_self._asgi_send = send
-                ws_self._scope = scope
-                ws_self.path_params = path_params
-                ws_self._accepted = False
-                ws_self._closed = False
-                from fastapi_turbo.datastructures import (
-                    Headers as _Hdr,
-                    URL as _URL,
-                    QueryParams as _QP,
-                    State as _State,
-                )
-                ws_self.headers = _Hdr(scope.get("headers", []))
-                # Build a Starlette-compatible URL object so
-                # ``ws.url.path`` / ``ws.url.query`` work.
-                _path = scope.get("path", "/")
-                _qs = scope.get("query_string", b"")
-                if isinstance(_qs, (bytes, bytearray)):
-                    _qs_str = _qs.decode("latin-1")
-                else:
-                    _qs_str = str(_qs)
-                _url_str = f"ws://testserver{_path}"
-                if _qs_str:
-                    _url_str = f"{_url_str}?{_qs_str}"
-                try:
-                    ws_self.url = _URL(_url_str)
-                except Exception:  # noqa: BLE001
-                    ws_self.url = _path
-                ws_self.query_params = _QP(_qs_str)
-                ws_self.scope = scope
-                ws_self._state_cls = _State
-
-            @property
-            def state(ws_self):
-                """``websocket.state`` shared with the scope so
-                middleware mutations propagate (Starlette parity)."""
-                existing = ws_self._scope.get("state")
-                if isinstance(existing, ws_self._state_cls):
-                    return existing
-                s = ws_self._state_cls()
-                ws_self._scope["state"] = s
-                return s
-
-            @property
-            def app(ws_self):
-                return ws_self._scope.get("app")
-
-            async def accept(ws_self, subprotocol=None, headers=None):
-                msg = await ws_self._asgi_receive()
-                if msg.get("type") != "websocket.connect":
-                    ws_self._closed = True
-                    return
-                await ws_self._asgi_send({
-                    "type": "websocket.accept",
-                    "subprotocol": subprotocol,
-                    "headers": headers or [],
-                })
-                ws_self._accepted = True
-
-            async def receive(ws_self):
-                return await ws_self._asgi_receive()
-
-            async def receive_text(ws_self):
-                msg = await ws_self._asgi_receive()
-                if msg.get("type") == "websocket.disconnect":
-                    raise _WSD(code=msg.get("code", 1000))
-                return msg.get("text", "")
-
-            async def receive_bytes(ws_self):
-                msg = await ws_self._asgi_receive()
-                if msg.get("type") == "websocket.disconnect":
-                    raise _WSD(code=msg.get("code", 1000))
-                return msg.get("bytes", b"")
-
-            async def receive_json(ws_self, mode: str = "text"):
-                import json as _json
-                if mode == "binary":
-                    return _json.loads(await ws_self.receive_bytes())
-                return _json.loads(await ws_self.receive_text())
-
-            async def iter_text(ws_self):
-                try:
-                    while True:
-                        yield await ws_self.receive_text()
-                except _WSD:
-                    return
-
-            async def iter_bytes(ws_self):
-                try:
-                    while True:
-                        yield await ws_self.receive_bytes()
-                except _WSD:
-                    return
-
-            async def iter_json(ws_self):
-                try:
-                    while True:
-                        yield await ws_self.receive_json()
-                except _WSD:
-                    return
-
-            async def send_text(ws_self, text):
-                await ws_self._asgi_send({
-                    "type": "websocket.send",
-                    "text": text,
-                })
-
-            async def send_bytes(ws_self, data):
-                await ws_self._asgi_send({
-                    "type": "websocket.send",
-                    "bytes": data,
-                })
-
-            async def send_json(ws_self, obj, mode: str = "text"):
-                import json as _json
-                encoded = _json.dumps(obj)
-                if mode == "binary":
-                    await ws_self.send_bytes(encoded.encode("utf-8"))
-                else:
-                    await ws_self.send_text(encoded)
-
-            async def close(ws_self, code=1000, reason=""):
-                if ws_self._closed:
-                    return
-                await ws_self._asgi_send({
-                    "type": "websocket.close",
-                    "code": code,
-                    "reason": reason,
-                })
-                ws_self._closed = True
-
-        ws_obj = _InProcessWS()
-
-        # Build kwargs from the endpoint signature using the same
-        # introspection the HTTP dispatcher uses, so ``Depends(...)`` /
-        # ``Query(...)`` / ``Header(...)`` / ``Cookie(...)`` / path
-        # params all work — not just bare WebSocket + path positional.
-        from fastapi_turbo._introspect import introspect_endpoint
-        from fastapi_turbo.dependencies import Depends as _Dep_marker_ws
-        from fastapi_turbo.websockets import WebSocket as _WS_cls
-
-        try:
-            ws_introspect_params = introspect_endpoint(
-                getattr(endpoint, "_fastapi_turbo_original_endpoint", endpoint),
-                getattr(matched_route, "path", "/") or "/",
-            )
-        except Exception:  # noqa: BLE001
-            ws_introspect_params = []
-
-        try:
-            sig = _insp_ws.signature(
-                getattr(endpoint, "_fastapi_turbo_original_endpoint", endpoint)
-            )
-        except (TypeError, ValueError):
-            return False
-
-        kwargs: dict = {}
-        # Identify which parameter is the WebSocket itself (by
-        # annotation or by name fallback).
-        ws_param_name = None
-        for pname, p in sig.parameters.items():
-            ann = p.annotation
-            if isinstance(ann, type) and issubclass(ann, _WS_cls):
-                ws_param_name = pname
-                break
-        if ws_param_name is None:
-            # First positional parameter convention (FastAPI tutorial
-            # style: ``async def ws(websocket: WebSocket, ...)``).
-            for pname, p in sig.parameters.items():
-                if p.kind in (
-                    _insp_ws.Parameter.POSITIONAL_ONLY,
-                    _insp_ws.Parameter.POSITIONAL_OR_KEYWORD,
-                ):
-                    ws_param_name = pname
-                    break
-        if ws_param_name is not None:
-            kwargs[ws_param_name] = ws_obj
-
-        # Header / cookie scope for query helpers.
-        from fastapi_turbo.datastructures import (
-            Headers as _Hdr_ws,
-            QueryParams as _QP_ws,
-        )
-        _ws_headers = _Hdr_ws(scope.get("headers", []))
-        _ws_qp = ws_obj.query_params
-
-        # Pydantic-driven scalar coercion for path / query / header
-        # params: ``room: int`` should arrive as ``int``, not the
-        # raw ``str`` from the URL template / query string. Mirrors
-        # the HTTP path's behaviour and matches upstream FastAPI.
-        from pydantic import (
-            TypeAdapter as _WS_TA,
-            ValidationError as _WS_PyVE,
-        )
-        from fastapi_turbo.param_functions import _ParamMarker as _PM_ws
-
-        def _coerce_to(ann, raw):
-            """Coerce ``raw`` to ``ann`` via a Pydantic TypeAdapter.
-            ``ann is None`` / ``str`` / ``inspect.Parameter.empty``
-            short-circuits to ``raw``. ``ValidationError`` propagates
-            so the outer try block closes the WS with 1008."""
-            if ann is None or ann is str or ann is _insp_ws.Parameter.empty:
-                return raw
-            try:
-                return _WS_TA(ann).validate_python(raw)
-            except _WS_PyVE:
-                raise
-
-        def _ws_coerce(p, raw):
-            """Apply the param's ``scalar_validator`` (a Pydantic
-            ``TypeAdapter``) to ``raw``. Falls back to the unwrapped
-            annotation if introspect didn't pre-build one."""
-            adapter = p.get("scalar_validator")
-            ann = p.get("_unwrapped_annotation")
-            if adapter is None and ann is not None and ann not in (str, type(None)):
-                try:
-                    adapter = _WS_TA(ann)
-                except Exception:  # noqa: BLE001
-                    adapter = None
-            if adapter is None:
-                return raw
-            return adapter.validate_python(raw)
-
-        def _ws_required_missing(name: str) -> "_WSE":
-            """Build a ``WebSocketException(1008)`` for a missing
-            required parameter. Caller raises so the outer try
-            closes with the user-facing close code."""
-            return _WSE(code=1008, reason=f"missing required parameter: {name}")
-
-        def _marker_kind(marker) -> str | None:
-            """Return ``"query"`` / ``"header"`` / ``"path"`` /
-            ``"cookie"`` for a Query / Header / Path / Cookie
-            marker; ``None`` for anything else."""
-            if not isinstance(marker, _PM_ws):
-                return None
-            return getattr(marker, "_kind", None)
-
-        def _marker_is_required(marker) -> bool:
-            """``Query(...)`` / ``Header(...)`` with no default — the
-            marker's ``default`` attribute is ``Ellipsis`` or
-            ``PydanticUndefined``. Anything else means the user
-            supplied a default (``Query(7)`` etc.)."""
-            d = getattr(marker, "default", None)
-            if d is ... or d is _insp_ws.Parameter.empty:
-                return True
-            try:
-                from pydantic_core import PydanticUndefined
-                if d is PydanticUndefined:
-                    return True
-            except ImportError:
-                pass
-            return False
-
-        def _resolve_marker_value(marker, alias_or_name: str, ann):
-            """Resolve a Query/Header/Path/Cookie marker from the
-            current WS scope. Coerces via ``ann`` (the dep param's
-            annotation). Raises ``WebSocketException(1008)`` when
-            the marker is required and the value is absent."""
-            kind = _marker_kind(marker)
-            alias = getattr(marker, "alias", None) or alias_or_name
-            raw = None
-            if kind == "query":
-                raw = _ws_qp.get(alias)
-            elif kind == "header":
-                # Header alias convert_underscores semantics: turn
-                # ``user_agent`` → ``user-agent``.
-                hdr_name = alias
-                if isinstance(hdr_name, str):
-                    hdr_name = hdr_name.replace("_", "-")
-                raw = _ws_headers.get(hdr_name)
-            elif kind == "path":
-                raw = path_params.get(alias)
-            elif kind == "cookie":
-                # Parse cookies from the Host header.
-                cookie_hdr = _ws_headers.get("cookie", "") or ""
-                from http.cookies import SimpleCookie
-                jar = SimpleCookie()
-                try:
-                    jar.load(cookie_hdr)
-                except Exception:  # noqa: BLE001
-                    pass
-                morsel = jar.get(alias)
-                raw = morsel.value if morsel is not None else None
-            if raw is None:
-                if _marker_is_required(marker):
-                    raise _ws_required_missing(alias_or_name)
-                # Use marker's default (if any).
-                d = getattr(marker, "default", None)
-                if d is ... or d is _insp_ws.Parameter.empty:
-                    return None
-                return d
-            return _coerce_to(ann, raw)
-
-        ws_dep_teardowns: list = []  # (gen, is_async, scope)
-
-        async def _ws_resolve_dep(dep_callable, dep_cache, use_cache=True, dep_scope=None):
-            """Recursive ``Depends`` resolver for the WS path.
-
-            Handles per-param resolution the way upstream FastAPI
-            does for WS dependencies:
-
-              * ``Depends(other)`` → recurse.
-              * ``Query(...)`` / ``Header(...)`` / ``Path(...)`` /
-                ``Cookie(...)`` markers → pull from the matching
-                scope, coerce via the dep's annotation, raise
-                ``WebSocketException(1008)`` when required and
-                missing.
-              * ``WebSocket`` annotation → inject the connection.
-              * Bare param with a name that's a path param → inject
-                that path param (coerced).
-              * Bare scalar with no marker → fall back to query
-                string lookup (Starlette WS-dep convention).
-              * Bare param with a default → use the default verbatim.
-
-            Honour ``app.dependency_overrides`` first so WS deps
-            obey the same override contract as HTTP deps.
-
-            ``use_cache`` mirrors ``Depends(..., use_cache=...)``:
-            when False, the resolver re-runs the dep on every
-            usage within one WS session. Earlier this resolver
-            unconditionally consulted ``dep_cache``, so two
-            ``Depends(d, use_cache=False)`` params in one handler
-            both got the FIRST call's value — broke FA's
-            ``no-cache`` contract (probe-confirmed: turbo returned
-            ``a=1, b=1, calls=1`` where upstream returns
-            ``a=1, b=2, calls=2``).
-            """
-            _ws_overrides = getattr(self, "dependency_overrides", None) or {}
-            _ws_orig_callable = dep_callable
-            dep_callable = _ws_overrides.get(dep_callable, dep_callable)
-            _scope_norm = (dep_scope or "request").lower()
-            _cache_key_ws = (_ws_orig_callable, _scope_norm)
-            if use_cache and _cache_key_ws in dep_cache:
-                return dep_cache[_cache_key_ws]
-            try:
-                dep_sig = _insp_ws.signature(dep_callable)
-            except (TypeError, ValueError):
-                dep_sig = None
-            dep_kwargs: dict = {}
-            if dep_sig is not None:
-                # Look up Depends() markers stashed in
-                # ``Annotated[T, Depends(...)]`` metadata as well as
-                # as the parameter ``default``. Without this, an
-                # ``Annotated[Session, Depends(dep_session, scope=
-                # 'request')]`` param would fall through to "treat
-                # as path/query" and 422 the WS handshake.
-                import typing as _tp_ws_local
-                try:
-                    _dep_hints = _tp_ws_local.get_type_hints(
-                        dep_callable, include_extras=True,
-                    )
-                except Exception:  # noqa: BLE001
-                    _dep_hints = {}
-                for dpname, dp in dep_sig.parameters.items():
-                    default = dp.default
-                    ann = dp.annotation
-                    # Pull from Annotated metadata if no default-form
-                    # marker was supplied.
-                    _ann_marker = None
-                    _hint = _dep_hints.get(dpname)
-                    if _hint is not None and hasattr(_hint, "__metadata__"):
-                        for _m in getattr(_hint, "__metadata__", ()):
-                            if isinstance(_m, _Dep_marker_ws):
-                                _ann_marker = _m
-                                break
-                    if _ann_marker is not None and not isinstance(default, _Dep_marker_ws):
-                        default = _ann_marker
-                    # Nested Depends.
-                    if isinstance(default, _Dep_marker_ws):
-                        nested = default.dependency
-                        if nested is not None:
-                            dep_kwargs[dpname] = await _ws_resolve_dep(
-                                nested,
-                                dep_cache,
-                                use_cache=getattr(default, "use_cache", True),
-                                dep_scope=getattr(default, "scope", None),
-                            )
-                        continue
-                    # Query / Header / Path / Cookie markers — coerce
-                    # AND raise 1008 if required and missing.
-                    if isinstance(default, _PM_ws):
-                        dep_kwargs[dpname] = _resolve_marker_value(
-                            default, dpname, ann
-                        )
-                        continue
-                    # WebSocket / HTTPConnection injection. WS deps
-                    # commonly take ``HTTPConnection`` (parent of
-                    # ``WebSocket`` — Starlette parity) so a single
-                    # dep works for both HTTP and WS routes. The
-                    # WebSocket itself satisfies that annotation.
-                    try:
-                        from fastapi_turbo.requests import (
-                            HTTPConnection as _HC_local,
-                        )
-                    except ImportError:
-                        _HC_local = None
-                    if isinstance(ann, type) and (
-                        issubclass(ann, _WS_cls)
-                        or (
-                            _HC_local is not None and issubclass(ann, _HC_local)
-                        )
-                    ):
-                        dep_kwargs[dpname] = ws_obj
-                        continue
-                    # Bare path-param shorthand.
-                    if dpname in path_params:
-                        dep_kwargs[dpname] = _coerce_to(ann, path_params[dpname])
-                        continue
-                    # Bare scalar → query lookup with coercion.
-                    if dpname in _ws_qp:
-                        dep_kwargs[dpname] = _coerce_to(ann, _ws_qp[dpname])
-                        continue
-                    if default is not _insp_ws.Parameter.empty:
-                        dep_kwargs[dpname] = default
-                        continue
-                    # No source for this param. Treat as required and
-                    # close the socket — better to surface than to
-                    # let the dep run with a missing kwarg (TypeError).
-                    raise _ws_required_missing(dpname)
-            # Handle generator / async-generator yield-deps so the
-            # FA contract works: dep yields the value, then the
-            # teardown runs after the WS handler completes (request
-            # scope) or before it returns (function scope, FA
-            # 0.120+).
-            # Use the resolver-arg ``dep_scope`` (passed by callers).
-            _scope_for_gen_ws = (dep_scope or "request").lower()
-            if _insp_ws.isasyncgenfunction(dep_callable):
-                _gen = dep_callable(**dep_kwargs)
-                val = await _gen.__anext__()
-                ws_dep_teardowns.append((_gen, True, _scope_for_gen_ws))
-            elif _insp_ws.isgeneratorfunction(dep_callable):
-                _gen = dep_callable(**dep_kwargs)
-                val = next(_gen)
-                ws_dep_teardowns.append((_gen, False, _scope_for_gen_ws))
-            elif _insp_ws.iscoroutinefunction(dep_callable):
-                val = await dep_callable(**dep_kwargs)
-            else:
-                val = dep_callable(**dep_kwargs)
-                if _insp_ws.iscoroutine(val):
-                    val = await val
-                elif _insp_ws.isasyncgen(val):
-                    _gen = val
-                    val = await _gen.__anext__()
-                    ws_dep_teardowns.append((_gen, True, _scope_for_gen_ws))
-                elif _insp_ws.isgenerator(val):
-                    _gen = val
-                    val = next(_gen)
-                    ws_dep_teardowns.append((_gen, False, _scope_for_gen_ws))
-            # Cache under the ORIGINAL callable so subsequent
-            # ``Depends(orig_callable)`` requests in the same WS
-            # session hit the cache regardless of any
-            # dependency_overrides indirection. Only store when
-            # the caller asked us to cache — ``use_cache=False``
-            # callers want a fresh value next time. Cache key
-            # includes ``dep_scope`` to keep function/request copies
-            # of the same callable separate (FA 0.120+).
-            if use_cache:
-                dep_cache[(_ws_orig_callable, _scope_for_gen_ws)] = val
-            return val
-
-        try:
-            # Param resolution + endpoint call live in the SAME try
-            # block so a ``Depends(auth)`` that raises
-            # ``WebSocketException(1008)`` is caught by the WSE
-            # handler below and closes the socket with the user's
-            # code — instead of escaping the dispatcher entirely
-            # (or worse, being silently swallowed). Same for
-            # ``ValidationError`` from a typed path/query coercion:
-            # bad-type input closes with 1008 rather than passing a
-            # raw string where the user expects an int.
-            ws_dep_cache: dict = {}
-            # Run app/router/route-level extra dependencies BEFORE
-            # the handler params resolve. Their return values are
-            # discarded (FA contract — extra deps are for side
-            # effects: auth, audit, append-to-list). Probe-confirmed
-            # against ``test_ws_dependencies::test_index`` etc.
-            _ws_extra_deps: list = []
-            _ws_extra_deps.extend(getattr(self, "dependencies", []) or [])
-            _ws_extra_deps.extend(getattr(self.router, "dependencies", []) or [])
-            # FA's order: app → include-time deps (passed via
-            # ``app.include_router(router, dependencies=[...])``) →
-            # router's own deps → route's own deps. ``include_deps``
-            # is stamped by ``include_router`` from the kwargs.
-            _ws_extra_deps.extend(
-                getattr(matched_route, "_fastapi_turbo_include_deps", []) or []
-            )
-            _ws_owner_router = getattr(
-                matched_route, "_fastapi_turbo_owner_router", None
-            )
-            if _ws_owner_router is not None:
-                _ws_extra_deps.extend(
-                    getattr(_ws_owner_router, "dependencies", []) or []
-                )
-            _ws_extra_deps.extend(
-                getattr(matched_route, "dependencies", []) or []
-            )
-            from fastapi_turbo.dependencies import Depends as _Dep_marker_ws_extra
-            for _xd in _ws_extra_deps:
-                if isinstance(_xd, _Dep_marker_ws_extra):
-                    _xd_call = _xd.dependency
-                    if _xd_call is None:
-                        continue
-                    await _ws_resolve_dep(
-                        _xd_call,
-                        ws_dep_cache,
-                        use_cache=getattr(_xd, "use_cache", True),
-                        dep_scope=getattr(_xd, "scope", None),
-                    )
-
-            for p in ws_introspect_params:
-                pname = p.get("name")
-                kind = p.get("kind")
-                if pname == ws_param_name:
-                    continue
-                if kind == "dependency":
-                    dep_callable = p.get("dep_callable")
-                    if dep_callable is not None:
-                        kwargs[pname] = await _ws_resolve_dep(
-                            dep_callable,
-                            ws_dep_cache,
-                            use_cache=p.get("use_cache", True),
-                            dep_scope=p.get("_dep_scope"),
-                        )
-                    continue
-                if kind == "path":
-                    if pname in path_params:
-                        kwargs[pname] = _ws_coerce(p, path_params[pname])
-                    continue
-                if kind == "query":
-                    alias = p.get("alias") or pname
-                    if alias in _ws_qp:
-                        kwargs[pname] = _ws_coerce(p, _ws_qp[alias])
-                    elif p.get("required", False):
-                        # Required ``Query(...)`` with no value:
-                        # close 1008 instead of passing the marker
-                        # object through as the kwarg (which would
-                        # let the endpoint run with the marker as
-                        # the value — a real auth bypass for
-                        # ``token: str = Query(...)`` patterns).
-                        raise _ws_required_missing(alias)
-                    elif p.get("has_default", False):
-                        kwargs[pname] = p.get("default_value")
-                    continue
-                if kind == "header":
-                    alias = p.get("alias") or pname
-                    if isinstance(alias, str):
-                        alias = alias.replace("_", "-")
-                    val = _ws_headers.get(alias)
-                    if val is not None:
-                        kwargs[pname] = _ws_coerce(p, val)
-                    elif p.get("required", False):
-                        raise _ws_required_missing(alias)
-                    elif p.get("has_default", False):
-                        kwargs[pname] = p.get("default_value")
-                    continue
-                # Path params not surfaced by introspection (e.g.
-                # when the param has no marker but appears in the
-                # URL template) still need to land on kwargs.
-                if pname in path_params and pname not in kwargs:
-                    kwargs[pname] = path_params[pname]
-
-            # Last-mile: any signature param still unbound that
-            # appears in path_params should land on kwargs (covers
-            # users who name a path param without annotating it).
-            for pname in sig.parameters:
-                if pname in kwargs:
-                    continue
-                if pname in path_params:
-                    kwargs[pname] = path_params[pname]
-
-            if _insp_ws.iscoroutinefunction(endpoint):
-                await endpoint(**kwargs)
-            else:
-                result = endpoint(**kwargs)
-                if _insp_ws.iscoroutine(result):
-                    await result
-            # Drain ALL dep teardowns (function-scope first, then
-            # request-scope — same order as HTTP, LIFO within each).
-            # WS doesn't have a "post-response" phase distinct from
-            # the handler returning, so all teardowns flush here.
-            # The cache key already separates function/request copies
-            # of the same callable, so the handler reads correct
-            # ``func_is_open`` / ``req_is_open`` snapshots BEFORE
-            # this drain. Errors propagate to the WS dispatcher's
-            # outer envelope so the test client surfaces them
-            # (matches FA's
-            # ``test_websocket_dependency_after_yield_broken``).
-            _ws_post_teardown_exc: BaseException | None = None
-            for _g, _is_a, _sc in reversed(ws_dep_teardowns):
-                try:
-                    if _is_a:
-                        try:
-                            await _g.__anext__()
-                        except StopAsyncIteration:
-                            pass
-                    else:
-                        try:
-                            next(_g)
-                        except StopIteration:
-                            pass
-                except BaseException as _exc:  # noqa: BLE001
-                    if _ws_post_teardown_exc is None:
-                        _ws_post_teardown_exc = _exc
-            ws_dep_teardowns.clear()
-            if _ws_post_teardown_exc is not None:
-                raise _ws_post_teardown_exc
-        except _WSE as _wsex:
-            # Endpoint raised ``WebSocketException(code=…)`` — Starlette
-            # closes the WS with the user's code rather than the
-            # generic 1011. This is what FA tests assert on
-            # (``assert exc_info.value.code == 1008``).
-            if not ws_obj._closed:
-                try:
-                    await ws_obj.close(
-                        code=_wsex.code,
-                        reason=getattr(_wsex, "reason", "") or "",
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-        except _WSD as _wsd:
-            # Disconnects propagate from receive helpers when the
-            # client closes mid-handler. Starlette stores this on
-            # the task so the test client can surface it via
-            # ``pytest.raises(WebSocketDisconnect)`` — match that
-            # contract by re-raising. Probe-confirmed against
-            # ``test_tutorial/test_websockets/test_tutorial002``.
-            raise
-        except _WS_PyVE as _vex:
-            # Bad input type for a path / query / header (e.g.
-            # ``room: int`` with ``/ws/abc``). Close with 1008
-            # (policy violation) — closer to FA's 422 semantic than
-            # the generic 1011 "internal error" which the client
-            # would interpret as a server-side bug.
-            _log.debug("in-process WS coercion failed: %r", _vex)
-            # FA: route through ``WebSocketRequestValidationError``
-            # exception handler if one is registered. The handler
-            # captures ``exc`` (with ``endpoint_ctx``), then re-
-            # raises (or closes the WS itself). Mirrors HTTP path's
-            # validation-error contract for parity with
-            # ``test_validation_error_context``.
-            try:
-                from fastapi_turbo.exceptions import (
-                    WebSocketRequestValidationError as _WRVE_local,
-                )
-            except ImportError:
-                _WRVE_local = None
-            _ws_endpoint_ctx_local: dict = {}
-            try:
-                import inspect as _ins_local
-                _ws_endpoint_ctx_local["function"] = getattr(
-                    endpoint, "__name__", None
-                )
-                _ws_endpoint_ctx_local["file"] = _ins_local.getsourcefile(
-                    endpoint
-                )
-                _ws_endpoint_ctx_local["line"] = _ins_local.getsourcelines(
-                    endpoint
-                )[1]
-            except (TypeError, OSError):
-                pass
-            # Use the FULL mounted path so sub-app endpoints surface
-            # the user-visible URL (``/sub/ws/...``), not the local
-            # one (``/ws/...``). ``scope['root_path']`` carries the
-            # mount prefix when the request was routed through
-            # ``app.mount("/sub", sub_app)``.
-            _route_path_local = (
-                getattr(matched_route, "path", None) or "/"
-            )
-            _root_path_for_ctx = scope.get("root_path", "") or ""
-            _ws_endpoint_ctx_local["path"] = (
-                _root_path_for_ctx + _route_path_local
-            )
-            if _WRVE_local is not None:
-                try:
-                    _wrve = _WRVE_local(
-                        errors=getattr(_vex, "errors", lambda: [])(),
-                        endpoint_ctx=_ws_endpoint_ctx_local,
-                    )
-                except Exception:  # noqa: BLE001
-                    _wrve = None
-                if _wrve is not None:
-                    _wrve_handler = (
-                        getattr(self, "exception_handlers", {}) or {}
-                    ).get(_WRVE_local)
-                    if _wrve_handler is not None:
-                        try:
-                            _r = _wrve_handler(ws_obj, _wrve)
-                            if _insp_ws.iscoroutine(_r):
-                                await _r
-                        except Exception:  # noqa: BLE001
-                            pass
-            if not ws_obj._closed:
-                try:
-                    await ws_obj.close(code=1008)
-                except Exception:  # noqa: BLE001
-                    pass
-        except Exception as _exc:  # noqa: BLE001
-            _log.debug("in-process WS endpoint raised: %r", _exc)
-            # Honour ``app.exception_handlers`` for the matched
-            # exception type. The handler signature is ``(websocket,
-            # exc)`` — same as Starlette. The handler typically calls
-            # ``websocket.close(code, reason)`` with a custom code,
-            # which our test client surfaces to ``pytest.raises``.
-            # Probe-confirmed against
-            # ``test_ws_router::test_depend_err_handler``.
-            _ws_handler, _ws_matched_cls = _find_exception_handler(self, _exc)
-            if _ws_handler is not None and _ws_matched_cls is not Exception:
-                try:
-                    if _insp_ws.iscoroutinefunction(_ws_handler):
-                        await _ws_handler(ws_obj, _exc)
-                    else:
-                        _r = _ws_handler(ws_obj, _exc)
-                        if _insp_ws.iscoroutine(_r):
-                            await _r
-                except Exception:  # noqa: BLE001
-                    pass
-                # Drain teardowns and return — the handler took care
-                # of closing the WS.
-                for _g2, _is_a2, _sc2 in reversed(ws_dep_teardowns):
-                    try:
-                        if _is_a2:
-                            try:
-                                await _g2.__anext__()
-                            except StopAsyncIteration:
-                                pass
-                        else:
-                            try:
-                                next(_g2)
-                            except StopIteration:
-                                pass
-                    except Exception:  # noqa: BLE001
-                        pass
-                ws_dep_teardowns.clear()
-                return True
-            # Skip the default 1011 close when an outer WS
-            # middleware will observe the raised exception — the
-            # middleware's own ``websocket.close(...)`` should be
-            # the one delivered. Probe-confirmed against
-            # ``test_ws_router::test_depend_err_middleware`` (a
-            # custom middleware closes with 1006/repr(exc)).
-            _ws_in_mw_flag = scope.get("_fastapi_turbo_ws_in_mw", False)
-            if not _ws_in_mw_flag and not ws_obj._closed:
-                try:
-                    await ws_obj.close(code=1011)
-                except Exception:  # noqa: BLE001
-                    pass
-            # Surface unhandled server-side exceptions to the test
-            # client (FA's contract — ``raise_server_exceptions=
-            # True`` propagates). The TestClient's ``__exit__`` on
-            # the WS session re-raises any task exception caught
-            # here. Probe-confirmed against
-            # ``test_dependency_after_yield_websockets::test_websocket
-            # _dependency_after_yield_broken``.
-            try:
-                _raise_se = getattr(self, "_fastapi_turbo_raise_server_exceptions", True)
-            except Exception:  # noqa: BLE001
-                _raise_se = True
-            # Drain teardowns BEFORE re-raising so dep finalisers
-            # run cleanly first.
-            for _g2, _is_a2, _sc2 in reversed(ws_dep_teardowns):
-                try:
-                    if _is_a2:
-                        try:
-                            await _g2.__anext__()
-                        except StopAsyncIteration:
-                            pass
-                    else:
-                        try:
-                            next(_g2)
-                        except StopIteration:
-                            pass
-                except Exception:  # noqa: BLE001
-                    pass
-            ws_dep_teardowns.clear()
-            if _raise_se:
-                raise
-        # Drain any teardowns left over after error paths so dep
-        # finalisers run on every exit (including WS close
-        # failures). Mirrors the HTTP post-response drain.
-        for _g, _is_a, _sc in reversed(ws_dep_teardowns):
-            try:
-                if _is_a:
-                    try:
-                        await _g.__anext__()
-                    except StopAsyncIteration:
-                        pass
-                else:
-                    try:
-                        next(_g)
-                    except StopIteration:
-                        pass
-            except Exception:  # noqa: BLE001
-                pass
-        ws_dep_teardowns.clear()
-        return True
 
     # ── server bootstrap ──────────────────────────────────────────────
 
