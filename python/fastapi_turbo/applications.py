@@ -7697,10 +7697,31 @@ class FastAPI(_real_fastapi.FastAPI):
         self._oneshot_disconnect_watch = needs_watch
         return needs_watch
 
+    def _door_fingerprint(self) -> tuple:
+        """Cheap structural fingerprint of the routes + middleware that the
+        door's Rust router and WS table are built from. Used to detect routes /
+        middleware / mounts added AFTER the first in-process request (e.g. lazy
+        ``app.mount`` / plugin registration) so the door re-registers instead of
+        serving a stale router (or 1000-closing a freshly-added WS route)."""
+        router = getattr(self, "router", None)
+        return (
+            len(getattr(router, "routes", None) or ()),
+            len(getattr(self, "_http_middlewares", None) or ()),
+            len(getattr(self, "_middleware_stack", None) or ()),
+            len(getattr(self, "_raw_asgi_middlewares", None) or ()),
+            len(getattr(self, "_mounts", None) or ()),
+        )
+
     def _ensure_oneshot_registered(self, scope: dict) -> None:
-        """Register the assembled router for this app once, using the same
-        full-fidelity args as ``app.run()``."""
-        if getattr(self, "_oneshot_registered", False):
+        """Register the assembled router for this app, using the same
+        full-fidelity args as ``app.run()``. Re-registers when the route /
+        middleware fingerprint changes (routes added after the first request),
+        so the door never serves a stale router."""
+        fp = self._door_fingerprint()
+        if (
+            getattr(self, "_oneshot_registered", False)
+            and getattr(self, "_oneshot_reg_fingerprint", None) == fp
+        ):
             return
         from fastapi_turbo._fastapi_turbo_core import register_app_router
 
@@ -7709,6 +7730,15 @@ class FastAPI(_real_fastapi.FastAPI):
         port = int(server[1] or 0)
         register_app_router(id(self), *self._build_server_args(host, port, for_door=True))
         self._oneshot_registered = True
+        # Store the fingerprint AFTER ``_build_server_args`` — it normalises the
+        # dynamic ``/openapi.json`` route into ``router.routes``, so capturing
+        # it post-registration keeps the value stable across later requests
+        # (otherwise every request would see a changed count and re-register).
+        self._oneshot_reg_fingerprint = self._door_fingerprint()
+        # A structural change also invalidates the cached WS route table and
+        # the disconnect-watch scan, which are derived from the same routes.
+        self._ws_door_route_table = None
+        self._oneshot_disconnect_watch = None
 
     def _oneshot_mutate_outer_scope(self, scope: dict) -> None:
         """Populate ``scope['route']`` / ``scope['path_params']`` /
@@ -8200,10 +8230,12 @@ class FastAPI(_real_fastapi.FastAPI):
         ``_wrap_websocket_endpoint`` output the Rust ``app.run()`` door
         registers (built by ``_collect_all_routes`` with the full effective
         dependency set), so the in-process door applies identical
-        deps/validation/middleware/exception handling. Routes are fixed after
-        startup, so the table is built once."""
+        deps/validation/middleware/exception handling. Cached, but rebuilt when
+        the route/middleware fingerprint changes (a WS route added after the
+        first WS request would otherwise 1000-close)."""
+        fp = self._door_fingerprint()
         cached = getattr(self, "_ws_door_route_table", None)
-        if cached is not None:
+        if cached is not None and getattr(self, "_ws_door_table_fingerprint", None) == fp:
             return cached
         import re as _re
         table: list = []
@@ -8228,6 +8260,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 (_re.compile(pattern), rd["endpoint"], r_path, rd.get("_route_obj"))
             )
         self._ws_door_route_table = table
+        self._ws_door_table_fingerprint = fp
         return table
 
     async def _asgi_ws_door(
