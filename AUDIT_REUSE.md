@@ -55,10 +55,19 @@ wins alone: ~900–1,000 LOC.
   ServerConfig. ~500 LOC net. Gated full 1125 / parity 151 / WS 22.
 - DONE (commit db017cd): the 2 audit BUGS (big-int JSON + dep-raised exception
   handlers) with regression tests.
-- DEFERRED: **collapse WS awaitables** → fold into 7.4 (WS door rewrites
-  websocket.rs anyway); **embedded docs HTML** → moderate follow-up (needs the
-  swagger oauth2-redirect HTML wired from Python via
+- DONE (Point 3, 2026-06-03): **collapse WS awaitables** — `ChannelAwaitable`/
+  `TextAwaitable`/`BytesAwaitable` → one `RecvAwaitable` with a `RecvKind`
+  enum (websocket.rs); lib.rs registers the single class. Pure refactor, gated
+  WS 22 / parity 151. (The W1 in-process WS door went Python-side over ASGI, so
+  these Rust awaitables now serve only `app.run()`.)
+- DEFERRED: **embedded docs HTML** → moderate follow-up (needs the swagger
+  oauth2-redirect HTML wired from Python via
   fastapi.openapi.docs.get_swagger_ui_oauth2_redirect_html; app.run()-only path).
+- INVALID (do NOT do): `_oneshot_selftest`→`#[cfg(test)]` — tests import it from
+  the built extension, so cfg-gating it out breaks them.
+- NOTE: the clone Python `Response` is now DELETED (responses.py → real
+  Starlette re-export, commit ac88de1); the responses.rs Tier-1 items
+  (JSON-writer fallback, pyerr→Starlette) still apply to the `app.run()` path.
 
 ### Tier 0 — quick, low-risk, no parity risk (~900–1,000 LOC)
 - **Dead code:** handler_bridge.rs 2nd event-loop machine + dead fns + dummy channel
