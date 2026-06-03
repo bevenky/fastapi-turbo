@@ -7,7 +7,7 @@
 //!   - State tracked via atomic u8 (matches Starlette's WebSocketState enum)
 //!   - Binary preserved as `Bytes` (no UTF-8 coercion)
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::Message;
 use bytes::Bytes;
 use crossbeam_channel as cb;
 use pyo3::prelude::*;
@@ -575,23 +575,6 @@ impl CloseAwaitable {
     }
 }
 
-// ── Pure Rust WS echo — baseline measurement ──────────────────────
-
-pub async fn handle_ws_echo_rust(socket: WebSocket) {
-    use futures_util::{SinkExt, StreamExt};
-    let (mut tx, mut rx) = socket.split();
-    while let Some(Ok(msg)) = rx.next().await {
-        match msg {
-            Message::Text(_) | Message::Binary(_) => {
-                if tx.send(msg).await.is_err() {
-                    break;
-                }
-            }
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-}
 
 // ── Python handler bridge ─────────────────────────────────────────
 

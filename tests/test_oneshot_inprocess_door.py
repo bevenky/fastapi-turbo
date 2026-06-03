@@ -2,12 +2,14 @@
 
 These tests drive requests through ``process_request`` — the PyO3 entry that
 runs the SAME assembled ``axum::Router`` in-process via
-``tower::Service::oneshot``, with no socket. This is the mechanism that will
-replace the ~3,300-line Python in-process HTTP dispatcher: uvicorn /
-serverless / ``TestClient(in_process=True)`` will feed requests here instead
-of re-implementing the request lifecycle in Python.
+``tower::Service::oneshot``, with no socket. This door REPLACED the Python
+in-process HTTP dispatcher (now deleted): uvicorn / serverless /
+``TestClient(in_process=True)`` feed requests through the door
+(``process_request_streaming`` at runtime; ``process_request`` is the buffered
+parity oracle these tests use) instead of re-implementing the request
+lifecycle in Python.
 
-The point of the dispatcher collapse is ONE engine, two doors:
+The dispatcher collapse is done — ONE engine, two doors:
   * door A — ``app.run()``         → ``axum::serve(listener, router)``
   * door B — ASGI ``__call__``     → ``process_request`` → ``router.oneshot``
 

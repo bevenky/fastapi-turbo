@@ -151,7 +151,6 @@ fn drain_one_sync_chunk(iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
     }
 }
 
-/// Drive a single `__anext__` against an async generator without entering an
 /// Iterate a synchronous Python iterator, sending each chunk through `tx`.
 fn iterate_sync_generator(
     _py: Python<'_>,

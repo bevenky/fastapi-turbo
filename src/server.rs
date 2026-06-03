@@ -653,13 +653,6 @@ fn assemble_app_router(
         )
     }));
 
-    // Pure Rust WebSocket echo — measures Axum WS baseline (no Python)
-    router = router.route("/_ws-echo", axum::routing::any(
-        |ws: axum::extract::ws::WebSocketUpgrade| async {
-            ws.on_upgrade(crate::websocket::handle_ws_echo_rust)
-        }
-    ));
-
     // Add OpenAPI / documentation routes if enabled. An empty
     // ``openapi_url`` means "disable OpenAPI + docs entirely" —
     // FA behavior tested by ``test_conditional_openapi``.
@@ -909,11 +902,11 @@ pub fn register_app_router(
 }
 
 /// Drive one HTTP request through a registered app's router in-process and
-/// return `(status, headers, body)`. The GIL is released while the runtime
-/// drives the dispatch; the Python handler re-acquires it inside the engine,
-/// exactly as under `app.run()`. Non-streaming for now — the body is
-/// buffered; streaming responses route through the Python fallback until the
-/// chunk-pump lands.
+/// return `(status, headers, body)` with the body fully buffered. The GIL is
+/// released while the runtime drives the dispatch; the Python handler
+/// re-acquires it inside the engine, exactly as under `app.run()`. The runtime
+/// door uses `process_request_streaming` (chunked body); this buffered variant
+/// is retained as a parity oracle for tests.
 #[pyfunction]
 #[pyo3(signature = (
     app_id, method, path, query_string, headers, body, client_host, client_port,

@@ -72,7 +72,7 @@ Snapshot counts shift as new regression tests land. Replace numbers with what `s
 | `response_model=` (filtering, aliases, `model_validate(obj)`) | Full | |
 | `status_code=` / `tags=` / `summary=` / `description=` / `response_description=` | Full | |
 | `app.mount("/sub", sub_app)` for FastAPI / StaticFiles / ASGI | Full | |
-| `app.host("subdomain", sub_app)` | Full | Dispatched in-process by the ASGI entry: ``_asgi_dispatch_in_process`` checks the registered hosts BEFORE route match and recurses into the matching sub-app's ``__call__`` (R28). Works under raw ``httpx.ASGITransport(app=app)`` / serverless / sandbox runs without binding a loopback socket. Sub-app keeps its own route table, lifespan, and middleware chain. |
+| `app.host("subdomain", sub_app)` | Full | Dispatched in-process by a host-matching HTTP middleware that checks the registered hosts BEFORE route match and recurses into the matching sub-app's ``__call__`` (R28). Works under raw ``httpx.ASGITransport(app=app)`` / serverless / sandbox runs without binding a loopback socket. Sub-app keeps its own route table, lifespan, and middleware chain. |
 | `redirect_slashes` | Full | |
 | HEAD auto-handling from GET | Full | 405 + `Allow: <declared>` — matches upstream FastAPI byte-for-byte. |
 | OPTIONS auto-generation for CORS | Full | True preflights (`Origin` + `Access-Control-Request-Method`) are handled by `CORSMiddleware`; bare OPTIONS on undeclared method returns 405 + `Allow: <declared>` — matches upstream. |
