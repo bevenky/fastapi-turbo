@@ -36,6 +36,7 @@ fn _fastapi_turbo_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The in-process ASGI door (second door into the one engine).
     m.add_function(wrap_pyfunction!(server::register_app_router, m)?)?;
     m.add_function(wrap_pyfunction!(server::process_request, m)?)?;
+    m.add_function(wrap_pyfunction!(server::process_request_streaming, m)?)?;
     m.add_function(wrap_pyfunction!(server::_oneshot_selftest, m)?)?;
     // Multi-worker mode (fd-passing acceptor + workers).
     m.add_function(wrap_pyfunction!(server::run_acceptor, m)?)?;
@@ -52,5 +53,6 @@ fn _fastapi_turbo_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<multipart::PySyncFile>()?;
     m.add_class::<multipart::ImmediateBytes>()?;
     m.add_class::<multipart::ImmediateNone>()?;
+    m.add_class::<server::PyResponseStream>()?;
     Ok(())
 }

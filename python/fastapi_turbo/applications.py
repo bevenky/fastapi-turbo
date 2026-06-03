@@ -8086,7 +8086,7 @@ class FastAPI(_real_fastapi.FastAPI):
         is not blocked (the GIL is released inside ``process_request``)."""
         import asyncio
 
-        from fastapi_turbo._fastapi_turbo_core import process_request
+        from fastapi_turbo._fastapi_turbo_core import process_request_streaming
 
         self._ensure_oneshot_registered(scope)
         # Decorate the outer scope with the matched route shape so
@@ -8115,9 +8115,9 @@ class FastAPI(_real_fastapi.FastAPI):
         client_port = int(client[1] or 0)
 
         loop = asyncio.get_running_loop()
-        status, resp_headers, resp_body = await loop.run_in_executor(
+        status, resp_headers, body_stream = await loop.run_in_executor(
             None,
-            process_request,
+            process_request_streaming,
             id(self),
             method,
             path,
@@ -8150,7 +8150,23 @@ class FastAPI(_real_fastapi.FastAPI):
                 "headers": out_headers,
             }
         )
-        await send({"type": "http.response.body", "body": bytes(resp_body)})
+        # Pump body chunks lazily off Axum's BodyDataStream. For a buffered
+        # response this is a single chunk; for a StreamingResponse / SSE it
+        # streams frame-by-frame with no 32 MiB cap and no hang on large or
+        # infinite bodies. ``next_chunk`` blocks on the shared oneshot runtime
+        # inside the executor so the asyncio loop stays free.
+        while True:
+            chunk = await loop.run_in_executor(None, body_stream.next_chunk)
+            if chunk is None:
+                break
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": bytes(chunk),
+                    "more_body": True,
+                }
+            )
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
 
         # Re-raise an unhandled server exception AFTER the 500 response is
         # sent, exactly like the Python dispatcher's ``_asgi_emit_exception``.

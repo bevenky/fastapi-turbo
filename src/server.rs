@@ -1008,6 +1008,151 @@ pub fn process_request(
     result.map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
+/// Look up the per-app assembled Axum router (cheap, Arc-backed clone).
+fn get_app_router(app_id: u64) -> Result<axum::Router, String> {
+    let guard = APP_ROUTERS
+        .read()
+        .map_err(|_| "APP_ROUTERS lock poisoned".to_string())?;
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&app_id))
+        .cloned()
+        .ok_or_else(|| {
+            "process_request: app not registered (call register_app_router first)".to_string()
+        })
+}
+
+/// Rebuild the ``http::Request`` from ASGI scope parts (shared by the buffered
+/// and streaming in-process entry points).
+fn build_inproc_request(
+    method: &str,
+    path: String,
+    query_string: String,
+    headers: &[(Vec<u8>, Vec<u8>)],
+    body: Vec<u8>,
+    client_host: &str,
+    client_port: u16,
+) -> Result<axum::http::Request<axum::body::Body>, String> {
+    let uri = if query_string.is_empty() {
+        path
+    } else {
+        format!("{path}?{query_string}")
+    };
+    let mut builder = axum::http::Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        builder = builder.header(k.as_slice(), v.as_slice());
+    }
+    let mut request = builder
+        .body(axum::body::Body::from(body))
+        .map_err(|e| format!("bad request: {e}"))?;
+    if let Ok(addr) = format!("{client_host}:{client_port}").parse::<std::net::SocketAddr>() {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+    }
+    Ok(request)
+}
+
+/// Streaming counterpart to [`process_request`]: drives the request through the
+/// assembled Axum router but DOES NOT buffer the body. Returns the status +
+/// headers immediately and an iterator (`PyResponseStream`) that yields the body
+/// chunks lazily — Axum's `BodyDataStream` does the framing, so the in-process
+/// door can pump a `StreamingResponse` (SSE / large / infinite) to ASGI `send`
+/// without the 32 MiB buffer cap. We add no streaming machinery of our own here;
+/// this is the GIL-releasing bridge over the same Axum `Body` `streaming.rs`
+/// already produces.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn process_request_streaming(
+    py: Python<'_>,
+    app_id: u64,
+    method: String,
+    path: String,
+    query_string: String,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    body: Vec<u8>,
+    client_host: String,
+    client_port: u16,
+) -> PyResult<(u16, Vec<(Vec<u8>, Vec<u8>)>, PyResponseStream)> {
+    let router = get_app_router(app_id).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    let request = build_inproc_request(
+        &method,
+        path,
+        query_string,
+        &headers,
+        body,
+        &client_host,
+        client_port,
+    )
+    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+    let result: Result<(u16, Vec<(Vec<u8>, Vec<u8>)>, axum::body::Body), String> = py.detach(|| {
+        oneshot_runtime().block_on(async move {
+            let join = tokio::spawn(async move {
+                use tower::ServiceExt;
+                let response = router
+                    .oneshot(request)
+                    .await
+                    .expect("axum Router service is Infallible");
+                let status = response.status().as_u16();
+                let resp_headers: Vec<(Vec<u8>, Vec<u8>)> = response
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str().as_bytes().to_vec(), v.as_bytes().to_vec()))
+                    .collect();
+                (status, resp_headers, response.into_body())
+            });
+            join.await.map_err(|e| format!("dispatch task error: {e}"))
+        })
+    });
+    let (status, resp_headers, axum_body) =
+        result.map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    Ok((
+        status,
+        resp_headers,
+        PyResponseStream {
+            stream: Mutex::new(Some(axum_body.into_data_stream())),
+        },
+    ))
+}
+
+/// Lazy body-chunk iterator over an Axum response `Body`. The door calls
+/// `next_chunk()` (in an executor thread) to pull one frame at a time and
+/// forward it to ASGI `send`. Axum's `BodyDataStream` owns the framing.
+#[pyclass]
+pub struct PyResponseStream {
+    // Mutex makes the (Send-but-not-Sync) BodyDataStream satisfy pyclass's
+    // Send+Sync bound; only ever locked from one executor thread at a time.
+    stream: Mutex<Option<axum::body::BodyDataStream>>,
+}
+
+#[pymethods]
+impl PyResponseStream {
+    /// Block for the next body chunk on the shared oneshot runtime (GIL
+    /// released). Returns `None` at end-of-stream.
+    fn next_chunk<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyBytes>>> {
+        use tokio_stream::StreamExt;
+        let next = py.detach(|| {
+            let mut guard = self.stream.lock().unwrap();
+            let stream = guard.as_mut()?;
+            oneshot_runtime().block_on(async { stream.next().await })
+        });
+        match next {
+            Some(Ok(b)) => Ok(Some(pyo3::types::PyBytes::new(py, &b))),
+            Some(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "oneshot door stream error: {e}"
+            ))),
+            None => {
+                *self.stream.lock().unwrap() = None;
+                Ok(None)
+            }
+        }
+    }
+}
+
 /// Self-test for the in-process oneshot mechanism: build a trivial pure-Rust
 /// router, drive one request through it via `oneshot` on the shared runtime,
 /// and return `(status, body)`. Proves the runtime + Service::oneshot + body
