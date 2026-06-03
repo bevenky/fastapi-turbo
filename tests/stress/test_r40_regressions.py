@@ -197,21 +197,10 @@ def test_parameter_model_with_validation_alias():
 # ────────────────────────────────────────────────────────────────────
 # #5 endpoint-signature kwarg filter
 # ────────────────────────────────────────────────────────────────────
-
-
-def test_endpoint_signature_filter_drops_synthesized_kwargs():
-    """Static check on the dispatcher: it must filter ``kwargs`` to
-    the endpoint's signature before calling, so synthesized
-    extraction kwargs and other introspect-only placeholders never
-    leak into the user fn. The earlier code passed ``**kwargs``
-    blindly."""
-    import inspect
-
-    from fastapi_turbo.applications import FastAPI as _FA
-    src = inspect.getsource(_FA._asgi_dispatch_in_process)
-    # Must filter kwargs by the endpoint's signature.
-    assert "_ep_sig_local" in src, src
-    assert "VAR_KEYWORD" in src, src
+# (The static source-introspection check on the Python in-process HTTP
+# dispatcher was removed when that dispatcher was deleted in Phase 7 —
+# the Rust oneshot door is now the only in-process HTTP engine, and its
+# kwarg/signature handling is covered end-to-end by the parity suite.)
 
 
 if __name__ == "__main__":
