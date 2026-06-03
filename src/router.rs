@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::handler_bridge::call_async_handler;
 use crate::multipart::{parse_boundary, parse_multipart, ParsedField, PyUploadFile};
 use crate::responses::{py_to_response_with_request, pyerr_to_response, serde_to_pyobj};
 use crate::websocket::handle_ws_upgrade;
@@ -2433,84 +2432,22 @@ async fn handle_request(
                     resp
                 }
                 Err(ref py_err) => {
-                    // Check if this is "needs event loop" — signal for fallback
-                    let msg = py_err
-                        .value(py)
-                        .str()
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-                    if msg.contains("event loop") {
-                        // Fallback re-runs the handler — tear down THIS attempt's
-                        // generators (the fallback re-enters its own).
-                        teardown_generator_deps(py, &gen_deps, true);
-                        // Return a sentinel status to signal fallback needed
-                        (StatusCode::from_u16(599).unwrap(), "NEEDS_EVENT_LOOP").into_response()
-                    } else {
-                        // FA exit-stack parity: throw the handler error into the
-                        // yield-deps; a dep that swallows it surfaces FastAPIError.
-                        let final_err = teardown_generator_deps_error(
-                            py,
-                            &gen_deps,
-                            py_err.clone_ref(py),
-                        );
-                        pyerr_to_response(py, &final_err)
-                    }
+                    // FA exit-stack parity: throw the handler error into the
+                    // yield-deps; a dep that swallows it surfaces FastAPIError.
+                    // (Async handlers always resolve via call_async_on_local_loop_with_app,
+                    // which routes a suspending coroutine to the worker loop — it never
+                    // surfaces a "needs event loop" error, so the old 599 fallback that
+                    // used to live here was unreachable and has been removed.)
+                    let final_err = teardown_generator_deps_error(
+                        py,
+                        &gen_deps,
+                        py_err.clone_ref(py),
+                    );
+                    pyerr_to_response(py, &final_err)
                 }
             }
         })
     });
-
-    // Check if the unified path signaled that an event loop is needed
-    if resp.status() == StatusCode::from_u16(599).unwrap() {
-        // Fall back to event-loop-based async execution
-        let handler_kwargs: HashMap<String, Py<PyAny>> = Python::attach(|py| {
-            let mut hk = HashMap::new();
-            // Re-extract all params (we lost them in the unified path)
-            // This is the slow path — only triggers for truly async handlers (asyncio.sleep etc.)
-            let mut resolved: HashMap<String, Py<PyAny>> = HashMap::new();
-            let mut _fallback_errs: Vec<serde_json::Value> = Vec::new();
-            for param in &state.params {
-                if param.kind != "dependency" {
-                    let _ = extract_single_param(
-                        py,
-                        param,
-                        &path_map,
-                        &query_params,
-                        &query_multi,
-                        &headers,
-                        &body_json,
-                        &body_bytes,
-                        &mut multipart_fields,
-                        &mut resolved,
-                        &mut _fallback_errs,
-                    );
-                }
-            }
-            // Re-resolve deps via the old approach won't work here...
-            // Just build kwargs from what we can
-            for param in &state.params {
-                if param.is_handler_param {
-                    if let Some(val) = resolved.get(&param.name) {
-                        hk.insert(param.name.clone(), val.clone_ref(py));
-                    }
-                }
-            }
-            hk
-        });
-
-        let handler = Python::attach(|py| state.handler.clone_ref(py));
-        return match call_async_handler(handler, handler_kwargs).await {
-            Ok(py_result) => Python::attach(|py| {
-                py_to_response_with_request(
-                    py,
-                    py_result.bind(py),
-                    range_header.as_deref(),
-                    if_range_header.as_deref(),
-                )
-            }),
-            Err(py_err) => Python::attach(|py| pyerr_to_response(py, &py_err)),
-        };
-    }
 
     resp
 }
@@ -2654,36 +2591,6 @@ fn teardown_generator_deps_error(
 }
 
 // ── Parameter extraction helpers ─────────────────────────────────────
-
-/// Extract ALL params directly into a PyDict (fast path for sync handlers without deps).
-/// Single GIL acquisition — no intermediate HashMap.
-#[allow(dead_code)] // Superseded by extract_params_to_pydict_full; kept as reference.
-fn extract_params_to_pydict<'py>(
-    py: Python<'py>,
-    params: &[ParamInfo],
-    path_map: &HashMap<String, String>,
-    query_params: &HashMap<String, String>,
-    headers: &Option<HeaderMap>,
-    body_json: &Option<&serde_json::Value>,
-    body_bytes: &[u8],
-    multipart_fields: &mut Option<HashMap<String, Vec<ParsedField>>>,
-    defers_extraction_errors: bool,
-    lax_content_type: bool,
-) -> Result<pyo3::Bound<'py, pyo3::types::PyDict>, Response> {
-    extract_params_to_pydict_full(
-        py,
-        params,
-        path_map,
-        query_params,
-        &HashMap::new(),
-        headers,
-        body_json,
-        body_bytes,
-        multipart_fields,
-        defers_extraction_errors,
-        lax_content_type,
-    )
-}
 
 fn extract_params_to_pydict_full<'py>(
     py: Python<'py>,

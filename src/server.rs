@@ -1685,11 +1685,6 @@ async fn shutdown_signal_for_port(port: u16) {
     }
 }
 
-#[allow(dead_code)]
-async fn shutdown_signal() {
-    shutdown_signal_for_port(0).await;
-}
-
 // ── Middleware configuration ─────────────────────────────────────────
 
 /// Parsed middleware configuration (GIL-free).

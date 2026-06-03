@@ -24,7 +24,6 @@ bytes = "1"
 http = "1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "compression-full", "fs", "validate-request", "set-header", "limit"] }
-multer = "3"
 url = "2"
 memchr = "2"
 

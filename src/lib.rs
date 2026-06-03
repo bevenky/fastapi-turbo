@@ -12,7 +12,6 @@
 use pyo3::prelude::*;
 
 mod cluster;
-mod config;
 mod handler_bridge;
 mod multipart;
 mod responses;
@@ -41,7 +40,6 @@ fn _fastapi_turbo_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Multi-worker mode (fd-passing acceptor + workers).
     m.add_function(wrap_pyfunction!(server::run_acceptor, m)?)?;
     m.add_function(wrap_pyfunction!(server::run_worker, m)?)?;
-    m.add_class::<config::ServerConfig>()?;
     m.add_class::<router::RouteInfo>()?;
     m.add_class::<router::ParamInfo>()?;
     m.add_class::<websocket::PyWebSocket>()?;
