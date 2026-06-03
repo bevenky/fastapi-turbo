@@ -43,9 +43,7 @@ fn _fastapi_turbo_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<router::RouteInfo>()?;
     m.add_class::<router::ParamInfo>()?;
     m.add_class::<websocket::PyWebSocket>()?;
-    m.add_class::<websocket::ChannelAwaitable>()?;
-    m.add_class::<websocket::TextAwaitable>()?;
-    m.add_class::<websocket::BytesAwaitable>()?;
+    m.add_class::<websocket::RecvAwaitable>()?;
     m.add_class::<websocket::CloseAwaitable>()?;
     m.add_class::<multipart::PyUploadFile>()?;
     m.add_class::<multipart::PySyncFile>()?;

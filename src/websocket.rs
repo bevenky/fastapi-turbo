@@ -3,7 +3,7 @@
 //! Architecture:
 //!   - Axum WebSocket → Rust tokio task reads messages, converts to typed enum
 //!   - Typed messages flow via crossbeam channel to Python
-//!   - Python receives via ChannelAwaitable (custom awaitable with GIL release)
+//!   - Python receives via RecvAwaitable (custom awaitable with GIL release)
 //!   - State tracked via atomic u8 (matches Starlette's WebSocketState enum)
 //!   - Binary preserved as `Bytes` (no UTF-8 coercion)
 
@@ -88,30 +88,44 @@ pub enum WsMessage {
     Close { code: u16, reason: String },
 }
 
-// ── Awaitables — custom Python awaitables backed by crossbeam ──────
+// ── Awaitable — one custom Python awaitable backed by crossbeam ────
 //
-// Three flavors, each tight in its hot path:
-//   - ChannelAwaitable  : returns ASGI dict (for receive())
-//   - TextAwaitable     : returns str directly (for receive_text())
-//   - BytesAwaitable    : returns bytes directly (for receive_bytes())
+// A single `RecvAwaitable` with a `RecvKind` selecting the return shape:
+//   - Dict  : ASGI dict (for receive())
+//   - Text  : str directly (for receive_text())
+//   - Bytes : bytes directly (for receive_bytes())
 //
-// All three share the SAME underlying channel receiver — each await consumes
-// one message. Cached per-PyWebSocket so Python's await doesn't allocate
-// a new pyclass per call.
+// All kinds share the SAME underlying channel receiver — each await consumes
+// one message. Cached per-PyWebSocket (one instance per kind) so Python's
+// await doesn't allocate a new pyclass per call.
 
 fn handle_close_err(state: &Arc<AtomicU8>) -> PyErr {
     state.store(STATE_DISCONNECTED, Ordering::Release);
     pyo3::exceptions::PyRuntimeError::new_err("WebSocket closed")
 }
 
+/// Direction of a WS receive awaitable — selects how the next channel
+/// message is surfaced to Python. One pyclass instead of three near-identical
+/// ones; each `PyWebSocket` caches one instance per kind.
+#[derive(Clone, Copy)]
+enum RecvKind {
+    /// ASGI dict: {"type": "websocket.receive"/"websocket.disconnect", ...} (receive()).
+    Dict,
+    /// str directly; raises WebSocketDisconnect on close (receive_text()).
+    Text,
+    /// bytes directly; raises WebSocketDisconnect on close (receive_bytes()).
+    Bytes,
+}
+
 #[pyclass]
-pub struct ChannelAwaitable {
+pub struct RecvAwaitable {
     rx: cb::Receiver<WsMessage>,
     state: Arc<AtomicU8>,
+    kind: RecvKind,
 }
 
 #[pymethods]
-impl ChannelAwaitable {
+impl RecvAwaitable {
     fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -119,116 +133,71 @@ impl ChannelAwaitable {
         slf
     }
 
-    /// Returns ASGI-style dict: {"type": "websocket.receive", "text"|"bytes": ...}
-    /// or {"type": "websocket.disconnect", "code": ..., "reason": ...}.
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let rx = self.rx.clone();
         let state = self.state.clone();
         let msg = py.detach(|| rx.recv().map_err(|_| handle_close_err(&state)))?;
-
-        let dict = PyDict::new(py);
-        match msg {
-            WsMessage::Text(t) => {
-                dict.set_item(
-                    pyo3::intern!(py, "type"),
-                    pyo3::intern!(py, "websocket.receive"),
-                )?;
-                dict.set_item(pyo3::intern!(py, "text"), t)?;
+        match self.kind {
+            RecvKind::Dict => {
+                let dict = PyDict::new(py);
+                match msg {
+                    WsMessage::Text(t) => {
+                        dict.set_item(
+                            pyo3::intern!(py, "type"),
+                            pyo3::intern!(py, "websocket.receive"),
+                        )?;
+                        dict.set_item(pyo3::intern!(py, "text"), t)?;
+                    }
+                    WsMessage::Binary(b) => {
+                        dict.set_item(
+                            pyo3::intern!(py, "type"),
+                            pyo3::intern!(py, "websocket.receive"),
+                        )?;
+                        dict.set_item(pyo3::intern!(py, "bytes"), PyBytes::new(py, &b))?;
+                    }
+                    WsMessage::Close { code, reason } => {
+                        self.state.store(STATE_DISCONNECTED, Ordering::Release);
+                        dict.set_item(
+                            pyo3::intern!(py, "type"),
+                            pyo3::intern!(py, "websocket.disconnect"),
+                        )?;
+                        dict.set_item(pyo3::intern!(py, "code"), code)?;
+                        dict.set_item(pyo3::intern!(py, "reason"), reason)?;
+                    }
+                }
+                Err(pyo3::exceptions::PyStopIteration::new_err(dict.unbind()))
             }
-            WsMessage::Binary(b) => {
-                dict.set_item(
-                    pyo3::intern!(py, "type"),
-                    pyo3::intern!(py, "websocket.receive"),
-                )?;
-                dict.set_item(pyo3::intern!(py, "bytes"), PyBytes::new(py, &b))?;
+            RecvKind::Text => {
+                let value: Py<PyAny> = match msg {
+                    WsMessage::Text(t) => t.into_pyobject(py)?.into_any().unbind(),
+                    WsMessage::Binary(b) => String::from_utf8(b.to_vec())
+                        .map_err(|_| {
+                            pyo3::exceptions::PyRuntimeError::new_err(
+                                "Received binary message when expecting text",
+                            )
+                        })?
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind(),
+                    WsMessage::Close { code, reason } => {
+                        self.state.store(STATE_DISCONNECTED, Ordering::Release);
+                        return Err(disconnect_err(py, code, &reason));
+                    }
+                };
+                Err(pyo3::exceptions::PyStopIteration::new_err(value))
             }
-            WsMessage::Close { code, reason } => {
-                self.state.store(STATE_DISCONNECTED, Ordering::Release);
-                dict.set_item(
-                    pyo3::intern!(py, "type"),
-                    pyo3::intern!(py, "websocket.disconnect"),
-                )?;
-                dict.set_item(pyo3::intern!(py, "code"), code)?;
-                dict.set_item(pyo3::intern!(py, "reason"), reason)?;
+            RecvKind::Bytes => {
+                let value: Py<PyAny> = match msg {
+                    WsMessage::Binary(b) => PyBytes::new(py, &b).into_any().unbind(),
+                    WsMessage::Text(s) => PyBytes::new(py, s.as_bytes()).into_any().unbind(),
+                    WsMessage::Close { code, reason } => {
+                        self.state.store(STATE_DISCONNECTED, Ordering::Release);
+                        return Err(disconnect_err(py, code, &reason));
+                    }
+                };
+                Err(pyo3::exceptions::PyStopIteration::new_err(value))
             }
         }
-        Err(pyo3::exceptions::PyStopIteration::new_err(dict.unbind()))
-    }
-}
-
-#[pyclass]
-pub struct TextAwaitable {
-    rx: cb::Receiver<WsMessage>,
-    state: Arc<AtomicU8>,
-}
-
-#[pymethods]
-impl TextAwaitable {
-    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    /// Returns str directly — fast path for receive_text().
-    /// On Close, raises a proper `WebSocketDisconnect` with code + reason
-    /// so the Python handler can catch it with one `except` clause — no
-    /// Python-side exception translation wrapper needed.
-    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let rx = self.rx.clone();
-        let state = self.state.clone();
-        let msg = py.detach(|| rx.recv().map_err(|_| handle_close_err(&state)))?;
-        let value: Py<PyAny> = match msg {
-            WsMessage::Text(t) => t.into_pyobject(py)?.into_any().unbind(),
-            WsMessage::Binary(b) => String::from_utf8(b.to_vec())
-                .map_err(|_| {
-                    pyo3::exceptions::PyRuntimeError::new_err(
-                        "Received binary message when expecting text",
-                    )
-                })?
-                .into_pyobject(py)?
-                .into_any()
-                .unbind(),
-            WsMessage::Close { code, reason } => {
-                self.state.store(STATE_DISCONNECTED, Ordering::Release);
-                return Err(disconnect_err(py, code, &reason));
-            }
-        };
-        Err(pyo3::exceptions::PyStopIteration::new_err(value))
-    }
-}
-
-#[pyclass]
-pub struct BytesAwaitable {
-    rx: cb::Receiver<WsMessage>,
-    state: Arc<AtomicU8>,
-}
-
-#[pymethods]
-impl BytesAwaitable {
-    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    /// Returns bytes directly — fast path for receive_bytes().
-    /// On Close, raises `WebSocketDisconnect` directly.
-    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let rx = self.rx.clone();
-        let state = self.state.clone();
-        let msg = py.detach(|| rx.recv().map_err(|_| handle_close_err(&state)))?;
-        let value: Py<PyAny> = match msg {
-            WsMessage::Binary(b) => PyBytes::new(py, &b).into_any().unbind(),
-            WsMessage::Text(s) => PyBytes::new(py, s.as_bytes()).into_any().unbind(),
-            WsMessage::Close { code, reason } => {
-                self.state.store(STATE_DISCONNECTED, Ordering::Release);
-                return Err(disconnect_err(py, code, &reason));
-            }
-        };
-        Err(pyo3::exceptions::PyStopIteration::new_err(value))
     }
 }
 
@@ -266,9 +235,9 @@ pub struct PyWebSocket {
     state: Arc<AtomicU8>,
     // Three cached awaitables — one per return-type (dict / text / bytes).
     // Each is lazily created on first use. Safe because a single WS has one reader.
-    cached_dict: std::sync::OnceLock<Py<ChannelAwaitable>>,
-    cached_text: std::sync::OnceLock<Py<TextAwaitable>>,
-    cached_bytes: std::sync::OnceLock<Py<BytesAwaitable>>,
+    cached_dict: std::sync::OnceLock<Py<RecvAwaitable>>,
+    cached_text: std::sync::OnceLock<Py<RecvAwaitable>>,
+    cached_bytes: std::sync::OnceLock<Py<RecvAwaitable>>,
     // Scope info populated by the Rust route handler from the inbound request.
     // Python reads via get_scope_dict() to build HTTPConnection-like properties.
     scope_info: Arc<WsScopeInfo>,
@@ -282,14 +251,15 @@ pub struct PyWebSocket {
 }
 
 impl PyWebSocket {
-    fn get_dict_awaitable(&self, py: Python<'_>) -> Py<ChannelAwaitable> {
+    fn get_dict_awaitable(&self, py: Python<'_>) -> Py<RecvAwaitable> {
         self.cached_dict
             .get_or_init(|| {
                 Py::new(
                     py,
-                    ChannelAwaitable {
+                    RecvAwaitable {
                         rx: self.rx.clone(),
                         state: self.state.clone(),
+                        kind: RecvKind::Dict,
                     },
                 )
                 .expect("create dict awaitable")
@@ -297,14 +267,15 @@ impl PyWebSocket {
             .clone_ref(py)
     }
 
-    fn get_text_awaitable(&self, py: Python<'_>) -> Py<TextAwaitable> {
+    fn get_text_awaitable(&self, py: Python<'_>) -> Py<RecvAwaitable> {
         self.cached_text
             .get_or_init(|| {
                 Py::new(
                     py,
-                    TextAwaitable {
+                    RecvAwaitable {
                         rx: self.rx.clone(),
                         state: self.state.clone(),
+                        kind: RecvKind::Text,
                     },
                 )
                 .expect("create text awaitable")
@@ -312,14 +283,15 @@ impl PyWebSocket {
             .clone_ref(py)
     }
 
-    fn get_bytes_awaitable(&self, py: Python<'_>) -> Py<BytesAwaitable> {
+    fn get_bytes_awaitable(&self, py: Python<'_>) -> Py<RecvAwaitable> {
         self.cached_bytes
             .get_or_init(|| {
                 Py::new(
                     py,
-                    BytesAwaitable {
+                    RecvAwaitable {
                         rx: self.rx.clone(),
                         state: self.state.clone(),
+                        kind: RecvKind::Bytes,
                     },
                 )
                 .expect("create bytes awaitable")
@@ -489,19 +461,19 @@ impl PyWebSocket {
     // ── Async receive — returns cached awaitable per return-type ───
 
     /// Returns the ASGI dict awaitable (for `await ws.receive()`).
-    fn receive_async(&self, py: Python<'_>) -> Py<ChannelAwaitable> {
+    fn receive_async(&self, py: Python<'_>) -> Py<RecvAwaitable> {
         self.get_dict_awaitable(py)
     }
 
     /// Returns a TEXT-specific awaitable (for `await ws.receive_text()`).
     /// Fast path: no dict allocation, direct str return.
-    fn receive_text_async(&self, py: Python<'_>) -> Py<TextAwaitable> {
+    fn receive_text_async(&self, py: Python<'_>) -> Py<RecvAwaitable> {
         self.get_text_awaitable(py)
     }
 
     /// Returns a BYTES-specific awaitable (for `await ws.receive_bytes()`).
     /// Fast path: no dict allocation, direct bytes return.
-    fn receive_bytes_async(&self, py: Python<'_>) -> Py<BytesAwaitable> {
+    fn receive_bytes_async(&self, py: Python<'_>) -> Py<RecvAwaitable> {
         self.get_bytes_awaitable(py)
     }
 
