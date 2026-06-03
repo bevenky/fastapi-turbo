@@ -29,18 +29,29 @@ import pytest
 # ── Response.set_cookie / delete_cookie ────────────────────────────
 
 
+def _set_cookies(resp):
+    """Decoded Set-Cookie header values from a (real Starlette) Response.
+    ``raw_headers`` is ``list[tuple[bytes, bytes]]`` and also carries
+    content-length, so filter by name and decode."""
+    out = []
+    for k, v in resp.raw_headers:
+        kk = k.decode("latin-1") if isinstance(k, bytes) else str(k)
+        if kk.lower() == "set-cookie":
+            out.append(v.decode("latin-1") if isinstance(v, bytes) else str(v))
+    return out
+
+
 class TestCookies:
     def test_set_cookie_basic(self):
         from fastapi.responses import Response
 
         r = Response(content="hi")
         r.set_cookie("session", "abc123")
-        assert len(r.raw_headers) == 1
-        name, value = r.raw_headers[0]
-        assert name == "set-cookie"
-        assert "session=abc123" in value
-        assert "Path=/" in value
-        assert "SameSite=lax" in value
+        cookies = _set_cookies(r)
+        assert len(cookies) == 1
+        assert "session=abc123" in cookies[0]
+        assert "Path=/" in cookies[0]
+        assert "SameSite=lax" in cookies[0]
 
     def test_set_cookie_all_options(self):
         from fastapi.responses import Response
@@ -50,7 +61,7 @@ class TestCookies:
             "k", "v", max_age=3600, path="/api", domain="example.com",
             secure=True, httponly=True, samesite="strict",
         )
-        value = r.raw_headers[0][1]
+        value = _set_cookies(r)[0]
         assert "k=v" in value
         assert "Max-Age=3600" in value
         assert "Path=/api" in value
@@ -64,7 +75,7 @@ class TestCookies:
 
         r = Response()
         r.delete_cookie("session")
-        value = r.raw_headers[0][1]
+        value = _set_cookies(r)[0]
         assert "session=" in value
         assert "Max-Age=0" in value
 
@@ -74,11 +85,10 @@ class TestCookies:
         r = Response()
         r.set_cookie("a", "1")
         r.set_cookie("b", "2")
-        assert len(r.raw_headers) == 2
-        assert r.raw_headers[0][0] == "set-cookie"
-        assert r.raw_headers[1][0] == "set-cookie"
-        assert "a=1" in r.raw_headers[0][1]
-        assert "b=2" in r.raw_headers[1][1]
+        cookies = _set_cookies(r)
+        assert len(cookies) == 2
+        assert "a=1" in cookies[0]
+        assert "b=2" in cookies[1]
 
 
 # ── response_class per route ──────────────────────────────────────

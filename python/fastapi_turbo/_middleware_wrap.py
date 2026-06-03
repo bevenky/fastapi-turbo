@@ -39,6 +39,7 @@ from fastapi_turbo._sentry_compat import (
 )
 from fastapi_turbo.requests import Request as _Request
 from fastapi_turbo.responses import JSONResponse as _JSONResponse
+from fastapi_turbo.encoders import jsonable_encoder as _jsonable_encoder
 
 _log = logging.getLogger("fastapi_turbo.applications")
 
@@ -219,7 +220,10 @@ def _make_asgi_middleware_shim(mw_cls, kwargs):
                 content=captured.get("body", b""),
                 status_code=captured["status"],
             )
-            resp.headers.clear()
+            # Reset to exactly the captured headers. ``raw_headers.clear()``
+            # empties the list the ``MutableHeaders`` view is bound to (real
+            # Starlette has no ``headers.clear()``); ``headers.append(str,str)``
+            # then repopulates it (and the backing raw_headers).
             resp.raw_headers.clear()
             for k, v in captured.get("headers", []):
                 if isinstance(k, bytes):
@@ -467,7 +471,10 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
         # None is a valid handler return value — FA encodes it as
         # JSONResponse(content=None) → body ``null``, status 200.
         # Middlewares that do ``response.headers[...]`` assume a Response.
-        return _JSONResponse(content=result)
+        # ``jsonable_encoder`` first (FA's default-return contract) so models /
+        # dataclasses / Decimals serialize — real Starlette JSONResponse passes
+        # no ``default=`` and would raise on a raw BaseModel otherwise.
+        return _JSONResponse(content=_jsonable_encoder(result))
 
     # Build a chain of sync callables. Each one drives its middleware via
     # coro.send(None) and returns the result. The innermost one calls the handler.

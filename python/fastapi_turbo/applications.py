@@ -2383,10 +2383,10 @@ def _response_from_asgi_messages(
     from fastapi_turbo.responses import Response as _Response
 
     resp = _Response(content=b"".join(body_parts), status_code=status_code)
-    resp.headers.clear()
+    # ``raw_headers.clear()`` resets the list the MutableHeaders view is bound
+    # to (real Starlette has no ``headers.clear()``); the append below
+    # repopulates from the inner app's headers.
     resp.raw_headers.clear()
-    if hasattr(resp.headers, "_extras"):
-        resp.headers._extras.clear()
     for raw_k, raw_v in headers:
         k = raw_k.decode("latin-1") if isinstance(raw_k, bytes) else str(raw_k)
         v = raw_v.decode("latin-1") if isinstance(raw_v, bytes) else str(raw_v)
@@ -2560,7 +2560,11 @@ async def _dispatch_to_subapp_route(subapp, request):
         return result
     if isinstance(result, (dict, list)) or result is None:
         return _JR(content=result)
-    return _JR(content=result)
+    # Raw model / dataclass / scalar — jsonable_encoder first (FA's
+    # default-return contract). Real Starlette JSONResponse passes no
+    # ``default=`` and would raise on a raw BaseModel.
+    from fastapi_turbo.encoders import jsonable_encoder as _je
+    return _JR(content=_je(result))
 
 
 def _wrap_with_exception_handlers(handler, app):
@@ -5828,8 +5832,8 @@ class FastAPI(_real_fastapi.FastAPI):
             )
             # Replace the default headers with the inner app's — content-
             # type etc. must come from the mounted app, not our JSON
-            # default.
-            resp.headers.clear()
+            # default. ``raw_headers.clear()`` resets the MutableHeaders view
+            # (real Starlette has no ``headers.clear()``).
             resp.raw_headers.clear()
             for raw_k, raw_v in status_holder["headers"]:
                 k = raw_k.decode("latin-1") if isinstance(raw_k, bytes) else str(raw_k)
