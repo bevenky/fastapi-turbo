@@ -476,8 +476,8 @@ class APIRouter:
         # they're served like any decorator-registered APIRoute.
         # Earlier the kwarg was accepted via ``**kwargs`` and silently
         # dropped (R52 finding 1). Mark each as Starlette-passthrough
-        # so the in-process dispatcher uses ``await endpoint(request)``
-        # rather than FastAPI's parameter-injection introspection.
+        # so route collection uses ``await endpoint(request)`` rather than
+        # FastAPI's parameter-injection introspection.
         if routes:
             for _r in routes:
                 _mark_starlette_compat_route(_r)
@@ -1233,7 +1233,7 @@ class APIRouter:
             return joined or "/"
 
         # Resolve the response_class cascade ONCE per included route
-        # so the in-process dispatcher doesn't have to walk the
+        # so route collection doesn't have to walk the
         # router/include tree at request time. Cascade matches
         # upstream: route own → child include_router default →
         # child router default → … → outermost include

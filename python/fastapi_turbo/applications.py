@@ -41,7 +41,6 @@ from fastapi_turbo._sentry_compat import (  # noqa: F401 — re-exported below
 )
 
 
-
 from fastapi_turbo._introspect import introspect_endpoint
 from fastapi_turbo._openapi import generate_openapi_schema
 from fastapi_turbo._resolution import build_resolution_plan, _make_sync_wrapper
@@ -1708,149 +1707,6 @@ def _collect_dependencies_from_markers(dependencies):
     return result
 
 
-def _find_exception_handler(app, exc):
-    """Locate a custom exception handler for ``exc`` walking
-    ``app.exception_handlers`` by MRO. Returns ``(handler, matched_cls)``
-    where ``matched_cls`` is the class the handler was registered for
-    (so callers can distinguish a custom-subclass handler from a
-    catch-all ``Exception`` handler — only the latter re-raises after
-    running, mirroring Starlette's ServerErrorMiddleware vs
-    ExceptionMiddleware split). Returns ``(None, None)`` when no
-    user-registered handler matches."""
-    handlers = getattr(app, "exception_handlers", {}) or {}
-    for cls in type(exc).__mro__:
-        h = handlers.get(cls)
-        if h is not None:
-            return h, cls
-    return None, None
-
-
-async def _asgi_emit_exception(app, scope, send, exc):
-    """Turn an exception raised during in-process dispatch into an
-    ASGI response by (a) consulting ``app.exception_handlers`` for a
-    user-registered handler, (b) falling back to FA-compatible
-    defaults for HTTPException / RequestValidationError / other.
-
-    Re-raise policy mirrors Starlette's ``ServerErrorMiddleware`` /
-    ``ExceptionMiddleware`` split:
-
-      * HTTPException, RequestValidationError, WebSocketException
-        (and their subclasses) — these ARE the intended response
-        types FastAPI uses to encode 4xx / 5xx outcomes. The handler
-        sends a response and we return; never re-raise — even if the
-        match landed via a user-registered ``Exception`` catch-all
-        (Starlette's ExceptionMiddleware would have caught these
-        BEFORE ServerErrorMiddleware ever saw them).
-      * Generic ``Exception`` — the user may have registered a
-        catch-all ``@app.exception_handler(Exception)`` to render a
-        custom 500. Upstream Starlette runs that handler AND THEN
-        re-raises so ``httpx.ASGITransport(raise_app_exceptions=True)``
-        / ``TestClient(raise_server_exceptions=True)`` propagate the
-        original exception out of the test, instead of silently
-        masking a real failure as a successful 500. We match that
-        contract: re-raise after delivering the response.
-
-    Earlier impl gated the re-raise on ``matched_cls is Exception``
-    only, so a user-registered ``@app.exception_handler(Exception)``
-    that caught an HTTPException via MRO would re-raise it — uvicorn
-    saw the raise after the response was queued, dropped the
-    transport, and the client timed out with no response (issue #1).
-    Probe-confirmed divergence."""
-    from fastapi_turbo.requests import Request as _Req
-    from fastapi_turbo.responses import JSONResponse as _JR
-    from fastapi_turbo.exceptions import (
-        HTTPException as _HE,
-        RequestValidationError as _RVE,
-        WebSocketException as _WSE,
-    )
-
-    handler, matched_cls = _find_exception_handler(app, exc)
-    if handler is not None:
-        request = _Req(dict(scope))
-        try:
-            import inspect as _insp
-            if _insp.iscoroutinefunction(handler):
-                resp = await handler(request, exc)
-            else:
-                resp = handler(request, exc)
-                if _insp.iscoroutine(resp):
-                    resp = await resp
-            await _send_asgi_response(send, resp)
-            # Re-raise rule mirrors Starlette: a handler registered
-            # for ``Exception`` itself (catch-all) sits in
-            # ``ServerErrorMiddleware``, which RE-RAISES after running
-            # so ``raise_app_exceptions=True`` test transports
-            # propagate the original exception. Handlers registered
-            # for a more specific class (HTTPException,
-            # CustomError, etc.) live in ``ExceptionMiddleware``,
-            # which sends the response and stops there. Gate on BOTH
-            # the matched class AND the exception's actual type — a
-            # user-registered Exception handler that catches an
-            # HTTPException via MRO must NOT re-raise (Starlette's
-            # ExceptionMiddleware would have intercepted it first).
-            if matched_cls is Exception and not isinstance(
-                exc, (_HE, _RVE, _WSE)
-            ):
-                raise exc
-            return
-        except Exception as handler_exc:  # noqa: BLE001
-            if handler_exc is exc:
-                # The deliberate re-raise above; let it propagate.
-                raise
-            # Handler itself blew up — fall through to default
-            # rendering of the original exception.
-            pass
-
-    if isinstance(exc, _HE):
-        headers = getattr(exc, "headers", None) or {}
-        # Per RFC 9110 + Starlette: HTTP 1xx / 204 / 304 MUST NOT
-        # carry a body. Earlier we always emitted ``{"detail":null}``
-        # which broke ``test_starlette_exception::test_no_body_status_
-        # code_exception_handlers`` (response.content asserted empty).
-        from fastapi_turbo.responses import Response as _PlainResp
-        if exc.status_code in (204, 304) or 100 <= exc.status_code < 200:
-            resp = _PlainResp(status_code=exc.status_code)
-        else:
-            resp = _JR(content={"detail": exc.detail}, status_code=exc.status_code)
-        for k, v in headers.items():
-            resp.headers[k] = v
-        await _send_asgi_response(send, resp)
-        return
-    if isinstance(exc, _RVE):
-        # Pydantic ``ctx`` may carry ``Decimal`` / ``Path`` /
-        # other JSON-non-native types that explode in
-        # ``json.dumps``. Run the error list through ``jsonable_
-        # encoder`` first so Decimal → float, datetime → str, etc.
-        # Probe-confirmed against
-        # ``test_multi_body_errors::test_jsonable_encoder_requiring_error``.
-        from fastapi_turbo.encoders import jsonable_encoder as _je2
-        await _send_asgi_response(
-            send, _JR(
-                content={"detail": _je2(exc.errors())}, status_code=422
-            )
-        )
-        return
-    # Unhandled non-FA exception. Upstream Starlette's
-    # ``ServerErrorMiddleware`` ALWAYS sends a 500 with body
-    # ``Internal Server Error`` first, then re-raises so
-    # ``raise_server_exceptions=True`` tests still see the
-    # exception. With ``raise_server_exceptions=False``, the
-    # transport catches the re-raise and the rendered 500 body
-    # is what the test sees. Probe-confirmed against
-    # ``test_dependency_after_yield_streaming::test_broken_session_
-    # data_no_raise``: expects ``response.text == "Internal Server
-    # Error"`` under ``raise_server_exceptions=False``.
-    try:
-        from fastapi_turbo.responses import PlainTextResponse as _PTR
-        await _send_asgi_response(
-            send,
-            _PTR("Internal Server Error", status_code=500),
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    raise exc
-
-
 def _parse_range_header(header_val: str, total_len: int):
     """Parse an RFC 7233 ``Range:`` header against a known file length.
 
@@ -2324,68 +2180,6 @@ def _load_real_starlette_class(submodule: str, classname: str):
         return cls
 
 
-_SENTRY_FASTAPI_HOOK_CACHE: dict = {"loaded": False, "fn": None, "integration_cls": None}
-
-
-def _maybe_set_sentry_transaction_name(app, scope, matched_route) -> None:
-    """If Sentry's ``FastApiIntegration`` is loaded, set the
-    transaction name from ``scope['route'].path`` — replicating
-    what Sentry's monkey-patched ``fastapi.routing.get_request_handler``
-    would do on upstream FastAPI. Our dispatcher bypasses that
-    handler, so the patch never fires; without this call, Sentry's
-    legacy ``SentryAsgiMiddleware(app)`` setup falls back to the
-    concrete-URL transaction name and ``test_legacy_setup`` diffs
-    the URL against the expected route shape.
-
-    No-op when Sentry isn't installed or the integration isn't
-    loaded — the lookup is cached after the first call so the
-    common no-Sentry path stays at one dict read per request."""
-    cache = _SENTRY_FASTAPI_HOOK_CACHE
-    if not cache["loaded"]:
-        try:
-            import sentry_sdk
-            from sentry_sdk.integrations.fastapi import (
-                FastApiIntegration,
-                _set_transaction_name_and_source,
-            )
-            cache["sdk"] = sentry_sdk
-            cache["fn"] = _set_transaction_name_and_source
-            cache["integration_cls"] = FastApiIntegration
-        except Exception:  # noqa: BLE001
-            cache["fn"] = None
-        cache["loaded"] = True
-
-    fn = cache["fn"]
-    if fn is None:
-        return
-    try:
-        sentry_sdk = cache["sdk"]
-        client = sentry_sdk.get_client()
-        integration = client.get_integration(cache["integration_cls"])
-        if integration is None:
-            return
-        # Sentry's helper expects a request-like with a ``.scope``
-        # attribute; build a minimal shim around the live ASGI
-        # scope so the function can read ``scope['route'].path``
-        # / ``scope['endpoint']`` exactly as it would on upstream.
-        class _RequestShim:
-            __slots__ = ("scope",)
-
-            def __init__(self, asgi_scope):
-                self.scope = asgi_scope
-
-        fn(
-            sentry_sdk.get_current_scope(),
-            integration.transaction_style,
-            _RequestShim(scope),
-        )
-    except Exception:  # noqa: BLE001
-        # Defensive: any failure inside Sentry's helper must not
-        # affect the response. Sentry's own monkey-patches do the
-        # same thing.
-        pass
-
-
 def _resolve_tower_bound_to_asgi_class(mw_cls):
     """Map a Tower-bound middleware marker class to its real
     Starlette ASGI3 equivalent so the in-process dispatcher can
@@ -2413,176 +2207,6 @@ def _resolve_tower_bound_to_asgi_class(mw_cls):
             "middleware.httpsredirect", "HTTPSRedirectMiddleware"
         )
     return None
-
-
-def _resolve_response_class(matched_route, app):
-    """Cascade: route.response_class →
-    route._fastapi_turbo_effective_response_class (stamped at
-    ``include_router`` time, carries the router-level or
-    include-level default) → app.default_response_class →
-    JSONResponse.
-
-    Mirrors upstream's resolution order so handlers on a router with
-    ``default_response_class=HTMLResponse`` (or included with
-    ``include_router(..., default_response_class=…)``) correctly
-    serialize string returns as HTML rather than JSON-quoting them."""
-    from fastapi_turbo.responses import JSONResponse as _JR_default
-    rc = getattr(matched_route, "response_class", None)
-    if rc is not None:
-        return rc
-    rc = getattr(matched_route, "_fastapi_turbo_effective_response_class", None)
-    if rc is not None:
-        return rc
-    rc = getattr(app, "default_response_class", None)
-    if rc is not None:
-        return rc
-    return _JR_default
-
-
-def _is_json_response_class(cls) -> bool:
-    """True when ``cls`` is a JSON-style Response that wants its
-    ``content`` to be a Python value (dict / list / Pydantic model
-    etc.) rather than a pre-rendered string. Used by the in-process
-    dispatch to decide whether to ``jsonable_encoder`` the raw
-    handler return before passing it to the response constructor."""
-    try:
-        from fastapi_turbo.responses import (
-            JSONResponse as _JR,
-            ORJSONResponse as _OR,
-            UJSONResponse as _UR,
-        )
-        return isinstance(cls, type) and issubclass(cls, (_JR, _OR, _UR))
-    except ImportError:
-        from fastapi_turbo.responses import JSONResponse as _JR
-        return isinstance(cls, type) and issubclass(cls, _JR)
-
-
-def _build_effective_body_plan(introspect_params, endpoint):
-    """Return a copy of ``introspect_params`` extended with a
-    ``_combined_body`` step covering handler + dep body fields when
-    multiple distinct body names are reachable through the dep tree.
-
-    FA's contract for ``Depends(d)`` where ``d`` declares a body param:
-    the body field becomes part of the *route's* request body. If the
-    handler has ``item: Item`` and a dep has ``item2: Item2``, the
-    wire format is ``{"item": ..., "item2": ...}``; if both share
-    name+type the body is shared (single field). Mirrors
-    ``build_resolution_plan``'s combining logic but produces only the
-    extraction step the in-process dispatcher needs.
-    """
-    from fastapi_turbo._introspect import (
-        introspect_endpoint as _ie_local,
-        _TypeAdapterProxy as _TAP_local,
-    )
-
-    handler_bodies = [
-        p for p in introspect_params
-        if p.get("kind") == "body" and p.get("name") != "_combined_body"
-    ]
-
-    dep_bodies: list[dict] = []
-    visited: set[int] = set()
-
-    def _walk(callable_):
-        if callable_ is None:
-            return
-        cid = id(callable_)
-        if cid in visited:
-            return
-        visited.add(cid)
-        try:
-            sub = _ie_local(callable_, "/")
-        except Exception:  # noqa: BLE001
-            return
-        for sp in sub:
-            sk = sp.get("kind")
-            if sk == "body":
-                dep_bodies.append(sp)
-            elif sk == "dependency":
-                _walk(sp.get("dep_callable"))
-
-    for p in introspect_params:
-        if p.get("kind") == "dependency":
-            _walk(p.get("dep_callable"))
-
-    # Dedup: same name → keep one. We accept the first occurrence
-    # (handler before deps; deps in walk order). FA's "duplicate"
-    # rule is name-based; types must match too, but the in-process
-    # dispatcher already enforces that via the chosen model_class.
-    seen_names: set[str] = set()
-    merged: list[dict] = []
-    for bp in handler_bodies + dep_bodies:
-        nm = bp.get("name")
-        if nm in seen_names:
-            continue
-        seen_names.add(nm)
-        merged.append(bp)
-
-    if len(merged) <= 1:
-        return introspect_params
-
-    # Build a synthetic ``_combined_body`` step. Replace handler body
-    # params with this single step.
-    try:
-        from pydantic import create_model
-    except ImportError:
-        return introspect_params
-
-    field_definitions: dict = {}
-    for bp in merged:
-        model_cls = bp.get("model_class")
-        if isinstance(model_cls, _TAP_local):
-            model_cls = model_cls._annotation
-        if model_cls is not None:
-            if bp.get("required", True):
-                field_definitions[bp["name"]] = (model_cls, ...)
-            else:
-                field_definitions[bp["name"]] = (model_cls, bp.get("default_value"))
-        else:
-            from typing import Any as _Any
-            type_map = {"int": int, "float": float, "bool": bool, "str": str}
-            py_type = type_map.get(bp.get("type_hint", ""), _Any)
-            field_definitions[bp["name"]] = (
-                py_type,
-                ... if bp.get("required", True) else bp.get("default_value"),
-            )
-
-    _endpoint_name = getattr(endpoint, "__name__", "endpoint")
-    try:
-        CombinedBody = create_model(f"Body_{_endpoint_name}", **field_definitions)
-    except Exception:  # noqa: BLE001
-        return introspect_params
-
-    body_names = [bp["name"] for bp in merged]
-    handler_body_names = {bp.get("name") for bp in handler_bodies}
-    _combined_required = any(bp.get("required", True) for bp in merged)
-    combined_step = {
-        "name": "_combined_body",
-        "kind": "body",
-        "type_hint": "model",
-        "required": _combined_required,
-        "default_value": None,
-        "has_default": not _combined_required,
-        "model_class": CombinedBody,
-        "alias": None,
-        "_embed": False,
-        "_body_param_names": body_names,
-        "_handler_body_names": list(handler_body_names),
-        "_is_handler_param": True,
-        "_is_combined_body_for_deps": True,
-    }
-    new_params: list = []
-    seen_combined = False
-    for p in introspect_params:
-        if p.get("kind") == "body":
-            if not seen_combined:
-                new_params.append(combined_step)
-                seen_combined = True
-            continue
-        new_params.append(p)
-    if not seen_combined:
-        new_params.append(combined_step)
-    return new_params
 
 
 async def _run_response_background(response) -> None:
@@ -7973,9 +7597,10 @@ class FastAPI(_real_fastapi.FastAPI):
 
     # ------------------------------------------------------------------
     # In-process ASGI door (door B): drive the SAME assembled axum::Router
-    # via tower::Service::oneshot — no socket, no double-hop. Opt-in while
-    # it's proven against the Python dispatcher; will become the default
-    # once the efficiency gate passes and the dispatcher is deleted.
+    # via tower::Service::oneshot — no socket, no double-hop. DEFAULT-ON and
+    # the sole in-process engine for HTTP + WebSocket; the Python dispatchers
+    # it replaced are deleted (Phase 7). FASTAPI_TURBO_ONESHOT_DOOR=0 opts out
+    # to the loopback Rust socket server.
     # ------------------------------------------------------------------
 
     def _oneshot_door_enabled(self) -> bool:
@@ -7987,17 +7612,6 @@ class FastAPI(_real_fastapi.FastAPI):
         to bind a port, so it won't work in socket-restricted sandboxes (the
         door does). See CLONE_DELETION_PLAN.md."""
         return os.environ.get("FASTAPI_TURBO_ONESHOT_DOOR", "1") != "0"
-
-    def _oneshot_door_can_handle(self, scope: dict) -> bool:
-        """True when the request can be served by driving the assembled
-        router in-process. The door now hosts the ENTIRE HTTP surface:
-        params/body/deps/validation, streaming + client-disconnect
-        (7.3a/7.3b), mounts (via ``_asgi_try_http_mount`` before the door),
-        bare-generator NDJSON (clone-compiled handler), and the full
-        middleware surface — including MIXED Tower+raw-ASGI middleware,
-        which ``_asgi_oneshot_http_with_mw`` composes as one
-        registration-ordered ASGI chain (H2). Nothing left to decline."""
-        return True
 
     def _door_has_tower_raw_mix(self) -> bool:
         """True when the app registered BOTH a raw-ASGI middleware and a
@@ -8043,27 +7657,15 @@ class FastAPI(_real_fastapi.FastAPI):
         return out
 
     def _oneshot_needs_disconnect_watch(self) -> bool:
-        """True when any route endpoint polls ``request.is_disconnected()`` (SSE
-        / long-poll), so ``_asgi_oneshot_http`` wires a disconnect ``Event`` +
-        receive-poller. Cached (routes are fixed after startup)."""
-        return self._oneshot_scan_streaming()[1]
-
-    def _oneshot_scan_streaming(self) -> tuple[bool, bool]:
-        """Scan route endpoints once and return
-        ``(has_bare_generator, needs_disconnect_watch)``:
-
-          * ``has_bare_generator`` — any sync/async generator endpoint. The door
-            can stream a ``StreamingResponse`` but does NOT auto-wrap a bare
-            generator into NDJSON, so such apps decline to the dispatcher.
-          * ``needs_disconnect_watch`` — any endpoint streams (constructs a
-            ``StreamingResponse`` / ``FileResponse`` / ``EventSourceResponse``)
-            or polls ``request.is_disconnected()``. The door wires a disconnect
-            ``Event`` + receive-poller so an SSE poll observes the drop AND an
-            otherwise-infinite stream is cancelled (the door drops the body
-            stream → the generator's GeneratorExit cleanup runs).
-
-        Static, AST-free; best-effort (False on inspection failure). Cached."""
-        cached = getattr(self, "_oneshot_streaming_scan", None)
+        """True when any route endpoint streams (constructs a
+        ``StreamingResponse`` / ``FileResponse`` / ``EventSourceResponse``) or
+        polls ``request.is_disconnected()`` (SSE / long-poll), so
+        ``_asgi_oneshot_http`` wires a disconnect ``Event`` + receive-poller —
+        an SSE poll then observes the drop AND an otherwise-infinite stream is
+        cancelled (the door drops the body stream → the generator's
+        ``GeneratorExit`` cleanup runs). Static, AST-free, best-effort (False on
+        inspection failure). Cached — routes are fixed after startup."""
+        cached = getattr(self, "_oneshot_disconnect_watch", None)
         if cached is not None:
             return cached
         import inspect as _inspect
@@ -8074,17 +7676,16 @@ class FastAPI(_real_fastapi.FastAPI):
             "FileResponse",
             "EventSourceResponse",
         )
-        has_bare_gen = False
         needs_watch = False
-        router = getattr(self, "router", None)
-        for route in getattr(router, "routes", None) or ():
+        for route in getattr(getattr(self, "router", None), "routes", None) or ():
             endpoint = getattr(route, "endpoint", None)
             if endpoint is None:
                 continue
+            # Bare generator endpoints (door streams them as NDJSON) keep the
+            # prior behaviour of not arming the watch from their own source.
             if _inspect.isasyncgenfunction(endpoint) or _inspect.isgeneratorfunction(
                 endpoint
             ):
-                has_bare_gen = True
                 continue
             try:
                 src = _inspect.getsource(endpoint)
@@ -8092,9 +7693,9 @@ class FastAPI(_real_fastapi.FastAPI):
                 continue
             if any(m in src for m in _WATCH_MARKERS):
                 needs_watch = True
-        result = (has_bare_gen, needs_watch)
-        self._oneshot_streaming_scan = result
-        return result
+                break
+        self._oneshot_disconnect_watch = needs_watch
+        return needs_watch
 
     def _ensure_oneshot_registered(self, scope: dict) -> None:
         """Register the assembled router for this app once, using the same
@@ -8283,9 +7884,10 @@ class FastAPI(_real_fastapi.FastAPI):
 
     async def _asgi_oneshot_http(self, scope: dict, receive: Callable, send: Callable) -> bool:
         """Drive one HTTP request through the Rust engine in-process via
-        ``process_request`` and emit the ASGI response. Returns True when
-        handled. The blocking dispatch runs in a thread so the asyncio loop
-        is not blocked (the GIL is released inside ``process_request``)."""
+        ``process_request_streaming`` and emit the ASGI response (status +
+        headers, then the body streamed chunk-by-chunk). Returns True when
+        handled. The blocking dispatch runs in a thread so the asyncio loop is
+        not blocked (the GIL is released inside the Rust call)."""
         import asyncio
 
         from fastapi_turbo._fastapi_turbo_core import process_request_streaming
@@ -8414,7 +8016,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 disconnect_task.cancel()
 
         # Re-raise an unhandled server exception AFTER the 500 response is
-        # sent, exactly like the Python dispatcher's ``_asgi_emit_exception``.
+        # sent (Starlette ServerErrorMiddleware semantics).
         # The Rust dispatch core renders the 500 (running any catch-all
         # ``@app.exception_handler(Exception)``) and records the original
         # exception on ``_captured_server_exceptions`` — via the compiled
@@ -8439,20 +8041,18 @@ class FastAPI(_real_fastapi.FastAPI):
 
         Dispatch rules:
           * ``lifespan``   → drive startup/shutdown handlers directly.
-          * ``http``       → TRY in-process dispatch (match path, run the
-                             route's Python endpoint, serialize the
-                             Response to ``send`` messages). Falls back
-                             to a loopback-proxy path only when the
-                             request needs a feature the in-process
-                             path doesn't cover (mounts, raw-ASGI
-                             middleware, etc.) or an unexpected error
-                             bubbles up. This makes the app usable in
-                             socket-restricted / sandboxed environments
-                             (``httpx.ASGITransport(app=app)``, hermetic
-                             test runners) without binding a real port.
-          * ``websocket``  → proxy via a loopback server (``websockets``
-                             library). In-process WebSocket dispatch is
-                             tracked separately.
+          * ``http``       → the in-process Rust oneshot door
+                             (``_asgi_oneshot_http_with_mw`` →
+                             ``process_request_streaming``) serves the request
+                             in-process — no socket needed, so the app works
+                             under ``httpx.ASGITransport(app=app)`` / hermetic
+                             test runners. ``FASTAPI_TURBO_ONESHOT_DOOR=0`` (or
+                             a ``_fastapi_turbo_force_proxy`` scope flag) opts
+                             out to the loopback Rust socket server.
+          * ``websocket``  → the in-process WebSocket door (``_asgi_ws_door``)
+                             drives a Python ``WebSocket`` over the ASGI
+                             receive/send channels, reusing the same wrapped
+                             endpoint ``app.run()`` uses; same opt-out applies.
         """
         if scope["type"] == "lifespan":
             await self._asgi_lifespan(scope, receive, send)
@@ -8700,9 +8300,7 @@ class FastAPI(_real_fastapi.FastAPI):
         # ``_run_lifespan_startup``), giving the worker-loop affinity
         # the door needs — this mirrors ``app.run()``'s startup path
         # rather than the async-dispatcher's caller-loop path. Issue #1.
-        _door_owns_http = self._oneshot_door_enabled() and self._oneshot_door_can_handle(
-            scope
-        )
+        _door_owns_http = self._oneshot_door_enabled()
         while True:
             message = await receive()
             if message["type"] == "lifespan.startup":

@@ -60,24 +60,6 @@ class _ImmediateNone:
 _IMMEDIATE_NONE = _ImmediateNone()
 
 
-class _RecvAwaitable:
-    """Wraps a Rust awaitable; translates its RuntimeError into
-    WebSocketDisconnect on the way out, and flips self._ws._app_state."""
-    __slots__ = ("_inner", "_ws")
-
-    def __init__(self, inner, ws):
-        self._inner = inner
-        self._ws = ws
-
-    def __await__(self):
-        try:
-            return (yield from self._inner.__await__())
-        except RuntimeError as e:
-            self._ws._app_state = WebSocketState.DISCONNECTED
-            code, reason = _extract_close_info_from_error(str(e))
-            raise WebSocketDisconnect(code=code, reason=reason) from e
-
-
 class WebSocket:
     """Wraps the Rust PyWebSocket for FastAPI/Starlette compatibility.
 

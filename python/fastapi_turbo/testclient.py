@@ -1172,10 +1172,7 @@ class TestClient:
         # at startup (asyncpg pool, ``asyncio.Lock``/``Event``) binds to
         # ``self._loop`` and the first request that awaits it hits "got
         # Future attached to a different loop". Issue #1.
-        _door_owns_http = (
-            getattr(self.app, "_oneshot_door_enabled", lambda: False)()
-            and getattr(self.app, "_oneshot_door_can_handle", lambda _s: False)({})
-        )
+        _door_owns_http = getattr(self.app, "_oneshot_door_enabled", lambda: False)()
         if self._in_process and (_has_lifespan or _has_startup_handlers):
             self._ensure_started()
             shim_run = getattr(self._client, "_run", None)
@@ -1233,10 +1230,7 @@ class TestClient:
         # lifespan was entered on the ``_async_worker`` loop, so shutdown
         # (and any ctx-manager / yield-dep teardown the lifespan CMs
         # hold) must run on that same loop via the sync helpers. Issue #1.
-        _door_owns_http = (
-            getattr(self.app, "_oneshot_door_enabled", lambda: False)()
-            and getattr(self.app, "_oneshot_door_can_handle", lambda _s: False)({})
-        )
+        _door_owns_http = getattr(self.app, "_oneshot_door_enabled", lambda: False)()
         try:
             stop_chain = getattr(self.app, "_stop_lifespan_mw_chain", None)
             if stop_chain is not None and stop_chain():
