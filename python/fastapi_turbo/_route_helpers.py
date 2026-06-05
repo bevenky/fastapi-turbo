@@ -113,7 +113,10 @@ def _apply_response_model(
     # `Optional[UserOut]` don't have `.model_validate`. Route them through
     # Pydantic's TypeAdapter so that lists of SQLAlchemy ORM instances are
     # dumped via `from_attributes`.
-    from fastapi_turbo.exceptions import ResponseValidationError as _RVE
+    from fastapi_turbo.exceptions import (
+        ResponseValidationError as _RVE,
+        _DoorResponseValidationError as _DResVE,
+    )
     if not hasattr(response_model, "model_validate"):
         from pydantic import TypeAdapter, ValidationError as _PyVE
         try:
@@ -149,7 +152,7 @@ def _apply_response_model(
                 }
                 for _e in exc.errors()
             ]
-            raise _RVE(errors=_prefixed, body=result, endpoint_ctx=endpoint_ctx) from None
+            raise _DResVE(errors=_prefixed, body=result, endpoint_ctx=endpoint_ctx) from None
         return ta.dump_python(validated, **dump_kwargs)
 
     try:
@@ -265,7 +268,7 @@ def _apply_response_model(
                     }
                     for _e in exc.errors()
                 ]
-                raise _RVE(errors=_prefixed, body=result, endpoint_ctx=endpoint_ctx) from None
+                raise _DResVE(errors=_prefixed, body=result, endpoint_ctx=endpoint_ctx) from None
         except ImportError:
             pass
     return result
@@ -538,7 +541,7 @@ def _build_default_route_handler(route, app):
     import json as _json
     from pydantic import TypeAdapter as _TA, ValidationError as _PyVE, BaseModel as _BM
     from fastapi_turbo.exceptions import (
-        RequestValidationError as _RVE,
+        _DoorRequestValidationError as _RVE,
         HTTPException as _HE,
     )
     from fastapi_turbo.param_functions import _ParamMarker as _PM

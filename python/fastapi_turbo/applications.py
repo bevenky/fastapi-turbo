@@ -193,7 +193,7 @@ def _try_compile_handler(
                         from pydantic import ValidationError as _PyVE
                         if isinstance(_exc, _PyVE):
                             from fastapi_turbo.exceptions import (
-                                RequestValidationError as _RVE,
+                                _DoorRequestValidationError as _RVE,
                             )
                             _errs = [
                                 {**e, "loc": ("body", _k, *tuple(e.get("loc", ())))}
@@ -273,8 +273,9 @@ def _try_compile_handler(
                     try:
                         from fastapi_turbo.exceptions import (
                             RequestValidationError as _RVE,
+                            _DoorRequestValidationError as _DRVE,
                         )
-                        exc = _RVE(detail, body=_rve_body, endpoint_ctx=_endpoint_ctx)
+                        exc = _DRVE(detail, body=_rve_body, endpoint_ctx=_endpoint_ctx)
                         if (
                             _app_ref is not None
                             and _RVE in _app_ref.exception_handlers
@@ -857,6 +858,7 @@ def _try_compile_handler(
                 try:
                     from fastapi_turbo.exceptions import (
                         RequestValidationError as _RVE,
+                        _DoorRequestValidationError as _DRVE,
                     )
                     _rve_body2 = None
                     if _raw_body_str_pending is not None:
@@ -864,7 +866,7 @@ def _try_compile_handler(
                             _rve_body2 = _json.loads(_raw_body_str_pending)
                         except Exception:
                             _rve_body2 = _raw_body_str_pending
-                    exc = _RVE(detail, body=_rve_body2, endpoint_ctx=_endpoint_ctx)
+                    exc = _DRVE(detail, body=_rve_body2, endpoint_ctx=_endpoint_ctx)
                     if _app is not None and _RVE in _app.exception_handlers:
                         handler_raised = False
                         try:
@@ -3935,7 +3937,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 return TypeAdapter(ann).validate_python(val)
             except Exception as exc:
                 from fastapi_turbo.exceptions import (
-                    WebSocketRequestValidationError as _WRVE,
+                    _DoorWebSocketRequestValidationError as _WRVE,
                 )
                 errors = []
                 try:
@@ -7424,7 +7426,10 @@ class FastAPI(_real_fastapi.FastAPI):
         # @exception_handler(RequestValidationError), let the Rust validation
         # error paths route the detail through it.
         validation_handler = None
-        from fastapi_turbo.exceptions import RequestValidationError as _RVE
+        from fastapi_turbo.exceptions import (
+            RequestValidationError as _RVE,
+            _DoorRequestValidationError as _DRVE,
+        )
         if _RVE in self.exception_handlers:
             from fastapi_turbo.requests import _door_make_request as _Req
             import json as _json
@@ -7465,7 +7470,7 @@ class FastAPI(_real_fastapi.FastAPI):
                         _ep_ctx = _ep_ctx_for(_ep, getattr(_rt, "path", None))
                 except Exception:
                     _ep_ctx = None
-                exc = _RVE(errors_list, body=_body_for_rve, endpoint_ctx=_ep_ctx)
+                exc = _DRVE(errors_list, body=_body_for_rve, endpoint_ctx=_ep_ctx)
                 req = _Req({
                     "type": "http",
                     "method": "POST",

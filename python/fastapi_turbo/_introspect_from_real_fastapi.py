@@ -523,7 +523,9 @@ def _serialize_via_field(content, field, flags, endpoint_ctx=None):
         return content
     value, errors = field.validate(content, {}, loc=("response",))
     if errors:
-        from fastapi.exceptions import ResponseValidationError
+        from fastapi_turbo.exceptions import (
+            _DoorResponseValidationError as ResponseValidationError,
+        )
 
         try:
             from fastapi._compat import _normalize_errors

@@ -586,11 +586,12 @@ class TestWebSocketDisconnect:
         from fastapi.exceptions import WebSocketDisconnect
         assert issubclass(WebSocketDisconnect, Exception)
 
-    def test_default_reason_none(self):
-        """WebSocketDisconnect defaults reason to None."""
+    def test_default_reason_empty(self):
+        """WebSocketDisconnect defaults reason to "" (real Starlette coerces
+        ``reason or ""``)."""
         from fastapi.exceptions import WebSocketDisconnect
         exc = WebSocketDisconnect()
-        assert exc.reason is None
+        assert exc.reason == ""
 
 
 # ===========================================================================
