@@ -1,80 +1,62 @@
-"""BackgroundTasks for running tasks after response is sent."""
+"""BackgroundTasks — real Starlette base + the door's loop-affinity drain.
 
+``BackgroundTask`` is re-exported from real Starlette. ``BackgroundTasks``
+subclasses real ``starlette.background.BackgroundTasks`` and adds ONLY
+``run_sync`` (plus the ``_tasks`` / ``_app`` names the Rust door + middleware
+wrapper reference). Why not a pure re-export: the door drives tasks itself (no
+ASGI server awaits ``__call__``), and must preserve async-task loop affinity
+(Issue #1) — async tasks go through ``_async_worker.submit`` on the shared
+worker loop, NOT real ``__call__``'s bare ``await`` (which would bind them to
+whatever loop happens to await it).
+
+Imported during ``fastapi_turbo`` package init BEFORE the compat shim rebinds
+``sys.modules``, so this resolves to REAL Starlette.
+"""
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable
+from typing import Any
 
-# Real starlette base — imported before the compat shim installs (resolves to real).
-# Subclassing it (without calling its __init__; we use our own ``_tasks`` and
-# override the public API) makes ``isinstance(bg, starlette.background.BackgroundTasks)``
-# True so REAL FastAPI's get_dependant recognizes a ``tasks: BackgroundTasks`` param
-# (the type bridge), while the clone's own behavior is unchanged.
-import starlette.background as _starlette_background
+from starlette.background import BackgroundTask, BackgroundTasks as _RealBackgroundTasks
+
+__all__ = ["BackgroundTask", "BackgroundTasks"]
 
 
-class BackgroundTask:
-    """A single background task."""
+class BackgroundTasks(_RealBackgroundTasks):
+    """Real Starlette ``BackgroundTasks`` (``add_task`` / ``tasks`` /
+    ``__call__`` inherited) plus the door's synchronous drain."""
 
-    def __init__(self, func: Callable, *args: Any, **kwargs: Any):
-        self.func = func
-        self.args = args
-        self.kwargs = kwargs
+    def __init__(self, tasks=None) -> None:
+        super().__init__(tasks)  # real: self.tasks = list(tasks or [])
+        # Set by the Rust router at injection time so async tasks submitted via
+        # ``run_sync`` honour the owning app's worker loop / ``worker_timeout``.
+        self._door_app: Any | None = None
 
-    async def __call__(self) -> None:
-        if inspect.iscoroutinefunction(self.func):
-            await self.func(*self.args, **self.kwargs)
-        else:
-            self.func(*self.args, **self.kwargs)
+    @property
+    def _tasks(self):
+        """Alias for the name the Rust door (router.rs ``drain_background_tasks``)
+        and middleware wrapper read."""
+        return self.tasks
 
+    @property
+    def _app(self):
+        return self._door_app
 
-class BackgroundTasks(_starlette_background.BackgroundTasks):
-    """Container for multiple background tasks to run after the response.
-
-    Compatible with FastAPI's ``BackgroundTasks`` dependency:
-
-        @app.post("/send")
-        async def send_email(background_tasks: BackgroundTasks):
-            background_tasks.add_task(send_email_task, "user@example.com")
-            return {"message": "sent"}
-
-    Subclasses real ``starlette.background.BackgroundTasks`` for isinstance parity
-    (the type bridge); manages its own ``_tasks`` and overrides the public API, so
-    real's ``__init__`` is intentionally not called.
-    """
-
-    def __init__(self) -> None:
-        self._tasks: list[BackgroundTask] = []
-        # Set by the Rust router at injection time so async tasks
-        # submitted via ``run_sync`` honour the owning app's
-        # ``worker_timeout`` — see ``router.rs::inject_background_tasks``.
-        self._app: Any | None = None
-
-    def add_task(self, func: Callable, *args: Any, **kwargs: Any) -> None:
-        """Add a function to be called in the background after response."""
-        self._tasks.append(BackgroundTask(func, *args, **kwargs))
-
-    async def _run(self) -> None:
-        """Execute all queued background tasks."""
-        for task in self._tasks:
-            await task()
-
-    async def __call__(self) -> None:
-        await self._run()
+    @_app.setter
+    def _app(self, value):
+        self._door_app = value
 
     def run_sync(self) -> None:
-        """Run all queued tasks synchronously — used by the Rust router
-        after the handler returns. Sync tasks run inline; async tasks get
-        submitted to the shared worker event loop so connection pools
-        (SQLAlchemy asyncpg, Redis async, httpx) keep their affinity.
-        """
-        for task in self._tasks:
-            if inspect.iscoroutinefunction(task.func):
-                # Submit to the shared worker loop (same loop handles all
-                # async deps and request handlers) so async DB / cache /
-                # HTTP clients reuse their existing connections.
-                from fastapi_turbo._async_worker import submit
-                submit(task.func(*task.args, **task.kwargs), app=self._app)
+        """Run all queued tasks after the response — the door has no ASGI server
+        to await ``__call__``. Sync tasks run inline; async tasks go to the
+        shared worker loop so async DB / cache / HTTP clients keep their
+        connection affinity (Issue #1)."""
+        from fastapi_turbo._async_worker import submit
+
+        for task in self.tasks:
+            func = task.func
+            if getattr(task, "is_async", False) or inspect.iscoroutinefunction(func):
+                submit(func(*task.args, **task.kwargs), app=self._door_app)
             else:
-                task.func(*task.args, **task.kwargs)
-        self._tasks.clear()
+                func(*task.args, **task.kwargs)
+        self.tasks.clear()

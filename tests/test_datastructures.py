@@ -281,7 +281,8 @@ def test_background_tasks():
     bt.add_task(sync_task, "sync")
     bt.add_task(async_task, "async")
 
-    asyncio.run(bt._run())
+    # real Starlette BackgroundTasks runs via __call__ (clone had _run)
+    asyncio.run(bt())
     assert results == ["sync", "async"]
 
 
