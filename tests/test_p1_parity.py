@@ -79,9 +79,11 @@ class TestSecuritySchemes:
 
 class TestRequestStream:
     def test_stream_yields_buffered_body(self):
-        from starlette.requests import Request
+        # The door buffers the body into the _body attr (real Starlette
+        # stream() short-circuits on it) via _door_make_request.
+        from fastapi_turbo.requests import _door_make_request
 
-        req = Request(scope={"type": "http", "_body": b"hello world"})
+        req = _door_make_request({"type": "http", "_body": b"hello world"})
 
         async def _consume():
             chunks = []
@@ -93,9 +95,9 @@ class TestRequestStream:
         assert chunks == [b"hello world", b""]
 
     def test_stream_empty_body(self):
-        from starlette.requests import Request
+        from fastapi_turbo.requests import _door_make_request
 
-        req = Request(scope={"type": "http"})
+        req = _door_make_request({"type": "http"})
 
         async def _consume():
             chunks = []
@@ -103,16 +105,17 @@ class TestRequestStream:
                 chunks.append(c)
             return chunks
 
-        assert asyncio.run(_consume()) == [b""]
+        # real Starlette stream() yields self._body then the b"" sentinel
+        assert asyncio.run(_consume()) == [b"", b""]
 
     def test_stream_yields_receive_chunks(self):
         from starlette.requests import Request
 
-        # Mock ASGI receive callable that yields 3 chunks
+        # Mock ASGI receive — real Starlette stream() reads message["type"].
         chunks_to_yield = [
-            {"body": b"part-1-", "more_body": True},
-            {"body": b"part-2-", "more_body": True},
-            {"body": b"part-3", "more_body": False},
+            {"type": "http.request", "body": b"part-1-", "more_body": True},
+            {"type": "http.request", "body": b"part-2-", "more_body": True},
+            {"type": "http.request", "body": b"part-3", "more_body": False},
         ]
         idx = [0]
 
