@@ -599,3 +599,31 @@ class Request(HTTPConnection, _starlette_requests.Request):
 
     def __repr__(self) -> str:
         return f"Request(scope={self._scope!r})"
+
+
+def _door_make_request(scope):
+    """Build the ``Request`` for the in-process / ``app.run()`` door.
+
+    The Rust door builds a MINIMAL ASGI scope; this factory enriches it with
+    the keys a real Starlette ``Request`` reads (request-line defaults,
+    ``root_path`` from the app, a default ``state``) so the SAME factory works
+    for the clone (now) and a real-Starlette re-export (next step). The scope
+    is mutated in place — not copied — so ``state`` / headers propagate across
+    every Request built from it (BaseHTTPMiddleware semantics). Called from the
+    Rust router (``request_cls``) and the Python door-side construction sites.
+    """
+    scope.setdefault("type", "http")
+    scope.setdefault("method", "GET")
+    scope.setdefault("path", "/")
+    scope.setdefault("query_string", b"")
+    scope.setdefault("scheme", "http")
+    app = scope.get("app")
+    if "root_path" not in scope:
+        scope["root_path"] = getattr(app, "root_path", "") or ""
+    if "state" not in scope:
+        # Real Starlette only does ``scope.setdefault("state", {})``; the door
+        # additionally seeds the app's lifespan/startup state so a request
+        # built off a bare scope still sees it (zero-behavior-change insurance).
+        seed = getattr(app, "_app_state", None) if app is not None else None
+        scope["state"] = dict(seed) if seed else {}
+    return Request(scope)

@@ -3683,9 +3683,9 @@ class FastAPI(_real_fastapi.FastAPI):
         handler = self._lookup_exception_handler(exc)
         if handler is None:
             return None
-        from fastapi_turbo.requests import Request
+        from fastapi_turbo.requests import _door_make_request
         scope = _current_request_scope.get() or {}
-        request = Request({**scope, "type": "http", "app": self})
+        request = _door_make_request({**scope, "type": "http", "app": self})
         if inspect.iscoroutinefunction(handler):
             coro = handler(request, exc)
             try:
@@ -3715,9 +3715,9 @@ class FastAPI(_real_fastapi.FastAPI):
         handler = self._lookup_exception_handler(exc)
         if handler is None:
             return None
-        from fastapi_turbo.requests import Request
+        from fastapi_turbo.requests import _door_make_request
         scope = _current_request_scope.get() or {}
-        request = Request({**scope, "type": "http", "app": self})
+        request = _door_make_request({**scope, "type": "http", "app": self})
         try:
             if inspect.iscoroutinefunction(handler):
                 # Drive the coroutine via the send(None) trick (works for handlers
@@ -7273,7 +7273,7 @@ class FastAPI(_real_fastapi.FastAPI):
         _app_self = self
 
         def _build_404_request(method, path, query, headers):
-            from fastapi_turbo.requests import Request
+            from fastapi_turbo.requests import _door_make_request
             # Normalize headers to list[(bytes, bytes)] for ASGI scope.
             hdr_list = []
             for k, v in headers or []:
@@ -7283,13 +7283,12 @@ class FastAPI(_real_fastapi.FastAPI):
                     v = v.encode("latin-1")
                 hdr_list.append((k, v))
             qs = query if isinstance(query, bytes) else (query or "").encode()
-            return Request({
+            return _door_make_request({
                 "type": "http",
                 "method": method,
                 "path": path,
                 "headers": hdr_list,
                 "query_string": qs,
-                "root_path": getattr(_app_self, "root_path", "") or "",
                 "app": _app_self,
                 "path_params": {},
             })
@@ -7427,7 +7426,7 @@ class FastAPI(_real_fastapi.FastAPI):
         validation_handler = None
         from fastapi_turbo.exceptions import RequestValidationError as _RVE
         if _RVE in self.exception_handlers:
-            from fastapi_turbo.requests import Request as _Req
+            from fastapi_turbo.requests import _door_make_request as _Req
             import json as _json
             _user_handler = self.exception_handlers[_RVE]
 

@@ -37,7 +37,7 @@ from fastapi_turbo._sentry_compat import (
     _refine_sentry_transaction,
     _refine_sentry_transaction_as_middleware,
 )
-from fastapi_turbo.requests import Request as _Request
+from fastapi_turbo.requests import Request as _Request, _door_make_request
 from fastapi_turbo.responses import JSONResponse as _JSONResponse
 from fastapi_turbo.encoders import jsonable_encoder as _jsonable_encoder
 
@@ -360,9 +360,9 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
                 if isinstance(val, _Request):
                     # Merge scope data from Rust's Request (has body, path_params,
                     # app, etc.) into the middleware's Request.
-                    for sk, sv in val._scope.items():
-                        if sk not in mw_request._scope:
-                            mw_request._scope[sk] = sv
+                    for sk, sv in val.scope.items():
+                        if sk not in mw_request.scope:
+                            mw_request.scope[sk] = sv
                     # Copy over the state from middleware's Request
                     kwargs[key] = mw_request
                     break
@@ -518,7 +518,7 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
     runner = _make_runner(0)
 
     def wrapped_sync(**kwargs):
-        request = _Request(_make_scope(kwargs))
+        request = _door_make_request(_make_scope(kwargs))
         # Store the middleware's Request object in kwargs so Rust's
         # inject_framework_objects can reuse it instead of creating a new one.
         # This ensures request.state set by middleware propagates to the handler.
@@ -582,7 +582,7 @@ def _drive_async_fallback(endpoint, middlewares, app, kwargs, is_async_endpoint)
     Used when a middleware suspends on real I/O (e.g., httpx call inside).
     """
     async def _chain():
-        request = _Request({"type": "http", "app": app, "_handler_kwargs": kwargs})
+        request = _door_make_request({"type": "http", "app": app, "_handler_kwargs": kwargs})
 
         async def call_handler():
             if is_async_endpoint:

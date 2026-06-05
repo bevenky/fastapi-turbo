@@ -56,9 +56,12 @@ fn request_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     if let Some(c) = REQUEST_CLS.get() {
         return Ok(c);
     }
+    // Door factory (not the class): enriches the minimal Rust-built scope with
+    // the keys a real Starlette Request needs (root_path, state, request-line
+    // defaults) and returns a Request. Called the same way — call1((scope,)).
     let cls: Py<PyAny> = py
         .import("fastapi_turbo.requests")?
-        .getattr("Request")?
+        .getattr("_door_make_request")?
         .unbind();
     let _ = REQUEST_CLS.set(cls);
     Ok(REQUEST_CLS.get().unwrap())
