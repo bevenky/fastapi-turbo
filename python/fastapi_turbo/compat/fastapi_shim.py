@@ -385,8 +385,11 @@ def _build() -> dict[str, types.ModuleType]:
     modules["fastapi.security.open_id_connect_url"] = fastapi_security_open_id
 
     fastapi_security_base = _mod("fastapi.security.base")
-    class SecurityBase: pass
-    fastapi_security_base.SecurityBase = SecurityBase  # type: ignore[attr-defined]
+    # Real ``SecurityBase`` (the clone schemes now subclass it — security.py), so
+    # ``isinstance(scheme, SecurityBase)`` and real ``get_dependant`` security
+    # detection work. ``_security._SecurityBase`` is the real class captured
+    # pre-shim.
+    fastapi_security_base.SecurityBase = _security._SecurityBase  # type: ignore[attr-defined]
     modules["fastapi.security.base"] = fastapi_security_base
 
     fastapi_security_utils = _mod("fastapi.security.utils")

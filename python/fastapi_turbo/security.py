@@ -26,6 +26,16 @@ from fastapi_turbo.param_functions import (
 )
 from fastapi_turbo.requests import Request
 
+# Real FastAPI marks a ``Depends(scheme)`` as a SECURITY dependency (→ OpenAPI
+# securitySchemes + the route's ``security`` requirement) only when the scheme is
+# an instance of the real ``SecurityBase``. The scheme classes below subclass it
+# so real ``get_dependant`` / ``get_openapi`` (the OpenAPI pivot + the adapter)
+# recognize them — while KEEPING the clone's ``.model`` dict (real
+# ``get_openapi`` serializes it via ``jsonable_encoder`` just the same, and the
+# clone ``_openapi.py`` + ``scheme.model["type"]`` tests stay valid). Imported
+# before the compat shim (``__init__.py``), so this resolves to REAL FastAPI.
+from fastapi.security.base import SecurityBase as _SecurityBase
+
 import inspect as _inspect
 
 # Real FastAPI's get_dependant introspects a security scheme via
@@ -159,7 +169,7 @@ def _get_authorization(request_or_str=None, **kwargs) -> str | None:
 
 
 @_request_sig
-class OAuth2:
+class OAuth2(_SecurityBase):
     """Base OAuth2 security scheme (matches FastAPI's OAuth2 base class).
 
     Can be used directly with custom flows or subclassed for specific
@@ -198,7 +208,7 @@ class OAuth2:
 
 
 @_request_sig
-class OAuth2PasswordBearer:
+class OAuth2PasswordBearer(_SecurityBase):
     """OAuth2 password bearer scheme.
 
     Extracts the bearer token from the Authorization header.
@@ -244,7 +254,7 @@ class OAuth2PasswordBearer:
 
 
 @_request_sig
-class HTTPBase:
+class HTTPBase(_SecurityBase):
     """Base class for HTTP-scheme security dependencies (``HTTPBearer``,
     ``HTTPDigest``, ``HTTPBasic``). FastAPI exports this as
     ``fastapi.security.http.HTTPBase`` and third-party auth libraries
@@ -348,7 +358,7 @@ class HTTPBearer(HTTPBase):
 
 
 @_request_sig
-class HTTPDigest:
+class HTTPDigest(_SecurityBase):
     """HTTP Digest authentication scheme.
 
     Extracts a ``Digest`` Authorization header and returns
@@ -390,7 +400,7 @@ class HTTPDigest:
 
 
 @_request_sig
-class HTTPBasic:
+class HTTPBasic(_SecurityBase):
     """HTTP Basic authentication scheme."""
 
     def __init__(
@@ -477,7 +487,7 @@ def _make_api_key_call(location: str, name: str, auto_error: bool, self_ref):
     return _call
 
 
-class _APIKeyBase:
+class _APIKeyBase(_SecurityBase):
     _location: str = "header"
 
     def __init__(self, *, name: str, scheme_name: str | None = None,
@@ -524,7 +534,7 @@ class SecurityScopes:
 
 
 @_request_sig
-class OAuth2ClientCredentials:
+class OAuth2ClientCredentials(_SecurityBase):
     """OAuth2 client-credentials flow (server-to-server auth).
 
     The OAuth2 flow where a client authenticates with its own credentials
@@ -579,7 +589,7 @@ class OAuth2ClientCredentials:
 
 
 @_request_sig
-class OAuth2AuthorizationCodeBearer:
+class OAuth2AuthorizationCodeBearer(_SecurityBase):
     """OAuth2 authorization-code flow (user-delegated auth)."""
 
     def __init__(
@@ -639,7 +649,7 @@ class OAuth2AuthorizationCodeBearer:
 # ── OpenID Connect ─────────────────────────────────────────────────
 
 
-class OpenIdConnect:
+class OpenIdConnect(_SecurityBase):
     """OpenID Connect discovery-URL based auth scheme."""
 
     def __init__(
