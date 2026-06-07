@@ -5945,7 +5945,7 @@ class FastAPI(_real_fastapi.FastAPI):
     # OpenAPI schema
     # ------------------------------------------------------------------
 
-    def _openapi_real_routes(self, route_dicts: list[dict]) -> list | None:
+    def _openapi_real_routes(self, route_dicts: list[dict], webhook: bool = False) -> list | None:
         """Build a real ``fastapi.routing.APIRoute`` per clone route dict so real
         ``fastapi.openapi.utils.get_openapi`` can generate the schema (the OpenAPI
         pivot). Returns the route list, or ``None`` if ANY route can't be built
@@ -5990,9 +5990,19 @@ class FastAPI(_real_fastapi.FastAPI):
                 response_description=getattr(
                     route, "response_description", "Successful Response"
                 ),
-                responses=getattr(route, "responses", None) or None,
+                # App-level ``responses`` merge into every route (clone behavior;
+                # real reads only route-level ``responses``). Route-level wins.
+                responses=(
+                    {**(getattr(self, "responses", None) or {}),
+                     **(getattr(route, "responses", None) or {})}
+                    or None
+                ),
                 deprecated=getattr(route, "deprecated", None),
-                operation_id=getattr(route, "operation_id", None),
+                # The clone already resolves the operationId via the full cascade
+                # (route → router → include → app generate_unique_id_function) and
+                # stamps it on rd; pass it through (real uses it verbatim). None →
+                # real's default generate_unique_id, which matches the clone default.
+                operation_id=rd.get("operation_id") or getattr(route, "operation_id", None),
                 response_model_include=getattr(route, "response_model_include", None),
                 response_model_exclude=getattr(route, "response_model_exclude", None),
                 response_model_by_alias=getattr(route, "response_model_by_alias", True),
@@ -6008,12 +6018,27 @@ class FastAPI(_real_fastapi.FastAPI):
                 include_in_schema=getattr(route, "include_in_schema", True),
                 name=getattr(route, "name", None),
                 callbacks=getattr(route, "callbacks", None),
-                openapi_extra=getattr(route, "openapi_extra", None),
             )
+            # Clone OpenAPI extensions the real fork's get_openapi has no route
+            # kwarg for → fold into openapi_extra (real deep_dict_updates it into
+            # the operation). servers/external_docs are operation-level; an
+            # explicit route ``security`` (incl. ``[]`` to disable) overrides the
+            # dep-derived security.
+            oe = dict(getattr(route, "openapi_extra", None) or {})
+            if getattr(route, "servers", None):
+                oe["servers"] = route.servers
+            if getattr(route, "external_docs", None):
+                oe["externalDocs"] = route.external_docs
+            if getattr(route, "security", None) is not None:
+                oe["security"] = route.security
+            kw["openapi_extra"] = oe or None
             if rc_ok:
                 kw["response_class"] = rc
+            # Webhooks are keyed by NAME (no leading-slash normalization) — use the
+            # route's own path; regular routes use rd["path"] (mount-prefixed).
+            path = getattr(route, "path", None) if webhook else rd["path"]
             try:
-                real_routes.append(_RealRoute(rd["path"], endpoint, **kw))
+                real_routes.append(_RealRoute(path or rd["path"], endpoint, **kw))
             except Exception:
                 return None
         return real_routes
@@ -6025,30 +6050,37 @@ class FastAPI(_real_fastapi.FastAPI):
         real_routes = self._openapi_real_routes(route_dicts)
         if real_routes is None:
             return None
-        real_webhooks = self._openapi_real_routes(webhook_dicts) if webhook_dicts else []
+        real_webhooks = (
+            self._openapi_real_routes(webhook_dicts, webhook=True) if webhook_dicts else []
+        )
         if real_webhooks is None:
             return None
         # Real get_openapi — NOT `from fastapi.openapi.utils import` (the shim rebinds
         # that to the clone generator). `_real_fastapi` is the real module captured
-        # pre-shim, so its `.openapi.utils.get_openapi` is the real one.
+        # pre-shim, so its `.openapi.utils.get_openapi` is the real one. Wrapped:
+        # schema-build can still fail for a route real get_dependant can't fully
+        # resolve at openapi-time (e.g. a locally-defined endpoint whose Annotated
+        # body can't re-resolve) — fall back to the clone generator rather than raise.
         _get_openapi = _real_fastapi.openapi.utils.get_openapi
-
-        return _get_openapi(
-            title=self.title,
-            version=self.version,
-            openapi_version=self.openapi_version,
-            summary=self.summary,
-            description=self.description,
-            routes=real_routes,
-            webhooks=real_webhooks,
-            tags=self.openapi_tags,
-            servers=effective_servers,
-            terms_of_service=self.terms_of_service,
-            contact=self.contact,
-            license_info=self.license_info,
-            separate_input_output_schemas=self.separate_input_output_schemas,
-            external_docs=self.external_docs,
-        )
+        try:
+            return _get_openapi(
+                title=self.title,
+                version=self.version,
+                openapi_version=self.openapi_version,
+                summary=self.summary,
+                description=self.description,
+                routes=real_routes,
+                webhooks=real_webhooks,
+                tags=self.openapi_tags,
+                servers=effective_servers,
+                terms_of_service=self.terms_of_service,
+                contact=self.contact,
+                license_info=self.license_info,
+                separate_input_output_schemas=self.separate_input_output_schemas,
+                external_docs=self.external_docs,
+            )
+        except Exception:
+            return None
 
     def openapi(self) -> dict[str, Any]:
         """Return the OpenAPI schema dict (cached after first call).

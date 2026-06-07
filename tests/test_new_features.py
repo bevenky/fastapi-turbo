@@ -312,7 +312,13 @@ class TestExamples:
         schema = app.openapi()
         op = schema["paths"]["/x"]["get"]
         params = op.get("parameters", [])
-        has_examples = any(p.get("examples") for p in params)
+        # ``Query(examples={named})`` named examples must appear in OpenAPI. Real
+        # FastAPI places them in the parameter's JSON Schema (``schema.examples``);
+        # the clone placed them at param level (``parameter.examples``) — accept
+        # either so the assertion holds under both generators.
+        has_examples = any(
+            p.get("examples") or p.get("schema", {}).get("examples") for p in params
+        )
         assert has_examples
 
 
