@@ -20,6 +20,7 @@ from abc import ABCMeta
 # introspection (the pivot adapter) recognizes it (correct ``in_`` / Body class),
 # while the clone's ``_introspect`` keeps reading our custom attrs (``_kind`` …).
 import fastapi.params as _real_params
+from starlette.datastructures import UploadFile as _RealUploadFile
 from pydantic.fields import FieldInfo
 
 
@@ -216,15 +217,23 @@ class File(_ParamMarker, _real_params.File):
     _kind = "file"
 
 
-class UploadFile(metaclass=ABCMeta):
+class UploadFile(_RealUploadFile, metaclass=ABCMeta):
     """File upload object matching FastAPI/Starlette's UploadFile interface.
 
-    The Rust multipart parser returns a PyUploadFile directly — this Python
-    class is (a) usable manually for testing, (b) registered as a virtual
-    superclass of PyUploadFile so ``isinstance(f, UploadFile)`` works.
+    SUBCLASSES real ``starlette.datastructures.UploadFile`` so that
+    ``issubclass(UploadFile, real UploadFile)`` is True — real FastAPI's
+    ``get_dependant`` / ``get_openapi`` then recognize a ``f: UploadFile`` param
+    as a file upload (the adapter / the real-OpenAPI pivot need this). The
+    installed Starlette's ``UploadFile`` lacks ``__get_pydantic_core_schema__``,
+    so real ``create_model_field`` can't build a field for it directly — we add
+    that schema (below) on the subclass.
 
-    The underlying bytes are held in-memory (axum buffers the whole request).
-    Read-cursor is independent per instance; seek/tell work as expected.
+    The Rust multipart parser returns a ``PyUploadFile`` directly (the actual
+    object handed to handlers); ``__subclasshook__`` makes
+    ``isinstance(rust_upload_file, UploadFile)`` True via duck typing (it also
+    covers any pre-shim real UploadFile instance). This class is additionally
+    usable manually for testing. Bytes are held in-memory (axum buffers the whole
+    request); read-cursor is independent per instance.
     """
 
     # __subclasshook__ makes isinstance(rust_upload_file, UploadFile) return True
@@ -246,11 +255,25 @@ class UploadFile(metaclass=ABCMeta):
         size: int | None = None,
         headers=None,
     ):
+        # Do NOT call real ``__init__`` (it requires a SpooledTemporaryFile and
+        # derives content_type from headers). Set the clone's attrs directly.
         self.filename = filename
         self.file = file
-        self.content_type = content_type
+        self._content_type = content_type
         self.size = size
         self.headers = headers or {}
+
+    # Real Starlette exposes ``content_type`` as a read-only property derived from
+    # headers; the clone keeps it an explicit, settable value (the Rust
+    # PyUploadFile / manual construction pass it directly), so override with a
+    # settable property over ``_content_type``.
+    @property
+    def content_type(self):
+        return self._content_type
+
+    @content_type.setter
+    def content_type(self, value):
+        self._content_type = value
 
     async def read(self, size: int = -1) -> bytes:
         if self.file is not None:
