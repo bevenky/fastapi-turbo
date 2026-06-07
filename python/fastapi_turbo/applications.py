@@ -1592,6 +1592,7 @@ def _run_pending_teardowns(
 # Imports hoisted to module-level for the hot path (used by wrapped endpoints)
 from fastapi_turbo.requests import Request as _Request
 from fastapi_turbo.responses import JSONResponse as _JSONResponse
+from fastapi_turbo.responses import Response as _real_starlette_response
 
 
 async def _ws_entry_with_asgi_chain(app_self, ws, path_params, inner_ws_entry):
@@ -5944,6 +5945,111 @@ class FastAPI(_real_fastapi.FastAPI):
     # OpenAPI schema
     # ------------------------------------------------------------------
 
+    def _openapi_real_routes(self, route_dicts: list[dict]) -> list | None:
+        """Build a real ``fastapi.routing.APIRoute`` per clone route dict so real
+        ``fastapi.openapi.utils.get_openapi`` can generate the schema (the OpenAPI
+        pivot). Returns the route list, or ``None`` if ANY route can't be built
+        real (caller falls back to the clone generator) — so the real path is
+        never worse than the clone path. WebSocket routes are skipped (get_openapi
+        documents only HTTP ``APIRoute``s)."""
+        _RealRoute = _real_fastapi.routing.APIRoute
+        _http = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+        real_routes: list = []
+        for rd in route_dicts:
+            if rd.get("is_websocket"):
+                continue
+            route = rd.get("_route_obj")
+            endpoint = getattr(route, "endpoint", None) if route is not None else None
+            if route is None or endpoint is None:
+                return None
+            methods = [m for m in (rd.get("methods") or []) if m in _http] or rd.get(
+                "methods"
+            )
+            # response_class only when it's a real Starlette Response subclass
+            # (responses.py re-exports real, so clone routes carry real classes);
+            # else let real APIRoute use its default so the media type is canonical.
+            rc = getattr(route, "response_class", None)
+            try:
+                rc_ok = isinstance(rc, type) and issubclass(
+                    rc, _real_starlette_response
+                )
+            except TypeError:
+                rc_ok = False
+            kw: dict = dict(
+                methods=methods,
+                dependencies=(
+                    rd.get("_combined_dependencies")
+                    or getattr(route, "dependencies", None)
+                    or None
+                ),
+                response_model=getattr(route, "response_model", None),
+                status_code=getattr(route, "status_code", None),
+                tags=getattr(route, "tags", None) or None,
+                summary=getattr(route, "summary", None),
+                description=getattr(route, "description", None) or "",
+                response_description=getattr(
+                    route, "response_description", "Successful Response"
+                ),
+                responses=getattr(route, "responses", None) or None,
+                deprecated=getattr(route, "deprecated", None),
+                operation_id=getattr(route, "operation_id", None),
+                response_model_include=getattr(route, "response_model_include", None),
+                response_model_exclude=getattr(route, "response_model_exclude", None),
+                response_model_by_alias=getattr(route, "response_model_by_alias", True),
+                response_model_exclude_unset=getattr(
+                    route, "response_model_exclude_unset", False
+                ),
+                response_model_exclude_defaults=getattr(
+                    route, "response_model_exclude_defaults", False
+                ),
+                response_model_exclude_none=getattr(
+                    route, "response_model_exclude_none", False
+                ),
+                include_in_schema=getattr(route, "include_in_schema", True),
+                name=getattr(route, "name", None),
+                callbacks=getattr(route, "callbacks", None),
+                openapi_extra=getattr(route, "openapi_extra", None),
+            )
+            if rc_ok:
+                kw["response_class"] = rc
+            try:
+                real_routes.append(_RealRoute(rd["path"], endpoint, **kw))
+            except Exception:
+                return None
+        return real_routes
+
+    def _openapi_real(self, route_dicts: list[dict], webhook_dicts: list[dict],
+                      effective_servers) -> dict | None:
+        """Real-FastAPI OpenAPI generation (``FASTAPI_TURBO_REAL_OPENAPI``). Returns
+        the schema, or ``None`` to fall back to the clone generator."""
+        real_routes = self._openapi_real_routes(route_dicts)
+        if real_routes is None:
+            return None
+        real_webhooks = self._openapi_real_routes(webhook_dicts) if webhook_dicts else []
+        if real_webhooks is None:
+            return None
+        # Real get_openapi — NOT `from fastapi.openapi.utils import` (the shim rebinds
+        # that to the clone generator). `_real_fastapi` is the real module captured
+        # pre-shim, so its `.openapi.utils.get_openapi` is the real one.
+        _get_openapi = _real_fastapi.openapi.utils.get_openapi
+
+        return _get_openapi(
+            title=self.title,
+            version=self.version,
+            openapi_version=self.openapi_version,
+            summary=self.summary,
+            description=self.description,
+            routes=real_routes,
+            webhooks=real_webhooks,
+            tags=self.openapi_tags,
+            servers=effective_servers,
+            terms_of_service=self.terms_of_service,
+            contact=self.contact,
+            license_info=self.license_info,
+            separate_input_output_schemas=self.separate_input_output_schemas,
+            external_docs=self.external_docs,
+        )
+
     def openapi(self) -> dict[str, Any]:
         """Return the OpenAPI schema dict (cached after first call).
 
@@ -5965,6 +6071,18 @@ class FastAPI(_real_fastapi.FastAPI):
             elif not any(s.get("url") == self.root_path for s in effective_servers):
                 effective_servers = [{"url": self.root_path}, *effective_servers]
         webhook_dicts = self._collect_routes_from_router(self.webhooks)
+        # OpenAPI pivot: real fastapi.openapi.utils.get_openapi over real APIRoutes
+        # rebuilt from the clone routes. Behind a flag during rollout; falls back to
+        # the clone generator if any route can't be built real (never worse).
+        import os as _os
+
+        if _os.environ.get("FASTAPI_TURBO_REAL_OPENAPI") == "1":
+            _real_schema = self._openapi_real(
+                route_dicts, webhook_dicts, effective_servers
+            )
+            if _real_schema is not None:
+                self.openapi_schema = _real_schema
+                return self.openapi_schema
         self.openapi_schema = generate_openapi_schema(
             title=self.title,
             version=self.version,
