@@ -42,7 +42,6 @@ from fastapi_turbo._sentry_compat import (  # noqa: F401 — re-exported below
 
 
 from fastapi_turbo._introspect import introspect_endpoint
-from fastapi_turbo._openapi import generate_openapi_schema
 from fastapi_turbo._resolution import build_resolution_plan, _make_sync_wrapper
 from fastapi_turbo.datastructures import State
 from fastapi_turbo.routing import (
@@ -2678,6 +2677,144 @@ def _signature_uses_clone_framework_type(endpoint) -> bool:
         return isinstance(ann, type) and issubclass(ann, fw)
 
     return any(_bare(h) for h in hints.values())
+
+
+def _oa_stream_info(response_model, response_class, endpoint):
+    """For the real-OpenAPI route build: classify a streaming endpoint. Returns
+    ``(needs_response_model_none, is_sse, is_json, inner_model_or_None)``.
+
+    - ``needs_response_model_none``: the return is ``AsyncIterable[...]`` / a
+      generator that real ``get_dependant`` CAN'T field — build with
+      ``response_model=None`` (true for SSE, NDJSON, and raw StreamingResponse).
+    - ``is_sse`` (``response_class`` is ``EventSourceResponse``) / ``is_json``
+      (NDJSON: NO response_class + AsyncIterable/generator): set real's native
+      ``route.is_sse_stream`` / ``is_json_stream`` + ``stream_item_field`` AFTER the
+      build so real get_openapi emits the SSE envelope / jsonl itemSchema.
+    - A raw ``StreamingResponse`` (``response_class`` set, not SSE) needs
+      ``response_model=None`` but NO content schema (matches upstream: 200 with only
+      a description) — hence is_json is gated on ``response_class is None``."""
+    import collections.abc as _abc
+    import typing as _typing
+    import inspect as _insp
+
+    _ro = _typing.get_origin(response_model)
+    needs_none = _ro in (
+        _abc.AsyncIterable, _abc.AsyncIterator, _abc.AsyncGenerator,
+        _abc.Iterable, _abc.Iterator, _abc.Generator,
+    ) or _insp.isasyncgenfunction(endpoint) or _insp.isgeneratorfunction(endpoint)
+
+    is_sse = False
+    try:
+        from fastapi_turbo.responses import EventSourceResponse as _ESR
+        if isinstance(response_class, type) and issubclass(response_class, _ESR):
+            is_sse = True
+    except Exception:  # noqa: BLE001
+        pass
+    # NDJSON only when there's NO response_class (a raw StreamingResponse documents
+    # no content). EventSourceResponse already handled by is_sse.
+    is_json = (not is_sse) and (response_class is None) and bool(needs_none)
+
+    inner = None
+    if is_sse or is_json:
+        _args = _typing.get_args(response_model)
+        if _args:
+            inner = _args[0]
+        try:  # the SSE transport wrapper is not the content model
+            from fastapi_turbo.sse import ServerSentEvent as _SSE
+            if isinstance(inner, type) and issubclass(inner, _SSE):
+                inner = None
+        except Exception:  # noqa: BLE001
+            pass
+        if not (isinstance(inner, type) and hasattr(inner, "model_json_schema")):
+            inner = None
+    return (bool(needs_none) or is_sse, is_sse, is_json, inner)
+
+
+def _oa_apply_stream(real_route, is_sse, is_json, inner) -> None:
+    """Set the native streaming attrs on a real APIRoute (built with
+    response_model=None) so real get_openapi emits the SSE/jsonl itemSchema."""
+    if is_sse:
+        real_route.is_sse_stream = True
+    elif is_json:
+        real_route.is_json_stream = True
+    if inner is not None:
+        real_route.stream_item_field = _real_fastapi.utils.create_model_field(
+            name=getattr(inner, "__name__", "StreamItem"),
+            type_=inner,
+            mode="serialization",
+        )
+
+
+def _shim_get_openapi(*, title, version, routes=None, webhooks=None, **kw):
+    """Shim for ``fastapi.openapi.utils.get_openapi`` — the clone ``_openapi.py``
+    generator is deleted, so user code doing
+    ``from fastapi.openapi.utils import get_openapi; get_openapi(routes=app.routes, ...)``
+    (e.g. a custom ``app.openapi``) must convert the CLONE route objects to real
+    ``APIRoute``s before calling REAL get_openapi. Builds from each route's own-level
+    attributes (mount/include prefixing is already baked into ``route.path``)."""
+    _RealRoute = _real_fastapi.routing.APIRoute
+    _http = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+
+    def _convert(route_list):
+        out = []
+        for route in route_list or []:
+            ep = getattr(route, "endpoint", None)
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None)
+            if ep is None or path is None or not methods:
+                continue  # Mount / WebSocket / non-API routes
+            rc = getattr(route, "response_class", None)
+            try:
+                rc_ok = isinstance(rc, type) and issubclass(rc, _real_starlette_response)
+            except TypeError:
+                rc_ok = False
+            rm = getattr(route, "response_model", None)
+            needs_none, is_sse, is_json, inner = _oa_stream_info(rm, rc, ep)
+            if needs_none:
+                rm = None
+            oe = dict(getattr(route, "openapi_extra", None) or {})
+            if getattr(route, "servers", None):
+                oe["servers"] = route.servers
+            if getattr(route, "external_docs", None):
+                oe["externalDocs"] = route.external_docs
+            if getattr(route, "security", None) is not None:
+                oe["security"] = route.security
+            rkw = dict(
+                methods=[m for m in methods if m in _http] or list(methods),
+                response_model=rm,
+                status_code=getattr(route, "status_code", None),
+                tags=getattr(route, "tags", None) or None,
+                summary=getattr(route, "summary", None),
+                description=getattr(route, "description", None) or "",
+                response_description=getattr(
+                    route, "response_description", "Successful Response"
+                ),
+                responses=getattr(route, "responses", None) or None,
+                deprecated=getattr(route, "deprecated", None),
+                operation_id=getattr(route, "operation_id", None),
+                dependencies=getattr(route, "dependencies", None) or None,
+                include_in_schema=getattr(route, "include_in_schema", True),
+                name=getattr(route, "name", None),
+                openapi_extra=oe or None,
+            )
+            if rc_ok:
+                rkw["response_class"] = rc
+            try:
+                rr = _RealRoute(path, ep, **rkw)
+            except Exception:  # noqa: BLE001
+                continue
+            if is_sse or is_json:
+                _oa_apply_stream(rr, is_sse, is_json, inner)
+            out.append(rr)
+        return out
+
+    return _real_fastapi.openapi.utils.get_openapi(
+        title=title,
+        version=version,
+        routes=_convert(routes),
+        webhooks=_convert(webhooks) if webhooks else None,
+        **kw,
+    )
 
 
 class FastAPI(_real_fastapi.FastAPI):
@@ -5955,6 +6092,14 @@ class FastAPI(_real_fastapi.FastAPI):
         _http = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
         out: list = []
         for c in clone_callbacks or []:
+            # A callback list item may be a ROUTER (callbacks=[cb_router]) rather
+            # than a route — flatten it into its routes.
+            if not hasattr(c, "endpoint") and getattr(c, "routes", None) is not None:
+                nested_router = self._openapi_real_callbacks(c.routes)
+                if nested_router is None:
+                    return None
+                out.extend(nested_router)
+                continue
             cp = getattr(c, "path", None)
             cep = getattr(c, "endpoint", None)
             if cp is None or cep is None:
@@ -6009,7 +6154,10 @@ class FastAPI(_real_fastapi.FastAPI):
             route = rd.get("_route_obj")
             endpoint = getattr(route, "endpoint", None) if route is not None else None
             if route is None or endpoint is None:
-                return None
+                # Internal/dynamic routes (/openapi.json, /docs, /redoc) carry no
+                # clone route object; they're include_in_schema=False so real
+                # get_openapi omits them anyway — skip, don't fall back.
+                continue
             methods = [m for m in (rd.get("methods") or []) if m in _http] or rd.get(
                 "methods"
             )
@@ -6025,29 +6173,16 @@ class FastAPI(_real_fastapi.FastAPI):
                 )
             except TypeError:
                 rc_ok = False
-            # Generator / streaming endpoints: the clone stores the return
+            # SSE / NDJSON streaming endpoints: the clone stores the return
             # annotation (e.g. AsyncIterable[Item]) as response_model, which real
-            # get_dependant can't turn into a response field. Drop it (real builds
-            # no response field — matches the clone's NDJSON-stream output).
-            import collections.abc as _abc
-            import typing as _typing
-
+            # get_dependant can't field. Build with response_model=None, then set
+            # real's native streaming attrs (is_sse_stream / is_json_stream +
+            # stream_item_field) AFTER the build so real get_openapi emits the
+            # spec SSE event envelope / jsonl itemSchema + lands the model.
             _rm = getattr(route, "response_model", None)
-            if inspect.isasyncgenfunction(endpoint) or inspect.isgeneratorfunction(
-                endpoint
-            ):
+            _needs_none, _is_sse, _is_json, _inner = _oa_stream_info(_rm, rc, endpoint)
+            if _needs_none:
                 _rm = None
-            else:
-                _ro = _typing.get_origin(_rm)
-                if _ro is not None and _ro in (
-                    _abc.AsyncIterable,
-                    _abc.AsyncIterator,
-                    _abc.AsyncGenerator,
-                    _abc.Iterator,
-                    _abc.Generator,
-                    _abc.Coroutine,
-                ):
-                    _rm = None
             # Rebuild clone callback routes → real so real get_openapi documents
             # the operation's ``callbacks`` (real can't process clone routes).
             # rd["callbacks"] is the COMBINED set (route + include + app level); the
@@ -6081,7 +6216,9 @@ class FastAPI(_real_fastapi.FastAPI):
                      **(rd.get("responses") or getattr(route, "responses", None) or {})}
                     or None
                 ),
-                deprecated=getattr(route, "deprecated", None),
+                # rd["deprecated"] carries include_router(deprecated=...) inheritance;
+                # the route object alone has only its own level.
+                deprecated=rd.get("deprecated") or getattr(route, "deprecated", None),
                 # The clone already resolves the operationId via the full cascade
                 # (route → router → include → app generate_unique_id_function) and
                 # stamps it on rd; pass it through (real uses it verbatim). None →
@@ -6122,49 +6259,45 @@ class FastAPI(_real_fastapi.FastAPI):
             # route's own path; regular routes use rd["path"] (mount-prefixed).
             path = getattr(route, "path", None) if webhook else rd["path"]
             try:
-                real_routes.append(_RealRoute(path or rd["path"], endpoint, **kw))
+                _real = _RealRoute(path or rd["path"], endpoint, **kw)
             except Exception:
                 return None
+            if _is_sse or _is_json:
+                _oa_apply_stream(_real, _is_sse, _is_json, _inner)
+            real_routes.append(_real)
         return real_routes
 
     def _openapi_real(self, route_dicts: list[dict], webhook_dicts: list[dict],
-                      effective_servers) -> dict | None:
-        """Real-FastAPI OpenAPI generation (``FASTAPI_TURBO_REAL_OPENAPI``). Returns
-        the schema, or ``None`` to fall back to the clone generator."""
+                      effective_servers) -> dict:
+        """Generate the OpenAPI schema via REAL ``fastapi.openapi.utils.get_openapi``
+        over real ``APIRoute``s rebuilt from the clone routes. This is the SOLE
+        generator (clone ``_openapi.py`` is deleted); errors propagate like real
+        FastAPI's. NOT ``from fastapi.openapi.utils import`` (the shim rebinds that);
+        ``_real_fastapi`` is the real module captured pre-shim."""
         real_routes = self._openapi_real_routes(route_dicts)
-        if real_routes is None:
-            return None
         real_webhooks = (
             self._openapi_real_routes(webhook_dicts, webhook=True) if webhook_dicts else []
         )
-        if real_webhooks is None:
-            return None
-        # Real get_openapi — NOT `from fastapi.openapi.utils import` (the shim rebinds
-        # that to the clone generator). `_real_fastapi` is the real module captured
-        # pre-shim, so its `.openapi.utils.get_openapi` is the real one. Wrapped:
-        # schema-build can still fail for a route real get_dependant can't fully
-        # resolve at openapi-time (e.g. a locally-defined endpoint whose Annotated
-        # body can't re-resolve) — fall back to the clone generator rather than raise.
-        _get_openapi = _real_fastapi.openapi.utils.get_openapi
-        try:
-            return _get_openapi(
-                title=self.title,
-                version=self.version,
-                openapi_version=self.openapi_version,
-                summary=self.summary,
-                description=self.description,
-                routes=real_routes,
-                webhooks=real_webhooks,
-                tags=self.openapi_tags,
-                servers=effective_servers,
-                terms_of_service=self.terms_of_service,
-                contact=self.contact,
-                license_info=self.license_info,
-                separate_input_output_schemas=self.separate_input_output_schemas,
-                external_docs=self.external_docs,
+        if real_routes is None or real_webhooks is None:
+            raise RuntimeError(
+                "fastapi-turbo: could not rebuild real OpenAPI routes for this app"
             )
-        except Exception:
-            return None
+        return _real_fastapi.openapi.utils.get_openapi(
+            title=self.title,
+            version=self.version,
+            openapi_version=self.openapi_version,
+            summary=self.summary,
+            description=self.description,
+            routes=real_routes,
+            webhooks=real_webhooks,
+            tags=self.openapi_tags,
+            servers=effective_servers,
+            terms_of_service=self.terms_of_service,
+            contact=self.contact,
+            license_info=self.license_info,
+            separate_input_output_schemas=self.separate_input_output_schemas,
+            external_docs=self.external_docs,
+        )
 
     def openapi(self) -> dict[str, Any]:
         """Return the OpenAPI schema dict (cached after first call).
@@ -6187,34 +6320,11 @@ class FastAPI(_real_fastapi.FastAPI):
             elif not any(s.get("url") == self.root_path for s in effective_servers):
                 effective_servers = [{"url": self.root_path}, *effective_servers]
         webhook_dicts = self._collect_routes_from_router(self.webhooks)
-        # OpenAPI pivot: real fastapi.openapi.utils.get_openapi over real APIRoutes
-        # rebuilt from the clone routes. Opt-in (FASTAPI_TURBO_REAL_OPENAPI=1) until
-        # the last default-on blockers clear (SecurityScopes adapter scope
-        # accumulation + ForwardRef rebuild-timing); falls back to the clone
-        # generator below for any route the real path can't build.
-        import os as _os
-
-        if _os.environ.get("FASTAPI_TURBO_REAL_OPENAPI") == "1":
-            _real_schema = self._openapi_real(
-                route_dicts, webhook_dicts, effective_servers
-            )
-            if _real_schema is not None:
-                self.openapi_schema = _real_schema
-                return self.openapi_schema
-        self.openapi_schema = generate_openapi_schema(
-            title=self.title,
-            version=self.version,
-            description=self.description,
-            routes=route_dicts,
-            servers=effective_servers,
-            terms_of_service=self.terms_of_service,
-            contact=self.contact,
-            license_info=self.license_info,
-            openapi_tags=self.openapi_tags,
-            webhooks=webhook_dicts,
-            external_docs=self.external_docs,
-            summary=self.summary,
-            separate_input_output_schemas=self.separate_input_output_schemas,
+        # OpenAPI is generated by REAL fastapi.openapi.utils.get_openapi over real
+        # APIRoutes rebuilt from the clone routes (the clone _openapi.py generator
+        # is deleted). Errors propagate like real FastAPI's.
+        self.openapi_schema = self._openapi_real(
+            route_dicts, webhook_dicts, effective_servers
         )
         return self.openapi_schema
 
@@ -7244,6 +7354,20 @@ class FastAPI(_real_fastapi.FastAPI):
                 ),
                 response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
             )
+            # SecurityScopes: the Rust door adapter doesn't accumulate the
+            # ``Security(..., scopes=[...])`` chain into SecurityScopes. Decline any
+            # route whose dependant tree (recursively) requests SecurityScopes so it
+            # runs on the clone door path (which does accumulate). OpenAPI generation
+            # still uses the real route (it doesn't go through this method).
+            def _wants_security_scopes(dep) -> bool:
+                if getattr(dep, "security_scopes_param_name", None):
+                    return True
+                return any(
+                    _wants_security_scopes(s)
+                    for s in getattr(dep, "dependencies", []) or []
+                )
+            if _wants_security_scopes(real.dependant):
+                return None
             params = extract_params_from_route(real)
             handler = build_handler(real)
         except Undelegable:

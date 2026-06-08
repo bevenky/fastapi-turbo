@@ -534,12 +534,16 @@ def _build() -> dict[str, types.ModuleType]:
     modules["fastapi.logger"] = fastapi_logger
 
     # ── fastapi.openapi.* ──────────────────────────────────────────
-    import fastapi_turbo._openapi as _oa
+    # The clone _openapi.py generator is deleted; app.openapi() generates via REAL
+    # get_openapi internally. For user code doing
+    # ``from fastapi.openapi.utils import get_openapi; get_openapi(routes=app.routes,...)``
+    # expose a wrapper that converts the CLONE route objects to real APIRoutes first
+    # (raw real get_openapi can't process clone routes).
     fastapi_openapi = _mod("fastapi.openapi")
     modules["fastapi.openapi"] = fastapi_openapi
 
     fastapi_openapi_utils = _mod("fastapi.openapi.utils")
-    fastapi_openapi_utils.get_openapi = _oa.generate_openapi_schema  # type: ignore[attr-defined]
+    fastapi_openapi_utils.get_openapi = _applications._shim_get_openapi  # type: ignore[attr-defined]
     modules["fastapi.openapi.utils"] = fastapi_openapi_utils
 
     # ── fastapi.openapi.constants ──────────────────────────────────

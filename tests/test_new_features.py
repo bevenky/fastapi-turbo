@@ -22,8 +22,15 @@ from __future__ import annotations
 import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
 
 import json
+from typing import Annotated  # noqa: F401 — module-level for string-annotation resolution
 
 import pytest
+
+# Module-level so endpoints defined inside tests (with `from __future__ import
+# annotations`, string annotations) resolve `Body`/`Annotated` from __globals__ at
+# OpenAPI-generation time — matching real FastAPI (which resolves hints from the
+# endpoint's module globals, not the defining function's locals).
+from fastapi import Body  # noqa: F401,E402
 
 
 # ── Response.set_cookie / delete_cookie ────────────────────────────

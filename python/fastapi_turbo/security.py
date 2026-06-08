@@ -513,12 +513,13 @@ class APIKeyCookie(_APIKeyBase):
     _location = "cookie"
 
 
-class SecurityScopes:
-    """Holds the scopes required by a security dependency."""
-
-    def __init__(self, scopes: list[str] | None = None):
-        self.scopes = scopes or []
-        self.scope_str = " ".join(self.scopes)
+# Real SecurityScopes (pre-shim import → REAL). Real ``get_dependant`` detects it
+# by identity (sets ``security_scopes_param_name``); a clone reimplementation isn't
+# recognized, so real ``get_openapi`` would fail to build its field. Behaviorally
+# identical (``scopes`` / ``scope_str``). Routes taking SecurityScopes stay on the
+# clone door path (declined in ``_adapter_route_info``), which accumulates the
+# ``Security(..., scopes=[...])`` chain; OpenAPI generation uses the real class.
+from fastapi.security import SecurityScopes
 
 
 # ── OAuth2 additional flows ─────────────────────────────────────────
