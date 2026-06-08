@@ -152,20 +152,21 @@ class WebSocket:
         """Case-insensitive headers view (Starlette-compatible Headers)."""
         from fastapi_turbo.datastructures import Headers
 
-        raw = self.scope.get("headers", [])
-        # ASGI headers are list[tuple[bytes, bytes]]; Headers class handles it.
-        if raw and isinstance(raw, list) and raw and isinstance(raw[0], tuple):
-            if isinstance(raw[0][0], (bytes, bytearray)):
-                # Convert to str pairs for the Headers class
-                raw = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in raw]
-        return Headers(raw)
+        # Real Starlette Headers takes ``raw=list[(bytes,bytes)]`` — normalize the
+        # scope headers (may be str or bytes pairs) to bytes.
+        norm = []
+        for k, v in self.scope.get("headers", []) or []:
+            kb = k if isinstance(k, (bytes, bytearray)) else str(k).encode("latin-1")
+            vb = v if isinstance(v, (bytes, bytearray)) else str(v).encode("latin-1")
+            norm.append((bytes(kb), bytes(vb)))
+        return Headers(raw=norm)
 
     @property
     def url(self):
         """WebSocket URL (Starlette-compatible URL)."""
         from fastapi_turbo.datastructures import URL
 
-        return URL(self.scope)
+        return URL(scope=self.scope)
 
     @property
     def base_url(self):
@@ -175,7 +176,7 @@ class WebSocket:
         scope = dict(self.scope)
         scope["path"] = "/"
         scope["query_string"] = b""
-        return URL(scope)
+        return URL(scope=scope)
 
     @property
     def query_params(self):
@@ -210,8 +211,8 @@ class WebSocket:
 
         c = self.scope.get("client")
         if c is None:
-            return Address(("0.0.0.0", 0))
-        return Address(c)
+            return Address("0.0.0.0", 0)
+        return Address(*c)
 
     @property
     def app(self):

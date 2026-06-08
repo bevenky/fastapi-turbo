@@ -28,9 +28,10 @@ def test_url_from_scope():
         "scheme": "http",
         "server": ("localhost", 8000),
         "path": "/api/items",
-        "query_string": "page=2",
+        "query_string": b"page=2",
+        "headers": [],
     }
-    u = URL(scope)
+    u = URL(scope=scope)  # real Starlette URL takes scope as a keyword
     assert u.scheme == "http"
     assert u.hostname == "localhost"
     assert u.path == "/api/items"
@@ -52,7 +53,7 @@ def test_headers_case_insensitive():
 def test_headers_from_tuples():
     from starlette.datastructures import Headers
 
-    h = Headers([(b"content-type", b"text/html"), (b"x-custom", b"val")])
+    h = Headers(raw=[(b"content-type", b"text/html"), (b"x-custom", b"val")])
     assert h["content-type"] == "text/html"
     assert h["x-custom"] == "val"
 
@@ -71,7 +72,7 @@ def test_query_params():
 def test_address():
     from starlette.datastructures import Address
 
-    a = Address(("127.0.0.1", 8080))
+    a = Address("127.0.0.1", 8080)  # real Starlette Address(host, port) NamedTuple
     assert a.host == "127.0.0.1"
     assert a.port == 8080
 

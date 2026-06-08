@@ -41,35 +41,23 @@ def test_compat_captures_preshim_uploadfile_at_install_time():
 
 
 def test_formdata_close_recognises_simulated_preshim_uploadfile():
-    """Simulate the pre-shim path explicitly: install a fake
-    ``UploadFile`` class into the compat module's
-    ``PRESHIM_STARLETTE_UPLOADFILE`` slot, build a ``FormData`` with
-    that type as a value, and verify ``await form.close()`` calls
-    its async ``close()``. This locks the lookup against the
-    captured-at-install-time slot, not the post-shim
-    ``sys.modules`` view."""
-    from fastapi_turbo import compat
-    from fastapi_turbo.datastructures import FormData
+    """datastructures.py is now a re-export of real Starlette; real FormData.close
+    closes real UploadFile subclasses (the real pre-shim class IS one), so the
+    clone's duck-typed PRESHIM recognition is gone. Verify real FormData.close
+    closes a real UploadFile and is a no-op for plain values."""
+    from starlette.datastructures import FormData, UploadFile
 
-    original_capture = compat.PRESHIM_STARLETTE_UPLOADFILE
     closed_log: list[bool] = []
 
-    class _FakePreShimUF:
-        def __init__(self):
-            self.filename = "x.txt"
-            self.file = None
-
+    class _UF(UploadFile):
         async def close(self):
             closed_log.append(True)
 
-    compat.PRESHIM_STARLETTE_UPLOADFILE = _FakePreShimUF
-    try:
-        async def _run():
-            f = FormData([("file", _FakePreShimUF())])
-            await f.close()
-        asyncio.run(_run())
-    finally:
-        compat.PRESHIM_STARLETTE_UPLOADFILE = original_capture
+    async def _run():
+        f = FormData([("file", _UF(file=None, filename="x.txt")), ("a", "1")])
+        await f.close()
+    asyncio.run(_run())
+    assert closed_log == [True], closed_log
 
     assert closed_log == [True], closed_log
 
@@ -124,7 +112,7 @@ def test_mutable_headers_setitem_replaces_existing():
     semantics — distinct from ``append``)."""
     from fastapi_turbo.datastructures import MutableHeaders
 
-    h = MutableHeaders([("x", "1"), ("x", "2")])
+    h = MutableHeaders(raw=[(b"x", b"1"), (b"x", b"2")])  # real Starlette: raw=bytes pairs
     h["x"] = "3"
     assert h.getlist("x") == ["3"], h.getlist("x")
 
@@ -151,7 +139,7 @@ def test_mutable_headers_setdefault_returns_existing_or_inserts():
 def test_mutable_headers_delitem_removes_all_duplicates():
     from fastapi_turbo.datastructures import MutableHeaders
 
-    h = MutableHeaders([("x", "1"), ("y", "2"), ("x", "3")])
+    h = MutableHeaders(raw=[(b"x", b"1"), (b"y", b"2"), (b"x", b"3")])
     del h["x"]
     assert h.getlist("x") == []
     assert h["y"] == "2"
