@@ -6025,6 +6025,29 @@ class FastAPI(_real_fastapi.FastAPI):
                 )
             except TypeError:
                 rc_ok = False
+            # Generator / streaming endpoints: the clone stores the return
+            # annotation (e.g. AsyncIterable[Item]) as response_model, which real
+            # get_dependant can't turn into a response field. Drop it (real builds
+            # no response field — matches the clone's NDJSON-stream output).
+            import collections.abc as _abc
+            import typing as _typing
+
+            _rm = getattr(route, "response_model", None)
+            if inspect.isasyncgenfunction(endpoint) or inspect.isgeneratorfunction(
+                endpoint
+            ):
+                _rm = None
+            else:
+                _ro = _typing.get_origin(_rm)
+                if _ro is not None and _ro in (
+                    _abc.AsyncIterable,
+                    _abc.AsyncIterator,
+                    _abc.AsyncGenerator,
+                    _abc.Iterator,
+                    _abc.Generator,
+                    _abc.Coroutine,
+                ):
+                    _rm = None
             # Rebuild clone callback routes → real so real get_openapi documents
             # the operation's ``callbacks`` (real can't process clone routes).
             # rd["callbacks"] is the COMBINED set (route + include + app level); the
@@ -6040,7 +6063,7 @@ class FastAPI(_real_fastapi.FastAPI):
                     or getattr(route, "dependencies", None)
                     or None
                 ),
-                response_model=getattr(route, "response_model", None),
+                response_model=_rm,
                 status_code=getattr(route, "status_code", None),
                 # rd["tags"]/["responses"] are the COMBINED include + route level
                 # (the route object alone carries only its own level).
@@ -6165,8 +6188,10 @@ class FastAPI(_real_fastapi.FastAPI):
                 effective_servers = [{"url": self.root_path}, *effective_servers]
         webhook_dicts = self._collect_routes_from_router(self.webhooks)
         # OpenAPI pivot: real fastapi.openapi.utils.get_openapi over real APIRoutes
-        # rebuilt from the clone routes. Behind a flag during rollout; falls back to
-        # the clone generator if any route can't be built real (never worse).
+        # rebuilt from the clone routes. Opt-in (FASTAPI_TURBO_REAL_OPENAPI=1) until
+        # the last default-on blockers clear (SecurityScopes adapter scope
+        # accumulation + ForwardRef rebuild-timing); falls back to the clone
+        # generator below for any route the real path can't build.
         import os as _os
 
         if _os.environ.get("FASTAPI_TURBO_REAL_OPENAPI") == "1":
