@@ -6016,7 +6016,9 @@ class FastAPI(_real_fastapi.FastAPI):
             # response_class only when it's a real Starlette Response subclass
             # (responses.py re-exports real, so clone routes carry real classes);
             # else let real APIRoute use its default so the media type is canonical.
-            rc = getattr(route, "response_class", None)
+            # rd["response_class"] is the RESOLVED class (route → router → app
+            # default_response_class); the route object alone may carry None.
+            rc = rd.get("response_class") or getattr(route, "response_class", None)
             try:
                 rc_ok = isinstance(rc, type) and issubclass(
                     rc, _real_starlette_response
@@ -6040,17 +6042,20 @@ class FastAPI(_real_fastapi.FastAPI):
                 ),
                 response_model=getattr(route, "response_model", None),
                 status_code=getattr(route, "status_code", None),
-                tags=getattr(route, "tags", None) or None,
+                # rd["tags"]/["responses"] are the COMBINED include + route level
+                # (the route object alone carries only its own level).
+                tags=rd.get("tags") or getattr(route, "tags", None) or None,
                 summary=getattr(route, "summary", None),
                 description=getattr(route, "description", None) or "",
                 response_description=getattr(
                     route, "response_description", "Successful Response"
                 ),
-                # App-level ``responses`` merge into every route (clone behavior;
-                # real reads only route-level ``responses``). Route-level wins.
+                # App-level ``responses`` merge under the combined route/include
+                # responses (clone behavior; real reads only route-level). The
+                # more-specific (route/include) wins.
                 responses=(
                     {**(getattr(self, "responses", None) or {}),
-                     **(getattr(route, "responses", None) or {})}
+                     **(rd.get("responses") or getattr(route, "responses", None) or {})}
                     or None
                 ),
                 deprecated=getattr(route, "deprecated", None),
