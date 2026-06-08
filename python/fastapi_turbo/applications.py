@@ -2182,6 +2182,45 @@ def _load_real_starlette_class(submodule: str, classname: str):
         return cls
 
 
+# Real Starlette/FastAPI middleware class names → fastapi-turbo
+# middleware-type tag. Post-flip, ``app.add_middleware(...)`` is handed the
+# REAL middleware class, which lacks our ``_fastapi_turbo_middleware_type``
+# marker — so we resolve it by class name (distinctive across the Starlette
+# middleware suite) and match across the MRO so user subclasses resolve too.
+# Pre-flip these names ALSO match the clone classes, but the marker (checked
+# first in ``_tower_type_for``) wins there, keeping behaviour identical.
+_REAL_MW_NAME_TO_TYPE = {
+    "CORSMiddleware": "cors",
+    "GZipMiddleware": "gzip",
+    "HTTPSRedirectMiddleware": "httpsredirect",
+    "TrustedHostMiddleware": "trustedhost",
+    "SessionMiddleware": "python_http_session",
+    "AuthenticationMiddleware": "python_http_auth",
+    "BaseHTTPMiddleware": "base_http",
+}
+
+
+def _tower_type_for(mw_cls):
+    """Resolve a middleware class (or string shorthand) to its
+    fastapi-turbo middleware-type tag, or ``None`` if unknown.
+
+    Recognises BOTH the clone's ``_fastapi_turbo_middleware_type`` marker
+    (which wins when present) AND real Starlette middleware classes by name,
+    so after the shim flip ``app.add_middleware(CORSMiddleware, ...)`` with
+    the *real* class still maps to the right Tower layer / Python-HTTP path.
+    A string is returned as-is (``app.add_middleware('cors', ...)``)."""
+    if isinstance(mw_cls, str):
+        return mw_cls
+    marker = getattr(mw_cls, "_fastapi_turbo_middleware_type", None)
+    if marker:
+        return marker
+    for base in getattr(mw_cls, "__mro__", ()):
+        tag = _REAL_MW_NAME_TO_TYPE.get(getattr(base, "__name__", ""))
+        if tag:
+            return tag
+    return None
+
+
 def _resolve_tower_bound_to_asgi_class(mw_cls):
     """Map a Tower-bound middleware marker class to its real
     Starlette ASGI3 equivalent so the in-process dispatcher can
@@ -2190,16 +2229,14 @@ def _resolve_tower_bound_to_asgi_class(mw_cls):
     own. For the in-process / TestClient path we substitute the
     real Starlette class loaded around the shim.
 
-    Accepts both class markers (with ``_fastapi_turbo_middleware_type``
-    attribute) AND string-shorthand forms — ``app.add_middleware('cors',
-    ...)`` registers the string directly so we look it up here too.
+    Accepts class markers, real Starlette classes (resolved by name via
+    ``_tower_type_for``), AND string-shorthand forms — ``app.add_middleware(
+    'cors', ...)`` registers the string directly so we look it up here too.
 
     Returns ``None`` if the class / string isn't a Tower-bound marker
-    we know how to substitute."""
-    if isinstance(mw_cls, str):
-        mw_type = mw_cls
-    else:
-        mw_type = getattr(mw_cls, "_fastapi_turbo_middleware_type", None)
+    we know how to substitute (only CORS/GZip/HTTPSRedirect substitute —
+    TrustedHost runs through the raw-ASGI chain unchanged)."""
+    mw_type = _tower_type_for(mw_cls)
     if mw_type == "cors":
         return _load_real_starlette_class("middleware.cors", "CORSMiddleware")
     if mw_type == "gzip":
@@ -3573,7 +3610,7 @@ class FastAPI(_real_fastapi.FastAPI):
             _resolve_tower_bound_to_asgi_class(middleware_cls)
             return
 
-        mw_type = getattr(middleware_cls, "_fastapi_turbo_middleware_type", None)
+        mw_type = _tower_type_for(middleware_cls)
         if mw_type and mw_type.startswith("python_http_"):
             try:
                 if args:
@@ -3709,25 +3746,24 @@ class FastAPI(_real_fastapi.FastAPI):
         return decorator
 
     def _build_middleware_config(self) -> list[dict[str, Any]]:
-        """Convert the middleware stack into dicts the Rust core can consume."""
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        """Convert the middleware stack into dicts the Rust core can consume.
 
+        Resolves each entry via ``_tower_type_for`` so both the clone marker
+        classes AND the real Starlette classes (post-flip) — plus string
+        shorthand — map to the same Tower layer config."""
         config: list[dict[str, Any]] = []
         for cls, kwargs in self._middleware_stack:
-            if isinstance(cls, str):
-                # String shorthand: app.add_middleware("cors", allow_origins=["*"])
-                config.append({"type": cls, **kwargs})
-            elif isinstance(cls, type) and issubclass(cls, TrustedHostMiddleware):
+            mw_type = _tower_type_for(cls)
+            if mw_type == "trustedhost":
                 config.append({
                     "type": "trustedhost",
                     "allowed_hosts": kwargs.get("allowed_hosts", ["*"]),
                 })
-            elif isinstance(cls, type) and issubclass(cls, HTTPSRedirectMiddleware):
+            elif mw_type == "httpsredirect":
                 config.append({"type": "httpsredirect"})
-            elif hasattr(cls, "_fastapi_turbo_middleware_type"):
-                # fastapi-turbo middleware class with a known Tower mapping
-                config.append({"type": cls._fastapi_turbo_middleware_type, **kwargs})
+            elif mw_type:
+                # cors / gzip / string shorthand / other known Tower mapping
+                config.append({"type": mw_type, **kwargs})
             # else: unknown ASGI middleware — skip for now
         return config
 
