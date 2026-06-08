@@ -18,12 +18,7 @@ from typing import Annotated, Optional
 from pydantic import BaseModel
 
 from fastapi_turbo.exceptions import HTTPException
-from fastapi_turbo.param_functions import (
-    Header as _Header,
-    Query as _Query,
-    Cookie as _Cookie,
-    Form as _Form,
-)
+from fastapi_turbo.param_functions import Form as _Form
 from fastapi_turbo.requests import Request
 
 # Real FastAPI marks a ``Depends(scheme)`` as a SECURITY dependency (→ OpenAPI
@@ -453,41 +448,17 @@ class HTTPBasic(_SecurityBase):
         return HTTPBasicCredentials(username=username, password=password)
 
 
-def _make_api_key_call(location: str, name: str, auto_error: bool, self_ref):
-    """Factory: build a __call__ with an instance-specific marker default.
-
-    Each APIKey* instance has its own `name` -- we synthesize an async def
-    whose default value is an instance-bound Header/Query/Cookie marker so
-    the dep resolver knows where to pull the value from. The marker is
-    excluded from the OpenAPI schema (``include_in_schema=False``) because
-    FastAPI documents these values under ``components.securitySchemes``,
-    not under the operation's ``parameters`` list.
-    """
-    if location == "header":
-        marker = _Header(default=None, alias=name, include_in_schema=False)
-    elif location == "query":
-        marker = _Query(default=None, alias=name, include_in_schema=False)
-    elif location == "cookie":
-        marker = _Cookie(default=None, alias=name, include_in_schema=False)
-    else:
-        marker = None
-
-    # Shadow-default used by inspect.signature -- the default VALUE is the
-    # marker itself, which the introspector recognises.
-    async def _call(api_key: str | None = marker, **_kwargs) -> str | None:
-        if api_key:
-            return api_key
-        if auto_error:
-            raise HTTPException(
-                status_code=401,
-                detail="Not authenticated",
-                headers={"WWW-Authenticate": "APIKey"},
-            )
-        return None
-    return _call
-
-
+@_request_sig
 class _APIKeyBase(_SecurityBase):
+    """API-key scheme base. Extracts the key from the request INTERNALLY (header /
+    query / cookie by ``name``) — matching real FastAPI's ``APIKeyBase``, which is
+    a ``SecurityBase`` that declares NO parameter (the key is documented under
+    ``components.securitySchemes``, not the operation's ``parameters``). The
+    previous clone declared an ``api_key`` Header/Query/Cookie marker param, which
+    made real ``get_openapi`` emit a phantom 422 + validation components. The
+    ``@_request_sig`` decorator pins the introspected signature to
+    ``(request: Request)`` so real ``get_dependant`` injects the request only."""
+
     _location: str = "header"
 
     def __init__(self, *, name: str, scheme_name: str | None = None,
@@ -499,12 +470,32 @@ class _APIKeyBase(_SecurityBase):
         self.model = {"type": "apiKey", "in": self._location, "name": name}
         if description:
             self.model["description"] = description
-        self._call = _make_api_key_call(self._location, name, auto_error, self)
-        import inspect as _inspect
-        self.__signature__ = _inspect.signature(self._call)
 
-    async def __call__(self, *args, **kwargs):
-        return await self._call(*args, **kwargs)
+    def _extract(self, request, kwargs) -> str | None:
+        # Backward compat: an explicit value handed in by a caller / legacy DI.
+        if kwargs.get("api_key") is not None:
+            return kwargs["api_key"]
+        if request is None:
+            return None
+        if self._location == "header":
+            return request.headers.get(self.name)
+        if self._location == "query":
+            return request.query_params.get(self.name)
+        if self._location == "cookie":
+            return request.cookies.get(self.name)
+        return None
+
+    async def __call__(self, request: Request = None, **kwargs) -> str | None:
+        api_key = self._extract(request, kwargs)
+        if api_key:
+            return api_key
+        if self.auto_error:
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "APIKey"},
+            )
+        return None
 
 
 class APIKeyHeader(_APIKeyBase):
@@ -649,6 +640,7 @@ class OAuth2AuthorizationCodeBearer(_SecurityBase):
 # ── OpenID Connect ─────────────────────────────────────────────────
 
 
+@_request_sig
 class OpenIdConnect(_SecurityBase):
     """OpenID Connect discovery-URL based auth scheme."""
 
