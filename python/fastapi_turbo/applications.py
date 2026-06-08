@@ -5945,6 +5945,54 @@ class FastAPI(_real_fastapi.FastAPI):
     # OpenAPI schema
     # ------------------------------------------------------------------
 
+    def _openapi_real_callbacks(self, clone_callbacks) -> list | None:
+        """Rebuild clone callback ``APIRoute``s as real ones (recursively) so real
+        ``get_openapi`` documents the operation's ``callbacks`` (it can't process
+        clone routes). Callback paths are OpenAPI runtime expressions (e.g.
+        ``{$callback_url}/...``) — real ``APIRoute`` accepts them. Returns ``None``
+        on any failure so the caller falls back to the clone generator."""
+        _RealRoute = _real_fastapi.routing.APIRoute
+        _http = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+        out: list = []
+        for c in clone_callbacks or []:
+            cp = getattr(c, "path", None)
+            cep = getattr(c, "endpoint", None)
+            if cp is None or cep is None:
+                return None
+            cm = [m for m in (getattr(c, "methods", None) or []) if m in _http] or getattr(
+                c, "methods", None
+            )
+            nested = getattr(c, "callbacks", None)
+            real_nested = self._openapi_real_callbacks(nested) if nested else None
+            if nested and real_nested is None:
+                return None
+            try:
+                out.append(
+                    _RealRoute(
+                        cp,
+                        cep,
+                        methods=cm,
+                        response_model=getattr(c, "response_model", None),
+                        status_code=getattr(c, "status_code", None),
+                        tags=getattr(c, "tags", None) or None,
+                        summary=getattr(c, "summary", None),
+                        description=getattr(c, "description", None) or "",
+                        response_description=getattr(
+                            c, "response_description", "Successful Response"
+                        ),
+                        responses=getattr(c, "responses", None) or None,
+                        deprecated=getattr(c, "deprecated", None),
+                        operation_id=getattr(c, "operation_id", None),
+                        include_in_schema=getattr(c, "include_in_schema", True),
+                        name=getattr(c, "name", None),
+                        openapi_extra=getattr(c, "openapi_extra", None),
+                        callbacks=real_nested,
+                    )
+                )
+            except Exception:
+                return None
+        return out
+
     def _openapi_real_routes(self, route_dicts: list[dict], webhook: bool = False) -> list | None:
         """Build a real ``fastapi.routing.APIRoute`` per clone route dict so real
         ``fastapi.openapi.utils.get_openapi`` can generate the schema (the OpenAPI
@@ -5975,6 +6023,14 @@ class FastAPI(_real_fastapi.FastAPI):
                 )
             except TypeError:
                 rc_ok = False
+            # Rebuild clone callback routes → real so real get_openapi documents
+            # the operation's ``callbacks`` (real can't process clone routes).
+            # rd["callbacks"] is the COMBINED set (route + include + app level); the
+            # route object alone only carries the route-level ones.
+            _cbs = rd.get("callbacks") or getattr(route, "callbacks", None)
+            _real_cbs = self._openapi_real_callbacks(_cbs) if _cbs else None
+            if _cbs and _real_cbs is None:
+                return None
             kw: dict = dict(
                 methods=methods,
                 dependencies=(
@@ -6017,7 +6073,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 ),
                 include_in_schema=getattr(route, "include_in_schema", True),
                 name=getattr(route, "name", None),
-                callbacks=getattr(route, "callbacks", None),
+                callbacks=_real_cbs,
             )
             # Clone OpenAPI extensions the real fork's get_openapi has no route
             # kwarg for → fold into openapi_extra (real deep_dict_updates it into
