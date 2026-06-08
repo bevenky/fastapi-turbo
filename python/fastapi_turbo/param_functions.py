@@ -312,4 +312,8 @@ class UploadFile(_RealUploadFile, metaclass=ABCMeta):
 
     @classmethod
     def __get_pydantic_json_schema__(cls, schema, handler):
-        return {"type": "string", "format": "binary"}
+        # OpenAPI 3.1 form (the default) — ``contentMediaType`` not the 3.0
+        # ``format: binary``. Real ``get_openapi`` (the OpenAPI pivot) passes this
+        # through verbatim; the clone ``_openapi.py`` hardcodes the file-param
+        # schema separately (``_build_form_file_body``) so its output is unchanged.
+        return {"type": "string", "contentMediaType": "application/octet-stream"}
