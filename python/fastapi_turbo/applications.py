@@ -7331,9 +7331,15 @@ class FastAPI(_real_fastapi.FastAPI):
         # _get_all_dependencies_for_route) and is passed to the real APIRoute below;
         # the adapter emits route-level deps (name=None) as non-handler-params so they
         # run for side effects (auth) without being passed to the handler.
-        # A custom status_code isn't carried on RouteInfo yet (the door defaults to
-        # 200) — fall back for correctness.
-        if rd.get("status_code") not in (None, 200):
+        # A custom status_code IS now carried on RouteInfo (the door applies it as
+        # the default status for non-Response results, overridable by a handler/dep
+        # ``response.status_code``), so custom-status routes ride the adapter — EXCEPT
+        # when the app has @app.middleware("http"): the chain renders the handler's
+        # result into a Response, past the door's default-status hook, so keep those
+        # on the clone path (which bakes the status into that Response).
+        if rd.get("status_code") not in (None, 200) and getattr(
+            self, "_http_middlewares", None
+        ):
             return None
         # Custom response_class is now applied by build_handler (it renders the
         # endpoint result via the class) + the door merges any dep-injected
@@ -7775,6 +7781,7 @@ class FastAPI(_real_fastapi.FastAPI):
                         handler_name=rd["handler_name"],
                         params=_ap,
                         is_websocket=False,
+                        status_code=rd.get("status_code"),
                     )
                 )
                 continue

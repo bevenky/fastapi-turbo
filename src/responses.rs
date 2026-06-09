@@ -158,11 +158,35 @@ pub fn py_to_response_with_request(
     range_header: Option<&str>,
     if_range_header: Option<&str>,
 ) -> Response {
+    // Route-level default status (``status_code=201``); 200 for normal routes.
+    // Only the non-Response handler results below use it — a returned Response /
+    // StreamingResponse / FileResponse keeps its own status.
+    let default_status = crate::router::route_default_status();
+    // No-body statuses (1xx/204/304) on a route-level ``status_code``: a non-Response
+    // value return (dict/list/tuple/None) must produce an EMPTY body (no JSON, no
+    // content-length) — matches FastAPI/Starlette. (A returned Response with a
+    // no-body status is handled in response_object_to_response.)
+    // Only strip on the ROUTE default when there's no injected Response shell — a
+    // handler/dep with ``response: Response`` may override the status to a body one
+    // (``status_code=204`` route, handler sets 400 + returns a dict). Shell routes
+    // are stripped on the FINAL status in apply_injected_response instead.
+    let no_body_status = (default_status.as_u16() < 200
+        || default_status == StatusCode::NO_CONTENT
+        || default_status == StatusCode::NOT_MODIFIED)
+        && !crate::router::has_injected_response();
+    if no_body_status
+        && (obj.is_instance_of::<PyDict>()
+            || obj.is_instance_of::<PyList>()
+            || obj.is_instance_of::<pyo3::types::PyTuple>()
+            || obj.is_instance_of::<PyNone>())
+    {
+        return default_status.into_response();
+    }
     // dict or list -> JSON (MOST COMMON — check first, skip attr lookups)
     if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() {
         let bytes = dict_to_json_bytes(py, obj);
         return (
-            StatusCode::OK,
+            default_status,
             [("content-type", "application/json")],
             bytes::Bytes::from(bytes),
         )
@@ -173,13 +197,13 @@ pub fn py_to_response_with_request(
     if obj.is_instance_of::<pyo3::types::PyTuple>() {
         let mut buf = String::new();
         write_any_json(py, obj, &mut buf);
-        return (StatusCode::OK, [("content-type", "application/json")], buf).into_response();
+        return (default_status, [("content-type", "application/json")], buf).into_response();
     }
 
-    // None -> 200 with "null" body (matches FastAPI: json-serializes None to null)
+    // None -> default status with "null" body (FastAPI json-serializes None to null)
     if obj.is_instance_of::<PyNone>() {
         return (
-            StatusCode::OK,
+            default_status,
             [("content-type", "application/json")],
             "null",
         )
@@ -309,14 +333,14 @@ pub fn py_to_response_with_request(
     if obj.is_instance_of::<PyBool>() {
         let value = pyobj_to_serde(py, obj);
         let body = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
-        return (StatusCode::OK, [("content-type", "application/json")], body).into_response();
+        return (default_status, [("content-type", "application/json")], body).into_response();
     }
 
     // int / float -> JSON number (matches FastAPI: all scalars are JSON-serialized)
     if obj.is_instance_of::<PyInt>() || obj.is_instance_of::<PyFloat>() {
         let value = pyobj_to_serde(py, obj);
         let body = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
-        return (StatusCode::OK, [("content-type", "application/json")], body).into_response();
+        return (default_status, [("content-type", "application/json")], body).into_response();
     }
 
     // str -> JSON-wrapped string (matches FastAPI: strings are JSON-serialized).
@@ -326,7 +350,7 @@ pub fn py_to_response_with_request(
     // escapes non-ASCII to \uXXXX when needed.
     if let Ok(s) = obj.extract::<String>() {
         let json = serde_json::to_string(&s).unwrap_or_else(|_| "\"\"".to_string());
-        return (StatusCode::OK, [("content-type", "application/json")], json).into_response();
+        return (default_status, [("content-type", "application/json")], json).into_response();
     }
 
     // Plain Python class with ``__dict__`` (FA dependency classes like
@@ -337,13 +361,13 @@ pub fn py_to_response_with_request(
         if let Ok(dict) = d.cast::<PyDict>() {
             let mut buf = String::with_capacity(64);
             write_dict_json(py, dict, &mut buf);
-            return (StatusCode::OK, [("content-type", "application/json")], buf).into_response();
+            return (default_status, [("content-type", "application/json")], buf).into_response();
         }
     }
 
     // Fallback: str() it
     let repr = obj.str().map(|s| s.to_string()).unwrap_or_default();
-    (StatusCode::OK, [("content-type", "text/plain")], repr).into_response()
+    (default_status, [("content-type", "text/plain")], repr).into_response()
 }
 
 /// Convert a Python Response-like object (has status_code, headers, body).
@@ -453,6 +477,18 @@ fn response_object_to_response(
         bytes::Bytes::new()
     };
 
+    // No-body statuses (1xx, 204, 304) must carry NO body and NO content-length —
+    // a JSONResponse(None) still renders b"null", which hyper would turn into
+    // content-length:4. Match Starlette: drop the body (and content-length below).
+    let is_no_body = status.as_u16() < 200
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED;
+    let body_bytes = if is_no_body {
+        bytes::Bytes::new()
+    } else {
+        body_bytes
+    };
+
     let mut resp = axum::response::Response::builder()
         .status(status)
         .body(axum::body::Body::from(body_bytes))
@@ -463,6 +499,9 @@ fn response_object_to_response(
     // the entries we just accumulated via raw_headers.
     for (k, v) in headers.iter() {
         hmap.append(k, v.clone());
+    }
+    if is_no_body {
+        hmap.remove(axum::http::header::CONTENT_LENGTH);
     }
 
     // Drain `Response(..., background=BackgroundTask(...))` or

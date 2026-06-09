@@ -601,6 +601,11 @@ def build_handler(route: Any):
     name = getattr(endpoint, "__name__", "endpoint")
     _ctx = endpoint_ctx_for(endpoint, getattr(route, "path", None))
 
+    # Route-level status_code (real APIRoute carries it) — bake it into a custom
+    # response_class render, since a returned Response keeps its own status (the
+    # door's default-status hook only applies to non-Response results).
+    _status_code = getattr(route, "status_code", None)
+
     def _finish(result):
         if field is not None:
             result = _serialize_via_field(result, field, flags, _ctx)
@@ -611,6 +616,8 @@ def build_handler(route: Any):
             # the door merges any dep-injected Response onto it.
             if isinstance(result, _Resp):
                 return result
+            if _status_code is not None:
+                return custom_rc(result, status_code=_status_code)
             return custom_rc(result)
         return result
 

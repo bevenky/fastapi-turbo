@@ -95,6 +95,31 @@ thread_local! {
     /// worker-thread invariant as the disconnect flag.
     static INJECTED_RESPONSE: std::cell::RefCell<Option<Py<PyAny>>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Per-request route-level default status code (``@app.get(status_code=201)``).
+    /// Set by handle_request from RouteState; read by ``py_to_response`` to status
+    /// non-Response handler results. Reset per request (worker-thread invariant).
+    static ROUTE_DEFAULT_STATUS: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
+/// The route-level default status for the request currently being served on this
+/// worker thread (``None`` → 200). Read by ``crate::responses::py_to_response``
+/// so a ``status_code=201`` route statuses its dict/list/None result.
+pub(crate) fn route_default_status() -> axum::http::StatusCode {
+    ROUTE_DEFAULT_STATUS
+        .with(|s| s.get())
+        .and_then(|c| axum::http::StatusCode::from_u16(c).ok())
+        .unwrap_or(axum::http::StatusCode::OK)
+}
+
+/// True when an injected Response shell exists for the current request — i.e. a
+/// handler/dep may still override the status. ``py_to_response`` uses this to AVOID
+/// pre-stripping a no-body body on the route default (e.g. ``status_code=204``)
+/// when the handler might override to a body status (``response.status_code=400``);
+/// shell routes are stripped post-merge in ``apply_injected_response`` on the final
+/// status instead.
+pub(crate) fn has_injected_response() -> bool {
+    INJECTED_RESPONSE.with(|c| c.borrow().is_some())
 }
 
 /// RAII guard: clears the per-request thread-locals on drop so they never leak to
@@ -108,6 +133,7 @@ impl Drop for DisconnectFlagGuard {
         INJECTED_RESPONSE.with(|r| {
             *r.borrow_mut() = None;
         });
+        ROUTE_DEFAULT_STATUS.with(|s| s.set(None));
     }
 }
 
@@ -507,13 +533,14 @@ fn apply_injected_response(py: Python<'_>, response: &mut Response) {
     let obj = INJECTED_RESPONSE.with(|cell| cell.borrow().as_ref().map(|o| o.clone_ref(py)));
     if let Some(obj) = obj {
         let obj = obj.into_bound(py);
-        // Apply status_code (but only if user set something non-default)
+        // Apply the shell's status_code when the handler/dep SET one. The shell is
+        // created with status_code=None (build_injected_object), so a successful
+        // u16 extract means it was explicitly set — and it overrides the route-level
+        // default (e.g. handler sets 200 to override a route ``status_code=201``).
         if let Ok(sc_attr) = obj.getattr("status_code") {
             if let Ok(sc) = sc_attr.extract::<u16>() {
-                if sc != 200 {
-                    if let Ok(s) = StatusCode::from_u16(sc) {
-                        *response.status_mut() = s;
-                    }
+                if let Ok(s) = StatusCode::from_u16(sc) {
+                    *response.status_mut() = s;
                 }
             }
         }
@@ -565,6 +592,19 @@ fn apply_injected_response(py: Python<'_>, response: &mut Response) {
                     }
                 }
             }
+        }
+        // If the (shell-overridden) status is a no-body status, strip the body +
+        // content-length: a dep/handler may have set 204/304 AFTER py_to_response
+        // already rendered a body (FastAPI/Starlette send no body for these).
+        let st = response.status();
+        if st.as_u16() < 200
+            || st == StatusCode::NO_CONTENT
+            || st == StatusCode::NOT_MODIFIED
+        {
+            *response.body_mut() = axum::body::Body::empty();
+            response
+                .headers_mut()
+                .remove(axum::http::header::CONTENT_LENGTH);
         }
     }
 }
@@ -919,6 +959,11 @@ pub struct RouteInfo {
     pub params: Vec<ParamInfo>,
     #[pyo3(get, set)]
     pub is_websocket: bool,
+    /// Route-level default status code (``@app.get(status_code=201)``). The door
+    /// applies it as the default status for non-Response handler results; a
+    /// handler/dep that sets ``response.status_code`` still overrides it.
+    #[pyo3(get, set)]
+    pub status_code: Option<u16>,
 }
 
 impl Clone for RouteInfo {
@@ -931,6 +976,7 @@ impl Clone for RouteInfo {
             handler_name: self.handler_name.clone(),
             params: self.params.clone(),
             is_websocket: self.is_websocket,
+            status_code: self.status_code,
         })
     }
 }
@@ -938,7 +984,7 @@ impl Clone for RouteInfo {
 #[pymethods]
 impl RouteInfo {
     #[new]
-    #[pyo3(signature = (path, methods, handler, is_async=false, handler_name="".to_string(), params=vec![], is_websocket=false))]
+    #[pyo3(signature = (path, methods, handler, is_async=false, handler_name="".to_string(), params=vec![], is_websocket=false, status_code=None))]
     fn new(
         path: String,
         methods: Vec<String>,
@@ -947,6 +993,7 @@ impl RouteInfo {
         handler_name: String,
         params: Vec<ParamInfo>,
         is_websocket: bool,
+        status_code: Option<u16>,
     ) -> Self {
         RouteInfo {
             path,
@@ -956,6 +1003,7 @@ impl RouteInfo {
             handler_name,
             params,
             is_websocket,
+            status_code,
         }
     }
 }
@@ -1098,6 +1146,10 @@ struct RouteState {
     /// The original APIRoute object — populated into
     /// ``request.scope["route"]`` so handlers can introspect the route.
     route_obj: Option<Py<PyAny>>,
+    /// Route-level default status code (``status_code=201``); applied to
+    /// non-Response handler results, overridable by a handler/dep-set
+    /// ``response.status_code``.
+    status_code: Option<u16>,
     // Note: body validation stays with Pydantic (Rust-backed) for 100% compatibility.
     // jsonschema crate can't handle custom validators, coercion, defaults, etc.
 }
@@ -1310,6 +1362,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     .and_then(|v| v.extract::<bool>(py))
                     .unwrap_or(false),
                 route_obj: route.handler.getattr(py, "_fastapi_turbo_route_obj").ok(),
+                status_code: route.status_code,
             })
         });
 
@@ -1897,6 +1950,9 @@ async fn handle_request(
     if let Some(flag) = disconnect_flag {
         REQUEST_DISCONNECT_FLAG.with(|f| *f.borrow_mut() = Some(flag));
     }
+    // Route-level default status (``status_code=201``) for py_to_response to apply
+    // to non-Response handler results; the guard clears it after the request.
+    ROUTE_DEFAULT_STATUS.with(|s| s.set(state.status_code));
 
     let path_map = path_params.map(|Path(m)| m).unwrap_or_default();
 
