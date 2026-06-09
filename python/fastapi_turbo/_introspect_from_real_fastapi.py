@@ -415,7 +415,36 @@ def _emit_body(route: Any, dep: Any, out: list[ParamInfo]) -> None:
         _emit_combined_body(route, dep, out)
 
 
-def _emit_dep(dep: Any, out: list[ParamInfo], uid: str, *, is_handler_param: bool) -> str:
+def _override_aware_dep(original: Any, app: Any, is_async: bool):
+    """Wrap a dependency callable so ``app.dependency_overrides`` is honored at
+    REQUEST time (the adapter bakes the original callable at build time; the clone
+    path resolved overrides per request). The door calls this wrapper with the
+    original dep's wired inputs, so a SAME-signature override (the documented
+    pattern) works transparently; the wrapper is keyed for dedup by the ORIGINAL
+    callable's id (set on the ParamInfo, not this wrapper)."""
+    if is_async:
+
+        async def _aw(*args, **kwargs):
+            ov = app.dependency_overrides
+            eff = ov.get(original, original) if ov else original
+            res = eff(*args, **kwargs)
+            if inspect.isawaitable(res):
+                return await res
+            return res
+
+        return _aw
+
+    def _w(*args, **kwargs):
+        ov = app.dependency_overrides
+        eff = ov.get(original, original) if ov else original
+        return eff(*args, **kwargs)
+
+    return _w
+
+
+def _emit_dep(
+    dep: Any, out: list[ParamInfo], uid: str, *, is_handler_param: bool, app: Any = None
+) -> str:
     """Emit the flat params for one dependency (post-order: its own inputs +
     sub-deps first, then the ``"dependency"`` entry). Returns the ``resolved`` key
     holding the dep's result, so a parent can wire it as an input."""
@@ -444,11 +473,15 @@ def _emit_dep(dep: Any, out: list[ParamInfo], uid: str, *, is_handler_param: boo
     # 2. sub-dependencies first (so they resolve before this dep), wired by the
     #    parent param name the sub-dep result feeds.
     for k, sub in enumerate(dep.dependencies):
-        sub_key = _emit_dep(sub, out, f"{uid}_{k}", is_handler_param=False)
+        sub_key = _emit_dep(sub, out, f"{uid}_{k}", is_handler_param=False, app=app)
         input_wiring.append((sub.name, sub_key))
 
-    # 3. the dependency itself.
+    # 3. the dependency itself. Wrap the callable so runtime app.dependency_overrides
+    #    are honored (dedup id stays the ORIGINAL callable's).
     result_key = dep.name if (is_handler_param and dep.name) else f"_dep{uid}"
+    dep_callable = (
+        _override_aware_dep(call, app, dep.is_coroutine_callable) if app is not None else call
+    )
     out.append(
         ParamInfo(
             name=result_key,
@@ -456,10 +489,10 @@ def _emit_dep(dep: Any, out: list[ParamInfo], uid: str, *, is_handler_param: boo
             type_hint="any",
             required=True,
             default_value=None,
-            has_default=False,
             model_class=None,
+            has_default=False,
             alias=None,
-            dep_callable=call,
+            dep_callable=dep_callable,
             dep_callable_id=(id(call) if getattr(dep, "use_cache", True) else None),
             is_async_dep=dep.is_coroutine_callable,
             is_generator_dep=is_gen,
@@ -471,10 +504,11 @@ def _emit_dep(dep: Any, out: list[ParamInfo], uid: str, *, is_handler_param: boo
     return result_key
 
 
-def extract_params_from_route(route: Any) -> list[ParamInfo]:
+def extract_params_from_route(route: Any, app: Any = None) -> list[ParamInfo]:
     """Map a real FastAPI ``APIRoute``'s ``route.dependant`` to the Rust engine's
     flat ``ParamInfo`` list. Raises :class:`Undelegable` for surface the Rust door
-    does not cover, so the caller falls back to real FastAPI."""
+    does not cover, so the caller falls back to real FastAPI. ``app`` (when given)
+    makes dependency callables honor runtime ``app.dependency_overrides``."""
     dep = route.dependant
 
     params: list[ParamInfo] = []
@@ -502,7 +536,7 @@ def extract_params_from_route(route: Any) -> list[ParamInfo]:
     # (``dependencies=[...]``) have name=None and run for their side effects only
     # (auth checks etc.) without being passed to the handler.
     for i, sub in enumerate(dep.dependencies):
-        _emit_dep(sub, params, str(i), is_handler_param=(sub.name is not None))
+        _emit_dep(sub, params, str(i), is_handler_param=(sub.name is not None), app=app)
 
     return params
 

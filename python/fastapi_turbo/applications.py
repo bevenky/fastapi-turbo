@@ -7407,7 +7407,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 )
             if _wants_security_scopes(real.dependant):
                 return None
-            params = extract_params_from_route(real)
+            params = extract_params_from_route(real, app=self)
             handler = build_handler(real)
         except Undelegable:
             return None
