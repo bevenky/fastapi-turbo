@@ -7464,6 +7464,180 @@ class FastAPI(_real_fastapi.FastAPI):
                     pass
         return params, handler, False
 
+    def _delegated_route_info(self, rd: dict, for_door_mix: bool = False):
+        """Fallback for routes the lean adapter declines (custom response_class,
+        custom status_code, UploadFile/Response edges, SecurityScopes, ...): serve
+        them via REAL FastAPI's own route handler so the clone-compiled
+        ``_introspect`` / ``_resolution`` path isn't needed.
+
+        ``route.get_route_handler()`` returns ``async (request) -> Response`` that
+        runs real FastAPI's full pipeline (validation, dependency resolution,
+        ``response_model`` serialization, status/headers). We register it as a
+        single ``inject_request`` param handler — the door builds the Request
+        (``needs_body`` includes ``has_inject_request``, so the body is read and
+        available for real FastAPI's ``request.form()``/``.json()``), the handler
+        returns a real Response the door renders.
+
+        Gated behind ``FASTAPI_TURBO_DELEGATE=1`` (default off) while it's proven
+        end-to-end. WebSocket / mounted routes decline (different protocols);
+        ``dependency_overrides`` declines (runtime override resolution stays on the
+        clone path for now). Returns ``(params, handler, is_async)`` or ``None``."""
+        import os
+
+        if os.environ.get("FASTAPI_TURBO_DELEGATE") != "1":
+            return None
+        if rd.get("is_websocket") or rd.get("_from_mount"):
+            return None
+        route = rd.get("_route_obj")
+        if route is None:
+            return None
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None:
+            return None
+        # Bare (sync/async) generator endpoints are auto-wrapped into an NDJSON
+        # StreamingResponse by the CLONE-compiled handler — real FastAPI does NOT
+        # auto-wrap, so delegating would mis-serialize the generator. Keep these on
+        # the clone path.
+        if inspect.isgeneratorfunction(endpoint) or inspect.isasyncgenfunction(endpoint):
+            return None
+        try:
+            from fastapi_turbo._fastapi_turbo_core import ParamInfo
+
+            _RealRoute = _real_fastapi.routing.APIRoute
+            _http_methods = [
+                m
+                for m in rd["methods"]
+                if m in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+            ]
+            real = _RealRoute(
+                rd["path"],
+                endpoint,
+                methods=_http_methods or rd["methods"],
+                dependencies=rd.get("_combined_dependencies") or None,
+                response_model=rd.get("response_model"),
+                status_code=(
+                    rd["status_code"] if rd.get("status_code") not in (None, 200) else None
+                ),
+                response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
+                    _real_fastapi.responses.JSONResponse
+                ),
+                response_model_include=getattr(route, "response_model_include", None),
+                response_model_exclude=getattr(route, "response_model_exclude", None),
+                response_model_by_alias=getattr(route, "response_model_by_alias", True),
+                response_model_exclude_unset=getattr(route, "response_model_exclude_unset", False),
+                response_model_exclude_defaults=getattr(
+                    route, "response_model_exclude_defaults", False
+                ),
+                response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
+            )
+            # The standalone route has no provider, so real FastAPI's
+            # solve_dependencies can't see ``app.dependency_overrides``. Point it at
+            # this app (a real FastAPI subclass) so overrides — added at startup OR
+            # at request time (TestClient) — are honored, matching the clone path.
+            real.dependency_overrides_provider = self
+            real_handler = real.get_route_handler()  # async (request) -> Response
+        except Exception:
+            return None
+
+        from contextlib import AsyncExitStack as _AsyncExitStack
+        import fastapi.exception_handlers as _fa_eh
+        from fastapi.exceptions import RequestValidationError as _RVE
+
+        async def handler(**kwargs):
+            request = kwargs["request"]
+            # Real FastAPI's route handler reads three nested AsyncExitStacks from
+            # the scope (files ⊃ inner ⊃ function), normally set by
+            # AsyncExitStackMiddleware + the request_response wrapper — both bypassed
+            # when we call get_route_handler() directly. ``async with A, B, C`` tears
+            # C→B→A down on exit AND propagates a handler exception INTO the yield-dep
+            # finalizers (so their except/finally observe it), matching FA.
+            async with (
+                _AsyncExitStack() as _file_stack,
+                _AsyncExitStack() as _inner_stack,
+                _AsyncExitStack() as _function_stack,
+            ):
+                request.scope["fastapi_middleware_astack"] = _file_stack
+                request.scope["fastapi_inner_astack"] = _inner_stack
+                request.scope["fastapi_function_astack"] = _function_stack
+                try:
+                    response = await real_handler(request)
+                except _RVE as exc:
+                    # The door validates in Rust → 422; a real-FastAPI-raised
+                    # RequestValidationError would otherwise be captured as a SERVER
+                    # exception (re-raised). Render 422 here via a user-registered
+                    # handler (specific RVE only — matches FastAPI, where RVE has its
+                    # own registered handler that beats the Exception catch-all) or
+                    # FastAPI's default. HTTPException propagates (Rust renders it).
+                    _uh = (self.exception_handlers or {}).get(_RVE)
+                    _res = (_uh or _fa_eh.request_validation_exception_handler)(
+                        request, exc
+                    )
+                    if inspect.isawaitable(_res):
+                        _res = await _res
+                    return _res
+                # FA order: background tasks run BEFORE yield-dep teardown (so they
+                # observe deps in their pre-teardown "started" state). The door runs
+                # ``response.background`` only after these astacks close, reversing
+                # that — so run them here, still inside the dep astacks, then clear so
+                # the door doesn't double-run them. (KNOWN edge: a request-scoped
+                # yield-dep observed by an OUTER @app.middleware sees it torn down a
+                # touch early vs FA, which closes request-scoped deps after send.)
+                _bg = getattr(response, "background", None)
+                if _bg is not None:
+                    _bgr = _bg()
+                    if inspect.isawaitable(_bgr):
+                        await _bgr
+                    response.background = None
+                return response
+
+        handler.__name__ = getattr(endpoint, "__name__", "endpoint")
+
+        # Mirror _adapter_route_info's wrapping order: async → SYNC submit-caller
+        # (the door drives sync handlers), then exception handlers (innermost, so
+        # real FastAPI's RequestValidationError/HTTPException dispatch to the app's
+        # handlers), then the @app.middleware("http") chain.
+        from fastapi_turbo._resolution import _make_sync_wrapper
+
+        handler = _make_sync_wrapper(handler, for_handler=True, app=self)
+        handler = _wrap_with_exception_handlers(handler, self)
+        http_mws = getattr(self, "_http_middlewares", None)
+        if http_mws:
+            from fastapi_turbo._middleware_wrap import _wrap_with_http_middlewares
+
+            if for_door_mix:
+                http_mws = [
+                    m
+                    for m in http_mws
+                    if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
+                ]
+            if http_mws:
+                handler = _wrap_with_http_middlewares(handler, http_mws, self)
+                try:
+                    handler._has_http_middleware = True
+                except (AttributeError, TypeError):
+                    pass
+
+        try:
+            handler._fastapi_turbo_route_obj = route
+        except (AttributeError, TypeError):
+            pass
+
+        params = [
+            ParamInfo(
+                name="request",
+                kind="inject_request",
+                type_hint="any",
+                required=False,
+                default_value=None,
+                has_default=False,
+                model_class=None,
+                alias=None,
+                is_handler_param=True,
+                scalar_validator=None,
+            )
+        ]
+        return params, handler, False
+
     def _build_server_args(self, host: str, port: int, for_door: bool = False) -> tuple:
         """Build the full positional argument tuple for ``run_server`` and
         ``register_app_router`` from the app's routes + config, so BOTH
@@ -7555,6 +7729,10 @@ class FastAPI(_real_fastapi.FastAPI):
             # Stage D: when the adapter (opt-in) can drive this route off real
             # FastAPI introspection, use its ParamInfo + handler directly.
             _adapted = self._adapter_route_info(rd, for_door_mix=_use_door_eps)
+            if _adapted is None:
+                # The lean adapter declined — try full delegation to real FastAPI's
+                # route handler (FASTAPI_TURBO_DELEGATE=1) before the clone path.
+                _adapted = self._delegated_route_info(rd, for_door_mix=_use_door_eps)
             if _adapted is not None:
                 _ap, _ah, _aasync = _adapted
                 # Stamp the real FastAPI route so the Rust bridge can expose
