@@ -5119,7 +5119,6 @@ class FastAPI(_real_fastapi.FastAPI):
                     "handler_name": getattr(route, "name", None),
                     "tags": extra_tags + list(getattr(route, "tags", []) or []),
                     "params": [_request_injection_param()],
-                    "_all_params": [],
                     "is_websocket": False,
                     "status_code": getattr(route, "status_code", None) or 200,
                     "summary": getattr(route, "summary", None),
@@ -5231,9 +5230,6 @@ class FastAPI(_real_fastapi.FastAPI):
                     "handler_name": route.name,
                     "tags": extra_tags + route.tags,
                     "params": custom_params,
-                    "_all_params": list(
-                        introspect_endpoint(route.endpoint, full_path)
-                    ),
                     "is_websocket": False,
                     "status_code": route.status_code or 200,
                     "summary": route.summary,
@@ -5329,9 +5325,6 @@ class FastAPI(_real_fastapi.FastAPI):
                     "_raw_annotation": None,
                     "_is_handler_param": False,
                 })
-
-            # Save all params (including deps) for OpenAPI security scheme detection
-            all_params_for_openapi = list(params)
 
             endpoint = route.endpoint
 
@@ -5692,7 +5685,6 @@ class FastAPI(_real_fastapi.FastAPI):
                     "handler_name": route.name,
                     "tags": extra_tags + route.tags,
                     "params": params,
-                    "_all_params": all_params_for_openapi,
                     # Combined global/include/router/route dependencies — lets the
                     # pivot adapter rebuild a real FastAPI route with the correct
                     # effective dependency graph (Stage D).
