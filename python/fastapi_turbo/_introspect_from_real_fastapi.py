@@ -477,6 +477,106 @@ def _override_aware_dep(original: Any, app: Any, is_async: bool):
     return _w
 
 
+def _async_gen_sync_bridge(original: Any, app: Any):
+    """Present an ASYNC-generator yield-dependency to the door as a plain SYNC
+    generator, driving its ``__anext__``/``athrow``/``aclose`` on the shared worker
+    loop (``_async_worker.submit`` releases the GIL while waiting → no deadlock).
+    The door's existing sync-gen enter (``send(None)``) and teardown
+    (``send``/``throw``/``close``) machinery then handles it IDENTICALLY to a sync
+    yield-dep — same enter, same teardown, same error/exit-stack semantics.
+
+    CONTEXTVARS: the dep runs on the worker loop (a different thread), but FastAPI
+    runs a yield-dep's set()/yield/reset() in the SAME contextvar context as the
+    handler. So we run __anext__/athrow/aclose inside a captured ``Context`` and
+    propagate the dep's contextvar mutations onto the request thread for the
+    handler to see (then restore on teardown so they don't leak to the next
+    request). ``app.dependency_overrides`` are resolved at call time."""
+    import contextvars
+
+    def _g(**kwargs):
+        from fastapi_turbo import _async_worker
+
+        eff = original
+        if app is not None:
+            ov = app.dependency_overrides
+            if ov:
+                eff = ov.get(original, original)
+        agen = eff(**kwargs)
+        if not hasattr(agen, "__anext__"):
+            # An override swapped in a sync generator / plain callable.
+            if hasattr(agen, "send"):
+                yield from agen
+            else:
+                yield agen
+            return
+
+        # One context for the whole dep lifecycle (enter + teardown), so a
+        # token created before yield is valid for reset() after yield.
+        ctx = contextvars.copy_context()
+        before = contextvars.copy_context()
+        restore_tokens: list = []
+
+        def _propagate():
+            # Apply the contextvar changes the dep made (in ctx) onto THIS thread's
+            # context so the handler sees them; remember tokens to undo on teardown.
+            for var in ctx:
+                new = ctx[var]
+                if var not in before or before[var] is not new:
+                    restore_tokens.append((var, var.set(new)))
+
+        def _restore():
+            for var, tok in reversed(restore_tokens):
+                try:
+                    var.reset(tok)
+                except (ValueError, LookupError):
+                    pass
+            restore_tokens.clear()
+
+        try:
+            value = _async_worker.submit(agen.__anext__(), context=ctx)
+        except StopAsyncIteration:
+            return
+        _propagate()
+        try:
+            yield value
+        except GeneratorExit:
+            # Door close() (a later dep/extraction failed) — run the async gen's
+            # cleanup on the loop, then honor GeneratorExit.
+            try:
+                _async_worker.submit(agen.aclose(), context=ctx)
+            except BaseException:  # noqa: BLE001 — teardown error, response done
+                pass
+            _restore()
+            raise
+        except BaseException as exc:  # noqa: BLE001
+            # Door throw(exc) (handler raised) — throw it into the async gen. A
+            # converted/re-raised error propagates (submit surfaces it here); a
+            # clean finish (StopAsyncIteration) means the dep SWALLOWED it → signal
+            # the door via StopIteration so it raises FastAPIError, matching sync.
+            try:
+                _async_worker.submit(agen.athrow(exc), context=ctx)
+            except StopAsyncIteration:
+                _restore()
+                return
+            except BaseException:
+                _restore()
+                raise
+            _restore()
+            raise
+        else:
+            # Door send(None) (success) — advance past the yield; a well-formed dep
+            # finishes with StopAsyncIteration. Any error here propagates and the
+            # door swallows it on the success path (same as a sync yield-dep).
+            try:
+                _async_worker.submit(agen.__anext__(), context=ctx)
+            except StopAsyncIteration:
+                pass
+            finally:
+                _restore()
+
+    return _g
+
+
 def _emit_dep(
     dep: Any, out: list[ParamInfo], uid: str, *, is_handler_param: bool, app: Any = None
 ) -> str:
@@ -486,10 +586,11 @@ def _emit_dep(
     call = dep.call
     # Use FastAPI's own callable classification (handles callable instances with an
     # async/gen ``__call__``, e.g. security schemes). Sync ``yield`` deps run on the
-    # door; async generators still need the event-loop exit stack.
-    if dep.is_async_gen_callable:
-        raise Undelegable("async generator dependency → real FastAPI")
-    is_gen = dep.is_gen_callable
+    # door directly; ASYNC ``yield`` deps are bridged to a sync generator that
+    # drives __anext__/athrow/aclose on the worker loop (see _async_gen_sync_bridge)
+    # so the door's sync-gen enter/teardown machinery handles them uniformly.
+    is_async_gen = dep.is_async_gen_callable
+    is_gen = dep.is_gen_callable or is_async_gen
     if _bucket_fields(dep, "body"):
         raise Undelegable("dependency with a body param → real FastAPI")
     if getattr(dep, "websocket_param_name", None) is not None:
@@ -512,11 +613,15 @@ def _emit_dep(
         input_wiring.append((sub.name, sub_key))
 
     # 3. the dependency itself. Wrap the callable so runtime app.dependency_overrides
-    #    are honored (dedup id stays the ORIGINAL callable's).
+    #    are honored (dedup id stays the ORIGINAL callable's). An async-generator
+    #    dep is wrapped in the sync-gen bridge instead (it resolves overrides too).
     result_key = dep.name if (is_handler_param and dep.name) else f"_dep{uid}"
-    dep_callable = (
-        _override_aware_dep(call, app, dep.is_coroutine_callable) if app is not None else call
-    )
+    if is_async_gen:
+        dep_callable = _async_gen_sync_bridge(call, app)
+    elif app is not None:
+        dep_callable = _override_aware_dep(call, app, dep.is_coroutine_callable)
+    else:
+        dep_callable = call
     out.append(
         ParamInfo(
             name=result_key,

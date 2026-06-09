@@ -3,9 +3,10 @@
 Builds REAL FastAPI apps, drives each route through the adapter → Rust oneshot
 door (register_app_router + process_request), and asserts the response matches
 real FastAPI's OWN response (httpx.ASGITransport) — the behavioral parity oracle
-that gates turning the adapter on. Also asserts the bounded-coverage cases
-(yield deps, deps with special params, Form model-expansion) raise Undelegable so
-the caller delegates to real FastAPI.
+that gates turning the adapter on. Yield deps (sync AND async-generator) ARE
+handled on the adapter now; the remaining bounded-coverage cases (query/header/
+cookie parameter-MODEL expansion, a dependency with a body param) raise
+Undelegable so the caller delegates to real FastAPI.
 
 Runs in a subprocess with the compat shim disabled so `import fastapi` is REAL.
 """
@@ -328,29 +329,36 @@ def main():
     if not (d_st == r_st == 200 and d_body == r_body):
         fails.append(f"/multi: door={d_st}/{d_body!r} real={r_st}/{r_body!r}")
 
-    # decline coverage: async-generator deps still delegate to real FastAPI.
+    # async-generator yield-deps now ride the adapter (bridged to the door's
+    # sync-gen machinery), so they must be HANDLED, not declined — and run
+    # end-to-end with teardown AFTER the response (matching sync yield-deps).
     dec_app = FastAPI()
+    _AY = []
     async def aydep():
+        _AY.append("enter")
         yield "x"
+        _AY.append("teardown")
     def plain(q: str = "z"):
         return q
     @dec_app.get("/y")
-    def y(v: str = Depends(aydep)): return {"v": v}
+    def y(v: str = Depends(aydep)):
+        _AY.append("handler")
+        return {"v": v}
     @dec_app.get("/ok")
     def okr(v: str = Depends(plain)): return {"v": v}
     for r in dec_app.routes:
         if not isinstance(r, APIRoute):
             continue
-        if r.path in ("/y",):
-            try:
-                extract_params_from_route(r); fails.append(f"{r.path} should be Undelegable")
-            except Undelegable:
-                pass
-        elif r.path == "/ok":
+        if r.path in ("/y", "/ok"):
             try:
                 extract_params_from_route(r)
             except Undelegable as e:
-                fails.append(f"/ok simple dep should be handled, got Undelegable: {e}")
+                fails.append(f"{r.path} dep should be handled, got Undelegable: {e}")
+    register(dec_app)
+    _AY.clear()
+    ay_st, ay_body = door(dec_app, "GET", "/y", "")
+    if not (ay_st == 200 and ay_body == {"v": "x"} and _AY == ["enter", "handler", "teardown"]):
+        fails.append(f"/y async-gen dep: st={ay_st} body={ay_body!r} events={_AY}")
 
     if fails:
         print("FAIL\n" + "\n".join(fails)); sys.exit(1)

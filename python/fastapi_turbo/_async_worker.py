@@ -141,8 +141,14 @@ def submit(
     *,
     timeout: float | None = _SENTINEL,  # type: ignore[valid-type]
     app=None,
+    context=None,
 ) -> object:
     """Schedule coro on the worker's loop and block until done.
+
+    ``context`` (a ``contextvars.Context``), when passed, runs the coroutine in
+    that context — so contextvar mutations the coroutine makes land in the caller-
+    supplied context (used by the async-generator yield-dep bridge to propagate a
+    dep's contextvars back to the request thread).
 
     ``timeout`` (seconds) controls how long we wait before giving up.
     When the timeout elapses, the background coroutine is **cancelled**
@@ -197,7 +203,11 @@ def submit(
                 pass
             ev.set()
             return
-        task = asyncio.ensure_future(_runner(), loop=loop)
+        task = (
+            loop.create_task(_runner(), context=context)
+            if context is not None
+            else asyncio.ensure_future(_runner(), loop=loop)
+        )
         box[2] = task
         # Between scheduling ``_kickoff`` and it actually running, the
         # caller may have timed out and requested cancellation. Check
