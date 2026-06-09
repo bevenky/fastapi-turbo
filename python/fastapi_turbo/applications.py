@@ -2783,6 +2783,96 @@ def _oa_apply_stream(real_route, is_sse, is_json, inner) -> None:
         )
 
 
+def _build_stream_handler(orig_endpoint, response_model, response_class, app):
+    """Wrap a generator endpoint (sync OR async) into a SYNC handler returning a
+    StreamingResponse — shared by the clone collection path AND the adapter so
+    generator routes ride the fast adapter path (off the clone). With a custom
+    ``response_class`` (EventSourceResponse / a StreamingResponse subclass) the
+    generator object is wrapped via the class; otherwise it auto-wraps to an
+    ``application/jsonl`` StreamingResponse (FA 0.136 native), validating each item
+    against an ``AsyncIterable[Item]`` response_model and surfacing
+    ``ResponseValidationError`` via ``app._captured_server_exceptions`` (TestClient
+    re-raise parity)."""
+    import inspect as _insp
+
+    is_async_gen = _insp.isasyncgenfunction(orig_endpoint)
+    # A custom response_class (a TYPE) wraps the generator object directly (SSE /
+    # raw StreamingResponse). The framework default is a DefaultPlaceholder
+    # INSTANCE (not a type) → fall through to the NDJSON auto-wrap.
+    rc = response_class if isinstance(response_class, type) else None
+    if rc is not None:
+
+        def _rc_wrap(_orig=orig_endpoint, _rc=rc, **kwargs):
+            return _rc(_orig(**kwargs))
+
+        return _rc_wrap
+
+    # NDJSON auto-wrap. Item validation when the return is ``AsyncIterable[Item]``.
+    item_adapter = None
+    import typing as _tp
+    import collections.abc as _cabc
+
+    if _tp.get_origin(response_model) in {
+        _cabc.AsyncIterable, _cabc.AsyncIterator, _cabc.AsyncGenerator,
+        _cabc.Iterable, _cabc.Iterator, _cabc.Generator,
+    }:
+        _args = _tp.get_args(response_model)
+        if _args:
+            try:
+                from pydantic import TypeAdapter as _TA
+                item_adapter = _TA(_args[0])
+            except Exception as _exc:  # noqa: BLE001
+                _log.debug("silent catch in applications: %r", _exc)
+                item_adapter = None
+
+    def _json_lines_wrap(
+        _orig=orig_endpoint, _is_a=is_async_gen,
+        _ta=item_adapter, _app=app, **kwargs,
+    ):
+        from fastapi_turbo.responses import StreamingResponse as _SR
+        from fastapi_turbo.encoders import jsonable_encoder as _je
+        from fastapi_turbo.exceptions import ResponseValidationError as _RVE
+        import json as _json
+
+        def _check(item):
+            if _ta is None:
+                return item
+            try:
+                return _ta.validate_python(item)
+            except Exception as exc:  # noqa: BLE001
+                from pydantic import ValidationError as _PyVE
+                if isinstance(exc, _PyVE):
+                    raise _RVE(errors=exc.errors(), body=item) from None
+                raise
+
+        if _is_a:
+            async def _iter_async():
+                try:
+                    async for item in _orig(**kwargs):
+                        validated = _check(item)
+                        yield (_json.dumps(_je(validated), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                except _RVE as exc:
+                    if _app is not None:
+                        _app._captured_server_exceptions.append(exc)
+                    return
+
+            return _SR(_iter_async(), media_type="application/jsonl")
+        else:
+            def _iter_sync():
+                try:
+                    for item in _orig(**kwargs):
+                        validated = _check(item)
+                        yield (_json.dumps(_je(validated), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                except _RVE as exc:
+                    if _app is not None:
+                        _app._captured_server_exceptions.append(exc)
+                    return
+
+            return _SR(_iter_sync(), media_type="application/jsonl")
+
+    return _json_lines_wrap
+
+
 def _shim_get_openapi(*, title, version, routes=None, webhooks=None, **kw):
     """Shim for ``fastapi.openapi.utils.get_openapi`` — the clone ``_openapi.py``
     generator is deleted, so user code doing
@@ -5338,82 +5428,11 @@ class FastAPI(_real_fastapi.FastAPI):
                 inspect.isasyncgenfunction(endpoint)
                 or inspect.isgeneratorfunction(endpoint)
             ) and not getattr(route, "response_class", None):
-                _orig_endpoint = endpoint
-                _is_async_gen = inspect.isasyncgenfunction(endpoint)
-                # FA parity: when the return annotation is
-                # ``AsyncIterable[Item]`` / ``Iterable[Item]``, validate
-                # each yielded item against ``Item`` and raise
-                # ``ResponseValidationError`` on mismatch — mirrors real
-                # FA's streaming validation path.
-                _item_adapter = None
-                _rm = getattr(route, "response_model", None)
-                import typing as _tp
-                import collections.abc as _cabc
-                if _tp.get_origin(_rm) in {
-                    _cabc.AsyncIterable, _cabc.AsyncIterator,
-                    _cabc.AsyncGenerator, _cabc.Iterable,
-                    _cabc.Iterator, _cabc.Generator,
-                }:
-                    _args = _tp.get_args(_rm)
-                    if _args:
-                        try:
-                            from pydantic import TypeAdapter as _TA
-                            _item_adapter = _TA(_args[0])
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                            _item_adapter = None
-
-                _app_for_stream = self
-
-                def _json_lines_wrap(
-                    _orig=_orig_endpoint, _is_a=_is_async_gen,
-                    _ta=_item_adapter, _app=_app_for_stream, **kwargs,
-                ):
-                    from fastapi_turbo.responses import StreamingResponse as _SR
-                    from fastapi_turbo.encoders import jsonable_encoder as _je
-                    from fastapi_turbo.exceptions import (
-                        ResponseValidationError as _RVE,
-                    )
-                    import json as _json
-                    def _check(item):
-                        if _ta is None:
-                            return item
-                        try:
-                            return _ta.validate_python(item)
-                        except Exception as exc:  # noqa: BLE001
-                            from pydantic import ValidationError as _PyVE
-                            if isinstance(exc, _PyVE):
-                                raise _RVE(errors=exc.errors(), body=item) from None
-                            raise
-                    if _is_a:
-                        async def _iter_async():
-                            try:
-                                async for item in _orig(**kwargs):
-                                    validated = _check(item)
-                                    yield (_json.dumps(_je(validated), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-                            except _RVE as exc:
-                                # FA parity: surface streaming-body
-                                # validation errors through
-                                # ``app._captured_server_exceptions``
-                                # so TestClient re-raises with
-                                # ``raise_server_exceptions=True``.
-                                if _app is not None:
-                                    _app._captured_server_exceptions.append(exc)
-                                return
-                        return _SR(_iter_async(), media_type="application/jsonl")
-                    else:
-                        def _iter_sync():
-                            try:
-                                for item in _orig(**kwargs):
-                                    validated = _check(item)
-                                    yield (_json.dumps(_je(validated), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-                            except _RVE as exc:
-                                if _app is not None:
-                                    _app._captured_server_exceptions.append(exc)
-                                return
-                        return _SR(_iter_sync(), media_type="application/jsonl")
-
-                endpoint = _json_lines_wrap
+                # NDJSON auto-wrap (FA 0.136 native). The shared helper is also
+                # used by the adapter so generator routes can ride the fast path.
+                endpoint = _build_stream_handler(
+                    endpoint, getattr(route, "response_model", None), None, self
+                )
 
             # Detect @wraps-wrapped async endpoints — a sync wrapper over an
             # ``async def`` reports ``iscoroutinefunction = False`` but calling
@@ -7302,16 +7321,16 @@ class FastAPI(_real_fastapi.FastAPI):
         endpoint = getattr(route, "endpoint", None)
         if endpoint is None:
             return None
-        # Bare generator endpoints (sync/async) are auto-wrapped into an NDJSON
-        # StreamingResponse by the CLONE-compiled handler (rd["endpoint"]) — the
-        # adapter's build_handler doesn't apply that wrap. Decline so the door
-        # runs the clone-compiled handler (which the door now streams, 7.3a).
+        # Bare generator endpoints (sync/async) auto-wrap into a streaming
+        # response (NDJSON, or the custom response_class for SSE). The adapter
+        # introspects the generator's params off real FastAPI and builds the wrap
+        # via _build_stream_handler (below) — so generators ride the fast adapter
+        # path (the door streams the result, 7.3a) instead of the clone.
         import inspect as _insp_gen
 
-        if _insp_gen.isgeneratorfunction(endpoint) or _insp_gen.isasyncgenfunction(
+        _is_gen = _insp_gen.isgeneratorfunction(endpoint) or _insp_gen.isasyncgenfunction(
             endpoint
-        ):
-            return None
+        )
         # Param markers (Depends/Query/Header/...) are now bridged to real FastAPI's
         # (see param_functions / dependencies), so real introspection recognizes
         # them. The generic name->kind net below still catches any clone TYPE real
@@ -7368,7 +7387,10 @@ class FastAPI(_real_fastapi.FastAPI):
                 endpoint,
                 methods=_http_methods or rd["methods"],
                 dependencies=rd.get("_combined_dependencies") or None,
-                response_model=rd.get("response_model"),
+                # A generator return is AsyncIterable[Item] / Iterable[Item] which
+                # real get_dependant can't field — build with response_model=None;
+                # item validation happens in _build_stream_handler instead.
+                response_model=None if _is_gen else rd.get("response_model"),
                 status_code=(
                     rd["status_code"] if rd.get("status_code") not in (None, 200) else None
                 ),
@@ -7389,7 +7411,15 @@ class FastAPI(_real_fastapi.FastAPI):
             # door builds ``SecurityScopes(scopes=...)`` from it (with scope-aware
             # per-request dep caching), so these routes run on the fast adapter path.
             params = extract_params_from_route(real, app=self)
-            handler = build_handler(real)
+            # Generators: build the streaming wrap (NDJSON or the custom
+            # response_class for SSE) instead of build_handler's await-the-endpoint
+            # path (which can't await an async-generator function).
+            if _is_gen:
+                handler = _build_stream_handler(
+                    endpoint, rd.get("response_model"), rd.get("response_class"), self
+                )
+            else:
+                handler = build_handler(real)
         except Undelegable:
             return None
         except Exception:
