@@ -7545,12 +7545,19 @@ class FastAPI(_real_fastapi.FastAPI):
 
         async def handler(**kwargs):
             request = kwargs["request"]
-            # Real FastAPI's route handler reads three nested AsyncExitStacks from
-            # the scope (files ⊃ inner ⊃ function), normally set by
-            # AsyncExitStackMiddleware + the request_response wrapper — both bypassed
-            # when we call get_route_handler() directly. ``async with A, B, C`` tears
-            # C→B→A down on exit AND propagates a handler exception INTO the yield-dep
-            # finalizers (so their except/finally observe it), matching FA.
+            # Real FastAPI's route handler reads three nested AsyncExitStacks from the
+            # scope (``fastapi_middleware_astack`` files ⊃ ``fastapi_inner_astack``
+            # request-scoped deps ⊃ ``fastapi_function_astack`` function-scoped deps),
+            # normally set by AsyncExitStackMiddleware + the request_response wrapper —
+            # both bypassed when we call get_route_handler() directly. ``async with
+            # A, B, C`` tears them down C→B→A INSIDE the request (so file/temp cleanup
+            # runs and a yield-dep's after-yield raise propagates to the caller) AND
+            # propagates a handler exception into the yield-dep finalizers (so their
+            # except/finally observe it) — matching FA's semantics. (Teardown can't be
+            # deferred past send to mirror FA's middleware/bg dep-observation ordering:
+            # the door owns send, and deferring breaks teardown-exception propagation +
+            # leaks temp files. We instead run background tasks before teardown below,
+            # which covers the common case.)
             async with (
                 _AsyncExitStack() as _file_stack,
                 _AsyncExitStack() as _inner_stack,
@@ -7564,10 +7571,10 @@ class FastAPI(_real_fastapi.FastAPI):
                 except _RVE as exc:
                     # The door validates in Rust → 422; a real-FastAPI-raised
                     # RequestValidationError would otherwise be captured as a SERVER
-                    # exception (re-raised). Render 422 here via a user-registered
-                    # handler (specific RVE only — matches FastAPI, where RVE has its
-                    # own registered handler that beats the Exception catch-all) or
-                    # FastAPI's default. HTTPException propagates (Rust renders it).
+                    # exception (re-raised). Render 422 via a user-registered handler
+                    # (specific RVE only — matches FA, where RVE's registered handler
+                    # beats the Exception catch-all) or FA's default. HTTPException
+                    # propagates (Rust renders it).
                     _uh = (self.exception_handlers or {}).get(_RVE)
                     _res = (_uh or _fa_eh.request_validation_exception_handler)(
                         request, exc
@@ -7575,13 +7582,9 @@ class FastAPI(_real_fastapi.FastAPI):
                     if inspect.isawaitable(_res):
                         _res = await _res
                     return _res
-                # FA order: background tasks run BEFORE yield-dep teardown (so they
-                # observe deps in their pre-teardown "started" state). The door runs
-                # ``response.background`` only after these astacks close, reversing
-                # that — so run them here, still inside the dep astacks, then clear so
-                # the door doesn't double-run them. (KNOWN edge: a request-scoped
-                # yield-dep observed by an OUTER @app.middleware sees it torn down a
-                # touch early vs FA, which closes request-scoped deps after send.)
+                # Run background tasks before yield-dep teardown (FA order: they
+                # observe deps in their pre-teardown state), then clear so the door
+                # doesn't double-run them.
                 _bg = getattr(response, "background", None)
                 if _bg is not None:
                     _bgr = _bg()
