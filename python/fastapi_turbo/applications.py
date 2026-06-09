@@ -7494,11 +7494,14 @@ class FastAPI(_real_fastapi.FastAPI):
         endpoint = getattr(route, "endpoint", None)
         if endpoint is None:
             return None
-        # Bare (sync/async) generator endpoints are auto-wrapped into an NDJSON
-        # StreamingResponse by the CLONE-compiled handler — real FastAPI does NOT
-        # auto-wrap, so delegating would mis-serialize the generator. Keep these on
-        # the clone path.
-        if inspect.isgeneratorfunction(endpoint) or inspect.isasyncgenfunction(endpoint):
+        # Bare ASYNC-generator endpoints: real FastAPI 0.136 natively auto-wraps them
+        # into an ``application/jsonl`` StreamingResponse (same as the clone), so
+        # delegation handles them — the door streams the returned StreamingResponse.
+        # SYNC generators are declined to the clone: real FA wraps them via
+        # iterate_in_threadpool, and the door doesn't propagate a mid-stream
+        # ResponseValidationError raised from that threadpool iterator (async gens
+        # propagate fine). Sync streaming is uncommon and was on the clone already.
+        if inspect.isgeneratorfunction(endpoint):
             return None
         try:
             from fastapi_turbo._fastapi_turbo_core import ParamInfo
