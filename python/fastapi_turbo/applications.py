@@ -2654,15 +2654,17 @@ def _wrap_with_exception_handlers(handler, app):
 
 
 def _clone_framework_types() -> tuple:
-    """Clone framework types real FastAPI's introspection still can't recognize
-    (reimplementations not bridged to real starlette subclasses yet). Request /
-    HTTPConnection / BackgroundTasks ARE bridged (they subclass the real types), so
-    they're omitted — real get_dependant recognizes them and the adapter handles
-    them. Response (read-only headers property), UploadFile, and WebSocket are not
-    yet bridged."""
+    """Clone framework types whose presence in a handler signature forces the
+    route onto the clone path. Request / HTTPConnection / BackgroundTasks /
+    Response are real starlette (sub)classes that real get_dependant recognizes —
+    and the door now shares ONE injected Response per request (handler + deps),
+    so a ``response: Response`` handler param is handled on the adapter. Only
+    UploadFile and WebSocket remain: UploadFile still has adapter edges (close
+    lifecycle / Form+File), and a ``ws: WebSocket`` param only appears on WS
+    routes (declined earlier via is_websocket; the entry also keeps the returned
+    tuple non-empty so _signature_uses_clone_framework_type doesn't decline all)."""
     types = []
     for mod, name in (
-        ("fastapi_turbo.responses", "Response"),
         ("fastapi_turbo.param_functions", "UploadFile"),
         ("fastapi_turbo.websockets", "WebSocket"),
     ):

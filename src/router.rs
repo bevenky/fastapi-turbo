@@ -360,7 +360,17 @@ fn build_injected_object(
             if let Some(existing) = slot.as_ref() {
                 Ok(existing.clone_ref(py))
             } else {
-                let resp = response_cls(py)?.bind(py).call0()?.unbind();
+                let resp = response_cls(py)?.bind(py).call0()?;
+                // Mimic FastAPI's solve_dependencies: this Response is a SHELL for
+                // status/headers only. Drop its empty-body ``content-length`` and
+                // null its ``status_code`` so merging it (apply_injected_response)
+                // never clobbers the real response's body length or status when the
+                // user didn't set them.
+                if let Ok(headers) = resp.getattr("headers") {
+                    let _ = headers.call_method1("__delitem__", ("content-length",));
+                }
+                let _ = resp.setattr("status_code", py.None());
+                let resp = resp.unbind();
                 *slot = Some(resp.clone_ref(py));
                 Ok(resp)
             }
