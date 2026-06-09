@@ -262,6 +262,7 @@ fn build_injected_object(
     query_params: &HashMap<String, String>,
     body_bytes: &[u8],
     client_addr: &Option<SocketAddr>,
+    oauth_scopes: &[String],
 ) -> PyResult<Py<PyAny>> {
     match kind {
         "inject_request" => {
@@ -402,11 +403,17 @@ fn build_injected_object(
             }
         }),
         "inject_security_scopes" => {
-            // Empty SecurityScopes — real scope collection from
-            // nested Security() dep chain happens in the resolver.
+            // ``SecurityScopes(scopes=...)`` — the adapter accumulates the scopes
+            // declared down the ``Security(..., scopes=[...])`` chain into the
+            // param's ``oauth_scopes`` at build time (FastAPI's
+            // ``dependant.security_scopes``). ``fastapi_turbo.security
+            // .SecurityScopes`` is the real ``fastapi.security`` class.
             let ss_mod = py.import("fastapi_turbo.security")?;
             let ss_cls = ss_mod.getattr("SecurityScopes")?;
             let scopes_list = pyo3::types::PyList::empty(py);
+            for s in oauth_scopes {
+                scopes_list.append(s)?;
+            }
             let kw = PyDict::new(py);
             kw.set_item("scopes", scopes_list)?;
             Ok(ss_cls.call((), Some(&kw))?.unbind())
@@ -456,6 +463,7 @@ fn inject_framework_objects(
                         query_params,
                         body_bytes,
                         client_addr,
+                        &param.oauth_scopes,
                     )?;
                     kwargs.set_item(&param.name, req.bind(py))?;
                 }
@@ -473,6 +481,7 @@ fn inject_framework_objects(
                     query_params,
                     body_bytes,
                     client_addr,
+                    &param.oauth_scopes,
                 )?;
                 kwargs.set_item(&param.name, obj.bind(py))?;
             }
@@ -875,6 +884,11 @@ pub struct ParamInfo {
     pub dep_input_names: Vec<(String, String)>,
     #[pyo3(get, set)]
     pub is_handler_param: bool,
+    /// OAuth2 scopes accumulated down the ``Security(..., scopes=[...])`` chain for
+    /// an ``inject_security_scopes`` param — the door builds ``SecurityScopes(
+    /// scopes=...)`` from this. Empty for every other param kind.
+    #[pyo3(get, set)]
+    pub oauth_scopes: Vec<String>,
 }
 
 impl Clone for ParamInfo {
@@ -896,6 +910,7 @@ impl Clone for ParamInfo {
             is_generator_dep: self.is_generator_dep,
             dep_input_names: self.dep_input_names.clone(),
             is_handler_param: self.is_handler_param,
+            oauth_scopes: self.oauth_scopes.clone(),
         })
     }
 }
@@ -903,7 +918,7 @@ impl Clone for ParamInfo {
 #[pymethods]
 impl ParamInfo {
     #[new]
-    #[pyo3(signature = (name, kind, type_hint="str".to_string(), required=true, default_value=None, has_default=false, model_class=None, alias=None, dep_callable=None, dep_callable_id=None, is_async_dep=false, is_generator_dep=false, dep_input_names=vec![], is_handler_param=true, scalar_validator=None))]
+    #[pyo3(signature = (name, kind, type_hint="str".to_string(), required=true, default_value=None, has_default=false, model_class=None, alias=None, dep_callable=None, dep_callable_id=None, is_async_dep=false, is_generator_dep=false, dep_input_names=vec![], is_handler_param=true, scalar_validator=None, oauth_scopes=vec![]))]
     fn new(
         name: String,
         kind: String,
@@ -920,6 +935,7 @@ impl ParamInfo {
         dep_input_names: Vec<(String, String)>,
         is_handler_param: bool,
         scalar_validator: Option<Py<PyAny>>,
+        oauth_scopes: Vec<String>,
     ) -> Self {
         ParamInfo {
             name,
@@ -938,6 +954,7 @@ impl ParamInfo {
             is_generator_dep,
             dep_input_names,
             is_handler_param,
+            oauth_scopes,
         }
     }
 }
@@ -2417,6 +2434,7 @@ async fn handle_request(
                                     &query_params,
                                     &body_bytes,
                                     &client_addr,
+                                    &param.oauth_scopes,
                                 ) {
                                     Ok(obj) => {
                                         resolved.insert(param.name.clone(), obj);

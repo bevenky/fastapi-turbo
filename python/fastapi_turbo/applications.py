@@ -7393,20 +7393,10 @@ class FastAPI(_real_fastapi.FastAPI):
                 ),
                 response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
             )
-            # SecurityScopes: the Rust door adapter doesn't accumulate the
-            # ``Security(..., scopes=[...])`` chain into SecurityScopes. Decline any
-            # route whose dependant tree (recursively) requests SecurityScopes so it
-            # runs on the clone door path (which does accumulate). OpenAPI generation
-            # still uses the real route (it doesn't go through this method).
-            def _wants_security_scopes(dep) -> bool:
-                if getattr(dep, "security_scopes_param_name", None):
-                    return True
-                return any(
-                    _wants_security_scopes(s)
-                    for s in getattr(dep, "dependencies", []) or []
-                )
-            if _wants_security_scopes(real.dependant):
-                return None
+            # SecurityScopes: the adapter accumulates the ``Security(...,
+            # scopes=[...])`` chain into each dependant's ``oauth_scopes`` and the
+            # door builds ``SecurityScopes(scopes=...)`` from it (with scope-aware
+            # per-request dep caching), so these routes run on the fast adapter path.
             params = extract_params_from_route(real, app=self)
             handler = build_handler(real)
         except Undelegable:

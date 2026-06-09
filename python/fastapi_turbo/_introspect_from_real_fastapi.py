@@ -335,6 +335,39 @@ def _emit_combined_body(route: Any, dep: Any, out: list[ParamInfo]) -> None:
         )
 
 
+def _scopes_for(dep: Any, kind: str) -> list[str]:
+    """OAuth2 scopes for an ``inject_security_scopes`` param: the dependant's
+    accumulated ``oauth_scopes`` (``parent + own`` down the ``Security(...,
+    scopes=[...])`` chain, order-preserving). Empty for every other inject kind —
+    the door builds ``SecurityScopes(scopes=...)`` from this."""
+    if kind != "inject_security_scopes":
+        return []
+    return list(getattr(dep, "oauth_scopes", None) or [])
+
+
+_U64_MASK = (1 << 64) - 1
+
+
+def _dep_cache_id(dep: Any, call: Any) -> int | None:
+    """Per-request dependency cache key as a ``u64`` for the door's ``dep_cache``.
+
+    Mirrors FastAPI's ``Dependant.cache_key`` — ``(call, scopes, scope)`` — so a
+    dependency reached via different ``Security(..., scopes=[...])`` chains is
+    cached SEPARATELY (it observes different ``SecurityScopes``), while a plain
+    dependency that doesn't use scopes stays shared. Returns ``None`` when
+    ``use_cache`` is False (no caching), matching the prior behavior. For the
+    common no-scope case the value is exactly ``id(call)`` (zero blast radius)."""
+    if not getattr(dep, "use_cache", True):
+        return None
+    try:
+        scopes = dep.cache_key[1]  # () unless the dependant actually uses scopes
+    except Exception:
+        scopes = ()
+    if not scopes:
+        return id(call)
+    return (id(call) ^ (hash(tuple(scopes)) & _U64_MASK)) & _U64_MASK
+
+
 def _emit_dep_special_params(dep: Any, out: list[ParamInfo], uid: str) -> list[tuple[str, str]]:
     """A dependency that takes Request/Response/BackgroundTasks/SecurityScopes:
     emit each as an ``inject_*`` dep-input (the door builds it into ``resolved``)
@@ -356,6 +389,7 @@ def _emit_dep_special_params(dep: Any, out: list[ParamInfo], uid: str) -> list[t
                     alias=None,
                     is_handler_param=False,
                     scalar_validator=None,
+                    oauth_scopes=_scopes_for(dep, kind),
                 )
             )
             wiring.append((pname, src_key))
@@ -380,6 +414,7 @@ def _emit_special_params(dep: Any, out: list[ParamInfo]) -> None:
                     alias=None,
                     is_handler_param=True,
                     scalar_validator=None,
+                    oauth_scopes=_scopes_for(dep, kind),
                 )
             )
 
@@ -493,7 +528,7 @@ def _emit_dep(
             has_default=False,
             alias=None,
             dep_callable=dep_callable,
-            dep_callable_id=(id(call) if getattr(dep, "use_cache", True) else None),
+            dep_callable_id=_dep_cache_id(dep, call),
             is_async_dep=dep.is_coroutine_callable,
             is_generator_dep=is_gen,
             dep_input_names=input_wiring,
