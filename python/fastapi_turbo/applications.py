@@ -7530,6 +7530,22 @@ class FastAPI(_real_fastapi.FastAPI):
                 ),
                 response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
             )
+            # Async-generator yield-dependencies: their teardown ordering relative
+            # to an outer @app.middleware can't be replicated at the handler level
+            # (the door applies middleware outside the delegated handler, and a
+            # deferred teardown breaks exception propagation + leaks temp files — see
+            # the handler comment below). The clone path orders these correctly, so
+            # decline them to it (the adapter already declines async-gen deps too).
+            def _has_async_gen_dep(dep) -> bool:
+                call = getattr(dep, "call", None)
+                if call is not None and inspect.isasyncgenfunction(call):
+                    return True
+                return any(
+                    _has_async_gen_dep(s) for s in getattr(dep, "dependencies", []) or []
+                )
+
+            if _has_async_gen_dep(real.dependant):
+                return None
             # The standalone route has no provider, so real FastAPI's
             # solve_dependencies can't see ``app.dependency_overrides``. Point it at
             # this app (a real FastAPI subclass) so overrides — added at startup OR
