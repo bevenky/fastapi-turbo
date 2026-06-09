@@ -637,6 +637,29 @@ def endpoint_ctx_for(endpoint, path=None) -> dict:
     return ctx
 
 
+def _route_has_uploads(route: Any) -> bool:
+    """True when the handler takes an ``UploadFile`` (``File()`` body field or a
+    ``UploadFile``/``list[UploadFile]`` annotation). Such routes need the door to
+    close the upload after the response — Starlette/FastAPI parity
+    (``test_upload_file_is_closed``). Deps with body params are declined, so only
+    the handler's own body params can carry uploads."""
+    try:
+        from starlette.datastructures import UploadFile as _UF
+
+        for bf in getattr(route.dependant, "body_params", []) or []:
+            if type(bf.field_info).__name__ == "File":
+                return True
+            ann = _unwrap_optional(bf.field_info.annotation)
+            if ann is _UF:
+                return True
+            args = getattr(ann, "__args__", None)
+            if args and any(a is _UF for a in args):
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def build_handler(route: Any):
     """Return the endpoint to register with the Rust door — wrapped to apply
     ``response_model`` filtering when the route declares one, and to render the
@@ -656,7 +679,9 @@ def build_handler(route: Any):
     rc = getattr(route, "response_class", None)
     custom_rc = rc if isinstance(rc, type) else None
 
-    if field is None and custom_rc is None:
+    has_uploads = _route_has_uploads(route)
+
+    if field is None and custom_rc is None and not has_uploads:
         return endpoint
 
     flags = (
@@ -690,7 +715,30 @@ def build_handler(route: Any):
             return custom_rc(result)
         return result
 
-    if inspect.iscoroutinefunction(endpoint):
+    # Close UploadFile(s) handed to the handler after the response is built —
+    # Starlette parity (``test_upload_file_is_closed``). Imported lazily to keep
+    # the adapter import light. Runs in ``finally`` so uploads close whether the
+    # handler succeeds or raises (matches Starlette's request-scoped teardown).
+    if has_uploads:
+        from fastapi_turbo._route_helpers import _close_upload_files
+
+        if inspect.iscoroutinefunction(endpoint):
+
+            async def wrapper(**kwargs):
+                try:
+                    return _finish(await endpoint(**kwargs))
+                finally:
+                    _close_upload_files(kwargs)
+
+        else:
+
+            def wrapper(**kwargs):
+                try:
+                    return _finish(endpoint(**kwargs))
+                finally:
+                    _close_upload_files(kwargs)
+
+    elif inspect.iscoroutinefunction(endpoint):
 
         async def wrapper(**kwargs):
             return _finish(await endpoint(**kwargs))

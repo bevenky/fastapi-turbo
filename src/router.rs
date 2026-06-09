@@ -3197,15 +3197,11 @@ fn extract_params_to_pydict_full<'py>(
                             // Collect all missing-field errors before
                             // surfacing — FA emits one 422 with every
                             // missing form/file field in the detail list.
-                            if defers_extraction_errors {
-                                extraction_errors.push(missing_error_detail("body", alias_name));
-                                continue;
-                            }
-                            return Err(validation_error_response(
-                                "body",
-                                alias_name,
-                                "field required",
-                            ));
+                            // Accumulate unconditionally (like the "form"
+                            // arm below); the post-loop block returns the
+                            // combined 422 for non-deferring routes.
+                            extraction_errors.push(missing_error_detail("body", alias_name));
+                            continue;
                         }
                     }
                 }

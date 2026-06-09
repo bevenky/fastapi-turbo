@@ -2665,7 +2665,6 @@ def _clone_framework_types() -> tuple:
     tuple non-empty so _signature_uses_clone_framework_type doesn't decline all)."""
     types = []
     for mod, name in (
-        ("fastapi_turbo.param_functions", "UploadFile"),
         ("fastapi_turbo.websockets", "WebSocket"),
     ):
         try:
