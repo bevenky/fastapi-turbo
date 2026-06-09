@@ -7333,17 +7333,9 @@ class FastAPI(_real_fastapi.FastAPI):
         # 200) — fall back for correctness.
         if rd.get("status_code") not in (None, 200):
             return None
-        # Only default-JSON-response routes — build_handler doesn't apply a custom
-        # response_class.
-        rc = rd.get("response_class")
-        if rc is not None:
-            try:
-                from fastapi_turbo.responses import JSONResponse as _JR
-
-                if rc is not _JR:
-                    return None
-            except Exception:
-                return None
+        # Custom response_class is now applied by build_handler (it renders the
+        # endpoint result via the class) + the door merges any dep-injected
+        # Response, so these routes ride the fast adapter path (~32K) not the clone.
         # Clone framework TYPES (Request/Response/BackgroundTasks/UploadFile/
         # WebSocket) are reimplementations, NOT real starlette subclasses, so real
         # FastAPI's introspection can't see them. Check the SIGNATURE and decline
@@ -7380,6 +7372,9 @@ class FastAPI(_real_fastapi.FastAPI):
                 response_model=rd.get("response_model"),
                 status_code=(
                     rd["status_code"] if rd.get("status_code") not in (None, 200) else None
+                ),
+                response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
+                    _real_fastapi.responses.JSONResponse
                 ),
                 response_model_include=getattr(route, "response_model_include", None),
                 response_model_exclude=getattr(route, "response_model_exclude", None),

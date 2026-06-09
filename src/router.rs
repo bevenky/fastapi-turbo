@@ -83,15 +83,30 @@ thread_local! {
     /// (the latter inside `block_in_place`).
     static REQUEST_DISCONNECT_FLAG: std::cell::RefCell<Option<Py<PyAny>>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Per-request SHARED injected ``Response``. FastAPI gives the handler AND
+    /// every dependency that takes ``response: Response`` the SAME object, so a
+    /// dep can set ``response.headers[...]`` / ``status_code`` and it carries onto
+    /// the final response. ``build_injected_object`` builds it lazily (the first
+    /// ``inject_response`` need wins, all later ones clone the same ref) and
+    /// ``apply_injected_response`` merges it onto the outgoing response — including
+    /// the case where ONLY a dependency (not the handler) injected it, which the
+    /// old kwargs-only merge missed. Thread-local + reset per request, same
+    /// worker-thread invariant as the disconnect flag.
+    static INJECTED_RESPONSE: std::cell::RefCell<Option<Py<PyAny>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// RAII guard: clears the per-request disconnect-flag thread-local on drop so it
-/// never leaks to the next request served on the same worker thread.
+/// RAII guard: clears the per-request thread-locals on drop so they never leak to
+/// the next request served on the same worker thread.
 struct DisconnectFlagGuard;
 impl Drop for DisconnectFlagGuard {
     fn drop(&mut self) {
         REQUEST_DISCONNECT_FLAG.with(|f| {
             *f.borrow_mut() = None;
+        });
+        INJECTED_RESPONSE.with(|r| {
+            *r.borrow_mut() = None;
         });
     }
 }
@@ -338,7 +353,18 @@ fn build_injected_object(
             }
             Ok(bg.unbind())
         }
-        "inject_response" => Ok(response_cls(py)?.bind(py).call0()?.unbind()),
+        "inject_response" => INJECTED_RESPONSE.with(|cell| {
+            // Return the per-request SHARED Response (FastAPI semantics) so the
+            // handler and every dependency mutate the same object.
+            let mut slot = cell.borrow_mut();
+            if let Some(existing) = slot.as_ref() {
+                Ok(existing.clone_ref(py))
+            } else {
+                let resp = response_cls(py)?.bind(py).call0()?.unbind();
+                *slot = Some(resp.clone_ref(py));
+                Ok(resp)
+            }
+        }),
         "inject_security_scopes" => {
             // Empty SecurityScopes — real scope collection from
             // nested Security() dep chain happens in the resolver.
@@ -462,19 +488,15 @@ fn drain_background_tasks(_py: Python<'_>, kwargs: &Bound<'_, PyDict>, params: &
 ///         response.status_code = 201
 ///         response.headers["x-custom"] = "1"
 ///         return {"ok": True}
-fn apply_injected_response(
-    py: Python<'_>,
-    kwargs: &Bound<'_, PyDict>,
-    params: &[ParamInfo],
-    response: &mut Response,
-) {
-    for param in params {
-        if param.kind != "inject_response" {
-            continue;
-        }
-        let Ok(Some(obj)) = kwargs.get_item(&param.name) else {
-            continue;
-        };
+fn apply_injected_response(py: Python<'_>, response: &mut Response) {
+    // Merge the per-request SHARED injected Response (set by the handler AND/OR
+    // any dependency) onto the outgoing response. Reading the thread-local — not
+    // handler kwargs — means a Response injected ONLY by a dependency still
+    // applies (the old kwargs-only merge missed that, dropping dep-set headers,
+    // e.g. on custom-response_class routes / include_router default-class chains).
+    let obj = INJECTED_RESPONSE.with(|cell| cell.borrow().as_ref().map(|o| o.clone_ref(py)));
+    if let Some(obj) = obj {
+        let obj = obj.into_bound(py);
         // Apply status_code (but only if user set something non-default)
         if let Ok(sc_attr) = obj.getattr("status_code") {
             if let Ok(sc) = sc_attr.extract::<u16>() {
@@ -1990,7 +2012,7 @@ async fn handle_request(
                             range_header.as_deref(),
                             if_range_header.as_deref(),
                         );
-                        apply_injected_response(py, &kwargs, &state.params, &mut resp);
+                        apply_injected_response(py, &mut resp);
                         resp
                     }
                     Err(py_err) => pyerr_to_response(py, &py_err),
@@ -2124,7 +2146,7 @@ async fn handle_request(
                                 range_header.as_deref(),
                                 if_range_header.as_deref(),
                             );
-                            apply_injected_response(py, &kwargs, &state.params, &mut resp);
+                            apply_injected_response(py, &mut resp);
                             resp
                         }
                         Err(e) => pyerr_to_response(py, &e),
@@ -2195,12 +2217,14 @@ async fn handle_request(
                     ) {
                         Ok(r) => {
                             drain_background_tasks(py, &kwargs, &state.params);
-                            py_to_response_with_request(
+                            let mut resp = py_to_response_with_request(
                                 py,
                                 r.bind(py),
                                 range_header.as_deref(),
                                 if_range_header.as_deref(),
-                            )
+                            );
+                            apply_injected_response(py, &mut resp);
+                            resp
                         }
                         Err(e) => pyerr_to_response(py, &e),
                     }
@@ -2479,12 +2503,13 @@ async fn handle_request(
                     // Build the response BEFORE yield-dep teardown so lazily
                     // serialized objects (e.g. ORM rows) materialize while the
                     // session is still open — matches FastAPI's exit-stack order.
-                    let resp = py_to_response_with_request(
+                    let mut resp = py_to_response_with_request(
                         py,
                         py_result.bind(py),
                         range_header.as_deref(),
                         if_range_header.as_deref(),
                     );
+                    apply_injected_response(py, &mut resp);
                     teardown_generator_deps(py, &gen_deps, false);
                     resp
                 }

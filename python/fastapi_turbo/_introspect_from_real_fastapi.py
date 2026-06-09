@@ -570,11 +570,24 @@ def endpoint_ctx_for(endpoint, path=None) -> dict:
 
 def build_handler(route: Any):
     """Return the endpoint to register with the Rust door — wrapped to apply
-    ``response_model`` filtering when the route declares one, else the endpoint
-    unchanged. The wrapper preserves the endpoint's sync/async-ness."""
+    ``response_model`` filtering when the route declares one, and to render the
+    result through a CUSTOM ``response_class`` when the route sets one (so those
+    routes ride the fast adapter path). The wrapper preserves the endpoint's
+    sync/async-ness. Default-JSON routes with no response_model return the
+    endpoint unchanged — the door does the fast Rust dict→JSON render."""
     endpoint = route.endpoint
     field = getattr(route, "response_field", None)
-    if field is None:
+
+    # Custom (non-default) response_class → render the result through it. A custom
+    # class is an actual TYPE (``response_class=HTMLResponse``, or a router default
+    # the route-dict already resolved to a class); the framework DEFAULT is a
+    # ``DefaultPlaceholder`` *instance* (not a type) → left to the door's fast Rust
+    # dict→JSON render. ``isinstance(rc, type)`` avoids comparing against
+    # shim-rebound DefaultPlaceholder/JSONResponse classes.
+    rc = getattr(route, "response_class", None)
+    custom_rc = rc if isinstance(rc, type) else None
+
+    if field is None and custom_rc is None:
         return endpoint
 
     flags = (
@@ -588,17 +601,28 @@ def build_handler(route: Any):
     name = getattr(endpoint, "__name__", "endpoint")
     _ctx = endpoint_ctx_for(endpoint, getattr(route, "path", None))
 
+    def _finish(result):
+        if field is not None:
+            result = _serialize_via_field(result, field, flags, _ctx)
+        if custom_rc is not None:
+            from starlette.responses import Response as _Resp
+
+            # Already a Response (StreamingResponse / explicit return) → pass through;
+            # the door merges any dep-injected Response onto it.
+            if isinstance(result, _Resp):
+                return result
+            return custom_rc(result)
+        return result
+
     if inspect.iscoroutinefunction(endpoint):
 
         async def wrapper(**kwargs):
-            result = await endpoint(**kwargs)
-            return _serialize_via_field(result, field, flags, _ctx)
+            return _finish(await endpoint(**kwargs))
 
     else:
 
         def wrapper(**kwargs):
-            result = endpoint(**kwargs)
-            return _serialize_via_field(result, field, flags, _ctx)
+            return _finish(endpoint(**kwargs))
 
     wrapper.__name__ = name
     return wrapper
