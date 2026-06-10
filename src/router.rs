@@ -809,6 +809,29 @@ fn pydantic_error_details(
     details
 }
 
+/// Pick the validator for a ``body`` param: the cached SchemaValidator, else the
+/// model class's ``__pydantic_validator__``, else the scalar ``TypeAdapter`` — the
+/// last covers NON-model typed bodies (``list[Model]`` / ``dict[...]`` etc.) which
+/// FastAPI validates against the body field's TypeAdapter just like a model body.
+fn resolve_body_validator(py: Python<'_>, param: &ParamInfo) -> Option<Py<PyAny>> {
+    if let Some(ref v) = param.cached_validator {
+        return Some(v.clone_ref(py));
+    }
+    if let Some(ref mc) = param.model_class {
+        if let Ok(v) = mc.bind(py).getattr("__pydantic_validator__") {
+            return Some(v.unbind());
+        }
+    }
+    // Non-model typed body: validate only STRUCTURAL containers (``list[Model]`` /
+    // ``tuple[...]`` → type_hint "list_*") via the TypeAdapter. dict / plain scalar
+    // bodies stay on the lenient body_json path so a missing Content-Type under
+    // ``strict_content_type=False`` is still accepted (test_strict_content_type_*).
+    if param.type_hint.starts_with("list") {
+        return param.scalar_validator.as_ref().map(|v| v.clone_ref(py));
+    }
+    None
+}
+
 /// Apply a parameter's default to the kwargs dict. Honors `has_default`:
 /// when the marker declares `default=None`, we pass Python `None` explicitly
 /// so the handler doesn't fall back to the function signature's default
@@ -2933,19 +2956,11 @@ fn extract_params_to_pydict_full<'py>(
                         }
                         None => lax_content_type,
                     };
-                    let val = if param.cached_validator.is_some() || param.model_class.is_some() {
+                    let body_validator = resolve_body_validator(py, param);
+                    let val = if let Some(ref validator) = body_validator {
                         let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
                         let result = if ct_is_json {
-                            if let Some(ref validator) = param.cached_validator {
-                                validator.call_method1(py, "validate_json", (py_bytes,))
-                            } else {
-                                param
-                                    .model_class
-                                    .as_ref()
-                                    .unwrap()
-                                    .getattr(py, "__pydantic_validator__")
-                                    .and_then(|v| v.call_method1(py, "validate_json", (py_bytes,)))
-                            }
+                            validator.call_method1(py, "validate_json", (py_bytes,))
                         } else {
                             // Non-JSON Content-Type. For a raw-bytes body param
                             // pass the bytes OBJECT — lossy UTF-8 decoding would
@@ -2959,16 +2974,7 @@ fn extract_params_to_pydict_full<'py>(
                                 let raw_str = std::str::from_utf8(body_bytes).unwrap_or("");
                                 pyo3::types::PyString::new(py, raw_str).into_any()
                             };
-                            if let Some(ref validator) = param.cached_validator {
-                                validator.call_method1(py, "validate_python", (py_input,))
-                            } else {
-                                param
-                                    .model_class
-                                    .as_ref()
-                                    .unwrap()
-                                    .getattr(py, "__pydantic_validator__")
-                                    .and_then(|v| v.call_method1(py, "validate_python", (py_input,)))
-                            }
+                            validator.call_method1(py, "validate_python", (py_input,))
                         };
                         match result {
                             Ok(v) => v,
@@ -3547,22 +3553,14 @@ fn extract_single_param(
         }
         "body" => {
             let is_combined = param.name == "_combined_body";
+            let body_validator = resolve_body_validator(py, param);
             if !body_bytes.is_empty() {
-                if param.cached_validator.is_some() || param.model_class.is_some() {
+                if let Some(ref validator) = body_validator {
                     // Validate raw bytes directly (FA shapes). On error,
                     // remap to FA's combined/with-body 422 (alias-aware loc,
                     // top-level ``input=None``) instead of a raw 500.
                     let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
-                    let result = if let Some(ref validator) = param.cached_validator {
-                        validator.call_method1(py, "validate_json", (py_bytes,))
-                    } else {
-                        param
-                            .model_class
-                            .as_ref()
-                            .unwrap()
-                            .getattr(py, "__pydantic_validator__")
-                            .and_then(|v| v.call_method1(py, "validate_json", (py_bytes,)))
-                    };
+                    let result = validator.call_method1(py, "validate_json", (py_bytes,));
                     match result {
                         Ok(v) => {
                             resolved.insert(param.name.clone(), v);
