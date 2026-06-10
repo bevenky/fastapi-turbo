@@ -822,15 +822,14 @@ fn resolve_body_validator(py: Python<'_>, param: &ParamInfo) -> Option<Py<PyAny>
             return Some(v.unbind());
         }
     }
-    // Non-model typed body: validate STRUCTURAL containers — ``list[Model]`` /
-    // ``tuple[...]`` (type_hint "list_*") and TYPED ``dict[K, V]`` (type_hint
-    // "dict") — via the TypeAdapter. A BARE ``dict`` / plain scalar body stays on
-    // the lenient body_json path so a missing Content-Type under
-    // ``strict_content_type=False`` is still accepted (test_strict_content_type_*).
-    if param.type_hint.starts_with("list") || param.type_hint == "dict" {
-        return param.scalar_validator.as_ref().map(|v| v.clone_ref(py));
-    }
-    None
+    // Non-model body: validate via the field's TypeAdapter (scalar_validator) —
+    // structural containers (``list[Model]``, typed ``dict[K, V]``), bare ``dict``,
+    // AND plain scalars (``float``/``int``/``str`` with constraints, e.g.
+    // ``Body(allow_inf_nan=False)``). All run through the Content-Type-aware
+    // validate_json/validate_python path, so strict_content_type is enforced (the
+    // lax flag now reaches the adapter handler) and field constraints are checked.
+    // (cached_validator / model_class are handled above.)
+    param.scalar_validator.as_ref().map(|v| v.clone_ref(py))
 }
 
 /// Apply a parameter's default to the kwargs dict. Honors `has_default`:
@@ -2882,7 +2881,25 @@ fn extract_params_to_pydict_full<'py>(
                             }
                         }
                         if !any_err {
-                            let _ = kwargs.set_item(&param.name, list);
+                            if param.scalar_validator.is_some() {
+                                // Feed the coerced list to the field TypeAdapter so
+                                // container types get FA semantics: frozenset/set
+                                // dedup, tuple arity (``tuple[int,int]`` rejects 3
+                                // values). Plain list[...] validators are identity.
+                                match run_scalar_validator_detail(
+                                    py,
+                                    param,
+                                    "query",
+                                    list.as_any(),
+                                ) {
+                                    Ok(validated) => {
+                                        let _ = kwargs.set_item(&param.name, validated);
+                                    }
+                                    Err(mut errs) => extraction_errors.append(&mut errs),
+                                }
+                            } else {
+                                let _ = kwargs.set_item(&param.name, list);
+                            }
                         }
                     }
                 } else if let Some(raw) = query_params.get(q_lookup) {
@@ -3496,7 +3513,10 @@ fn extract_single_param(
     match param.kind.as_str() {
         "path" => {
             let p_lookup: &str = param.alias.as_deref().unwrap_or(&param.name);
-            if let Some(raw) = path_map.get(&param.name) {
+            // Look up by the alias-aware key: a path param shared with a dependency
+            // is emitted with a synthetic name (``_dep0__user_id``) but the matchit
+            // capture key is the real name (``user_id``) carried in ``alias``.
+            if let Some(raw) = path_map.get(p_lookup) {
                 resolved.insert(
                     param.name.clone(),
                     coerce_str_to_py(py, raw, &param.type_hint),
@@ -3685,7 +3705,10 @@ fn extract_single_param(
                 .as_ref()
                 .and_then(|h| h.get("cookie"))
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| parse_cookie_value(s, &param.name));
+                // Alias-aware: a Cookie() consumed as a dependency input has a
+                // synthetic ``param.name`` (``_dep0__last_query``) but the real
+                // cookie name is in ``alias`` (loc_name).
+                .and_then(|s| parse_cookie_value(s, loc_name));
             if let Some(raw) = cookie_val {
                 resolved.insert(
                     param.name.clone(),

@@ -43,13 +43,14 @@ event-loop exit stack: **async-generator** ``yield`` dependencies. Those raise
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import typing
 from collections.abc import Mapping as _abc_Mapping
 from typing import Any
 
 from fastapi_turbo._fastapi_turbo_core import ParamInfo
-from fastapi_turbo._door_support import _get_type_name
+from fastapi_turbo._door_support import _TypeAdapterProxy, _get_type_name
 
 try:  # pydantic v2 sentinel for "no default"
     from pydantic_core import PydanticUndefined
@@ -78,6 +79,39 @@ def _unwrap_optional(ann: Any) -> Any:
         if len(non_none) == 1:
             return non_none[0]
     return ann
+
+
+def _callable_is_async(fn: Any) -> bool:
+    """True for an ``async def`` OR a SYNC ``functools.wraps`` wrapper over an
+    ``async def`` (``inspect.iscoroutinefunction`` is False for the latter, but the
+    call returns a coroutine the door must await). Follows ``__wrapped__``."""
+    if inspect.iscoroutinefunction(fn):
+        return True
+    try:
+        return inspect.iscoroutinefunction(inspect.unwrap(fn))
+    except Exception:
+        return False
+
+
+def _has_json_marker(fi: Any) -> bool:
+    """A pydantic ``Json[...]`` field carries a Json marker in field_info.metadata.
+    FastAPI never getlists a Json field — it reads the single raw JSON string and
+    lets the Json TypeAdapter decode it."""
+    for m in getattr(fi, "metadata", None) or ():
+        tn = type(m).__name__
+        if tn == "Json" or getattr(type(m), "__qualname__", "").endswith(".Json"):
+            return True
+    return False
+
+
+def _is_union_of_basemodels(ann: Any) -> bool:
+    """True for ``ModelA | ModelB`` (a Union whose non-None members are all
+    BaseModels) — a single Form field of this shape validates as a union model."""
+    origin = typing.get_origin(ann)
+    if origin is typing.Union or (origin is not None and getattr(origin, "__name__", "") == "UnionType"):
+        members = [a for a in typing.get_args(ann) if a is not type(None)]
+        return len(members) >= 2 and all(_is_basemodel(m) for m in members)
+    return False
 
 
 def _default_of(field_info: Any) -> Any:
@@ -164,6 +198,14 @@ def _param_from_field(
     # through the model (defaults included) instead of being passed as a raw dict.
     body_ann = _unwrap_optional(ann)
     is_body_model = kind == "body" and _is_basemodel(body_ann)
+    # A @dataclass body validates via a TypeAdapter proxy (the door's model_class
+    # path) just like a BaseModel — _is_basemodel is False for dataclasses.
+    is_dataclass_body = (
+        kind == "body"
+        and not is_body_model
+        and isinstance(body_ann, type)
+        and dataclasses.is_dataclass(body_ann)
+    )
     explicit_alias = _alias_of(fi)
     if name is not None:
         resolved_name = name
@@ -172,14 +214,19 @@ def _param_from_field(
     else:
         resolved_name = mf.name
         alias = explicit_alias
-    if is_body_model:
+    if is_body_model or is_dataclass_body:
         type_hint = "model"
     else:
         type_hint = _get_type_name(ann)
+        # A pydantic Json[...] scalar (query/header/cookie/form): force single-value
+        # so the door's scalar branch runs the Json TypeAdapter (decodes the JSON
+        # string) instead of treating list[...] as repeated values.
+        if kind in ("query", "header", "cookie", "form") and _has_json_marker(fi):
+            type_hint = "str"
         # A TYPED dict body (``dict[int, float]``) needs structural validation (the
         # door validates "dict" via the field TypeAdapter); a BARE ``dict`` stays
         # "str" → the lenient body_json path (keeps strict_content_type lax handling).
-        if kind == "body" and typing.get_origin(body_ann) in (dict, _abc_Mapping):
+        elif kind == "body" and typing.get_origin(body_ann) in (dict, _abc_Mapping):
             if typing.get_args(body_ann):
                 type_hint = "dict"
     return ParamInfo(
@@ -189,7 +236,11 @@ def _param_from_field(
         required=required,
         default_value=_default_of(fi),
         has_default=not required,
-        model_class=(body_ann if is_body_model else None),
+        model_class=(
+            body_ann
+            if is_body_model
+            else (_TypeAdapterProxy(body_ann) if is_dataclass_body else None)
+        ),
         alias=alias,
         scalar_validator=_field_validator(mf, is_body_model, kind),
         is_handler_param=is_handler_param,
@@ -602,13 +653,13 @@ def _emit_body(route: Any, dep: Any, out: list[ParamInfo]) -> None:
         # request_body_to_args (exact alias/extra/list parity, like query/header/
         # cookie). The field-by-field _expand_param_model couldn't reproduce
         # model_config extra or the raw-dict 422 ``input``.
-        if (
-            len(body_fields) == 1
-            and fi_names == {"Form"}
-            and _is_basemodel(_unwrap_optional(body_fields[0].field_info.annotation))
-        ):
-            _emit_form_param_model(body_fields[0], out, body_fields[0].name, is_handler_param=True)
-            return
+        if len(body_fields) == 1 and fi_names == {"Form"}:
+            _form_ann = body_fields[0].field_info.annotation
+            if _is_basemodel(_unwrap_optional(_form_ann)) or _is_union_of_basemodels(_form_ann):
+                _emit_form_param_model(
+                    body_fields[0], out, body_fields[0].name, is_handler_param=True
+                )
+                return
         for bf in body_fields:
             kind = "file" if type(bf.field_info).__name__ == "File" else "form"
             ann = _unwrap_optional(bf.field_info.annotation)
@@ -984,6 +1035,17 @@ def build_handler(route: Any):
     has_uploads = _route_has_uploads(route)
 
     if field is None and custom_rc is None and not has_uploads:
+        if not inspect.iscoroutinefunction(endpoint) and _callable_is_async(endpoint):
+            # A sync ``@wraps`` wrapper over an ``async def``: return a true
+            # coroutine function so the door awaits it (iscoroutinefunction(endpoint)
+            # is False, so returning it unchanged would render an un-awaited
+            # coroutine). Genuinely-async endpoints are returned as-is — the
+            # adapter's is_async gate already drives them on the loop.
+            async def _await_wrapper(**kwargs):
+                return await endpoint(**kwargs)
+
+            _await_wrapper.__name__ = getattr(endpoint, "__name__", "endpoint")
+            return _await_wrapper
         return endpoint
 
     flags = (
@@ -1024,7 +1086,7 @@ def build_handler(route: Any):
     if has_uploads:
         from fastapi_turbo._route_helpers import _close_upload_files
 
-        if inspect.iscoroutinefunction(endpoint):
+        if _callable_is_async(endpoint):
 
             async def wrapper(**kwargs):
                 try:
@@ -1040,8 +1102,10 @@ def build_handler(route: Any):
                 finally:
                     _close_upload_files(kwargs)
 
-    elif inspect.iscoroutinefunction(endpoint):
-
+    elif _callable_is_async(endpoint):
+        # async def, OR a sync ``@wraps`` wrapper over an async def — await the
+        # returned coroutine so a true coroutine-function handler reaches the door
+        # (else the door would call it sync and render an un-awaited coroutine).
         async def wrapper(**kwargs):
             return _finish(await endpoint(**kwargs))
 

@@ -7878,6 +7878,17 @@ class FastAPI(_real_fastapi.FastAPI):
                         _ah._fastapi_turbo_route_obj = _rt_obj
                     except (AttributeError, TypeError):
                         pass
+                # The door reads ``_fastapi_turbo_lax_content_type`` off the
+                # RouteInfo.handler; the lax flag was stamped on the ORIGINAL
+                # endpoint, so copy it onto the freshly-built adapter handler
+                # (else a lax route with a body validator wrongly 422s a
+                # no-Content-Type body — strict_content_type=False parity).
+                _ep_for_lax = rd.get("endpoint")
+                if getattr(_ep_for_lax, "_fastapi_turbo_lax_content_type", False):
+                    try:
+                        _ah._fastapi_turbo_lax_content_type = True
+                    except (AttributeError, TypeError):
+                        pass
                 route_infos.append(
                     RouteInfo(
                         path=rd["path"],

@@ -27,8 +27,10 @@ Imported during package init BEFORE the compat shim rebinds ``sys.modules`` (see
 from __future__ import annotations
 
 from fastapi.exceptions import (
+    DependencyScopeError,
     FastAPIDeprecationWarning,
     FastAPIError,
+    PydanticV1NotSupportedError,
     RequestErrorModel,
     RequestValidationError,
     ResponseValidationError,
@@ -59,14 +61,6 @@ __all__ = [
     "_DoorWebSocketRequestValidationError",
     "_DoorResponseValidationError",
 ]
-
-
-class DependencyScopeError(FastAPIError):
-    """Raised when a dependency is used outside its allowed scope (no real equivalent)."""
-
-
-class PydanticV1NotSupportedError(FastAPIError):
-    """Raised when a Pydantic v1 model is used where FastAPI requires v2 (no real equivalent)."""
 
 
 def _loc_as_tuples(errors):
