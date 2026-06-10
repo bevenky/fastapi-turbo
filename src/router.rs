@@ -3000,6 +3000,32 @@ fn extract_params_to_pydict_full<'py>(
                         py_bytes.into_any().unbind()
                     };
                     let _ = kwargs.set_item(&param.name, val.bind(py));
+                } else if !param.required && param.model_class.is_some() {
+                    // Optional body model absent (e.g. ``Body(embed=True) = None``
+                    // where every embedded field is optional): build it from
+                    // defaults (validate ``{}``) so the getters / handler see the
+                    // field defaults — FA returns the defaulted model, not 422.
+                    let empty = pyo3::types::PyBytes::new(py, b"{}");
+                    let built = if let Some(ref validator) = param.cached_validator {
+                        validator.call_method1(py, "validate_json", (empty,))
+                    } else {
+                        param
+                            .model_class
+                            .as_ref()
+                            .unwrap()
+                            .getattr(py, "__pydantic_validator__")
+                            .and_then(|v| v.call_method1(py, "validate_json", (empty,)))
+                    };
+                    match built {
+                        Ok(v) => {
+                            let _ = kwargs.set_item(&param.name, v.bind(py));
+                        }
+                        // All-optional model shouldn't error on ``{}``; if it does,
+                        // fall through to the default/None path.
+                        Err(_) => {
+                            let _ = apply_default(py, &kwargs, param);
+                        }
+                    }
                 } else if apply_default(py, &kwargs, param) {
                     // Default applied
                 } else if param.required {
@@ -3588,6 +3614,33 @@ fn extract_single_param(
                     // Raw bytes couldn't be parsed as JSON — hand them on.
                     let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
                     resolved.insert(param.name.clone(), py_bytes.into_any().unbind());
+                }
+            } else if !param.required && param.model_class.is_some() {
+                // Optional body model absent (e.g. ``Body(embed=True) = None``):
+                // build it from defaults (validate ``{}``) so the getters / handler
+                // see field defaults — FA returns the defaulted model, not None/422.
+                let empty = pyo3::types::PyBytes::new(py, b"{}");
+                let built = if let Some(ref validator) = param.cached_validator {
+                    validator.call_method1(py, "validate_json", (empty,))
+                } else {
+                    param
+                        .model_class
+                        .as_ref()
+                        .unwrap()
+                        .getattr(py, "__pydantic_validator__")
+                        .and_then(|v| v.call_method1(py, "validate_json", (empty,)))
+                };
+                match built {
+                    Ok(v) => {
+                        resolved.insert(param.name.clone(), v);
+                    }
+                    Err(_) => {
+                        let v = match &param.default_value {
+                            Some(d) => d.clone_ref(py),
+                            None => py.None(),
+                        };
+                        resolved.insert(param.name.clone(), v);
+                    }
                 }
             } else if param.has_default {
                 let v = match &param.default_value {

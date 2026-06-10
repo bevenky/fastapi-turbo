@@ -447,14 +447,22 @@ def _emit_combined_body(route: Any, dep: Any, out: list[ParamInfo]) -> None:
     combined_model = bf.field_info.annotation if bf is not None else None
     if combined_model is None or not _is_basemodel(combined_model):
         raise Undelegable("no combined body_field → real FastAPI")
+    # The combined body is OPTIONAL when its field_info has a default (e.g.
+    # ``Body(embed=True) = None`` → every embedded field optional) — an absent body
+    # then builds the model from defaults instead of 422-ing. Required for a normal
+    # embed / multiple-body.
+    try:
+        body_required = bool(bf.field_info.is_required())
+    except Exception:  # noqa: BLE001
+        body_required = True
     out.append(
         ParamInfo(
             name="_combined_body",
             kind="body",
             type_hint="model",
-            required=True,
+            required=body_required,
             default_value=None,
-            has_default=False,
+            has_default=not body_required,
             model_class=combined_model,
             alias=None,
             scalar_validator=None,
