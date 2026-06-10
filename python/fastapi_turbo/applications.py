@@ -4601,7 +4601,7 @@ class FastAPI(_real_fastapi.FastAPI):
             except OSError:
                 pass
 
-    def _route_obj_reusable(self, rd: dict, route) -> bool:
+    def _route_obj_reusable(self, rd: dict, route, allow_prefixed: bool = False) -> bool:
         """P10.4 collection inversion: True when the decoration-built REAL
         route can BE the adapter/delegation source directly — i.e. the
         collection walker added nothing on top of what the route object's
@@ -4612,9 +4612,18 @@ class FastAPI(_real_fastapi.FastAPI):
         cases, which must KEEP rebuilding:
 
         - include_router()/router/mount prefixes: ``rd["path"]`` carries
-          the full prefixed path; ``route.path`` does not (a ``{param}``
-          inside an added prefix would be classified as a QUERY param by
-          the decoration-time dependant);
+          the full prefixed path; ``route.path`` does not. With
+          ``allow_prefixed=True`` (the ADAPTER site) a brace-free added
+          prefix still reuses — the dependant only ever consumed the
+          path-param NAME set from the path, and the caller passes
+          ``ctx_path`` to ``build_handler`` so error contexts keep the
+          full path. A ``{param}`` inside the added prefix was classified
+          as a QUERY param by the decoration-time dependant, so those
+          rebuild. The DELEGATED site requires strict path equality:
+          real 0.136's request/response validation-error endpoint
+          context renders ``METHOD {route.path}`` from the route object
+          itself (upstream's ``test_validation_error_context`` asserts
+          the full ``/sub/items/`` mount path);
         - app/include/router-level dependencies: they live ONLY in
           ``rd["_combined_dependencies"]`` and reach a dependant solely
           via the rebuild's ``dependencies=`` ctor arg. The live route's
@@ -4627,8 +4636,19 @@ class FastAPI(_real_fastapi.FastAPI):
           (a rebuild-input fix; caught by the ``is`` check below).
         """
         try:
-            if rd["path"] != route.path:
-                return False
+            rd_path = rd["path"]
+            route_path = route.path
+            if rd_path != route_path:
+                if not allow_prefixed:
+                    return False
+                # Prefixed (include_router/router-prefix/mount): reusable
+                # only when the ADDED prefix is brace-free — it then adds
+                # no path-param names, which is all the decoration-time
+                # dependant consumed from the path.
+                if not rd_path.endswith(route_path):
+                    return False
+                if "{" in rd_path[: len(rd_path) - len(route_path)]:
+                    return False
             merged = rd.get("_combined_dependencies") or []
             own = list(getattr(route, "dependencies", None) or [])
             if len(merged) != len(own) or any(
@@ -4729,7 +4749,7 @@ class FastAPI(_real_fastapi.FastAPI):
         except Exception:
             return None
         try:
-            if self._route_obj_reusable(rd, route):
+            if self._route_obj_reusable(rd, route, allow_prefixed=True):
                 # P10.4 inversion: the decoration-built real-APIRoute subclass
                 # already carries the exact dependant/response fields the
                 # rebuild below would reproduce — use it as the source of
@@ -4784,7 +4804,7 @@ class FastAPI(_real_fastapi.FastAPI):
                     endpoint, rd.get("response_model"), rd.get("response_class"), self
                 )
             else:
-                handler = build_handler(real)
+                handler = build_handler(real, ctx_path=rd["path"])
         except Undelegable:
             return None
         except Exception:

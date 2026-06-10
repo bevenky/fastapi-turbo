@@ -1021,13 +1021,17 @@ def _route_has_uploads(route: Any) -> bool:
     return False
 
 
-def build_handler(route: Any):
+def build_handler(route: Any, *, ctx_path: str | None = None):
     """Return the endpoint to register with the Rust door — wrapped to apply
     ``response_model`` filtering when the route declares one, and to render the
     result through a CUSTOM ``response_class`` when the route sets one (so those
     routes ride the fast adapter path). The wrapper preserves the endpoint's
     sync/async-ness. Default-JSON routes with no response_model return the
-    endpoint unchanged — the door does the fast Rust dict→JSON render."""
+    endpoint unchanged — the door does the fast Rust dict→JSON render.
+
+    ``ctx_path`` overrides ``route.path`` in the error context — the P10.4
+    reuse path hands in the decoration-built route, whose ``path`` lacks any
+    include/router prefix; the caller passes the rd's full path instead."""
     endpoint = route.endpoint
     field = getattr(route, "response_field", None)
 
@@ -1065,7 +1069,7 @@ def build_handler(route: Any):
         getattr(route, "response_model_exclude_none", False),
     )
     name = getattr(endpoint, "__name__", "endpoint")
-    _ctx = endpoint_ctx_for(endpoint, getattr(route, "path", None))
+    _ctx = endpoint_ctx_for(endpoint, ctx_path or getattr(route, "path", None))
 
     # Route-level status_code (real APIRoute carries it) — bake it into a custom
     # response_class render, since a returned Response keeps its own status (the
