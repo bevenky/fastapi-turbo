@@ -518,234 +518,63 @@ def _looks_like_body(annotation) -> bool:
         return False
 
 
-def _build_default_route_handler(route, app):
-    """Return an ``async (request) -> Response`` callable that runs
-    the route's full pipeline (body parsing, param validation, endpoint
-    call, response serialization) given a Starlette-style ``Request``.
 
-    This is what ``APIRoute.get_route_handler()`` returns by default.
-    Custom route-class subclasses wrap this in their own coroutine so
-    the request is pre-processed before the pipeline runs — GzipRoute
-    swaps it for a ``GzipRequest`` that decompresses on ``body()``,
-    TimedRoute wraps the response with a timing header, etc.
 
-    Scope: supports the subset FA's ``get_request_handler`` hits on
-    the tutorial patterns — single ``Body()`` param (list/dict/primitive/
-    Pydantic model), ``Request`` injection, ``HTTPException`` / Pydantic
-    ``ValidationError`` translation into ``RequestValidationError``.
-    Complex dep graphs and form/file params fall back to the default
-    compiled handler since those tutorials don't exercise them.
-    """
-    import inspect as _ins
-    import typing as _tp
-    import json as _json
-    from pydantic import TypeAdapter as _TA, ValidationError as _PyVE, BaseModel as _BM
-    from fastapi_turbo.exceptions import (
-        _DoorRequestValidationError as _RVE,
-        HTTPException as _HE,
+def _build_real_default_route_handler(route, app):
+    """``async (request) -> Response`` via REAL FastAPI's pipeline for this
+    route — what ``super().get_route_handler()`` hands a custom route class.
+    Builds a plain real ``fastapi.routing.APIRoute`` from the route's metadata
+    (mirroring ``_delegated_route_info``) and wraps its handler with the three
+    AsyncExitStack scopes real FA's handler reads off ``request.scope``."""
+    from contextlib import AsyncExitStack as _AES
+
+    from fastapi_turbo.applications import _real_fastapi
+
+    methods = [
+        m
+        for m in (getattr(route, "methods", None) or ["GET"])
+        if m in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+    ] or ["GET"]
+    real = _real_fastapi.routing.APIRoute(
+        getattr(route, "path", "/"),
+        route.endpoint,
+        methods=methods,
+        dependencies=getattr(route, "dependencies", None) or None,
+        response_model=getattr(route, "response_model", None),
+        status_code=(
+            route.status_code
+            if getattr(route, "status_code", None) not in (None, 200)
+            else None
+        ),
+        response_class=getattr(route, "response_class", None)
+        or _real_fastapi.datastructures.Default(_real_fastapi.responses.JSONResponse),
+        response_model_include=getattr(route, "response_model_include", None),
+        response_model_exclude=getattr(route, "response_model_exclude", None),
+        response_model_by_alias=getattr(route, "response_model_by_alias", True),
+        response_model_exclude_unset=getattr(route, "response_model_exclude_unset", False),
+        response_model_exclude_defaults=getattr(
+            route, "response_model_exclude_defaults", False
+        ),
+        response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
     )
-    from fastapi_turbo.param_functions import _ParamMarker as _PM
-    from fastapi_turbo.dependencies import Depends as _Dep
-    from fastapi_turbo.responses import Response as _Resp, JSONResponse as _JR
-    from fastapi_turbo.encoders import jsonable_encoder as _je
-
-    endpoint = route.endpoint
-    try:
-        sig = _ins.signature(endpoint)
-    except (TypeError, ValueError):
-        sig = None
-    try:
-        hints = _tp.get_type_hints(endpoint, include_extras=True)
-    except Exception as _exc:  # noqa: BLE001
-        _log.debug("silent catch in applications: %r", _exc)
-        hints = {}
-
-    # Classify params from the endpoint signature.
-    # Each entry: (name, kind, annotation, marker, default)
-    # kind in {"body", "request", "query", "path", "header", "cookie",
-    #          "depends", "other"}.
-    param_plan: list[dict] = []
-    if sig is not None:
-        from fastapi_turbo.requests import Request as _Req, HTTPConnection as _HC
-        for pname, p in sig.parameters.items():
-            if p.kind in (_ins.Parameter.VAR_POSITIONAL, _ins.Parameter.VAR_KEYWORD):
-                continue
-            ann = hints.get(pname, p.annotation)
-            inner_ann = ann
-            markers: list = []
-            if _tp.get_origin(ann) is _tp.Annotated:
-                args = _tp.get_args(ann)
-                if args:
-                    inner_ann = args[0]
-                    markers = [m for m in args[1:]]
-            default = p.default
-            marker = None
-            for m in markers:
-                if isinstance(m, (_PM, _Dep)):
-                    marker = m
-                    break
-            if marker is None and isinstance(default, (_PM, _Dep)):
-                marker = default
-            kind = "other"
-            if isinstance(marker, _Dep):
-                kind = "depends"
-            elif isinstance(marker, _PM):
-                kind = getattr(marker, "_kind", "query") or "query"
-            elif isinstance(inner_ann, type) and issubclass(inner_ann, (_Req, _HC)):
-                kind = "request"
-            elif pname not in getattr(route, "path_params", set()) and _looks_like_body(inner_ann):
-                # FA parity: a Pydantic model / dataclass / generic-mapping
-                # annotation without an explicit marker is a Body param.
-                # Path params are excluded since ``/{x}`` wins.
-                kind = "body"
-            param_plan.append({
-                "name": pname,
-                "kind": kind,
-                "ann": inner_ann,
-                "marker": marker,
-                "default": default,
-            })
-
-    # Pre-build a body TypeAdapter when a single Body() param exists.
-    body_param = next((p for p in param_plan if p["kind"] == "body"), None)
-    body_adapter = None
-    body_model_cls = None
-    if body_param is not None:
-        try:
-            if isinstance(body_param["ann"], type) and issubclass(body_param["ann"], _BM):
-                body_model_cls = body_param["ann"]
-            else:
-                body_adapter = _TA(body_param["ann"])
-        except Exception as _exc:  # noqa: BLE001
-            _log.debug("silent catch in applications: %r", _exc)
-
-    is_async_endpoint = _ins.iscoroutinefunction(endpoint)
-    _app_ref = app
-    _route_ref = route
+    real.dependency_overrides_provider = app
+    inner = real.get_route_handler()
 
     async def default_handler(request):
-        # Build kwargs one param at a time; for Body, read from
-        # ``await request.body()`` so Request subclass overrides fire.
-        kwargs: dict = {}
-        for p in param_plan:
-            nm = p["name"]
-            kd = p["kind"]
-            if kd == "request":
-                kwargs[nm] = request
-            elif kd == "body":
-                raw = await request.body()
-                if not raw:
-                    # Missing body → raise RequestValidationError mirroring
-                    # FA's "missing required body" response.
-                    raise _RVE([
-                        {
-                            "type": "missing",
-                            "loc": ("body",),
-                            "msg": "Field required",
-                            "input": None,
-                        }
-                    ], body=None)
-                try:
-                    parsed = _json.loads(raw)
-                except _json.JSONDecodeError as exc:
-                    raise _RVE([
-                        {
-                            "type": "json_invalid",
-                            "loc": ("body", exc.pos),
-                            "msg": f"JSON decode error: {exc.msg}",
-                            "input": {},
-                        }
-                    ], body=raw.decode("utf-8", errors="replace"))
-                try:
-                    if body_model_cls is not None:
-                        kwargs[nm] = body_model_cls.model_validate(parsed)
-                    elif body_adapter is not None:
-                        kwargs[nm] = body_adapter.validate_python(parsed)
-                    else:
-                        kwargs[nm] = parsed
-                except _PyVE as exc:
-                    # FA parity: prepend ``"body"`` to each error's
-                    # ``loc`` tuple and strip the pydantic-only ``url``
-                    # / ``ctx`` keys so the JSON response matches FA's
-                    # shape exactly (``loc: ["body"]`` for root errors,
-                    # ``loc: ["body", "field"]`` for field errors).
-                    errs = []
-                    for err in exc.errors():
-                        # Strip pydantic's doc-link ``url`` field but
-                        # preserve ``ctx`` (constraint values like
-                        # ``{min_length: 1}``) — upstream FastAPI
-                        # emits ctx in 422 response bodies (R39).
-                        new_err = {
-                            k: v for k, v in err.items()
-                            if k != "url"
-                        }
-                        loc = list(new_err.get("loc", ()))
-                        new_err["loc"] = ["body", *loc] if loc else ["body"]
-                        errs.append(new_err)
-                    raise _RVE(errs, body=parsed) from None
-            elif kd == "query":
-                # Pull from request.query_params; honour marker's alias/default.
-                alias = getattr(p["marker"], "alias", None) or nm
-                raw_val = request.query_params.get(alias)
-                if raw_val is None:
-                    if p["default"] is not _ins.Parameter.empty and not isinstance(p["default"], _PM):
-                        kwargs[nm] = p["default"]
-                    elif hasattr(p["marker"], "default") and p["marker"].default is not ...:
-                        kwargs[nm] = p["marker"].default
-                else:
-                    kwargs[nm] = raw_val
-            elif kd == "path":
-                kwargs[nm] = request.path_params.get(nm)
-            elif kd == "header":
-                alias = getattr(p["marker"], "alias", None) or nm
-                kwargs[nm] = request.headers.get(alias.replace("_", "-"))
-            elif kd == "cookie":
-                kwargs[nm] = request.cookies.get(nm)
-            elif kd == "depends":
-                # Minimal support: call the dep with no args (sync or async).
-                # Tutorial patterns don't exercise deep dep graphs through
-                # the custom-route-class path; when someone does, the
-                # Rust-compiled pipeline handles it instead.
-                dep_fn = p["marker"].dependency
-                if dep_fn is None:
-                    kwargs[nm] = None
-                elif _ins.iscoroutinefunction(dep_fn):
-                    kwargs[nm] = await dep_fn()
-                else:
-                    kwargs[nm] = dep_fn()
-            else:  # "other" — primitive query without marker
-                kwargs[nm] = request.query_params.get(nm)
-
-        # Call the endpoint.
-        result = endpoint(**kwargs)
-        if _ins.iscoroutine(result):
-            result = await result
-
-        # Wrap into a Response — defer to the route's response_class /
-        # status_code if set, else fall back to JSON encoding. Response
-        # instances pass through untouched.
-        if isinstance(result, _Resp):
-            return result
-
-        rm = getattr(_route_ref, "response_model", None)
-        if rm is not None:
-            try:
-                result = _apply_response_model(
-                    result, rm,
-                    include=getattr(_route_ref, "response_model_include", None),
-                    exclude=getattr(_route_ref, "response_model_exclude", None),
-                    exclude_unset=getattr(_route_ref, "response_model_exclude_unset", False),
-                    exclude_defaults=getattr(_route_ref, "response_model_exclude_defaults", False),
-                    exclude_none=getattr(_route_ref, "response_model_exclude_none", False),
-                    by_alias=getattr(_route_ref, "response_model_by_alias", True),
-                )
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("silent catch in applications: %r", _exc)
-
-        response_cls = getattr(_route_ref, "response_class", None) or _JR
-        status_code = getattr(_route_ref, "status_code", None) or 200
-        encoded = _je(result)
-        return response_cls(content=encoded, status_code=status_code)
+        async with _AES() as _file_stack, _AES() as _inner_stack, _AES() as _function_stack:
+            request.scope["fastapi_middleware_astack"] = _file_stack
+            request.scope["fastapi_inner_astack"] = _inner_stack
+            request.scope["fastapi_function_astack"] = _function_stack
+            response = await inner(request)
+            # Run background tasks before yield-dep teardown (FA order), then
+            # clear so the door doesn't double-run them.
+            _bg = getattr(response, "background", None)
+            if _bg is not None:
+                _bgr = _bg()
+                if inspect.isawaitable(_bgr):
+                    await _bgr
+                response.background = None
+            return response
 
     return default_handler
 
@@ -770,9 +599,13 @@ def _build_custom_route_handler_endpoint(route, app):
 
     # Expose the builder so ``APIRoute._default_route_handler`` can
     # resolve it. ``get_route_handler``'s ``super().get_route_handler()``
-    # call routes through this.
+    # call routes through this — it returns REAL FastAPI's route handler (a
+    # plain real APIRoute built from this route's metadata), so a user's
+    # wrapper (GzipRoute/TimedRoute) wraps real FA's full pipeline: byte-exact
+    # body parsing, validation, response_model serialization. The clone
+    # mini-pipeline (_build_default_route_handler) is no longer on this path.
     def _build_default() -> Callable:
-        return _build_default_route_handler(route, app)
+        return _build_real_default_route_handler(route, app)
 
     route._fastapi_turbo_build_default_handler = _build_default  # type: ignore[attr-defined]
 

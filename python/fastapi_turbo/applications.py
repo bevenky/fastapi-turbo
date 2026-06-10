@@ -74,7 +74,6 @@ from fastapi_turbo._route_helpers import (  # noqa: F401 — re-exports
     _apply_response_model,
     _apply_status_code,
     _build_custom_route_handler_endpoint,
-    _build_default_route_handler,
     _close_one_upload,
     _close_upload_files,
     _has_overridden_get_route_handler,
@@ -7919,8 +7918,24 @@ class FastAPI(_real_fastapi.FastAPI):
             _adapted = self._adapter_route_info(rd, for_door_mix=_use_door_eps)
             if _adapted is None:
                 # The lean adapter declined — try full delegation to real FastAPI's
-                # route handler (FASTAPI_TURBO_DELEGATE=1) before the clone path.
+                # route handler (default-on) before the clone path.
                 _adapted = self._delegated_route_info(rd, for_door_mix=_use_door_eps)
+            _trace_path = os.environ.get("FASTAPI_TURBO_TRACE_CLONE")
+            if _adapted is None and _trace_path:
+                # Clone-deletion telemetry: name every route that still falls back
+                # to the clone-compiled handler (both adapter+delegation declined).
+                # Appends to the file named by the env var (stderr is swallowed by
+                # pytest's per-test capture for passing tests).
+                try:
+                    with open(_trace_path, "a") as _tf:
+                        _tf.write(
+                            f"{sorted(rd.get('methods') or [])} {rd.get('path')} "
+                            f"ws={bool(rd.get('is_websocket'))} "
+                            f"mount={bool(rd.get('_from_mount'))} "
+                            f"route_obj={'y' if rd.get('_route_obj') is not None else 'n'}\n"
+                        )
+                except OSError:
+                    pass
             if _adapted is not None:
                 _ap, _ah, _aasync = _adapted
                 # Stamp the real FastAPI route so the Rust bridge can expose
