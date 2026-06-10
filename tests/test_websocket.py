@@ -715,3 +715,38 @@ def test_websocket_handler_no_accept_times_out(server_app):
     import httpx
     r = httpx.get(f"{url}/health")
     assert r.status_code == 200
+
+
+# -- Pure-unit regression tests (no server needed) --------------------------
+
+
+def test_receive_recovers_close_code_from_ws_closed_error():
+    """receive() must parse WS_CLOSED:<code>:<reason> RuntimeErrors from the
+    Rust fallback path instead of hardcoding code 1000 (P8 side-finding)."""
+    from fastapi_turbo.websockets import WebSocket
+
+    class _FakeRustWS:
+        async def receive_async(self):
+            raise RuntimeError("WS_CLOSED:4001:bye")
+
+    ws = WebSocket(_rust_ws=_FakeRustWS())
+    msg = asyncio.run(ws.receive())
+    assert msg == {"type": "websocket.disconnect", "code": 4001, "reason": "bye"}
+
+
+def test_receive_plain_runtime_error_maps_to_1000():
+    """Non-WS_CLOSED RuntimeErrors (e.g. 'WebSocket closed' when the channel
+    is dropped) keep the legacy mapping: code 1000, message as reason."""
+    from fastapi_turbo.websockets import WebSocket
+
+    class _FakeRustWS:
+        async def receive_async(self):
+            raise RuntimeError("WebSocket closed")
+
+    ws = WebSocket(_rust_ws=_FakeRustWS())
+    msg = asyncio.run(ws.receive())
+    assert msg == {
+        "type": "websocket.disconnect",
+        "code": 1000,
+        "reason": "WebSocket closed",
+    }
