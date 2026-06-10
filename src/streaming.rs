@@ -138,11 +138,9 @@ fn drain_one_sync_chunk(iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
         Ok(val) => Some(python_val_to_bytes(&val)),
         Err(e) => {
             if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
-                if let Ok(app_lock) = crate::router::APP_INSTANCE.read() {
-                    if let Some(ref app_obj) = *app_lock {
-                        if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-                            let _ = lst.call_method1(py, "append", (e.value(py),));
-                        }
+                if let Some(app_obj) = crate::router::current_app(py) {
+                    if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+                        let _ = lst.call_method1(py, "append", (e.value(py),));
                     }
                 }
             }
@@ -196,11 +194,9 @@ fn iterate_sync_generator(
                 // surfaces it to the caller (FA parity — streaming-body
                 // failures must reach the test just like synchronous
                 // handler failures).
-                if let Ok(app_lock) = crate::router::APP_INSTANCE.read() {
-                    if let Some(ref app_obj) = *app_lock {
-                        if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-                            let _ = lst.call_method1(py, "append", (e.value(py),));
-                        }
+                if let Some(app_obj) = crate::router::current_app(py) {
+                    if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+                        let _ = lst.call_method1(py, "append", (e.value(py),));
                     }
                 }
                 break;

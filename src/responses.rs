@@ -635,11 +635,9 @@ pub fn pyerr_to_response(py: Python<'_>, err: &PyErr) -> Response {
     // as a successful 500, breaking ``httpx.ASGITransport(raise_app_
     // exceptions=True)`` / ``TestClient(raise_server_exceptions=True)``.
     // Same mechanism the streaming path already uses (streaming.rs).
-    if let Ok(app_lock) = crate::router::APP_INSTANCE.read() {
-        if let Some(ref app_obj) = *app_lock {
-            if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-                let _ = lst.call_method1(py, "append", (err.value(py),));
-            }
+    if let Some(app_obj) = crate::router::current_app(py) {
+        if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+            let _ = lst.call_method1(py, "append", (err.value(py),));
         }
     }
     // Print traceback to stderr and return plain-text 500.

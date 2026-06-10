@@ -441,6 +441,11 @@ pub fn run_server(
     if let Ok(mut slot) = crate::router::NOT_FOUND_HANDLER.write() {
         *slot = not_found_handler;
     }
+    // Clone the app for the runtime's worker threads BEFORE it's moved into the
+    // global slot — each worker thread of THIS server binds itself to this app so
+    // the door's 500-capture targets the right ``_captured_server_exceptions`` when
+    // multiple apps run their own loopback servers in one process.
+    let app_for_threads: Option<Py<PyAny>> = app.as_ref().map(|a| a.clone_ref(py));
     if let Ok(mut slot) = crate::router::APP_INSTANCE.write() {
         *slot = app;
     }
@@ -451,12 +456,23 @@ pub fn run_server(
     let mw_configs = parse_middleware_configs(py, &middlewares)?;
 
     // Release the GIL for the entire duration of the blocking server run.
-    py.detach(|| {
-        let rt = Runtime::new().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Failed to create tokio runtime: {e}"
-            ))
-        })?;
+    py.detach(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            // Bind every worker thread to THIS server's app (once at thread start —
+            // no per-request cost) so error capture finds the right app.
+            .on_thread_start(move || {
+                let bound = app_for_threads
+                    .as_ref()
+                    .map(|a| Python::attach(|py| a.clone_ref(py)));
+                crate::router::set_current_app(bound);
+            })
+            .build()
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to create tokio runtime: {e}"
+                ))
+            })?;
 
         // Assemble the complete Axum application router: user routes +
         // the pure-Rust baseline endpoints + OpenAPI/docs + static mounts

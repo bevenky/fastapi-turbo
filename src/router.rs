@@ -109,6 +109,35 @@ thread_local! {
     /// Set by handle_request from RouteState; read by ``py_to_response`` to status
     /// non-Response handler results. Reset per request (worker-thread invariant).
     static ROUTE_DEFAULT_STATUS: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+
+    /// The app served by THIS worker thread's runtime. ``run_server`` sets it once
+    /// per worker thread (``on_thread_start``) so the door's error-capture sites
+    /// append a 500 to the RIGHT app's ``_captured_server_exceptions`` even when
+    /// several apps run their own loopback servers in one process (parametrized
+    /// tests). Falls back to the global ``APP_INSTANCE`` when unset (in-process
+    /// door / single app). Not reset per request — it's a per-thread/per-server
+    /// binding, not per-request state.
+    static CURRENT_APP: std::cell::RefCell<Option<Py<PyAny>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Bind the current worker thread to its server's app (called from
+/// ``run_server``'s ``on_thread_start``).
+pub(crate) fn set_current_app(app: Option<Py<PyAny>>) {
+    CURRENT_APP.with(|c| *c.borrow_mut() = app);
+}
+
+/// The app handling the current request: the per-thread ``CURRENT_APP`` if the
+/// thread was bound by ``run_server``, else the global ``APP_INSTANCE`` (in-process
+/// door / single-app ``app.run``). Used by the 500-capture / dep-exception sites.
+pub(crate) fn current_app(py: Python<'_>) -> Option<Py<PyAny>> {
+    CURRENT_APP.with(|c| c.borrow().as_ref().map(|a| a.clone_ref(py)))
+        .or_else(|| {
+            APP_INSTANCE
+                .read()
+                .ok()
+                .and_then(|g| g.as_ref().map(|a| a.clone_ref(py)))
+        })
 }
 
 /// The route-level default status for the request currently being served on this
@@ -2733,11 +2762,7 @@ fn teardown_generator_deps(py: Python<'_>, gen_deps: &[Py<PyAny>], errored: bool
 /// the handler's response when one matched, else ``None`` (caller falls back to
 /// ``pyerr_to_response``, which renders the default + captures for re-raise).
 fn try_user_dep_exception_handler(py: Python<'_>, py_err: &PyErr) -> Option<Response> {
-    let app = APP_INSTANCE
-        .read()
-        .ok()?
-        .as_ref()
-        .map(|p| p.clone_ref(py))?;
+    let app = current_app(py)?;
     let exc = py_err.value(py);
     let result = app
         .bind(py)
