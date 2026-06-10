@@ -199,6 +199,16 @@ pub fn py_to_response_with_request(
         write_any_json(py, obj, &mut buf);
         return (default_status, [("content-type", "application/json")], buf).into_response();
     }
+    // Sets / frozensets: serialize as a JSON array (FA's jsonable_encoder does the
+    // same). A handler returning a ``set`` (e.g. a ``set``/``frozenset`` Form or
+    // body param echoed back) must not serialize as the Python set repr.
+    if obj.is_instance_of::<pyo3::types::PySet>()
+        || obj.is_instance_of::<pyo3::types::PyFrozenSet>()
+    {
+        let mut buf = String::new();
+        write_any_json(py, obj, &mut buf);
+        return (default_status, [("content-type", "application/json")], buf).into_response();
+    }
 
     // None -> default status with "null" body (FastAPI json-serializes None to null)
     if obj.is_instance_of::<PyNone>() {

@@ -3257,8 +3257,10 @@ fn extract_params_to_pydict_full<'py>(
                             let coerce_inner = !inner.is_empty() && inner != "str";
                             let list = pyo3::types::PyList::empty(py);
                             let mut any_err = false;
+                            let mut has_file = false;
                             for (idx, f) in fs.drain(..).enumerate() {
                                 if f.filename.is_some() {
+                                    has_file = true;
                                     let wrapped = make_upload_file(py, f).map_err(|_e| {
                                         validation_error_response("body", alias_name, "alloc")
                                     })?;
@@ -3285,7 +3287,26 @@ fn extract_params_to_pydict_full<'py>(
                                 }
                             }
                             if !any_err {
-                                let _ = kwargs.set_item(&param.name, list);
+                                if !has_file && param.scalar_validator.is_some() {
+                                    // Run the field TypeAdapter on the coerced list
+                                    // for container semantics (frozenset/set dedup,
+                                    // ``tuple[int,int]`` arity). Skip when any item
+                                    // is an UploadFile (the validator would reject
+                                    // it). loc is "body" for form fields.
+                                    match run_scalar_validator_detail(
+                                        py,
+                                        param,
+                                        "body",
+                                        list.as_any(),
+                                    ) {
+                                        Ok(validated) => {
+                                            let _ = kwargs.set_item(&param.name, validated);
+                                        }
+                                        Err(mut errs) => extraction_errors.append(&mut errs),
+                                    }
+                                } else {
+                                    let _ = kwargs.set_item(&param.name, list);
+                                }
                             }
                         } else {
                             let field = fs.remove(0);
