@@ -4602,9 +4602,8 @@ class FastAPI(_real_fastapi.FastAPI):
                 pass
 
     def _adapter_route_info(self, rd: dict, for_door_mix: bool = False):
-        """Stage D (DEFAULT-ON; opt OUT via ``FASTAPI_TURBO_ADAPTER=0``): drive a
-        route's door params off REAL FastAPI introspection instead of the clone's
-        ``_introspect``.
+        """Stage D: drive a route's door params off REAL FastAPI introspection
+        instead of the clone's ``_introspect``.
 
         Rebuilds a real ``fastapi.routing.APIRoute`` from the route's effective
         config (full path, original endpoint, combined dependencies, response_model
@@ -4613,10 +4612,6 @@ class FastAPI(_real_fastapi.FastAPI):
         to the clone path — for WebSocket/mounted routes, non-default response
         classes (the adapter applies response_model but not a custom response_class),
         or anything the adapter declines (e.g. async-generator deps)."""
-        import os
-
-        if os.environ.get("FASTAPI_TURBO_ADAPTER") == "0":
-            return None
         if rd.get("is_websocket") or rd.get("_from_mount"):
             return None
         # dependency_overrides (a testing feature) is resolved at request time by
