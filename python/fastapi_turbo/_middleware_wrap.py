@@ -37,8 +37,9 @@ from fastapi_turbo._sentry_compat import (
     _refine_sentry_transaction,
     _refine_sentry_transaction_as_middleware,
 )
-from fastapi_turbo.requests import Request as _Request
+from fastapi_turbo.requests import Request as _Request, _door_make_request
 from fastapi_turbo.responses import JSONResponse as _JSONResponse
+from fastapi_turbo.encoders import jsonable_encoder as _jsonable_encoder
 
 _log = logging.getLogger("fastapi_turbo.applications")
 
@@ -219,7 +220,10 @@ def _make_asgi_middleware_shim(mw_cls, kwargs):
                 content=captured.get("body", b""),
                 status_code=captured["status"],
             )
-            resp.headers.clear()
+            # Reset to exactly the captured headers. ``raw_headers.clear()``
+            # empties the list the ``MutableHeaders`` view is bound to (real
+            # Starlette has no ``headers.clear()``); ``headers.append(str,str)``
+            # then repopulates it (and the backing raw_headers).
             resp.raw_headers.clear()
             for k, v in captured.get("headers", []):
                 if isinstance(k, bytes):
@@ -356,9 +360,9 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
                 if isinstance(val, _Request):
                     # Merge scope data from Rust's Request (has body, path_params,
                     # app, etc.) into the middleware's Request.
-                    for sk, sv in val._scope.items():
-                        if sk not in mw_request._scope:
-                            mw_request._scope[sk] = sv
+                    for sk, sv in val.scope.items():
+                        if sk not in mw_request.scope:
+                            mw_request.scope[sk] = sv
                     # Copy over the state from middleware's Request
                     kwargs[key] = mw_request
                     break
@@ -368,6 +372,22 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
         # JSON responses before the user MW sees them. Without an equivalent
         # conversion here, our user-MW `except` clauses would catch
         # `HTTPException` and mangle it — diverging from FastAPI.
+        # Rust-generated 422 (param coercion / missing) is deferred into this
+        # chain (the wrapper advertises ``_fastapi_turbo_defers_extraction_errors``
+        # below) so user ``@app.middleware("http")`` wraps validation errors the
+        # same way FastAPI's ExceptionMiddleware does. A COMPILED endpoint
+        # handles the ``__fastapi_turbo_extraction_errors__`` sentinel itself
+        # (running deps first, so a dep HTTPException can pre-empt the 422); a
+        # RAW endpoint can't, so build the FA-shaped 422 here and return it —
+        # returning (not raising) lets it flow back out through ``call_next`` so
+        # middlewares add their headers. Shape matches Rust ``dispatch_validation_error``.
+        if not getattr(endpoint, "_fastapi_turbo_defers_extraction_errors", False):
+            _ee = kwargs.get("__fastapi_turbo_extraction_errors__")
+            if _ee is not None:
+                import json as _ee_json
+                return _JSONResponse(
+                    content={"detail": _ee_json.loads(_ee)}, status_code=422
+                )
         # When the endpoint is a RAW user handler (no ``_try_compile_handler``
         # wrap, which happens for no-deps / no-response-model routes), it
         # won't accept our framework-private kwargs. Filter them out.
@@ -451,7 +471,10 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
         # None is a valid handler return value — FA encodes it as
         # JSONResponse(content=None) → body ``null``, status 200.
         # Middlewares that do ``response.headers[...]`` assume a Response.
-        return _JSONResponse(content=result)
+        # ``jsonable_encoder`` first (FA's default-return contract) so models /
+        # dataclasses / Decimals serialize — real Starlette JSONResponse passes
+        # no ``default=`` and would raise on a raw BaseModel otherwise.
+        return _JSONResponse(content=_jsonable_encoder(result))
 
     # Build a chain of sync callables. Each one drives its middleware via
     # coro.send(None) and returns the result. The innermost one calls the handler.
@@ -495,7 +518,7 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
     runner = _make_runner(0)
 
     def wrapped_sync(**kwargs):
-        request = _Request(_make_scope(kwargs))
+        request = _door_make_request(_make_scope(kwargs))
         # Store the middleware's Request object in kwargs so Rust's
         # inject_framework_objects can reuse it instead of creating a new one.
         # This ensures request.state set by middleware propagates to the handler.
@@ -529,6 +552,12 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
                 request._pending_teardowns = []
 
     wrapped_sync._has_http_middleware = True
+    # Tell Rust to DEFER param-validation (422) errors into this wrapper instead
+    # of returning them directly — otherwise middleware never wraps validation
+    # errors (a drop-in violation: auth/logging/CORS headers missing on 422s).
+    # ``_call_handler_sync`` above converts the deferred sentinel to a 422 for
+    # raw endpoints; compiled endpoints raise it themselves after running deps.
+    wrapped_sync._fastapi_turbo_defers_extraction_errors = True
     # Preserve the original user endpoint reference through the
     # middleware wrapper so Sentry endpoint-style transaction naming
     # (which calls ``transaction_from_function(endpoint)``) sees
@@ -553,7 +582,7 @@ def _drive_async_fallback(endpoint, middlewares, app, kwargs, is_async_endpoint)
     Used when a middleware suspends on real I/O (e.g., httpx call inside).
     """
     async def _chain():
-        request = _Request({"type": "http", "app": app, "_handler_kwargs": kwargs})
+        request = _door_make_request({"type": "http", "app": app, "_handler_kwargs": kwargs})
 
         async def call_handler():
             if is_async_endpoint:

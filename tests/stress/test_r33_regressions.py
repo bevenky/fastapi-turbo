@@ -95,7 +95,11 @@ def test_compatibility_md_force_mode_count_isnt_obviously_stale():
         [sys.executable, "-m", "pytest", "tests/", "-q", "--timeout=60"],
         cwd=str(repo),
         env={
-            **os.environ,
+            # Strip FASTAPI_TURBO_ONESHOT_DOOR so the spawned suite measures
+            # the door-OFF baseline COMPATIBILITY.md pins — otherwise a parent
+            # dual-door run leaks the flag in and the count drifts.
+            **{k: v for k, v in os.environ.items()
+               if k != "FASTAPI_TURBO_ONESHOT_DOOR"},
             "FASTAPI_TURBO_FORCE_LOOPBACK_DENIED": "1",
             # Avoid recursion: the spawned pytest must not run THIS
             # test (which would spawn pytest again, ad infinitum).

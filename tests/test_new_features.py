@@ -22,11 +22,30 @@ from __future__ import annotations
 import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
 
 import json
+from typing import Annotated  # noqa: F401 — module-level for string-annotation resolution
 
 import pytest
 
+# Module-level so endpoints defined inside tests (with `from __future__ import
+# annotations`, string annotations) resolve `Body`/`Annotated` from __globals__ at
+# OpenAPI-generation time — matching real FastAPI (which resolves hints from the
+# endpoint's module globals, not the defining function's locals).
+from fastapi import Body  # noqa: F401,E402
+
 
 # ── Response.set_cookie / delete_cookie ────────────────────────────
+
+
+def _set_cookies(resp):
+    """Decoded Set-Cookie header values from a (real Starlette) Response.
+    ``raw_headers`` is ``list[tuple[bytes, bytes]]`` and also carries
+    content-length, so filter by name and decode."""
+    out = []
+    for k, v in resp.raw_headers:
+        kk = k.decode("latin-1") if isinstance(k, bytes) else str(k)
+        if kk.lower() == "set-cookie":
+            out.append(v.decode("latin-1") if isinstance(v, bytes) else str(v))
+    return out
 
 
 class TestCookies:
@@ -35,12 +54,11 @@ class TestCookies:
 
         r = Response(content="hi")
         r.set_cookie("session", "abc123")
-        assert len(r.raw_headers) == 1
-        name, value = r.raw_headers[0]
-        assert name == "set-cookie"
-        assert "session=abc123" in value
-        assert "Path=/" in value
-        assert "SameSite=lax" in value
+        cookies = _set_cookies(r)
+        assert len(cookies) == 1
+        assert "session=abc123" in cookies[0]
+        assert "Path=/" in cookies[0]
+        assert "SameSite=lax" in cookies[0]
 
     def test_set_cookie_all_options(self):
         from fastapi.responses import Response
@@ -50,7 +68,7 @@ class TestCookies:
             "k", "v", max_age=3600, path="/api", domain="example.com",
             secure=True, httponly=True, samesite="strict",
         )
-        value = r.raw_headers[0][1]
+        value = _set_cookies(r)[0]
         assert "k=v" in value
         assert "Max-Age=3600" in value
         assert "Path=/api" in value
@@ -64,7 +82,7 @@ class TestCookies:
 
         r = Response()
         r.delete_cookie("session")
-        value = r.raw_headers[0][1]
+        value = _set_cookies(r)[0]
         assert "session=" in value
         assert "Max-Age=0" in value
 
@@ -74,11 +92,10 @@ class TestCookies:
         r = Response()
         r.set_cookie("a", "1")
         r.set_cookie("b", "2")
-        assert len(r.raw_headers) == 2
-        assert r.raw_headers[0][0] == "set-cookie"
-        assert r.raw_headers[1][0] == "set-cookie"
-        assert "a=1" in r.raw_headers[0][1]
-        assert "b=2" in r.raw_headers[1][1]
+        cookies = _set_cookies(r)
+        assert len(cookies) == 2
+        assert "a=1" in cookies[0]
+        assert "b=2" in cookies[1]
 
 
 # ── response_class per route ──────────────────────────────────────
@@ -95,14 +112,11 @@ class TestResponseClass:
         def get_html():
             return "<h1>hi</h1>"
 
-        # Collect route metadata
-        routes = app._collect_all_routes()
-        assert routes[0]["endpoint"] is not get_html  # wrapped
-
-        # Invoke the compiled endpoint
-        result = routes[0]["endpoint"]()
-        assert hasattr(result, "status_code")
-        assert result.media_type == "text/html"
+        from fastapi_turbo.testclient import TestClient
+        resp = TestClient(app, in_process=True).get("/html")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert resp.text == "<h1>hi</h1>"
 
     def test_response_class_ignores_existing_response(self):
         from fastapi import FastAPI
@@ -302,7 +316,13 @@ class TestExamples:
         schema = app.openapi()
         op = schema["paths"]["/x"]["get"]
         params = op.get("parameters", [])
-        has_examples = any(p.get("examples") for p in params)
+        # ``Query(examples={named})`` named examples must appear in OpenAPI. Real
+        # FastAPI places them in the parameter's JSON Schema (``schema.examples``);
+        # the clone placed them at param level (``parameter.examples``) — accept
+        # either so the assertion holds under both generators.
+        has_examples = any(
+            p.get("examples") or p.get("schema", {}).get("examples") for p in params
+        )
         assert has_examples
 
 
@@ -452,10 +472,10 @@ class TestExceptionHandler:
         def fail():
             raise HTTPException(status_code=400, detail="bad")
 
-        routes = app._collect_all_routes()
-        result = routes[0]["endpoint"]()
-        assert hasattr(result, "status_code")
-        assert result.status_code == 418
+        from fastapi_turbo.testclient import TestClient
+        resp = TestClient(app, in_process=True).get("/fail")
+        assert resp.status_code == 418
+        assert resp.json() == {"caught": "bad"}
 
     def test_mro_lookup(self):
         from fastapi import FastAPI
@@ -519,10 +539,9 @@ class TestHTTPMiddleware:
             call_log.append("handler")
             return {"x": 1}
 
-        routes = app._collect_all_routes()
-        # Sync-driven chain (fast path) — endpoint stays sync
-        assert routes[0]["is_async"] is False
-        result = routes[0]["endpoint"]()
+        from fastapi_turbo.testclient import TestClient
+        resp = TestClient(app, in_process=True).get("/hello")
+        assert resp.json() == {"x": 1}
         assert call_log == ["before", "handler", "after"]
 
     def test_middleware_chain_order(self):
@@ -550,8 +569,8 @@ class TestHTTPMiddleware:
             call_log.append("handler")
             return {}
 
-        routes = app._collect_all_routes()
-        routes[0]["endpoint"]()
+        from fastapi_turbo.testclient import TestClient
+        TestClient(app, in_process=True).get("/")
         # FA convention: LAST-decorated middleware is OUTERMOST.
         # @mw2 is outer → runs first on request, last on response.
         assert call_log == ["mw2_in", "mw1_in", "handler", "mw1_out", "mw2_out"]

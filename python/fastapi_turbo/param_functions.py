@@ -13,6 +13,14 @@ from __future__ import annotations
 
 from abc import ABCMeta
 
+# Real FastAPI's param classes. Imported during package init BEFORE the compat
+# shim installs, so this resolves to the REAL module; the bound reference stays
+# real after the shim rebinds ``sys.modules['fastapi']``. Each marker below
+# multiply-inherits from the matching ``_real_params.*`` so REAL FastAPI
+# introspection (the pivot adapter) recognizes it (correct ``in_`` / Body class),
+# while the clone's ``_introspect`` keeps reading our custom attrs (``_kind`` …).
+import fastapi.params as _real_params
+from starlette.datastructures import UploadFile as _RealUploadFile
 from pydantic.fields import FieldInfo
 
 
@@ -62,9 +70,6 @@ class _ParamMarker(FieldInfo):
         json_schema_extra=None,
         **extra,
     ):
-        # Store custom attrs that FieldInfo doesn't natively keep
-        self.include_in_schema = include_in_schema
-        self.example = example
         # FA emits ``FastAPIDeprecationWarning`` when ``example=`` is
         # supplied — tests
         # (e.g. ``test_schema_extra_examples::test_openapi_schema``)
@@ -93,9 +98,6 @@ class _ParamMarker(FieldInfo):
                 _FADeprecationWarning,
                 stacklevel=4,
             )
-        self.regex = pattern or regex
-        self.pattern = self.regex
-        self.openapi_examples = openapi_examples
 
         # Build kwargs for FieldInfo.__init__. Pydantic's ``Field(...)``
         # implicitly propagates ``alias`` to ``validation_alias`` and
@@ -145,6 +147,16 @@ class _ParamMarker(FieldInfo):
 
         super().__init__(default=default, **fi_kwargs, **extra)
 
+        # Store the clone's custom attrs AFTER super().__init__ — real FastAPI's
+        # marker __init__ (now a base class) sets ``example``/``openapi_examples``
+        # to DefaultPlaceholder/Undefined sentinels that the clone's OpenAPI
+        # serializer chokes on, so our plain values must win.
+        self.include_in_schema = include_in_schema
+        self.example = example
+        self.regex = pattern or regex
+        self.pattern = self.regex
+        self.openapi_examples = openapi_examples
+
     def __repr__(self) -> str:
         # FastAPI's param classes use a minimal repr that just shows
         # the default value. Tests (and some user debug output) assert
@@ -158,19 +170,19 @@ class _ParamMarker(FieldInfo):
         return f"{type(self).__name__}({default_repr})"
 
 
-class Param(_ParamMarker):
+class Param(_ParamMarker, _real_params.Param):
     pass
 
 
-class Query(_ParamMarker):
+class Query(_ParamMarker, _real_params.Query):
     _kind = "query"
 
 
-class Path(_ParamMarker):
+class Path(_ParamMarker, _real_params.Path):
     _kind = "path"
 
 
-class Header(_ParamMarker):
+class Header(_ParamMarker, _real_params.Header):
     _kind = "header"
 
     def __init__(self, default=..., *, convert_underscores: bool = True, **kwargs):
@@ -178,11 +190,11 @@ class Header(_ParamMarker):
         self.convert_underscores = convert_underscores
 
 
-class Cookie(_ParamMarker):
+class Cookie(_ParamMarker, _real_params.Cookie):
     _kind = "cookie"
 
 
-class Body(_ParamMarker):
+class Body(_ParamMarker, _real_params.Body):
     _kind = "body"
 
     def __init__(self, default=..., *, embed: bool | None = None, media_type: str = "application/json", **kwargs):
@@ -193,7 +205,7 @@ class Body(_ParamMarker):
         self.media_type = media_type
 
 
-class Form(_ParamMarker):
+class Form(_ParamMarker, _real_params.Form):
     _kind = "form"
 
     def __init__(self, default=..., *, media_type: str = "application/x-www-form-urlencoded", **kw):
@@ -201,19 +213,27 @@ class Form(_ParamMarker):
         self.media_type = media_type
 
 
-class File(_ParamMarker):
+class File(_ParamMarker, _real_params.File):
     _kind = "file"
 
 
-class UploadFile(metaclass=ABCMeta):
+class UploadFile(_RealUploadFile, metaclass=ABCMeta):
     """File upload object matching FastAPI/Starlette's UploadFile interface.
 
-    The Rust multipart parser returns a PyUploadFile directly — this Python
-    class is (a) usable manually for testing, (b) registered as a virtual
-    superclass of PyUploadFile so ``isinstance(f, UploadFile)`` works.
+    SUBCLASSES real ``starlette.datastructures.UploadFile`` so that
+    ``issubclass(UploadFile, real UploadFile)`` is True — real FastAPI's
+    ``get_dependant`` / ``get_openapi`` then recognize a ``f: UploadFile`` param
+    as a file upload (the adapter / the real-OpenAPI pivot need this). The
+    installed Starlette's ``UploadFile`` lacks ``__get_pydantic_core_schema__``,
+    so real ``create_model_field`` can't build a field for it directly — we add
+    that schema (below) on the subclass.
 
-    The underlying bytes are held in-memory (axum buffers the whole request).
-    Read-cursor is independent per instance; seek/tell work as expected.
+    The Rust multipart parser returns a ``PyUploadFile`` directly (the actual
+    object handed to handlers); ``__subclasshook__`` makes
+    ``isinstance(rust_upload_file, UploadFile)`` True via duck typing (it also
+    covers any pre-shim real UploadFile instance). This class is additionally
+    usable manually for testing. Bytes are held in-memory (axum buffers the whole
+    request); read-cursor is independent per instance.
     """
 
     # __subclasshook__ makes isinstance(rust_upload_file, UploadFile) return True
@@ -235,11 +255,25 @@ class UploadFile(metaclass=ABCMeta):
         size: int | None = None,
         headers=None,
     ):
+        # Do NOT call real ``__init__`` (it requires a SpooledTemporaryFile and
+        # derives content_type from headers). Set the clone's attrs directly.
         self.filename = filename
         self.file = file
-        self.content_type = content_type
+        self._content_type = content_type
         self.size = size
         self.headers = headers or {}
+
+    # Real Starlette exposes ``content_type`` as a read-only property derived from
+    # headers; the clone keeps it an explicit, settable value (the Rust
+    # PyUploadFile / manual construction pass it directly), so override with a
+    # settable property over ``_content_type``.
+    @property
+    def content_type(self):
+        return self._content_type
+
+    @content_type.setter
+    def content_type(self, value):
+        self._content_type = value
 
     async def read(self, size: int = -1) -> bytes:
         if self.file is not None:
@@ -278,4 +312,8 @@ class UploadFile(metaclass=ABCMeta):
 
     @classmethod
     def __get_pydantic_json_schema__(cls, schema, handler):
-        return {"type": "string", "format": "binary"}
+        # OpenAPI 3.1 form (the default) — ``contentMediaType`` not the 3.0
+        # ``format: binary``. Real ``get_openapi`` (the OpenAPI pivot) passes this
+        # through verbatim; the clone ``_openapi.py`` hardcodes the file-param
+        # schema separately (``_build_form_file_body``) so its output is unchanged.
+        return {"type": "string", "contentMediaType": "application/octet-stream"}

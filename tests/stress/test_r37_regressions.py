@@ -254,6 +254,9 @@ def test_compat_md_doc_count_isnt_off_by_more_than_one():
                if k not in (
                    "FASTAPI_TURBO_FORCE_LOOPBACK_DENIED",
                    "FASTAPI_TURBO_FORCE_LOOPBACK_ALLOWED",
+                   # door-OFF baseline: don't let a parent dual-door run leak
+                   # the flag into the count-measuring subprocess.
+                   "FASTAPI_TURBO_ONESHOT_DOOR",
                )}
     sub_env["FASTAPI_TURBO_SKIP_DOC_DRIFT_CHECK"] = "1"
     proc = subprocess.run(

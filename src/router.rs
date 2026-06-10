@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::handler_bridge::call_async_handler;
 use crate::multipart::{parse_boundary, parse_multipart, ParsedField, PyUploadFile};
 use crate::responses::{py_to_response_with_request, pyerr_to_response, serde_to_pyobj};
 use crate::websocket::handle_ws_upgrade;
@@ -57,12 +56,126 @@ fn request_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
     if let Some(c) = REQUEST_CLS.get() {
         return Ok(c);
     }
+    // Door factory (not the class): enriches the minimal Rust-built scope with
+    // the keys a real Starlette Request needs (root_path, state, request-line
+    // defaults) and returns a Request. Called the same way — call1((scope,)).
     let cls: Py<PyAny> = py
         .import("fastapi_turbo.requests")?
-        .getattr("Request")?
+        .getattr("_door_make_request")?
         .unbind();
     let _ = REQUEST_CLS.set(cls);
     Ok(REQUEST_CLS.get().unwrap())
+}
+
+/// In-process disconnect flag for the streaming door: carried on the request's
+/// Axum extensions from `process_request_streaming` through the router to
+/// `handle_request`, then stashed in the Python ``Request`` scope so
+/// ``request.is_disconnected()`` can observe a client drop (the door's
+/// receive-poller sets it). The inner object is a Python ``threading.Event``.
+/// ``Arc`` so it satisfies the ``Clone + Send + Sync`` extension bound.
+#[derive(Clone)]
+pub struct DisconnectFlag(pub std::sync::Arc<Py<PyAny>>);
+
+thread_local! {
+    /// Per-request disconnect flag, set by `handle_request` (from the extension)
+    /// and read where the Python ``Request`` scope is built. Thread-local because
+    /// `handle_request` and `build_injected_object` run on the same worker thread
+    /// (the latter inside `block_in_place`).
+    static REQUEST_DISCONNECT_FLAG: std::cell::RefCell<Option<Py<PyAny>>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Per-request SHARED injected ``Response``. FastAPI gives the handler AND
+    /// every dependency that takes ``response: Response`` the SAME object, so a
+    /// dep can set ``response.headers[...]`` / ``status_code`` and it carries onto
+    /// the final response. ``build_injected_object`` builds it lazily (the first
+    /// ``inject_response`` need wins, all later ones clone the same ref) and
+    /// ``apply_injected_response`` merges it onto the outgoing response — including
+    /// the case where ONLY a dependency (not the handler) injected it, which the
+    /// old kwargs-only merge missed. Thread-local + reset per request, same
+    /// worker-thread invariant as the disconnect flag.
+    static INJECTED_RESPONSE: std::cell::RefCell<Option<Py<PyAny>>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Per-request SHARED injected ``BackgroundTasks``. FastAPI gives the handler
+    /// AND every dependency that takes ``background_tasks: BackgroundTasks`` the
+    /// SAME instance, so a dep can add tasks and they run after the response.
+    /// ``build_injected_object`` builds it lazily (first need wins, later ones
+    /// share); ``drain_background_tasks`` drains this one instance. Reset per
+    /// request (worker-thread invariant, like INJECTED_RESPONSE).
+    static INJECTED_BACKGROUND_TASKS: std::cell::RefCell<Option<Py<PyAny>>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Per-request route-level default status code (``@app.get(status_code=201)``).
+    /// Set by handle_request from RouteState; read by ``py_to_response`` to status
+    /// non-Response handler results. Reset per request (worker-thread invariant).
+    static ROUTE_DEFAULT_STATUS: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+
+    /// The app served by THIS worker thread's runtime. ``run_server`` sets it once
+    /// per worker thread (``on_thread_start``) so the door's error-capture sites
+    /// append a 500 to the RIGHT app's ``_captured_server_exceptions`` even when
+    /// several apps run their own loopback servers in one process (parametrized
+    /// tests). Falls back to the global ``APP_INSTANCE`` when unset (in-process
+    /// door / single app). Not reset per request — it's a per-thread/per-server
+    /// binding, not per-request state.
+    static CURRENT_APP: std::cell::RefCell<Option<Py<PyAny>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Bind the current worker thread to its server's app (called from
+/// ``run_server``'s ``on_thread_start``).
+pub(crate) fn set_current_app(app: Option<Py<PyAny>>) {
+    CURRENT_APP.with(|c| *c.borrow_mut() = app);
+}
+
+/// The app handling the current request: the per-thread ``CURRENT_APP`` if the
+/// thread was bound by ``run_server``, else the global ``APP_INSTANCE`` (in-process
+/// door / single-app ``app.run``). Used by the 500-capture / dep-exception sites.
+pub(crate) fn current_app(py: Python<'_>) -> Option<Py<PyAny>> {
+    CURRENT_APP.with(|c| c.borrow().as_ref().map(|a| a.clone_ref(py)))
+        .or_else(|| {
+            APP_INSTANCE
+                .read()
+                .ok()
+                .and_then(|g| g.as_ref().map(|a| a.clone_ref(py)))
+        })
+}
+
+/// The route-level default status for the request currently being served on this
+/// worker thread (``None`` → 200). Read by ``crate::responses::py_to_response``
+/// so a ``status_code=201`` route statuses its dict/list/None result.
+pub(crate) fn route_default_status() -> axum::http::StatusCode {
+    ROUTE_DEFAULT_STATUS
+        .with(|s| s.get())
+        .and_then(|c| axum::http::StatusCode::from_u16(c).ok())
+        .unwrap_or(axum::http::StatusCode::OK)
+}
+
+/// True when an injected Response shell exists for the current request — i.e. a
+/// handler/dep may still override the status. ``py_to_response`` uses this to AVOID
+/// pre-stripping a no-body body on the route default (e.g. ``status_code=204``)
+/// when the handler might override to a body status (``response.status_code=400``);
+/// shell routes are stripped post-merge in ``apply_injected_response`` on the final
+/// status instead.
+pub(crate) fn has_injected_response() -> bool {
+    INJECTED_RESPONSE.with(|c| c.borrow().is_some())
+}
+
+/// RAII guard: clears the per-request thread-locals on drop so they never leak to
+/// the next request served on the same worker thread.
+struct DisconnectFlagGuard;
+impl Drop for DisconnectFlagGuard {
+    fn drop(&mut self) {
+        REQUEST_DISCONNECT_FLAG.with(|f| {
+            *f.borrow_mut() = None;
+        });
+        INJECTED_RESPONSE.with(|r| {
+            *r.borrow_mut() = None;
+        });
+        INJECTED_BACKGROUND_TASKS.with(|b| {
+            *b.borrow_mut() = None;
+        });
+        ROUTE_DEFAULT_STATUS.with(|s| s.set(None));
+    }
 }
 
 fn response_cls(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
@@ -173,8 +286,199 @@ fn inject_request_metadata(
     }
 }
 
+/// Build one framework-provided object for an ``inject_*`` kind (Request /
+/// BackgroundTasks / Response / SecurityScopes). Shared by handler-kwarg
+/// injection and dependency-input resolution (a dep that takes ``request:
+/// Request`` etc.), so both produce the same object shape.
+#[allow(clippy::too_many_arguments)]
+fn build_injected_object(
+    py: Python<'_>,
+    kind: &str,
+    state: &RouteState,
+    scope_method: &Option<String>,
+    scope_path: &Option<String>,
+    scope_query: &Option<String>,
+    headers: &Option<HeaderMap>,
+    path_map: &HashMap<String, String>,
+    query_params: &HashMap<String, String>,
+    body_bytes: &[u8],
+    client_addr: &Option<SocketAddr>,
+    oauth_scopes: &[String],
+) -> PyResult<Py<PyAny>> {
+    match kind {
+        "inject_request" => {
+            // Build an ASGI-ish scope dict
+            let scope = PyDict::new(py);
+            scope.set_item("type", "http")?;
+            scope.set_item("method", scope_method.as_deref().unwrap_or("GET"))?;
+            scope.set_item("path", scope_path.as_deref().unwrap_or("/"))?;
+            let qs_bytes: &[u8] = scope_query.as_deref().map(|s| s.as_bytes()).unwrap_or(b"");
+            scope.set_item("query_string", pyo3::types::PyBytes::new(py, qs_bytes))?;
+            // Headers as list of (bytes, bytes)
+            let hdrs_list = pyo3::types::PyList::empty(py);
+            if let Some(h) = headers {
+                for (k, v) in h.iter() {
+                    let k_b = pyo3::types::PyBytes::new(py, k.as_str().as_bytes());
+                    let v_b = pyo3::types::PyBytes::new(py, v.as_bytes());
+                    hdrs_list.append((k_b, v_b))?;
+                }
+            }
+            scope.set_item("headers", hdrs_list)?;
+            // Path params
+            let pp = PyDict::new(py);
+            for (k, v) in path_map.iter() {
+                pp.set_item(k, v)?;
+            }
+            scope.set_item("path_params", pp)?;
+            // Query params as a dict too (convenience)
+            let qp = PyDict::new(py);
+            for (k, v) in query_params.iter() {
+                qp.set_item(k, v)?;
+            }
+            scope.set_item("query_params", qp)?;
+            // ASGI scope fields: scheme + server + http_version.
+            // FastAPI reads `request.url.hostname` / `.port` off
+            // these, and many apps reflect the original Host back.
+            scope.set_item("scheme", "http")?;
+            scope.set_item("http_version", "1.1")?;
+            if let Some((host, port)) = SERVER_ADDR.get() {
+                // Starlette uses the Host header as the authoritative
+                // source when present, falling back to the bound
+                // address. Match that behavior so apps behind a
+                // proxy see the external host.
+                let (effective_host, effective_port) = headers
+                    .as_ref()
+                    .and_then(|h| h.get("host"))
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| {
+                        if let Some((h, p)) = s.rsplit_once(':') {
+                            let p = p.parse::<u16>().unwrap_or(*port);
+                            (h.to_string(), p)
+                        } else {
+                            (s.to_string(), *port)
+                        }
+                    })
+                    .unwrap_or_else(|| (host.clone(), *port));
+                scope.set_item("server", (effective_host, effective_port))?;
+            }
+            // Starlette/FastAPI: request.app -> scope["app"]. vLLM and
+            // SGLang read `request.app.state.<field>` on every request.
+            if let Ok(guard) = APP_INSTANCE.read() {
+                if let Some(app) = guard.as_ref() {
+                    scope.set_item("app", app.bind(py))?;
+                }
+            }
+            // Pre-populate the body so `await request.body()` / .json()
+            // / .form() return the already-buffered bytes without needing
+            // a real ASGI receive() callable. vLLM parses bodies this way.
+            if !body_bytes.is_empty() {
+                scope.set_item("_body", pyo3::types::PyBytes::new(py, body_bytes))?;
+            }
+            // Client address (host, port) tuple for request.client.
+            // Starlette TestClient parity: when ``User-Agent:
+            // testclient``, use ``("testclient", 50000)`` so
+            // ``request.client.host == "testclient"`` matches
+            // Starlette's fake ASGI client.
+            let is_testclient = headers
+                .as_ref()
+                .and_then(|h| h.get("user-agent"))
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s == "testclient")
+                .unwrap_or(false);
+            if is_testclient {
+                scope.set_item("client", ("testclient", 50000u16))?;
+            } else if let Some(addr) = client_addr {
+                let client_tuple = (addr.ip().to_string(), addr.port());
+                scope.set_item("client", client_tuple)?;
+            }
+            // Starlette/FA: ``request.scope["route"]`` exposes
+            // the matched APIRoute. Some handlers read it to
+            // pull route metadata (path template, methods).
+            if let Some(ref route) = state.route_obj {
+                scope.set_item("route", route.bind(py))?;
+            }
+            // In-process disconnect flag (streaming door): expose it on the scope
+            // so ``request.is_disconnected()`` can observe a client drop. Only
+            // present for apps with is_disconnected endpoints (the door sets it).
+            REQUEST_DISCONNECT_FLAG.with(|f| {
+                if let Some(flag) = f.borrow().as_ref() {
+                    let _ = scope.set_item("_fastapi_turbo_disconnect", flag.bind(py));
+                }
+            });
+
+            Ok(request_cls(py)?.bind(py).call1((scope,))?.unbind())
+        }
+        "inject_background_tasks" => INJECTED_BACKGROUND_TASKS.with(|cell| {
+            // Return the per-request SHARED BackgroundTasks (FastAPI semantics) so
+            // the handler AND every dependency add to the SAME instance — which
+            // ``drain_background_tasks`` then runs after the response. (A dep's
+            // tasks were previously dropped: it got its own instance, in ``resolved``,
+            // never drained.)
+            let mut slot = cell.borrow_mut();
+            if let Some(existing) = slot.as_ref() {
+                return Ok(existing.clone_ref(py));
+            }
+            let bg = bg_tasks_cls(py)?.bind(py).call0()?;
+            // Stash the current app on the BackgroundTasks instance
+            // so ``run_sync`` can pass ``app=`` when submitting async
+            // tasks to the worker loop — preserves per-app timeout
+            // isolation for work that runs *after* the response.
+            if let Ok(app_slot) = APP_INSTANCE.read() {
+                if let Some(app) = app_slot.as_ref() {
+                    let _ = bg.setattr("_app", app.bind(py));
+                }
+            }
+            let bg = bg.unbind();
+            *slot = Some(bg.clone_ref(py));
+            Ok(bg)
+        }),
+        "inject_response" => INJECTED_RESPONSE.with(|cell| {
+            // Return the per-request SHARED Response (FastAPI semantics) so the
+            // handler and every dependency mutate the same object.
+            let mut slot = cell.borrow_mut();
+            if let Some(existing) = slot.as_ref() {
+                Ok(existing.clone_ref(py))
+            } else {
+                let resp = response_cls(py)?.bind(py).call0()?;
+                // Mimic FastAPI's solve_dependencies: this Response is a SHELL for
+                // status/headers only. Drop its empty-body ``content-length`` and
+                // null its ``status_code`` so merging it (apply_injected_response)
+                // never clobbers the real response's body length or status when the
+                // user didn't set them.
+                if let Ok(headers) = resp.getattr("headers") {
+                    let _ = headers.call_method1("__delitem__", ("content-length",));
+                }
+                let _ = resp.setattr("status_code", py.None());
+                let resp = resp.unbind();
+                *slot = Some(resp.clone_ref(py));
+                Ok(resp)
+            }
+        }),
+        "inject_security_scopes" => {
+            // ``SecurityScopes(scopes=...)`` — the adapter accumulates the scopes
+            // declared down the ``Security(..., scopes=[...])`` chain into the
+            // param's ``oauth_scopes`` at build time (FastAPI's
+            // ``dependant.security_scopes``). ``fastapi_turbo.security
+            // .SecurityScopes`` is the real ``fastapi.security`` class.
+            let ss_mod = py.import("fastapi_turbo.security")?;
+            let ss_cls = ss_mod.getattr("SecurityScopes")?;
+            let scopes_list = pyo3::types::PyList::empty(py);
+            for s in oauth_scopes {
+                scopes_list.append(s)?;
+            }
+            let kw = PyDict::new(py);
+            kw.set_item("scopes", scopes_list)?;
+            Ok(ss_cls.call((), Some(&kw))?.unbind())
+        }
+        _ => Ok(py.None()),
+    }
+}
+
 /// Inject framework-provided objects (Request / BackgroundTasks / Response)
 /// as handler kwargs right before dispatch. Handlers ask for them by type.
+/// Dependency-input inject params (``is_handler_param == false``) are built into
+/// the resolver's `resolved` map instead, so they're skipped here.
+#[allow(clippy::too_many_arguments)]
 fn inject_framework_objects(
     py: Python<'_>,
     kwargs: &Bound<'_, PyDict>,
@@ -189,6 +493,9 @@ fn inject_framework_objects(
     client_addr: &Option<SocketAddr>,
 ) -> PyResult<()> {
     for param in &state.params {
+        if !param.is_handler_param {
+            continue;
+        }
         match param.kind.as_str() {
             "inject_request" => {
                 // Reuse the middleware's Request object if present — this ensures
@@ -196,129 +503,39 @@ fn inject_framework_objects(
                 if let Ok(Some(mw_req)) = kwargs.get_item("_middleware_request") {
                     kwargs.set_item(&param.name, mw_req)?;
                 } else {
-                    // Build an ASGI-ish scope dict
-                    let scope = PyDict::new(py);
-                    scope.set_item("type", "http")?;
-                    scope.set_item("method", scope_method.as_deref().unwrap_or("GET"))?;
-                    scope.set_item("path", scope_path.as_deref().unwrap_or("/"))?;
-                    let qs_bytes: &[u8] =
-                        scope_query.as_deref().map(|s| s.as_bytes()).unwrap_or(b"");
-                    scope.set_item("query_string", pyo3::types::PyBytes::new(py, qs_bytes))?;
-                    // Headers as list of (bytes, bytes)
-                    let hdrs_list = pyo3::types::PyList::empty(py);
-                    if let Some(h) = headers {
-                        for (k, v) in h.iter() {
-                            let k_b = pyo3::types::PyBytes::new(py, k.as_str().as_bytes());
-                            let v_b = pyo3::types::PyBytes::new(py, v.as_bytes());
-                            hdrs_list.append((k_b, v_b))?;
-                        }
-                    }
-                    scope.set_item("headers", hdrs_list)?;
-                    // Path params
-                    let pp = PyDict::new(py);
-                    for (k, v) in path_map.iter() {
-                        pp.set_item(k, v)?;
-                    }
-                    scope.set_item("path_params", pp)?;
-                    // Query params as a dict too (convenience)
-                    let qp = PyDict::new(py);
-                    for (k, v) in query_params.iter() {
-                        qp.set_item(k, v)?;
-                    }
-                    scope.set_item("query_params", qp)?;
-                    // ASGI scope fields: scheme + server + http_version.
-                    // FastAPI reads `request.url.hostname` / `.port` off
-                    // these, and many apps reflect the original Host back.
-                    scope.set_item("scheme", "http")?;
-                    scope.set_item("http_version", "1.1")?;
-                    if let Some((host, port)) = SERVER_ADDR.get() {
-                        // Starlette uses the Host header as the authoritative
-                        // source when present, falling back to the bound
-                        // address. Match that behavior so apps behind a
-                        // proxy see the external host.
-                        let (effective_host, effective_port) = headers
-                            .as_ref()
-                            .and_then(|h| h.get("host"))
-                            .and_then(|v| v.to_str().ok())
-                            .map(|s| {
-                                if let Some((h, p)) = s.rsplit_once(':') {
-                                    let p = p.parse::<u16>().unwrap_or(*port);
-                                    (h.to_string(), p)
-                                } else {
-                                    (s.to_string(), *port)
-                                }
-                            })
-                            .unwrap_or_else(|| (host.clone(), *port));
-                        scope.set_item("server", (effective_host, effective_port))?;
-                    }
-                    // Starlette/FastAPI: request.app -> scope["app"]. vLLM and
-                    // SGLang read `request.app.state.<field>` on every request.
-                    if let Ok(guard) = APP_INSTANCE.read() {
-                        if let Some(app) = guard.as_ref() {
-                            scope.set_item("app", app.bind(py))?;
-                        }
-                    }
-                    // Pre-populate the body so `await request.body()` / .json()
-                    // / .form() return the already-buffered bytes without needing
-                    // a real ASGI receive() callable. vLLM parses bodies this way.
-                    if !body_bytes.is_empty() {
-                        scope.set_item("_body", pyo3::types::PyBytes::new(py, body_bytes))?;
-                    }
-                    // Client address (host, port) tuple for request.client.
-                    // Starlette TestClient parity: when ``User-Agent:
-                    // testclient``, use ``("testclient", 50000)`` so
-                    // ``request.client.host == "testclient"`` matches
-                    // Starlette's fake ASGI client.
-                    let is_testclient = headers
-                        .as_ref()
-                        .and_then(|h| h.get("user-agent"))
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s == "testclient")
-                        .unwrap_or(false);
-                    if is_testclient {
-                        scope.set_item("client", ("testclient", 50000u16))?;
-                    } else if let Some(addr) = client_addr {
-                        let client_tuple = (addr.ip().to_string(), addr.port());
-                        scope.set_item("client", client_tuple)?;
-                    }
-                    // Starlette/FA: ``request.scope["route"]`` exposes
-                    // the matched APIRoute. Some handlers read it to
-                    // pull route metadata (path template, methods).
-                    if let Some(ref route) = state.route_obj {
-                        scope.set_item("route", route.bind(py))?;
-                    }
-
-                    let req = request_cls(py)?.bind(py).call1((scope,))?;
-                    kwargs.set_item(&param.name, req)?;
+                    let req = build_injected_object(
+                        py,
+                        "inject_request",
+                        state,
+                        scope_method,
+                        scope_path,
+                        scope_query,
+                        headers,
+                        path_map,
+                        query_params,
+                        body_bytes,
+                        client_addr,
+                        &param.oauth_scopes,
+                    )?;
+                    kwargs.set_item(&param.name, req.bind(py))?;
                 }
             }
-            "inject_background_tasks" => {
-                let bg = bg_tasks_cls(py)?.bind(py).call0()?;
-                // Stash the current app on the BackgroundTasks instance
-                // so ``run_sync`` can pass ``app=`` when submitting async
-                // tasks to the worker loop — preserves per-app timeout
-                // isolation for work that runs *after* the response.
-                if let Ok(app_slot) = APP_INSTANCE.read() {
-                    if let Some(app) = app_slot.as_ref() {
-                        let _ = bg.setattr("_app", app.bind(py));
-                    }
-                }
-                kwargs.set_item(&param.name, bg)?;
-            }
-            "inject_response" => {
-                let resp = response_cls(py)?.bind(py).call0()?;
-                kwargs.set_item(&param.name, resp)?;
-            }
-            "inject_security_scopes" => {
-                // Empty SecurityScopes — real scope collection from
-                // nested Security() dep chain happens in the resolver.
-                let ss_mod = py.import("fastapi_turbo.security")?;
-                let ss_cls = ss_mod.getattr("SecurityScopes")?;
-                let scopes_list = pyo3::types::PyList::empty(py);
-                let kw = PyDict::new(py);
-                kw.set_item("scopes", scopes_list)?;
-                let obj = ss_cls.call((), Some(&kw))?;
-                kwargs.set_item(&param.name, obj)?;
+            "inject_background_tasks" | "inject_response" | "inject_security_scopes" => {
+                let obj = build_injected_object(
+                    py,
+                    param.kind.as_str(),
+                    state,
+                    scope_method,
+                    scope_path,
+                    scope_query,
+                    headers,
+                    path_map,
+                    query_params,
+                    body_bytes,
+                    client_addr,
+                    &param.oauth_scopes,
+                )?;
+                kwargs.set_item(&param.name, obj.bind(py))?;
             }
             _ => {}
         }
@@ -330,8 +547,25 @@ fn inject_framework_objects(
 /// received gets DEFERRED — tasks run on a tokio blocking thread after
 /// the response is flushed, matching FastAPI/Starlette semantics.
 /// The handler doesn't wait for task completion.
-fn drain_background_tasks(_py: Python<'_>, kwargs: &Bound<'_, PyDict>, params: &[ParamInfo]) {
+fn drain_background_tasks(py: Python<'_>, kwargs: &Bound<'_, PyDict>, params: &[ParamInfo]) {
     let mut seen_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // Drain the per-request SHARED BackgroundTasks (handler + every dependency add
+    // to it) — a dep-injected instance lives in ``resolved``, not ``kwargs``, so the
+    // kwargs scan below would miss it. Dedup by ptr against the kwargs scan.
+    let shared = INJECTED_BACKGROUND_TASKS.with(|c| c.borrow().as_ref().map(|o| o.clone_ref(py)));
+    if let Some(bg) = shared {
+        let bg = bg.bind(py);
+        seen_ids.insert(bg.as_ptr() as usize);
+        let has_tasks = bg
+            .getattr("_tasks")
+            .ok()
+            .and_then(|t| t.len().ok())
+            .map(|n| n > 0)
+            .unwrap_or(false);
+        if has_tasks {
+            let _ = bg.call_method0("run_sync");
+        }
+    }
     for param in params {
         if param.kind == "inject_background_tasks" {
             if let Ok(Some(bg_obj)) = kwargs.get_item(&param.name) {
@@ -368,26 +602,23 @@ fn drain_background_tasks(_py: Python<'_>, kwargs: &Bound<'_, PyDict>, params: &
 ///         response.status_code = 201
 ///         response.headers["x-custom"] = "1"
 ///         return {"ok": True}
-fn apply_injected_response(
-    py: Python<'_>,
-    kwargs: &Bound<'_, PyDict>,
-    params: &[ParamInfo],
-    response: &mut Response,
-) {
-    for param in params {
-        if param.kind != "inject_response" {
-            continue;
-        }
-        let Ok(Some(obj)) = kwargs.get_item(&param.name) else {
-            continue;
-        };
-        // Apply status_code (but only if user set something non-default)
+fn apply_injected_response(py: Python<'_>, response: &mut Response) {
+    // Merge the per-request SHARED injected Response (set by the handler AND/OR
+    // any dependency) onto the outgoing response. Reading the thread-local — not
+    // handler kwargs — means a Response injected ONLY by a dependency still
+    // applies (the old kwargs-only merge missed that, dropping dep-set headers,
+    // e.g. on custom-response_class routes / include_router default-class chains).
+    let obj = INJECTED_RESPONSE.with(|cell| cell.borrow().as_ref().map(|o| o.clone_ref(py)));
+    if let Some(obj) = obj {
+        let obj = obj.into_bound(py);
+        // Apply the shell's status_code when the handler/dep SET one. The shell is
+        // created with status_code=None (build_injected_object), so a successful
+        // u16 extract means it was explicitly set — and it overrides the route-level
+        // default (e.g. handler sets 200 to override a route ``status_code=201``).
         if let Ok(sc_attr) = obj.getattr("status_code") {
             if let Ok(sc) = sc_attr.extract::<u16>() {
-                if sc != 200 {
-                    if let Ok(s) = StatusCode::from_u16(sc) {
-                        *response.status_mut() = s;
-                    }
+                if let Ok(s) = StatusCode::from_u16(sc) {
+                    *response.status_mut() = s;
                 }
             }
         }
@@ -398,7 +629,7 @@ fn apply_injected_response(
         if let Ok(raw) = obj.getattr("raw_headers") {
             if let Ok(list) = raw.cast::<pyo3::types::PyList>() {
                 for item in list.iter() {
-                    if let Ok((ks, _)) = item.extract::<(String, String)>() {
+                    if let Some((ks, _)) = crate::responses::extract_header_pair(&item) {
                         raw_keys.insert(ks.to_ascii_lowercase());
                     }
                 }
@@ -429,7 +660,7 @@ fn apply_injected_response(
         if let Ok(raw) = obj.getattr("raw_headers") {
             if let Ok(list) = raw.cast::<pyo3::types::PyList>() {
                 for item in list.iter() {
-                    if let Ok((ks, vs)) = item.extract::<(String, String)>() {
+                    if let Some((ks, vs)) = crate::responses::extract_header_pair(&item) {
                         if let (Ok(hn), Ok(hv)) = (
                             HeaderName::try_from(ks.as_str()),
                             HeaderValue::from_str(&vs),
@@ -439,6 +670,19 @@ fn apply_injected_response(
                     }
                 }
             }
+        }
+        // If the (shell-overridden) status is a no-body status, strip the body +
+        // content-length: a dep/handler may have set 204/304 AFTER py_to_response
+        // already rendered a body (FastAPI/Starlette send no body for these).
+        let st = response.status();
+        if st.as_u16() < 200
+            || st == StatusCode::NO_CONTENT
+            || st == StatusCode::NOT_MODIFIED
+        {
+            *response.body_mut() = axum::body::Body::empty();
+            response
+                .headers_mut()
+                .remove(axum::http::header::CONTENT_LENGTH);
         }
     }
 }
@@ -634,6 +878,29 @@ fn pydantic_error_details(
     details
 }
 
+/// Pick the validator for a ``body`` param: the cached SchemaValidator, else the
+/// model class's ``__pydantic_validator__``, else the scalar ``TypeAdapter`` — the
+/// last covers NON-model typed bodies (``list[Model]`` / ``dict[...]`` etc.) which
+/// FastAPI validates against the body field's TypeAdapter just like a model body.
+fn resolve_body_validator(py: Python<'_>, param: &ParamInfo) -> Option<Py<PyAny>> {
+    if let Some(ref v) = param.cached_validator {
+        return Some(v.clone_ref(py));
+    }
+    if let Some(ref mc) = param.model_class {
+        if let Ok(v) = mc.bind(py).getattr("__pydantic_validator__") {
+            return Some(v.unbind());
+        }
+    }
+    // Non-model body: validate via the field's TypeAdapter (scalar_validator) —
+    // structural containers (``list[Model]``, typed ``dict[K, V]``), bare ``dict``,
+    // AND plain scalars (``float``/``int``/``str`` with constraints, e.g.
+    // ``Body(allow_inf_nan=False)``). All run through the Content-Type-aware
+    // validate_json/validate_python path, so strict_content_type is enforced (the
+    // lax flag now reaches the adapter handler) and field constraints are checked.
+    // (cached_validator / model_class are handled above.)
+    param.scalar_validator.as_ref().map(|v| v.clone_ref(py))
+}
+
 /// Apply a parameter's default to the kwargs dict. Honors `has_default`:
 /// when the marker declares `default=None`, we pass Python `None` explicitly
 /// so the handler doesn't fall back to the function signature's default
@@ -705,10 +972,21 @@ pub struct ParamInfo {
     pub is_async_dep: bool,
     #[pyo3(get, set)]
     pub is_generator_dep: bool,
+    /// ``Depends(..., scope="function")`` (FastAPI 0.136). A function-scope yield
+    /// dependency tears down BEFORE the response is sent (its post-yield raise
+    /// becomes the response); the default ("request") scope tears down AFTER the
+    /// response body. Only meaningful when ``is_generator_dep``.
+    #[pyo3(get, set)]
+    pub is_function_scope: bool,
     #[pyo3(get, set)]
     pub dep_input_names: Vec<(String, String)>,
     #[pyo3(get, set)]
     pub is_handler_param: bool,
+    /// OAuth2 scopes accumulated down the ``Security(..., scopes=[...])`` chain for
+    /// an ``inject_security_scopes`` param — the door builds ``SecurityScopes(
+    /// scopes=...)`` from this. Empty for every other param kind.
+    #[pyo3(get, set)]
+    pub oauth_scopes: Vec<String>,
 }
 
 impl Clone for ParamInfo {
@@ -728,8 +1006,10 @@ impl Clone for ParamInfo {
             dep_callable_id: self.dep_callable_id,
             is_async_dep: self.is_async_dep,
             is_generator_dep: self.is_generator_dep,
+            is_function_scope: self.is_function_scope,
             dep_input_names: self.dep_input_names.clone(),
             is_handler_param: self.is_handler_param,
+            oauth_scopes: self.oauth_scopes.clone(),
         })
     }
 }
@@ -737,7 +1017,7 @@ impl Clone for ParamInfo {
 #[pymethods]
 impl ParamInfo {
     #[new]
-    #[pyo3(signature = (name, kind, type_hint="str".to_string(), required=true, default_value=None, has_default=false, model_class=None, alias=None, dep_callable=None, dep_callable_id=None, is_async_dep=false, is_generator_dep=false, dep_input_names=vec![], is_handler_param=true, scalar_validator=None))]
+    #[pyo3(signature = (name, kind, type_hint="str".to_string(), required=true, default_value=None, has_default=false, model_class=None, alias=None, dep_callable=None, dep_callable_id=None, is_async_dep=false, is_generator_dep=false, dep_input_names=vec![], is_handler_param=true, scalar_validator=None, oauth_scopes=vec![], is_function_scope=false))]
     fn new(
         name: String,
         kind: String,
@@ -754,6 +1034,8 @@ impl ParamInfo {
         dep_input_names: Vec<(String, String)>,
         is_handler_param: bool,
         scalar_validator: Option<Py<PyAny>>,
+        oauth_scopes: Vec<String>,
+        is_function_scope: bool,
     ) -> Self {
         ParamInfo {
             name,
@@ -770,8 +1052,10 @@ impl ParamInfo {
             dep_callable_id,
             is_async_dep,
             is_generator_dep,
+            is_function_scope,
             dep_input_names,
             is_handler_param,
+            oauth_scopes,
         }
     }
 }
@@ -793,6 +1077,11 @@ pub struct RouteInfo {
     pub params: Vec<ParamInfo>,
     #[pyo3(get, set)]
     pub is_websocket: bool,
+    /// Route-level default status code (``@app.get(status_code=201)``). The door
+    /// applies it as the default status for non-Response handler results; a
+    /// handler/dep that sets ``response.status_code`` still overrides it.
+    #[pyo3(get, set)]
+    pub status_code: Option<u16>,
 }
 
 impl Clone for RouteInfo {
@@ -805,6 +1094,7 @@ impl Clone for RouteInfo {
             handler_name: self.handler_name.clone(),
             params: self.params.clone(),
             is_websocket: self.is_websocket,
+            status_code: self.status_code,
         })
     }
 }
@@ -812,7 +1102,7 @@ impl Clone for RouteInfo {
 #[pymethods]
 impl RouteInfo {
     #[new]
-    #[pyo3(signature = (path, methods, handler, is_async=false, handler_name="".to_string(), params=vec![], is_websocket=false))]
+    #[pyo3(signature = (path, methods, handler, is_async=false, handler_name="".to_string(), params=vec![], is_websocket=false, status_code=None))]
     fn new(
         path: String,
         methods: Vec<String>,
@@ -821,6 +1111,7 @@ impl RouteInfo {
         handler_name: String,
         params: Vec<ParamInfo>,
         is_websocket: bool,
+        status_code: Option<u16>,
     ) -> Self {
         RouteInfo {
             path,
@@ -830,6 +1121,7 @@ impl RouteInfo {
             handler_name,
             params,
             is_websocket,
+            status_code,
         }
     }
 }
@@ -972,6 +1264,10 @@ struct RouteState {
     /// The original APIRoute object — populated into
     /// ``request.scope["route"]`` so handlers can introspect the route.
     route_obj: Option<Py<PyAny>>,
+    /// Route-level default status code (``status_code=201``); applied to
+    /// non-Response handler results, overridable by a handler/dep-set
+    /// ``response.status_code``.
+    status_code: Option<u16>,
     // Note: body validation stays with Pydantic (Rust-backed) for 100% compatibility.
     // jsonschema crate can't handle custom validators, coercion, defaults, etc.
 }
@@ -1132,7 +1428,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
             // matches stock FastAPI's error shape (`model_attributes_type`
             // instead of `model_type`, FA-style messages, no ctx).
             let fa_factory = py
-                .import("fastapi_turbo._introspect")
+                .import("fastapi_turbo._door_support")
                 .and_then(|m| m.getattr("_make_fa_body_validator"))
                 .ok();
             for param in &mut params {
@@ -1184,6 +1480,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     .and_then(|v| v.extract::<bool>(py))
                     .unwrap_or(false),
                 route_obj: route.handler.getattr(py, "_fastapi_turbo_route_obj").ok(),
+                status_code: route.status_code,
             })
         });
 
@@ -1594,6 +1891,14 @@ async fn handle_request(
         }
         m
     };
+    // In-process disconnect flag (streaming door) — read off the request's Axum
+    // extension BEFORE the body is consumed; stashed in the thread-local below
+    // (after the body await, on the dispatch thread) so the Request scope picks
+    // it up. None for the socket path and for apps without is_disconnected.
+    let disconnect_flag: Option<Py<PyAny>> = request
+        .extensions()
+        .get::<DisconnectFlag>()
+        .map(|f| Python::attach(|py| f.0.clone_ref(py)));
     // === Pure Rust work — no GIL needed ===
 
     // For file/form params inspect Content-Type once. We support three body
@@ -1755,6 +2060,18 @@ async fn handle_request(
         (bytes::Bytes::new(), None, None, None)
     };
 
+    // Publish the disconnect flag to the per-request thread-local NOW — after the
+    // body await, so we're on the same worker thread the dispatch (and the
+    // Request-scope build) runs on. The guard clears it when handle_request
+    // returns, so it never leaks to the next request on this thread.
+    let _disc_guard = DisconnectFlagGuard;
+    if let Some(flag) = disconnect_flag {
+        REQUEST_DISCONNECT_FLAG.with(|f| *f.borrow_mut() = Some(flag));
+    }
+    // Route-level default status (``status_code=201``) for py_to_response to apply
+    // to non-Response handler results; the guard clears it after the request.
+    ROUTE_DEFAULT_STATUS.with(|s| s.set(state.status_code));
+
     let path_map = path_params.map(|Path(m)| m).unwrap_or_default();
 
     // === Fast path: sync handler with NO dependencies ===
@@ -1879,7 +2196,7 @@ async fn handle_request(
                             range_header.as_deref(),
                             if_range_header.as_deref(),
                         );
-                        apply_injected_response(py, &kwargs, &state.params, &mut resp);
+                        apply_injected_response(py, &mut resp);
                         resp
                     }
                     Err(py_err) => pyerr_to_response(py, &py_err),
@@ -1892,7 +2209,11 @@ async fn handle_request(
     // For async handlers (with or without deps), run via loop.run_until_complete()
     // on a thread-local event loop. This eliminates the ~100-150μs cross-thread
     // overhead of run_coroutine_threadsafe. All DB awaits resolve on THIS thread.
-    if state.is_async {
+    // Async handlers WITHOUT dependencies use the dedicated local-loop path here.
+    // Async handlers WITH dependencies fall through to the unified deps loop below,
+    // which resolves the dependency graph AND drives the async handler — block C's
+    // extract-only path never resolved deps.
+    if state.is_async && !state.has_dep_params {
         return tokio::task::block_in_place(|| {
             Python::attach(|py| {
                 set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
@@ -2009,7 +2330,7 @@ async fn handle_request(
                                 range_header.as_deref(),
                                 if_range_header.as_deref(),
                             );
-                            apply_injected_response(py, &kwargs, &state.params, &mut resp);
+                            apply_injected_response(py, &mut resp);
                             resp
                         }
                         Err(e) => pyerr_to_response(py, &e),
@@ -2064,15 +2385,30 @@ async fn handle_request(
                             }
                         }
                     }
-                    match state.handler.call(py, (), Some(&kwargs)) {
+                    // ASYNC handler WITH dependencies — must be DRIVEN, not just
+                    // called (a bare .call returns the un-awaited coroutine). We're
+                    // inside `if state.is_async`, so always drive on the local loop,
+                    // exactly like the no-dep async branches above.
+                    let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
+                        .read()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
+                    match crate::handler_bridge::call_async_on_local_loop_with_app(
+                        py,
+                        &state.handler,
+                        &kwargs,
+                        app_for_submit.as_ref(),
+                    ) {
                         Ok(r) => {
                             drain_background_tasks(py, &kwargs, &state.params);
-                            py_to_response_with_request(
+                            let mut resp = py_to_response_with_request(
                                 py,
                                 r.bind(py),
                                 range_header.as_deref(),
                                 if_range_header.as_deref(),
-                            )
+                            );
+                            apply_injected_response(py, &mut resp);
+                            resp
                         }
                         Err(e) => pyerr_to_response(py, &e),
                     }
@@ -2087,10 +2423,40 @@ async fn handle_request(
             set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
             let mut resolved: HashMap<String, Py<PyAny>> = HashMap::new();
             let mut dep_cache: HashMap<u64, String> = HashMap::new();
+            // Live ``yield`` dependency generators awaiting teardown.
+            // (generator, is_function_scope). Function-scope deps tear down before
+            // the response; request-scope (default) after the body.
+            let mut gen_deps: Vec<(Py<PyAny>, bool)> = Vec::new();
+            // Accumulate missing/coercion errors from extra-dep INPUT params so
+            // a route with several ``Depends`` each missing a required param
+            // surfaces ALL of them in one 422 (FA parity), and skip any dep
+            // whose own inputs failed to extract.
+            let mut dep_extraction_errors: Vec<serde_json::Value> = Vec::new();
+            let mut failed_sources: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            // App handle for routing a suspending async dep to the shared
+            // worker loop (the same loop lifespan + handlers run on) so
+            // loop-affinity / configured timeouts hold. Issue: async deps
+            // that actually ``await`` (asyncio.sleep, async DB I/O) used to
+            // raise "Coroutine suspended" via the try-sync-only path.
+            let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
+                .read()
+                .ok()
+                .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
 
             for param in &state.params {
                 match param.kind.as_str() {
                     "dependency" => {
+                        // Skip a dep whose input(s) failed extraction — its
+                        // error is already accumulated; calling it would raise
+                        // on the missing kwarg and mask the real 422.
+                        if param
+                            .dep_input_names
+                            .iter()
+                            .any(|(_, src)| failed_sources.contains(src))
+                        {
+                            continue;
+                        }
                         // Check cache first
                         if let Some(func_id) = param.dep_callable_id {
                             if let Some(cached_key) = dep_cache.get(&func_id) {
@@ -2113,9 +2479,26 @@ async fn handle_request(
                             }
                         }
 
-                        // Call the dep — try synchronous completion via send(None)
-                        let result = if param.is_async_dep {
-                            try_call_async_sync(py, dep_callable, &dep_kwargs)
+                        // Call the dep. A ``yield`` dep is entered (and stashed for
+                        // teardown); async via send(None); plain sync directly.
+                        let result = if param.is_generator_dep {
+                            enter_sync_generator_dep(
+                                py,
+                                dep_callable,
+                                &dep_kwargs,
+                                &mut gen_deps,
+                                param.is_function_scope,
+                            )
+                        } else if param.is_async_dep {
+                            // Try-sync first; a suspending coroutine routes to the
+                            // shared worker loop (run_coroutine_threadsafe) so deps
+                            // that genuinely ``await`` resolve instead of erroring.
+                            crate::handler_bridge::call_async_on_local_loop_with_app(
+                                py,
+                                dep_callable,
+                                &dep_kwargs,
+                                app_for_submit.as_ref(),
+                            )
                         } else {
                             dep_callable.call(py, (), Some(&dep_kwargs))
                         };
@@ -2127,191 +2510,468 @@ async fn handle_request(
                                 }
                                 resolved.insert(param.name.clone(), val);
                             }
-                            Err(py_err) => return pyerr_to_response(py, &py_err),
+                            Err(py_err) => {
+                                teardown_generator_deps(py, &gen_deps, true);
+                                if let Some(resp) =
+                                    try_user_dep_exception_handler(py, &py_err)
+                                {
+                                    return resp;
+                                }
+                                return pyerr_to_response(py, &py_err);
+                            }
                         }
                     }
                     _ => {
-                        // Extract non-dep params
-                        if let Err(resp) = extract_single_param(
-                            py,
-                            param,
-                            &path_map,
-                            &query_params,
-                            &headers,
-                            &body_json,
-                            &mut resolved,
-                        ) {
-                            return resp;
+                        // Only extract dependency-INPUT params here (into `resolved`
+                        // for dep wiring). Handler-facing params — incl. form/file and
+                        // body — are produced by the full extractor below so the deps
+                        // path reaches parity with the no-dep fast paths.
+                        if !param.is_handler_param {
+                            if param.kind.starts_with("inject_") {
+                                // A dependency that takes a Request/Response/etc. —
+                                // build the framework object into `resolved` so the
+                                // dep wiring can feed it as an input.
+                                match build_injected_object(
+                                    py,
+                                    param.kind.as_str(),
+                                    &state,
+                                    &scope_method,
+                                    &scope_path,
+                                    &scope_query,
+                                    &headers,
+                                    &path_map,
+                                    &query_params,
+                                    &body_bytes,
+                                    &client_addr,
+                                    &param.oauth_scopes,
+                                ) {
+                                    Ok(obj) => {
+                                        resolved.insert(param.name.clone(), obj);
+                                    }
+                                    Err(e) => {
+                                        teardown_generator_deps(py, &gen_deps, true);
+                                        if let Some(resp) =
+                                            try_user_dep_exception_handler(py, &e)
+                                        {
+                                            return resp;
+                                        }
+                                        return pyerr_to_response(py, &e);
+                                    }
+                                }
+                            } else {
+                                let before = dep_extraction_errors.len();
+                                if let Err(resp) = extract_single_param(
+                                    py,
+                                    param,
+                                    &path_map,
+                                    &query_params,
+                                    &query_multi,
+                                    &headers,
+                                    &body_json,
+                                    &body_bytes,
+                                    &mut multipart_fields,
+                                    &mut resolved,
+                                    &mut dep_extraction_errors,
+                                ) {
+                                    // Body-level error short-circuits with a
+                                    // complete combined 422.
+                                    teardown_generator_deps(py, &gen_deps, true);
+                                    return resp;
+                                }
+                                // A scalar that failed extraction was pushed to
+                                // the accumulator (not ``resolved``) — mark it so
+                                // dependent deps skip rather than raise.
+                                if dep_extraction_errors.len() > before {
+                                    failed_sources.insert(param.name.clone());
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            // Build handler kwargs
-            let kwargs = PyDict::new(py);
+            // Extra-dep input params that were missing/invalid surface as one
+            // combined 422 across ALL deps (FA accumulates them) before the
+            // handler-param extractor runs.
+            if !dep_extraction_errors.is_empty() {
+                teardown_generator_deps(py, &gen_deps, true);
+                return dispatch_validation_error(serde_json::json!({
+                    "detail": dep_extraction_errors,
+                }));
+            }
+
+            // Build handler kwargs via the full extractor (scalars/body/form/file,
+            // skipping deps + dep-inputs through is_handler_param), then overlay the
+            // resolved dependency results and inject framework objects. This brings
+            // the deps path to parity with the no-dep fast paths for special params
+            // (Request/Response/BackgroundTasks/SecurityScopes) and Form/File.
+            let body_json_opt = if state.has_body_params {
+                body_json.as_ref()
+            } else {
+                None
+            };
+            let kwargs = match extract_params_to_pydict_full(
+                py,
+                &state.params,
+                &path_map,
+                &query_params,
+                &query_multi,
+                &headers,
+                &body_json_opt,
+                &body_bytes,
+                &mut multipart_fields,
+                state.defers_extraction_errors,
+                state.lax_content_type,
+            ) {
+                Ok(kw) => kw,
+                Err(resp) => {
+                    teardown_generator_deps(py, &gen_deps, true);
+                    return resp;
+                }
+            };
             for param in &state.params {
-                if param.is_handler_param {
+                if param.is_handler_param && param.kind == "dependency" {
                     if let Some(val) = resolved.get(&param.name) {
                         let _ = kwargs.set_item(&param.name, val.bind(py));
                     }
                 }
             }
+            if let Err(e) = inject_framework_objects(
+                py,
+                &kwargs,
+                &state,
+                &scope_method,
+                &scope_path,
+                &scope_query,
+                &headers,
+                &path_map,
+                &query_params,
+                &body_bytes,
+                &client_addr,
+            ) {
+                teardown_generator_deps(py, &gen_deps, true);
+                return pyerr_to_response(py, &e);
+            }
+            if state.has_http_middleware {
+                inject_request_metadata(
+                    py,
+                    &kwargs,
+                    &scope_method,
+                    &scope_path,
+                    &scope_query,
+                    &headers,
+                );
+                if let Some(ref raw) = raw_body_for_mw {
+                    if !raw.is_empty() {
+                        let _ = kwargs.set_item(
+                            "__fastapi_turbo_raw_body_bytes__",
+                            pyo3::types::PyBytes::new(py, raw),
+                        );
+                    }
+                }
+            }
 
-            // Call handler — try sync completion for async handlers too
+            // Call handler. Deps are already resolved into `kwargs` above, so an
+            // async handler is driven on the local loop (handles suspension) — the
+            // 599 fallback below can't re-resolve deps, so we must not rely on it.
             let result = if state.is_async {
-                try_call_async_sync(py, &state.handler, &kwargs)
+                let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
+                    .read()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
+                crate::handler_bridge::call_async_on_local_loop_with_app(
+                    py,
+                    &state.handler,
+                    &kwargs,
+                    app_for_submit.as_ref(),
+                )
             } else {
                 state.handler.call(py, (), Some(&kwargs))
             };
 
             match result {
-                Ok(py_result) => py_to_response_with_request(
-                    py,
-                    py_result.bind(py),
-                    range_header.as_deref(),
-                    if_range_header.as_deref(),
-                ),
-                Err(ref py_err) => {
-                    // Check if this is "needs event loop" — signal for fallback
-                    let msg = py_err
-                        .value(py)
-                        .str()
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-                    if msg.contains("event loop") {
-                        // Return a sentinel status to signal fallback needed
-                        (StatusCode::from_u16(599).unwrap(), "NEEDS_EVENT_LOOP").into_response()
+                Ok(py_result) => {
+                    // Run any BackgroundTasks the handler received (deferred).
+                    drain_background_tasks(py, &kwargs, &state.params);
+                    // FA exit-stack order: FUNCTION-scope yield-deps (inner stack)
+                    // tear down BEFORE the response is built/sent — a post-yield
+                    // raise becomes the response.
+                    if let Err(e) = teardown_function_scope_gens(py, &gen_deps) {
+                        // Don't leak request-scope deps — close them, then render
+                        // the function-scope raise through the user handlers.
+                        teardown_request_scope_gens(py, &gen_deps, true);
+                        try_user_dep_exception_handler(py, &e)
+                            .unwrap_or_else(|| pyerr_to_response(py, &e))
                     } else {
-                        pyerr_to_response(py, py_err)
+                        // A STREAMING body that reads a request-scope dep must keep
+                        // it open until end-of-stream — wrap body_iterator so the
+                        // deps tear down after the body (returns true → skip the
+                        // immediate teardown). Must run BEFORE py_to_response reads
+                        // the (now-wrapped) body_iterator.
+                        let deferred = maybe_defer_request_scope_to_stream(
+                            py,
+                            py_result.bind(py),
+                            &gen_deps,
+                        );
+                        // Build the response while request-scope deps are still open
+                        // (lazy ORM rows materialize) — matches FA's exit-stack order.
+                        let mut resp = py_to_response_with_request(
+                            py,
+                            py_result.bind(py),
+                            range_header.as_deref(),
+                            if_range_header.as_deref(),
+                        );
+                        apply_injected_response(py, &mut resp);
+                        if !deferred {
+                            // REQUEST-scope (default) yield-deps tear down AFTER the
+                            // (buffered) response.
+                            teardown_request_scope_gens(py, &gen_deps, false);
+                        }
+                        resp
                     }
+                }
+                Err(ref py_err) => {
+                    // FA exit-stack parity: throw the handler error into the
+                    // yield-deps; a dep that swallows it surfaces FastAPIError.
+                    // (Async handlers always resolve via call_async_on_local_loop_with_app,
+                    // which routes a suspending coroutine to the worker loop — it never
+                    // surfaces a "needs event loop" error, so the old 599 fallback that
+                    // used to live here was unreachable and has been removed.)
+                    let final_err = teardown_generator_deps_error(
+                        py,
+                        &gen_deps,
+                        py_err.clone_ref(py),
+                    );
+                    pyerr_to_response(py, &final_err)
                 }
             }
         })
     });
 
-    // Check if the unified path signaled that an event loop is needed
-    if resp.status() == StatusCode::from_u16(599).unwrap() {
-        // Fall back to event-loop-based async execution
-        let handler_kwargs: HashMap<String, Py<PyAny>> = Python::attach(|py| {
-            let mut hk = HashMap::new();
-            // Re-extract all params (we lost them in the unified path)
-            // This is the slow path — only triggers for truly async handlers (asyncio.sleep etc.)
-            let mut resolved: HashMap<String, Py<PyAny>> = HashMap::new();
-            for param in &state.params {
-                if param.kind != "dependency" {
-                    let _ = extract_single_param(
-                        py,
-                        param,
-                        &path_map,
-                        &query_params,
-                        &headers,
-                        &body_json,
-                        &mut resolved,
-                    );
-                }
-            }
-            // Re-resolve deps via the old approach won't work here...
-            // Just build kwargs from what we can
-            for param in &state.params {
-                if param.is_handler_param {
-                    if let Some(val) = resolved.get(&param.name) {
-                        hk.insert(param.name.clone(), val.clone_ref(py));
-                    }
-                }
-            }
-            hk
-        });
-
-        let handler = Python::attach(|py| state.handler.clone_ref(py));
-        return match call_async_handler(handler, handler_kwargs).await {
-            Ok(py_result) => Python::attach(|py| {
-                py_to_response_with_request(
-                    py,
-                    py_result.bind(py),
-                    range_header.as_deref(),
-                    if_range_header.as_deref(),
-                )
-            }),
-            Err(py_err) => Python::attach(|py| pyerr_to_response(py, &py_err)),
-        };
-    }
-
     resp
 }
 
-// ── Async try-sync helper ────────────────────────────────────────────
+// ── yield (generator) dependency helpers ─────────────────────────────
 
-/// Try to call an async Python function synchronously via coro.send(None).
-/// If the coroutine completes immediately (StopIteration), returns the value.
-/// If it suspends or needs an event loop, returns an error.
-fn try_call_async_sync(
+/// Enter a sync ``yield`` dependency: call it to get the generator, advance to
+/// the first yield (``send(None)``) to obtain the dependency value, and stash the
+/// live generator so its teardown runs after the response is built.
+fn enter_sync_generator_dep(
     py: Python<'_>,
-    handler: &Py<PyAny>,
-    kwargs: &pyo3::Bound<'_, PyDict>,
+    dep_callable: &Py<PyAny>,
+    dep_kwargs: &pyo3::Bound<'_, PyDict>,
+    gen_deps: &mut Vec<(Py<PyAny>, bool)>,
+    is_function_scope: bool,
 ) -> PyResult<Py<PyAny>> {
-    let coro = handler.call(py, (), Some(kwargs))?;
-    match coro.call_method1(py, "send", (py.None(),)) {
-        Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
-            // Completed synchronously — extract value
-            match e.value(py).getattr("value") {
-                Ok(val) => Ok(val.unbind()),
-                Err(_) => Ok(py.None()),
+    let gen = dep_callable.call(py, (), Some(dep_kwargs))?;
+    match gen.call_method1(py, "send", (py.None(),)) {
+        Ok(v) => {
+            gen_deps.push((gen, is_function_scope));
+            Ok(v)
+        }
+        // A generator that returns without yielding has no value and nothing to
+        // tear down — surface its StopIteration ``value`` (usually None).
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => Ok(e
+            .value(py)
+            .getattr("value")
+            .map(|v| v.unbind())
+            .unwrap_or_else(|_| py.None())),
+        Err(e) => Err(e),
+    }
+}
+
+/// Run teardown for every entered ``yield`` dependency, in reverse order. On the
+/// success path we advance past the yield (running post-yield cleanup, e.g.
+/// ``db.close()``); on the error path we ``close()`` the generator (raising
+/// ``GeneratorExit`` so ``try/finally`` cleanup still runs). Teardown errors are
+/// swallowed — the response has already been produced.
+fn teardown_generator_deps(py: Python<'_>, gen_deps: &[(Py<PyAny>, bool)], errored: bool) {
+    for (gen, _is_func) in gen_deps.iter().rev() {
+        if errored {
+            let _ = gen.call_method0(py, "close");
+        } else if gen.call_method1(py, "send", (py.None(),)).is_ok() {
+            // Yielded again (multi-yield dep) — close out the remainder.
+            // (StopIteration / teardown error means it's already done.)
+            let _ = gen.call_method0(py, "close");
+        }
+    }
+}
+
+/// Tear down FUNCTION-scope yield deps (FA ``function_stack``) on the success
+/// path — BEFORE the response is built/sent. Advances each past its yield (LIFO);
+/// a post-yield raise is RETURNED so the caller turns it into the response (FA's
+/// ``function_stack.__aexit__`` propagating before ``await response()``).
+fn teardown_function_scope_gens(py: Python<'_>, gen_deps: &[(Py<PyAny>, bool)]) -> PyResult<()> {
+    for (gen, is_func) in gen_deps.iter().rev() {
+        if !*is_func {
+            continue;
+        }
+        match gen.call_method1(py, "send", (py.None(),)) {
+            // Yielded again (multi-yield) — close out the remainder.
+            Ok(_) => {
+                let _ = gen.call_method0(py, "close");
+            }
+            // Normal completion.
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {}
+            // Raised after yield → becomes the response.
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Tear down REQUEST-scope (default) yield deps (FA ``request_stack``) — AFTER the
+/// response body. ``errored`` closes them (GeneratorExit); otherwise advances past
+/// the yield. A post-yield raise is CAPTURED onto the app (the response is already
+/// sent, so TestClient re-raises it) rather than swallowed.
+fn teardown_request_scope_gens(py: Python<'_>, gen_deps: &[(Py<PyAny>, bool)], errored: bool) {
+    for (gen, is_func) in gen_deps.iter().rev() {
+        if *is_func {
+            continue;
+        }
+        if errored {
+            let _ = gen.call_method0(py, "close");
+            continue;
+        }
+        match gen.call_method1(py, "send", (py.None(),)) {
+            Ok(_) => {
+                let _ = gen.call_method0(py, "close");
+            }
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {}
+            Err(e) => {
+                if let Some(app) = current_app(py) {
+                    if let Ok(lst) = app.getattr(py, "_captured_server_exceptions") {
+                        let _ = lst.call_method1(py, "append", (e.value(py),));
+                    }
+                }
             }
         }
-        Err(e) => {
-            // Check if it's a "no running event loop" error — treat same as suspension
-            let is_runtime = e.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py);
-            let msg = e.value(py).str().map(|s| s.to_string()).unwrap_or_default();
-            if is_runtime && msg.contains("event loop") {
-                let _ = coro.call_method0(py, "close");
-                // TODO: fall back to event loop bridge for truly async handlers
-                Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "Handler requires a running event loop (asyncio.sleep, etc.). Use sync deps for best performance.",
-                ))
-            } else {
-                Err(e)
+    }
+}
+
+/// For a STREAMING result with REQUEST-scope yield deps, defer their teardown to
+/// end-of-stream: wrap the ``StreamingResponse``'s ``body_iterator`` (Python helper)
+/// so the deps stay open while the body is read (FA ``request_stack`` order — the
+/// session a streaming body iterates must not be closed first). Returns true when
+/// it deferred, so the caller SKIPS the immediate request-scope teardown.
+fn maybe_defer_request_scope_to_stream(
+    py: Python<'_>,
+    result: &Bound<'_, PyAny>,
+    gen_deps: &[(Py<PyAny>, bool)],
+) -> bool {
+    // Only StreamingResponse-like results carry a body_iterator.
+    if !result.hasattr("body_iterator").unwrap_or(false) {
+        return false;
+    }
+    let req_gens = pyo3::types::PyList::empty(py);
+    for (gen, is_func) in gen_deps.iter() {
+        if !*is_func {
+            let _ = req_gens.append(gen.bind(py));
+        }
+    }
+    if req_gens.is_empty() {
+        return false;
+    }
+    let app_arg = match current_app(py) {
+        Some(a) => a.into_bound(py),
+        None => py.None().into_bound(py),
+    };
+    py.import("fastapi_turbo.applications")
+        .and_then(|m| m.getattr("_door_wrap_stream_teardown"))
+        .and_then(|f| f.call1((app_arg, result, &req_gens)))
+        .is_ok()
+}
+
+/// Door dep-resolution error path: route a dependency-raised exception through
+/// the app's user ``@app.exception_handler`` handlers (FA parity — the Python
+/// dispatcher does this; the door previously rendered the default 500 directly,
+/// ignoring user handlers for exceptions raised INSIDE a dependency). Returns
+/// the handler's response when one matched, else ``None`` (caller falls back to
+/// ``pyerr_to_response``, which renders the default + captures for re-raise).
+fn try_user_dep_exception_handler(py: Python<'_>, py_err: &PyErr) -> Option<Response> {
+    let app = current_app(py)?;
+    let exc = py_err.value(py);
+    let result = app
+        .bind(py)
+        .call_method1("_door_handle_dep_exception", (exc,))
+        .ok()?;
+    if result.is_none() {
+        return None;
+    }
+    Some(py_to_response_with_request(py, &result, None, None))
+}
+
+/// Construct a ``fastapi_turbo.exceptions.FastAPIError`` (re-exports the real
+/// ``fastapi.exceptions.FastAPIError``). Falls back to the import/construction
+/// error so the caller always gets *some* PyErr to surface.
+fn fastapi_error(py: Python<'_>, msg: &str) -> PyErr {
+    match py
+        .import("fastapi_turbo.exceptions")
+        .and_then(|m| m.getattr("FastAPIError"))
+        .and_then(|cls| cls.call1((msg,)))
+    {
+        Ok(inst) => PyErr::from_value(inst),
+        Err(e) => e,
+    }
+}
+
+/// Error-path teardown that mirrors FastAPI's exit-stack protocol: the live
+/// exception is thrown into each ``yield`` dependency (reverse / LIFO order).
+/// A dependency that catches the exception WITHOUT re-raising (its generator
+/// returns via ``StopIteration``) *suppresses* it — FA forbids this and raises
+/// ``FastAPIError``. A dependency that re-raises (the same or a different
+/// exception) propagates it. Returns the error to surface to the client.
+fn teardown_generator_deps_error(
+    py: Python<'_>,
+    gen_deps: &[(Py<PyAny>, bool)],
+    original: PyErr,
+) -> PyErr {
+    let mut live: Option<PyErr> = Some(original);
+    for (gen, _is_func) in gen_deps.iter().rev() {
+        match live.take() {
+            Some(err) => {
+                let exc = err.value(py).clone();
+                match gen.call_method1(py, "throw", (exc,)) {
+                    // Generator returned without re-raising → swallowed the error.
+                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                        live = None;
+                    }
+                    // Generator re-raised (same or different exception) → propagate.
+                    Err(e) => {
+                        live = Some(e);
+                    }
+                    // Generator yielded again after throw — a misbehaving dep;
+                    // close it and keep the original error live.
+                    Ok(_) => {
+                        let _ = gen.call_method0(py, "close");
+                        live = Some(err);
+                    }
+                }
+            }
+            None => {
+                // Exception already suppressed by an inner dep — this outer dep
+                // exits normally (advance past its yield, then close).
+                if gen.call_method1(py, "send", (py.None(),)).is_ok() {
+                    let _ = gen.call_method0(py, "close");
+                }
             }
         }
-        Ok(_) => {
-            let _ = coro.call_method0(py, "close");
-            Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Coroutine suspended — requires event loop",
-            ))
-        }
+    }
+    match live {
+        Some(e) => e,
+        // The exception was swallowed by a yield-dep that didn't re-raise.
+        None => fastapi_error(
+            py,
+            "Response not awaited. There's a high chance that the \
+             application code is raising an exception and a dependency with yield \
+             has a block with a bare except, or a block with except Exception, \
+             and is not raising the exception again. Read more about it in the \
+             docs: https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/#dependencies-with-yield-and-except",
+        ),
     }
 }
 
 // ── Parameter extraction helpers ─────────────────────────────────────
-
-/// Extract ALL params directly into a PyDict (fast path for sync handlers without deps).
-/// Single GIL acquisition — no intermediate HashMap.
-#[allow(dead_code)] // Superseded by extract_params_to_pydict_full; kept as reference.
-fn extract_params_to_pydict<'py>(
-    py: Python<'py>,
-    params: &[ParamInfo],
-    path_map: &HashMap<String, String>,
-    query_params: &HashMap<String, String>,
-    headers: &Option<HeaderMap>,
-    body_json: &Option<&serde_json::Value>,
-    body_bytes: &[u8],
-    multipart_fields: &mut Option<HashMap<String, Vec<ParsedField>>>,
-    defers_extraction_errors: bool,
-    lax_content_type: bool,
-) -> Result<pyo3::Bound<'py, pyo3::types::PyDict>, Response> {
-    extract_params_to_pydict_full(
-        py,
-        params,
-        path_map,
-        query_params,
-        &HashMap::new(),
-        headers,
-        body_json,
-        body_bytes,
-        multipart_fields,
-        defers_extraction_errors,
-        lax_content_type,
-    )
-}
 
 fn extract_params_to_pydict_full<'py>(
     py: Python<'py>,
@@ -2413,7 +3073,25 @@ fn extract_params_to_pydict_full<'py>(
                             }
                         }
                         if !any_err {
-                            let _ = kwargs.set_item(&param.name, list);
+                            if param.scalar_validator.is_some() {
+                                // Feed the coerced list to the field TypeAdapter so
+                                // container types get FA semantics: frozenset/set
+                                // dedup, tuple arity (``tuple[int,int]`` rejects 3
+                                // values). Plain list[...] validators are identity.
+                                match run_scalar_validator_detail(
+                                    py,
+                                    param,
+                                    "query",
+                                    list.as_any(),
+                                ) {
+                                    Ok(validated) => {
+                                        let _ = kwargs.set_item(&param.name, validated);
+                                    }
+                                    Err(mut errs) => extraction_errors.append(&mut errs),
+                                }
+                            } else {
+                                let _ = kwargs.set_item(&param.name, list);
+                            }
                         }
                     }
                 } else if let Some(raw) = query_params.get(q_lookup) {
@@ -2488,35 +3166,25 @@ fn extract_params_to_pydict_full<'py>(
                         }
                         None => lax_content_type,
                     };
-                    let val = if param.cached_validator.is_some() || param.model_class.is_some() {
+                    let body_validator = resolve_body_validator(py, param);
+                    let val = if let Some(ref validator) = body_validator {
                         let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
                         let result = if ct_is_json {
-                            if let Some(ref validator) = param.cached_validator {
-                                validator.call_method1(py, "validate_json", (py_bytes,))
-                            } else {
-                                param
-                                    .model_class
-                                    .as_ref()
-                                    .unwrap()
-                                    .getattr(py, "__pydantic_validator__")
-                                    .and_then(|v| v.call_method1(py, "validate_json", (py_bytes,)))
-                            }
+                            validator.call_method1(py, "validate_json", (py_bytes,))
                         } else {
-                            // Non-JSON Content-Type — pass raw string to
-                            // validate_python so Pydantic errors with
-                            // model_attributes_type (FA parity).
-                            let raw_str = std::str::from_utf8(body_bytes).unwrap_or("");
-                            let py_str = pyo3::types::PyString::new(py, raw_str).into_any();
-                            if let Some(ref validator) = param.cached_validator {
-                                validator.call_method1(py, "validate_python", (py_str,))
+                            // Non-JSON Content-Type. For a raw-bytes body param
+                            // pass the bytes OBJECT — lossy UTF-8 decoding would
+                            // corrupt a binary payload (a 0xFF byte makes
+                            // from_utf8 fail → unwrap_or("") → handler sees 0
+                            // bytes). For other types pass the decoded string so
+                            // Pydantic errors with model_attributes_type (FA parity).
+                            let py_input = if param.type_hint == "bytes" {
+                                pyo3::types::PyBytes::new(py, body_bytes).into_any()
                             } else {
-                                param
-                                    .model_class
-                                    .as_ref()
-                                    .unwrap()
-                                    .getattr(py, "__pydantic_validator__")
-                                    .and_then(|v| v.call_method1(py, "validate_python", (py_str,)))
-                            }
+                                let raw_str = std::str::from_utf8(body_bytes).unwrap_or("");
+                                pyo3::types::PyString::new(py, raw_str).into_any()
+                            };
+                            validator.call_method1(py, "validate_python", (py_input,))
                         };
                         match result {
                             Ok(v) => v,
@@ -2549,7 +3217,8 @@ fn extract_params_to_pydict_full<'py>(
                     };
                     let _ = kwargs.set_item(&param.name, val.bind(py));
                 } else if apply_default(py, &kwargs, param) {
-                    // Default applied
+                    // Default applied (incl. a single ``Optional[Model]`` body whose
+                    // default is ``None`` — absent body → None, not a built model).
                 } else if param.required {
                     // Empty body + required: FA behaviour depends on whether
                     // we have a single body field (scalar/model) or an
@@ -2745,15 +3414,11 @@ fn extract_params_to_pydict_full<'py>(
                             // Collect all missing-field errors before
                             // surfacing — FA emits one 422 with every
                             // missing form/file field in the detail list.
-                            if defers_extraction_errors {
-                                extraction_errors.push(missing_error_detail("body", alias_name));
-                                continue;
-                            }
-                            return Err(validation_error_response(
-                                "body",
-                                alias_name,
-                                "field required",
-                            ));
+                            // Accumulate unconditionally (like the "form"
+                            // arm below); the post-loop block returns the
+                            // combined 422 for non-deferring routes.
+                            extraction_errors.push(missing_error_detail("body", alias_name));
+                            continue;
                         }
                     }
                 }
@@ -2784,8 +3449,10 @@ fn extract_params_to_pydict_full<'py>(
                             let coerce_inner = !inner.is_empty() && inner != "str";
                             let list = pyo3::types::PyList::empty(py);
                             let mut any_err = false;
+                            let mut has_file = false;
                             for (idx, f) in fs.drain(..).enumerate() {
                                 if f.filename.is_some() {
+                                    has_file = true;
                                     let wrapped = make_upload_file(py, f).map_err(|_e| {
                                         validation_error_response("body", alias_name, "alloc")
                                     })?;
@@ -2812,7 +3479,26 @@ fn extract_params_to_pydict_full<'py>(
                                 }
                             }
                             if !any_err {
-                                let _ = kwargs.set_item(&param.name, list);
+                                if !has_file && param.scalar_validator.is_some() {
+                                    // Run the field TypeAdapter on the coerced list
+                                    // for container semantics (frozenset/set dedup,
+                                    // ``tuple[int,int]`` arity). Skip when any item
+                                    // is an UploadFile (the validator would reject
+                                    // it). loc is "body" for form fields.
+                                    match run_scalar_validator_detail(
+                                        py,
+                                        param,
+                                        "body",
+                                        list.as_any(),
+                                    ) {
+                                        Ok(validated) => {
+                                            let _ = kwargs.set_item(&param.name, validated);
+                                        }
+                                        Err(mut errs) => extraction_errors.append(&mut errs),
+                                    }
+                                } else {
+                                    let _ = kwargs.set_item(&param.name, list);
+                                }
                             }
                         } else {
                             let field = fs.remove(0);
@@ -3018,18 +3704,32 @@ fn extract_params_to_pydict_full<'py>(
 }
 
 /// Extract a single param into the resolved HashMap (slow path for dep handlers).
+#[allow(clippy::too_many_arguments)]
 fn extract_single_param(
     py: Python<'_>,
     param: &ParamInfo,
     path_map: &HashMap<String, String>,
     query_params: &HashMap<String, String>,
+    query_multi: &HashMap<String, Vec<String>>,
     headers: &Option<HeaderMap>,
     body_json: &Option<serde_json::Value>,
+    body_bytes: &[u8],
+    multipart_fields: &mut Option<HashMap<String, Vec<ParsedField>>>,
     resolved: &mut HashMap<String, Py<PyAny>>,
+    accum: &mut Vec<serde_json::Value>,
 ) -> Result<(), Response> {
+    // Scalar (path/query/header/cookie) missing/coercion errors are PUSHED
+    // into ``accum`` (the caller emits one combined 422 across all extra
+    // deps — FA accumulates every missing required dep-input, not just the
+    // first). Body-level errors still short-circuit with ``Err(Response)``
+    // (a combined-body 422 already lists every missing body field).
     match param.kind.as_str() {
         "path" => {
-            if let Some(raw) = path_map.get(&param.name) {
+            let p_lookup: &str = param.alias.as_deref().unwrap_or(&param.name);
+            // Look up by the alias-aware key: a path param shared with a dependency
+            // is emitted with a synthetic name (``_dep0__user_id``) but the matchit
+            // capture key is the real name (``user_id``) carried in ``alias``.
+            if let Some(raw) = path_map.get(p_lookup) {
                 resolved.insert(
                     param.name.clone(),
                     coerce_str_to_py(py, raw, &param.type_hint),
@@ -3041,16 +3741,36 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response(
-                    "path",
-                    &param.name,
-                    "field required",
-                ));
+                accum.push(missing_error_detail("path", p_lookup));
             }
         }
         "query" => {
             let q_lookup: &str = param.alias.as_deref().unwrap_or(&param.name);
-            if let Some(raw) = query_params.get(q_lookup) {
+            // List types collect ALL values for repeated ``?k=a&k=b`` — a
+            // param-model field typed ``list[str]`` must see both, not the
+            // single last-wins value from ``query_params``.
+            if param.type_hint.starts_with("list_") {
+                let values = query_multi.get(q_lookup).cloned().unwrap_or_default();
+                if values.is_empty() {
+                    if param.has_default {
+                        let v = match &param.default_value {
+                            Some(d) => d.clone_ref(py),
+                            None => py.None(),
+                        };
+                        resolved.insert(param.name.clone(), v);
+                    } else if param.required {
+                        accum.push(missing_error_detail("query", q_lookup));
+                    }
+                } else {
+                    let inner = &param.type_hint[5..]; // strip "list_"
+                    let list = pyo3::types::PyList::empty(py);
+                    for v in &values {
+                        let coerced = coerce_str_to_py(py, v, inner);
+                        let _ = list.append(coerced.bind(py));
+                    }
+                    resolved.insert(param.name.clone(), list.into_any().unbind());
+                }
+            } else if let Some(raw) = query_params.get(q_lookup) {
                 resolved.insert(
                     param.name.clone(),
                     coerce_str_to_py(py, raw, &param.type_hint),
@@ -3062,26 +3782,90 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response(
-                    "query",
-                    &param.name,
-                    "field required",
-                ));
+                accum.push(missing_error_detail("query", q_lookup));
             }
         }
         "body" => {
-            if let Some(ref json_val) = body_json {
-                let raw_dict = serde_to_pyobj(py, json_val);
-                let val = if let Some(ref model_cls) = param.model_class {
-                    model_cls
-                        .call_method1(py, "model_validate", (raw_dict.bind(py),))
-                        .map_err(|e| {
-                            validation_error_response("body", &param.name, &format!("{e}"))
-                        })?
+            let is_combined = param.name == "_combined_body";
+            let body_validator = resolve_body_validator(py, param);
+            if !body_bytes.is_empty() {
+                if let Some(ref validator) = body_validator {
+                    // Validate raw bytes directly (FA shapes). On error,
+                    // remap to FA's combined/with-body 422 (alias-aware loc,
+                    // top-level ``input=None``) instead of a raw 500.
+                    // A COMBINED body (embed/multiple) whose JSON is NOT an object
+                    // (e.g. ``[]``): real FA extracts each field → all missing. Feed
+                    // ``{}`` so the validator emits per-field missing (loc=["body",
+                    // field], input=None) instead of a top-level model_attributes_type.
+                    let combined_non_object = is_combined
+                        && serde_json::from_slice::<serde_json::Value>(body_bytes)
+                            .map(|v| !v.is_object())
+                            .unwrap_or(false);
+                    let py_bytes = if combined_non_object {
+                        pyo3::types::PyBytes::new(py, b"{}")
+                    } else {
+                        pyo3::types::PyBytes::new(py, body_bytes)
+                    };
+                    let result = validator.call_method1(py, "validate_json", (py_bytes,));
+                    match result {
+                        Ok(v) => {
+                            resolved.insert(param.name.clone(), v);
+                        }
+                        Err(e) => {
+                            // FA body-parse errors (HTTPException) win as-is.
+                            if e.value(py).getattr("status_code").is_ok() {
+                                return Err(crate::responses::pyerr_to_response(py, &e));
+                            }
+                            if is_combined {
+                                if combined_non_object {
+                                    return Err(pydantic_error_response_combined(py, &e, "body"));
+                                }
+                                return Err(pydantic_error_response_combined_with_body(
+                                    py, &e, "body", body_bytes,
+                                ));
+                            }
+                            return Err(pydantic_error_response_with_body(
+                                py, &e, "body", body_bytes,
+                            ));
+                        }
+                    }
+                } else if let Some(ref json_val) = body_json {
+                    // No Pydantic model — pass the parsed dict through.
+                    resolved.insert(param.name.clone(), serde_to_pyobj(py, json_val));
                 } else {
-                    raw_dict
+                    // Raw bytes couldn't be parsed as JSON — hand them on.
+                    let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
+                    resolved.insert(param.name.clone(), py_bytes.into_any().unbind());
+                }
+            } else if is_combined && !param.required && param.model_class.is_some() {
+                // Optional COMBINED body absent (e.g. ``Body(embed=True) = None``
+                // where every embedded field is optional): build it from defaults
+                // (validate ``{}``) so the getters see field defaults — FA returns
+                // the defaulted model. A single ``Optional[Model]`` body is NOT
+                // combined → falls to the default (None) below.
+                let empty = pyo3::types::PyBytes::new(py, b"{}");
+                let built = if let Some(ref validator) = param.cached_validator {
+                    validator.call_method1(py, "validate_json", (empty,))
+                } else {
+                    param
+                        .model_class
+                        .as_ref()
+                        .unwrap()
+                        .getattr(py, "__pydantic_validator__")
+                        .and_then(|v| v.call_method1(py, "validate_json", (empty,)))
                 };
-                resolved.insert(param.name.clone(), val);
+                match built {
+                    Ok(v) => {
+                        resolved.insert(param.name.clone(), v);
+                    }
+                    Err(_) => {
+                        let v = match &param.default_value {
+                            Some(d) => d.clone_ref(py),
+                            None => py.None(),
+                        };
+                        resolved.insert(param.name.clone(), v);
+                    }
+                }
             } else if param.has_default {
                 let v = match &param.default_value {
                     Some(d) => d.clone_ref(py),
@@ -3089,15 +3873,26 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response(
-                    "body",
-                    &param.name,
-                    "field required",
-                ));
+                // Empty body + required combined body: feed ``{}`` so the
+                // validator emits per-field missing errors (loc=["body",<field>]).
+                if is_combined {
+                    if let Some(ref validator) = param.cached_validator {
+                        let empty = pyo3::types::PyBytes::new(py, b"{}");
+                        if let Err(e) = validator.call_method1(py, "validate_json", (empty,)) {
+                            if e.value(py).getattr("status_code").is_ok() {
+                                return Err(crate::responses::pyerr_to_response(py, &e));
+                            }
+                            return Err(pydantic_error_response_combined(py, &e, "body"));
+                        }
+                    }
+                    return Err(missing_body_error());
+                }
+                return Err(validation_error_response("body", &param.name, "field required"));
             }
         }
         "header" => {
-            let lookup = param.alias.as_deref().unwrap_or(&param.name).to_lowercase();
+            let loc_name = param.alias.as_deref().unwrap_or(&param.name);
+            let lookup = loc_name.to_lowercase();
             let header_val = headers
                 .as_ref()
                 .and_then(|h| h.get(lookup.as_str()))
@@ -3114,19 +3909,19 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response(
-                    "header",
-                    &param.name,
-                    "field required",
-                ));
+                accum.push(missing_error_detail("header", loc_name));
             }
         }
         "cookie" => {
+            let loc_name = param.alias.as_deref().unwrap_or(&param.name);
             let cookie_val = headers
                 .as_ref()
                 .and_then(|h| h.get("cookie"))
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| parse_cookie_value(s, &param.name));
+                // Alias-aware: a Cookie() consumed as a dependency input has a
+                // synthetic ``param.name`` (``_dep0__last_query``) but the real
+                // cookie name is in ``alias`` (loc_name).
+                .and_then(|s| parse_cookie_value(s, loc_name));
             if let Some(raw) = cookie_val {
                 resolved.insert(
                     param.name.clone(),
@@ -3139,11 +3934,61 @@ fn extract_single_param(
                 };
                 resolved.insert(param.name.clone(), v);
             } else if param.required {
-                return Err(validation_error_response(
-                    "cookie",
-                    &param.name,
-                    "field required",
-                ));
+                accum.push(missing_error_detail("cookie", loc_name));
+            }
+        }
+        "form" | "file" => {
+            // Dependency-input form/file fields (Form model-expansion). Values are
+            // re-validated by the model builder, so plain strings / UploadFiles
+            // suffice here; absent fields fall back to the default (e.g.
+            // _PM_MISSING) so the model applies its own default/missing logic.
+            let alias_name = param.alias.as_deref().unwrap_or(&param.name);
+            let wants_list = param.type_hint.starts_with("list_");
+            let wants_raw_bytes = param.type_hint == "bytes" || param.type_hint == "list_bytes";
+            let fields = multipart_fields.as_mut().and_then(|m| m.remove(alias_name));
+            match fields {
+                Some(mut fs) if !fs.is_empty() => {
+                    if wants_list {
+                        let list = pyo3::types::PyList::empty(py);
+                        for f in fs.drain(..) {
+                            if f.filename.is_some() && !wants_raw_bytes {
+                                if let Ok(uf) = make_upload_file(py, f) {
+                                    let _ = list.append(uf);
+                                }
+                            } else if wants_raw_bytes {
+                                let _ = list.append(pyo3::types::PyBytes::new(py, &f.data));
+                            } else {
+                                let text = String::from_utf8_lossy(&f.data).into_owned();
+                                let _ = list.append(pyo3::types::PyString::new(py, &text));
+                            }
+                        }
+                        resolved.insert(param.name.clone(), list.into_any().unbind());
+                    } else {
+                        let f = fs.remove(0);
+                        let val = if f.filename.is_some() && !wants_raw_bytes {
+                            make_upload_file(py, f)
+                                .map(|uf| uf.unbind())
+                                .unwrap_or_else(|_| py.None())
+                        } else if wants_raw_bytes {
+                            pyo3::types::PyBytes::new(py, &f.data).into_any().unbind()
+                        } else {
+                            let text = String::from_utf8_lossy(&f.data).into_owned();
+                            coerce_str_to_py(py, &text, &param.type_hint)
+                        };
+                        resolved.insert(param.name.clone(), val);
+                    }
+                }
+                _ => {
+                    if param.has_default {
+                        let v = match &param.default_value {
+                            Some(d) => d.clone_ref(py),
+                            None => py.None(),
+                        };
+                        resolved.insert(param.name.clone(), v);
+                    } else if param.required {
+                        return Err(validation_error_response("body", alias_name, "field required"));
+                    }
+                }
             }
         }
         _ => {}
@@ -3307,42 +4152,6 @@ fn coercion_error_detail_indexed(
     })
 }
 
-/// Build a 422 response for a str→type coercion failure at a specific
-/// list index (loc = [location, field, index]).
-#[allow(dead_code)]
-fn coercion_error_response_indexed(
-    loc: &str,
-    name: &str,
-    index: usize,
-    raw: &str,
-    type_hint: &str,
-) -> Response {
-    let (err_type, msg) = match type_hint {
-        "int" => (
-            "int_parsing",
-            "Input should be a valid integer, unable to parse string as an integer",
-        ),
-        "float" => (
-            "float_parsing",
-            "Input should be a valid number, unable to parse string as a number",
-        ),
-        "bool" => (
-            "bool_parsing",
-            "Input should be a valid boolean, unable to interpret input",
-        ),
-        _ => ("value_error", "Value error"),
-    };
-    let body = serde_json::json!({
-        "detail": [{
-            "type": err_type,
-            "loc": [loc, name, index],
-            "msg": msg,
-            "input": raw,
-        }]
-    });
-    dispatch_validation_error(body)
-}
-
 /// Build a 422 response for a str→type coercion failure (int_parsing, etc.),
 /// in Pydantic-v2 format.
 fn coercion_error_response(loc: &str, name: &str, raw: &str, type_hint: &str) -> Response {
@@ -3370,14 +4179,6 @@ fn coercion_error_response(loc: &str, name: &str, raw: &str, type_hint: &str) ->
         }]
     });
     dispatch_validation_error(body)
-}
-
-/// Convert a Pydantic ValidationError (from body model validation) into a
-/// FastAPI-style 422 response. Prepends `loc_prefix` (e.g. "body") to each
-/// error's location.
-#[allow(dead_code)]
-fn pydantic_error_response(py: Python<'_>, err: &PyErr, loc_prefix: &str) -> Response {
-    pydantic_error_response_with_loc_ext(py, err, &[loc_prefix], false)
 }
 
 fn pydantic_error_response_with_body(

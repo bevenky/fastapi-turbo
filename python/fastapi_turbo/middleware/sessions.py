@@ -140,9 +140,18 @@ class SessionMiddleware:
         parts.append("HttpOnly")
         parts.append(f"SameSite={self.same_site.capitalize()}")
         cookie_str = "; ".join(parts)
-        if hasattr(response, "raw_headers"):
-            response.raw_headers.append(("set-cookie", cookie_str))
-        elif hasattr(response, "headers"):
+        _hdrs = getattr(response, "headers", None)
+        if _hdrs is not None and hasattr(_hdrs, "append"):
+            # Real Starlette MutableHeaders.append → a (bytes, bytes)
+            # raw_headers entry, preserving duplicate Set-Cookie headers.
+            # (Appending a str tuple to real raw_headers would crash
+            # MutableHeaders.items() — it does ``key.decode()``.)
+            _hdrs.append("set-cookie", cookie_str)
+        elif hasattr(response, "raw_headers"):
+            response.raw_headers.append(
+                (b"set-cookie", cookie_str.encode("latin-1"))
+            )
+        elif _hdrs is not None:
             # Fallback for plain dict returns wrapped mid-flight
             response.headers["set-cookie"] = cookie_str
 

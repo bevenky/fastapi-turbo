@@ -10,6 +10,13 @@ import logging
 import os
 from typing import Any, Callable, Sequence
 
+# Real pip FastAPI for the "accelerate real FastAPI" pivot. This module is imported
+# by fastapi_turbo/__init__.py BEFORE the compat shim installs (see __init__.py),
+# so `import fastapi` here resolves to the REAL package — captured before any
+# sys.modules shadowing. fastapi_turbo.FastAPI subclasses it; later pivot steps
+# delete the clone overrides so the real base's routing/openapi/deps show through.
+import fastapi as _real_fastapi
+
 # Module logger for the silently-swallowed paths. ``except Exception:
 # pass`` used to be the default; where the swallow is genuinely
 # defensive (optional integrations, best-effort introspection) we now
@@ -34,19 +41,17 @@ from fastapi_turbo._sentry_compat import (  # noqa: F401 — re-exported below
 )
 
 
-
-from fastapi_turbo._introspect import introspect_endpoint
-from fastapi_turbo._openapi import generate_openapi_schema
-from fastapi_turbo._resolution import build_resolution_plan, _make_sync_wrapper
+from fastapi_turbo._door_support import _make_sync_wrapper
 from fastapi_turbo.datastructures import State
 from fastapi_turbo.routing import (
     APIRouter,
     APIRoute,
-    _adapt_websocket_endpoint_class,
     _looks_like_starlette_mount,
     _looks_like_starlette_websocket_route,
     _mark_starlette_compat_route,
+    _unset_to_none,
 )
+from fastapi_turbo._ws_support import _adapt_websocket_endpoint_class
 
 
 class URLPath(str):
@@ -68,7 +73,6 @@ from fastapi_turbo._route_helpers import (  # noqa: F401 — re-exports
     _apply_response_model,
     _apply_status_code,
     _build_custom_route_handler_endpoint,
-    _build_default_route_handler,
     _close_one_upload,
     _close_upload_files,
     _has_overridden_get_route_handler,
@@ -77,1337 +81,6 @@ from fastapi_turbo._route_helpers import (  # noqa: F401 — re-exports
     _model_needs_full_dump,
     _wrap_response_class,
 )
-
-
-def _try_compile_handler(
-    endpoint,
-    params,
-    app=None,
-    response_model=None,
-    response_model_include=None,
-    response_model_exclude=None,
-    response_model_exclude_unset=False,
-    response_model_exclude_defaults=False,
-    response_model_exclude_none=False,
-    response_model_by_alias=True,
-    response_class=None,
-    status_code=None,
-    path=None,
-    route_obj=None,
-):
-    """Compile deps + handler into a SINGLE Python function (1 PyO3 call instead of N+1).
-
-    At startup, if ALL deps are trivially-sync (no generators, no real async I/O),
-    we generate a function that resolves deps inline and calls the handler.
-    Rust makes ONE call with extracted params -> gets back the response.
-
-    Now also supports:
-    - dependency_overrides: checks app.dependency_overrides at call time
-    - generator deps (yield): runs generator, captures value, cleans up after handler
-    - response_model: filters the response through the model if set
-    """
-    # Build the endpoint context FA surfaces in
-    # ``ValidationException.endpoint_ctx`` — file/line/function/path.
-    # Tests assert on ``"get_user" in str(exc)`` which uses this.
-    import inspect as _inspect_mod
-    _endpoint_ctx: dict = {}
-    try:
-        _endpoint_ctx["function"] = getattr(endpoint, "__name__", None)
-        _endpoint_ctx["file"] = _inspect_mod.getsourcefile(endpoint)
-        _endpoint_ctx["line"] = _inspect_mod.getsourcelines(endpoint)[1]
-    except (TypeError, OSError):
-        pass
-    if path is not None:
-        _endpoint_ctx["path"] = path
-
-    _rm_include = response_model_include
-    _rm_exclude = response_model_exclude
-    _rm_exclude_unset = response_model_exclude_unset
-    _rm_exclude_defaults = response_model_exclude_defaults
-    _rm_exclude_none = response_model_exclude_none
-    _rm_by_alias = response_model_by_alias
-    _response_class = response_class
-
-    dep_steps = [p for p in params if p["kind"] == "dependency"]
-    _has_exc_handlers = app is not None and bool(getattr(app, "exception_handlers", None))
-    _debug_on = app is not None and bool(getattr(app, "debug", False))
-    _has_enum_params = any(
-        p.get("enum_class") is not None and p.get("_is_handler_param")
-        for p in params
-    )
-    # Container-type coercion map: list[int] → set/frozenset/tuple when
-    # the handler's annotation is a sequence type other than ``list``.
-    # Rust always produces a ``list`` for repeated query/header params;
-    # we wrap it here so handlers that declare ``frozenset[int]`` get
-    # deduplicated input that matches FA / Pydantic semantics.
-    _container_coerce = {
-        p["name"]: p["container_type"]
-        for p in params
-        if p.get("container_type") and p.get("_is_handler_param")
-    }
-    _container_ctors = {"set": set, "frozenset": frozenset, "tuple": tuple}
-
-    # For tuple-typed form params, build a TypeAdapter so Pydantic
-    # enforces arity + per-element type coercion. ``tuple[int, int]``
-    # sent as ``values=1&values=2&values=3`` should 422.
-    _tuple_form_adapters: dict = {}
-    for _p in params:
-        if (
-            _p.get("_is_handler_param")
-            and _p.get("container_type") == "tuple"
-            and _p.get("kind") == "form"
-        ):
-            _ann = _p.get("_unwrapped_annotation")
-            import typing as _tp_local
-            if _ann is not None and _tp_local.get_origin(_ann) is tuple:
-                _args = _tp_local.get_args(_ann)
-                # Fixed-arity tuple (``tuple[int, int]``) — TypeAdapter
-                # handles both coercion and arity. Variadic tuples
-                # (``tuple[int, ...]``) are left to the ctor below.
-                if _args and Ellipsis not in _args:
-                    try:
-                        from pydantic import TypeAdapter as _TA
-                        _tuple_form_adapters[_p["name"]] = _TA(_ann)
-                    except Exception as _exc:  # noqa: BLE001
-                        _log.debug("silent catch in applications: %r", _exc)
-
-    def _apply_container_coerce(filtered: dict) -> None:
-        if not _container_coerce:
-            return
-        for _k, _name in _container_coerce.items():
-            if _k in filtered:
-                # Tuple form with fixed arity: route through Pydantic so
-                # both arity and per-element types are enforced.
-                _adapter = _tuple_form_adapters.get(_k)
-                if _adapter is not None:
-                    try:
-                        filtered[_k] = _adapter.validate_python(filtered[_k])
-                        continue
-                    except Exception as _exc:  # noqa: BLE001
-                        from pydantic import ValidationError as _PyVE
-                        if isinstance(_exc, _PyVE):
-                            from fastapi_turbo.exceptions import (
-                                RequestValidationError as _RVE,
-                            )
-                            _errs = [
-                                {**e, "loc": ("body", _k, *tuple(e.get("loc", ())))}
-                                for e in _exc.errors()
-                            ]
-                            raise _RVE(_errs) from None
-                        raise
-                _ctor = _container_ctors.get(_name)
-                if _ctor is not None and not isinstance(filtered[_k], _ctor):
-                    try:
-                        filtered[_k] = _ctor(filtered[_k])
-                    except TypeError:
-                        pass
-
-    # Detect required body/form/file params — these want FA's
-    # "collect every missing field in one 422" behaviour, which
-    # needs the compiled wrapper path so Rust can defer extraction
-    # errors rather than returning on the first missing field.
-    _has_form_or_body_params = any(
-        p.get("required") and p.get("kind") in ("body", "form", "file")
-        for p in params
-    )
-    if not dep_steps:
-        if (
-            response_model is not None
-            or _response_class is not None
-            or _has_exc_handlers
-            or _debug_on
-            or status_code is not None
-            or _has_enum_params
-            or _container_coerce
-            or _has_form_or_body_params
-        ):
-            # Even without deps, we may need response_model filtering or response_class wrapping
-            handler_param_names = {p["name"] for p in params if p.get("_is_handler_param")}
-            # Build enum coercion map: {param_name: EnumClass} for query/path params
-            _enum_coerce = {
-                p["name"]: p["enum_class"]
-                for p in params
-                if p.get("enum_class") is not None and p.get("_is_handler_param")
-            }
-            handler_func = endpoint
-            if inspect.iscoroutinefunction(handler_func):
-                handler_func = _make_sync_wrapper(handler_func, for_handler=True, app=app)
-
-            _app_ref = app
-            _route_path_for_scope = path
-            _endpoint_for_scope = endpoint
-
-            def _compiled_no_deps(**kwargs):
-                # Stamp endpoint/route onto the request scope so Sentry's
-                # ``_set_transaction_name_and_source`` switches from
-                # URL-based naming (``http://host/path``) to route-based
-                # (``/items/{item_id}``) or endpoint-based (``pkg.mod.fn``).
-                _refine_request_scope_for_route(_endpoint_for_scope, _route_path_for_scope)
-                # Drain any deferred extraction errors from Rust and
-                # surface them as a single 422 — matches FA's "one JSON
-                # body listing EVERY missing required field" behaviour
-                # even when the handler itself has no dep chain.
-                _pending = kwargs.pop("__fastapi_turbo_extraction_errors__", None)
-                _raw_body_str = kwargs.pop("__fastapi_turbo_raw_body_str__", None)
-                kwargs.pop("__fastapi_turbo_raw_body_bytes__", None)
-                if _pending is not None:
-                    from fastapi_turbo.responses import JSONResponse as _JSONResp
-                    import json as _json
-                    detail = _json.loads(_pending)
-                    # FA parity: ``RequestValidationError.body`` holds
-                    # the raw JSON body (dict) so custom exception
-                    # handlers can inspect what the caller sent.
-                    _rve_body = None
-                    if _raw_body_str is not None:
-                        try:
-                            _rve_body = _json.loads(_raw_body_str)
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                            _rve_body = _raw_body_str
-                    try:
-                        from fastapi_turbo.exceptions import (
-                            RequestValidationError as _RVE,
-                        )
-                        exc = _RVE(detail, body=_rve_body, endpoint_ctx=_endpoint_ctx)
-                        if (
-                            _app_ref is not None
-                            and _RVE in _app_ref.exception_handlers
-                        ):
-                            handler_raised = False
-                            try:
-                                handler_result = _app_ref._invoke_exception_handler_strict(exc)
-                            except Exception as _exc:  # noqa: BLE001
-                                _log.debug("silent catch in applications: %r", _exc)
-                                handler_raised = True
-                                handler_result = None
-                            if handler_raised and _app_ref is not None:
-                                _app_ref._captured_server_exceptions.append(exc)
-                            if handler_result is not None:
-                                return handler_result
-                    except ImportError:
-                        pass
-                    return _JSONResp(
-                        content={"detail": detail},
-                        status_code=422,
-                    )
-                try:
-                    filtered = {k: kwargs[k] for k in handler_param_names if k in kwargs}
-                    # Coerce raw strings to Enum types (FastAPI does this automatically)
-                    for _ek, _ecls in _enum_coerce.items():
-                        if _ek in filtered and isinstance(filtered[_ek], str):
-                            try:
-                                filtered[_ek] = _ecls(filtered[_ek])
-                            except (ValueError, KeyError):
-                                pass
-                    try:
-                        _apply_container_coerce(filtered)
-                    except Exception as _ccexc:
-                        from fastapi_turbo.exceptions import (
-                            RequestValidationError as _RVE2,
-                        )
-                        if isinstance(_ccexc, _RVE2):
-                            from fastapi_turbo.responses import (
-                                JSONResponse as _JRx,
-                            )
-                            return _JRx(
-                                content={"detail": list(_ccexc.errors())},
-                                status_code=422,
-                            )
-                        raise
-                    result = handler_func(**filtered)
-                except Exception as exc:
-                    _maybe_print_debug_traceback(_app_ref, exc)
-                    # Sentry parity: HTTPException status codes in the
-                    # integration's ``failed_request_status_codes`` set
-                    # should emit events. Covers the no-custom-handler
-                    # path where ``_invoke_exception_handler`` isn't
-                    # reached.
-                    _maybe_sentry_capture_failed_request(exc)
-                    # Handler-response semantics (Starlette parity):
-                    #   - specific exception class handled → NOT re-raised
-                    #   - ``Exception`` catch-all handled → still re-raised
-                    handler_result = None
-                    handler_raised = False
-                    if _app_ref is not None and _app_ref.exception_handlers:
-                        try:
-                            handler_result = _app_ref._invoke_exception_handler(exc)
-                        except Exception:
-                            handler_raised = True
-                    handled_by_specific = False
-                    if handler_result is not None and not handler_raised:
-                        for exc_cls in (
-                            _app_ref.exception_handlers.keys() if _app_ref else []
-                        ):
-                            if exc_cls is Exception:
-                                continue
-                            if isinstance(exc_cls, type) and isinstance(exc, exc_cls):
-                                handled_by_specific = True
-                                break
-                    try:
-                        from fastapi_turbo.exceptions import HTTPException as _HE
-                        if (
-                            _app_ref is not None
-                            and not isinstance(exc, _HE)
-                            and not handled_by_specific
-                        ):
-                            _app_ref._captured_server_exceptions.append(exc)
-                    except ImportError:
-                        pass
-                    if handler_result is not None and not handler_raised:
-                        return handler_result
-                    raise
-                if response_model is not None:
-                    try:
-                        result = _apply_response_model(
-                            result, response_model,
-                            include=_rm_include, exclude=_rm_exclude,
-                            exclude_unset=_rm_exclude_unset,
-                            exclude_defaults=_rm_exclude_defaults,
-                            exclude_none=_rm_exclude_none,
-                            by_alias=_rm_by_alias,
-                            endpoint_ctx=_endpoint_ctx,
-                        )
-                    except Exception as _rve:  # noqa: BLE001
-                        # Route through
-                        # ``@app.exception_handler(ResponseValidationError)``
-                        # if registered. Capture for TestClient's
-                        # ``raise_server_exceptions`` — if user's
-                        # handler raises, re-raise that. If no handler,
-                        # propagate so the test with ``pytest.raises``
-                        # sees the RVE.
-                        from fastapi_turbo.exceptions import (
-                            ResponseValidationError as _RVE2,
-                        )
-                        if (
-                            _app_ref is not None
-                            and _RVE2 in _app_ref.exception_handlers
-                        ):
-                            handler_raised = False
-                            try:
-                                hdl_result = _app_ref._invoke_exception_handler_strict(_rve)
-                            except Exception as _exc:  # noqa: BLE001
-                                _log.debug("silent catch in applications: %r", _exc)
-                                handler_raised = True
-                                hdl_result = None
-                            if handler_raised and _app_ref is not None:
-                                _app_ref._captured_server_exceptions.append(_rve)
-                                raise
-                            if hdl_result is not None:
-                                return hdl_result
-                        if _app_ref is not None:
-                            _app_ref._captured_server_exceptions.append(_rve)
-                        raise
-                if _response_class is not None:
-                    result = _wrap_response_class(result, _response_class)
-                if status_code is not None:
-                    result = _apply_status_code(result, status_code)
-                # Close UploadFile(s) handed to the handler — Starlette
-                # parity. ``test_upload_file_is_closed`` asserts the
-                # file is closed after the response is built.
-                _close_upload_files(filtered)
-                return result
-
-            _compiled_no_deps._fastapi_turbo_original_endpoint = endpoint  # type: ignore[attr-defined]
-            _compiled_no_deps._fastapi_turbo_defers_extraction_errors = True  # type: ignore[attr-defined]
-            # Expose the endpoint-context dict so the mount-prefix path
-            # patcher (``_collect_all_routes``) can rewrite ``ctx["path"]``
-            # to the user-visible mount-prefixed URL — otherwise a
-            # ``RequestValidationError`` / ``ResponseValidationError``
-            # raised from a mounted sub-app shows the sub-app-internal
-            # path (``/items/``) instead of what the client actually hit
-            # (``/sub/items/``).
-            _compiled_no_deps._fastapi_turbo_endpoint_ctx = _endpoint_ctx  # type: ignore[attr-defined]
-            return _compiled_no_deps
-        return None
-
-    handler_param_names = {p["name"] for p in params if p.get("_is_handler_param")}
-
-    # Build enum coercion map for the deps path too
-    _enum_coerce_deps = {
-        p["name"]: p["enum_class"]
-        for p in params
-        if p.get("enum_class") is not None and p.get("_is_handler_param")
-    }
-
-    # Prepare dep callables (wrap async -> sync) and store originals for override lookup
-    dep_chain = []
-    for dep in dep_steps:
-        original_func = dep.get("_original_dep_callable", dep["dep_callable"])
-        func = dep["dep_callable"]
-        is_generator = dep.get("is_generator_dep", False)
-        if inspect.iscoroutinefunction(func) and not is_generator:
-            func = _make_sync_wrapper(func, app=app)
-        dep_chain.append((
-            dep["name"],
-            func,
-            original_func,
-            dep.get("dep_input_map", []),
-            dep.get("dep_callable_id"),
-            is_generator,
-            # Propagate the user's `use_cache` flag — when False, the same
-            # dep callable is re-invoked for each usage within the request.
-            bool(dep.get("use_cache", True)),
-            # Accumulated Security(..., scopes=[...]) for this dep — used
-            # to populate SecurityScopes kwargs at call time. Tuple of
-            # (param_name, [scopes]) or None.
-            (
-                (dep.get("_security_scopes_param"), dep.get("_security_scopes") or [])
-                if dep.get("_security_scopes_param")
-                else None
-            ),
-            # FA 0.120+ scope: ``function`` or ``request``. Used to split
-            # teardown ordering — function-scope runs immediately after
-            # the handler returns (exceptions from yield-after-yield
-            # surface as HTTP errors); request-scope is deferred until
-            # after the response (including streaming body) is sent.
-            dep.get("_dep_scope") or "request",
-        ))
-
-    _orig_endpoint = endpoint  # async fn retained for the batched-submit path
-    handler_func = endpoint
-    if inspect.iscoroutinefunction(handler_func):
-        handler_func = _make_sync_wrapper(handler_func, for_handler=True, app=app)
-
-    # Capture app reference for override lookup at call time
-    _app = app
-
-    # Cache of introspected override plans (signature params + nested deps).
-    # Keyed by id(override_callable). Mini-plan lets us filter kwargs to
-    # what the override accepts and resolve any sub-``Depends`` it declares.
-    _override_plan_cache: dict[int, dict[str, Any]] = {}
-
-    def _resolve_override_kwargs(
-        override_func, original_dk, resolved_env, app_obj, cache_obj
-    ):
-        """Shape ``dk`` for an override. Filter to params the override
-        accepts; for its own ``Depends()`` markers, resolve each sub-dep
-        (one level deep — nested overrides propagate through this same
-        path on the next call).
-        """
-        from fastapi_turbo.dependencies import Depends as _Dep
-        plan = _override_plan_cache.get(id(override_func))
-        if plan is None:
-            try:
-                sig = inspect.signature(override_func)
-            except (TypeError, ValueError):
-                _override_plan_cache[id(override_func)] = {"accepted": None, "subs": {}, "sig": None}
-                return original_dk
-            accepted: set[str] = set()
-            subs: dict[str, tuple[Any, Any]] = {}
-            for pname, param in sig.parameters.items():
-                accepted.add(pname)
-                default = param.default
-                if isinstance(default, _Dep):
-                    subs[pname] = (default.dependency, default)
-                else:
-                    ann = param.annotation
-                    import typing as _typ
-                    if _typ.get_origin(ann) is _typ.Annotated:
-                        for meta in _typ.get_args(ann)[1:]:
-                            if isinstance(meta, _Dep):
-                                subs[pname] = (meta.dependency, meta)
-                                break
-            plan = {"accepted": accepted, "subs": subs, "sig": sig}
-            _override_plan_cache[id(override_func)] = plan
-
-        accepted = plan["accepted"]
-        if accepted is None:
-            return original_dk
-
-        dk: dict[str, Any] = {k: v for k, v in original_dk.items() if k in accepted}
-
-        # Pull missing simple-type params (query/header/cookie) from the raw
-        # Request — the override may need params the original dep chain
-        # never declared (so Rust never extracted them). We accept the
-        # Request out of ``resolved_env`` under the synthetic injection
-        # name ``__fastapi_turbo_override_request__``.
-        _req = resolved_env.get("__fastapi_turbo_override_request__")
-        _sig = plan.get("sig")
-        if _req is not None and _sig is not None:
-            for pname, param in _sig.parameters.items():
-                if pname in dk:
-                    continue
-                if pname in plan["subs"]:
-                    continue
-                # Pull from query string first, then headers, then cookies.
-                try:
-                    qp = _req.query_params
-                    if pname in qp:
-                        dk[pname] = qp[pname]
-                        continue
-                except Exception as _exc:  # noqa: BLE001
-                    _log.debug("silent catch in applications: %r", _exc)
-                try:
-                    hp = _req.headers
-                    if pname in hp:
-                        dk[pname] = hp[pname]
-                        continue
-                except Exception as _exc:  # noqa: BLE001
-                    _log.debug("silent catch in applications: %r", _exc)
-                try:
-                    cp = _req.cookies
-                    if pname in cp:
-                        dk[pname] = cp[pname]
-                        continue
-                except Exception as _exc:  # noqa: BLE001
-                    _log.debug("silent catch in applications: %r", _exc)
-
-        for pname, (sub_callable, _sub_marker) in plan["subs"].items():
-            # Respect nested dependency_overrides.
-            effective = sub_callable
-            if app_obj is not None and app_obj.dependency_overrides:
-                effective = app_obj.dependency_overrides.get(sub_callable, sub_callable)
-            sub_key = id(effective)
-            if sub_key in cache_obj:
-                dk[pname] = cache_obj[sub_key]
-                continue
-            # Resolve sub-dep's own kwargs recursively (one level).
-            sub_dk = _resolve_override_kwargs(effective, resolved_env, resolved_env, app_obj, cache_obj)
-            try:
-                if inspect.iscoroutinefunction(effective):
-                    sub_val = _make_sync_wrapper(effective, app=app)(**sub_dk)
-                else:
-                    sub_val = effective(**sub_dk)
-            except TypeError as te:
-                # Override's sub-dep needs request-bound params we never
-                # extracted (e.g. a query param ``k`` that the original
-                # chain didn't require). Convert to a FA-shaped 422 —
-                # identifying missing required params from the
-                # signature.
-                msg = str(te)
-                missing = []
-                try:
-                    sig = inspect.signature(effective)
-                    for pn, p in sig.parameters.items():
-                        if pn not in sub_dk and p.default is inspect.Parameter.empty:
-                            missing.append(pn)
-                except Exception as _exc:  # noqa: BLE001
-                    _log.debug("silent catch in applications: %r", _exc)
-                if missing:
-                    from fastapi_turbo.exceptions import HTTPException as _HE
-                    detail = [
-                        {
-                            "type": "missing",
-                            "loc": ["query", m],
-                            "msg": "Field required",
-                            "input": None,
-                        }
-                        for m in missing
-                    ]
-                    raise _HE(status_code=422, detail=detail) from None
-                raise
-            dk[pname] = sub_val
-            cache_obj[sub_key] = sub_val
-        return dk
-
-    # When the resolution plan combined multiple body params (handler body
-    # + dep body) into one ``_combined_body`` (see ``build_resolution_plan``),
-    # the compiled handler needs to split the combined model back into
-    # individual named body slots so dep input_maps that reference them by
-    # name still resolve.
-    _combined_body_split_names: list[str] | None = None
-    for _bstep in params:
-        if (
-            _bstep.get("name") == "_combined_body"
-            and _bstep.get("_is_combined_body_for_deps")
-            and _bstep.get("_body_param_names")
-        ):
-            _combined_body_split_names = list(_bstep["_body_param_names"])
-            break
-
-    def _compiled(**kwargs):
-        # Stamp endpoint/route onto the request scope so Sentry can
-        # refine transaction names from URL to route / endpoint style.
-        _refine_request_scope_for_route(endpoint, path)
-        # FastAPI semantics: a ``Depends(...)`` that raises
-        # ``HTTPException`` short-circuits BEFORE parameter validation
-        # errors surface. Rust collects extraction errors and stashes
-        # them in a private kwarg so we can try running deps first —
-        # if any dep raises ``HTTPException`` that response wins; if
-        # all deps succeed we then emit the queued 422.
-        _raw_body_str_pending = kwargs.pop("__fastapi_turbo_raw_body_str__", None)
-        kwargs.pop("__fastapi_turbo_raw_body_bytes__", None)
-        _pending_extraction_errors_json = kwargs.pop(
-            "__fastapi_turbo_extraction_errors__", None
-        )
-        # If the plan combined body params for the dep chain, unpack the
-        # combined model into the individual names so downstream input_maps
-        # still find ``item`` / ``item2`` / etc.
-        if _combined_body_split_names is not None:
-            _cb = kwargs.get("_combined_body")
-            if _cb is not None:
-                for _bn in _combined_body_split_names:
-                    try:
-                        kwargs[_bn] = getattr(_cb, _bn)
-                    except AttributeError:
-                        pass
-        resolved = kwargs
-        cache = {}
-        generators_to_cleanup: list[tuple] = []
-        # Starlette/FastAPI semantics: yield-dep teardown runs AFTER the
-        # response has been built and the middleware chain has unwound.
-        # If this call originates from a middleware-wrapped entry point,
-        # `_middleware_request` is present in kwargs and carries a
-        # `_pending_teardowns` list that the outer wrapper drains once
-        # the MW chain returns. When no middleware is in play we fall back
-        # to running teardown in our own finally block (no deferral
-        # possible).
-        _mw_req = kwargs.get("_middleware_request")
-        _defer_teardown = _mw_req is not None
-        if _defer_teardown:
-            if not hasattr(_mw_req, "_pending_teardowns"):
-                _mw_req._pending_teardowns = []
-
-        try:
-            for name, func, original_func, input_map, func_id, is_generator, use_cache, sec_scopes_info, dep_scope in dep_chain:
-                # Check dependency_overrides at call time (P0 fix #1)
-                actual_func = func
-                override_used = None
-                if _app is not None and _app.dependency_overrides:
-                    override = _app.dependency_overrides.get(original_func)
-                    if override is not None:
-                        override_used = override
-                        actual_func = override
-                        if inspect.iscoroutinefunction(actual_func):
-                            actual_func = _make_sync_wrapper(actual_func, app=app)
-
-                # Respect `use_cache=False` — force a fresh call for each
-                # usage of this dep within the request (FastAPI semantics).
-                # Cache key also includes ``dep_scope`` — FA 0.120+ treats
-                # ``scope="function"`` and ``scope="request"`` as separate
-                # instances (so ``function``-scope teardown doesn't tear
-                # down a ``request``-scope sibling).
-                _cache_key = (func_id, dep_scope) if func_id is not None else None
-                if use_cache and _cache_key is not None and _cache_key in cache:
-                    resolved[name] = cache[_cache_key]
-                    continue
-                # Skip deps whose required inputs never arrived — when
-                # there are queued extraction errors, a missing input
-                # is what the user will see in the 422 anyway. Running
-                # the dep body with missing kwargs would just raise a
-                # confusing TypeError. But when an override is in play,
-                # run it regardless: the override's signature may not
-                # need the missing inputs at all (FA parity for
-                # ``dependency_overrides``).
-                if (
-                    override_used is None
-                    and _pending_extraction_errors_json is not None
-                    and any(sk not in resolved for _, sk in input_map)
-                ):
-                    continue
-                dk = {pn: resolved[sk] for pn, sk in input_map if sk in resolved}
-
-                # Populate this dep's SecurityScopes param with the
-                # accumulated ``Security(..., scopes=[...])`` scopes
-                # from the call chain. Rust injected an empty
-                # SecurityScopes placeholder; we replace it here.
-                if sec_scopes_info is not None:
-                    _ss_param, _ss_list = sec_scopes_info
-                    try:
-                        from fastapi_turbo.security import SecurityScopes as _SS
-                        dk[_ss_param] = _SS(scopes=list(_ss_list))
-                    except Exception as _exc:  # noqa: BLE001
-                        _log.debug("silent catch in applications: %r", _exc)
-
-                if override_used is not None:
-                    # Override may have a different signature from the
-                    # original (fewer params, or its own Depends sub-deps).
-                    # Drop kwargs the override doesn't accept, and resolve
-                    # its sub-deps via a lazily-built mini-plan.
-                    dk = _resolve_override_kwargs(
-                        override_used, dk, resolved, _app, cache
-                    )
-
-                if is_generator:
-                    # Generator dep (yield) support.
-                    gen = actual_func(**dk)
-                    if inspect.isasyncgen(gen):
-                        # Dispatch strategy for async yield-deps:
-                        #
-                        # * ASYNC handler → run the whole dep lifecycle
-                        #   (setup + teardown) on the worker loop. This
-                        #   is the only path that is safe for async
-                        #   resources whose teardown uses
-                        #   ``asyncio.create_task`` /
-                        #   ``get_running_loop`` (SQLAlchemy's
-                        #   ``AsyncSession.__aexit__``, asyncpg pool
-                        #   release, redis.asyncio). Driving those
-                        #   teardowns via sync ``coro.send(None)`` on
-                        #   the request thread raises
-                        #   ``RuntimeError: no running event loop`` —
-                        #   and trying to recover by calling
-                        #   ``gen.__anext__()`` again corrupts the
-                        #   generator ("cannot reuse already awaited
-                        #   aclose()"). Always submit on the worker.
-                        #
-                        # * SYNC handler → keep the try-sync fast path
-                        #   so that contextvar mutations inside the
-                        #   async-gen are visible to the handler on the
-                        #   same thread (FA parity via
-                        #   ``test_dependency_contextvars``). No async
-                        #   resource teardown is expected here — if the
-                        #   gen is ContextVar-only, it never touches the
-                        #   loop.
-                        _handler_is_async = inspect.iscoroutinefunction(endpoint)
-                        if _handler_is_async:
-                            from fastapi_turbo._async_worker import submit as _submit
-                            result = _submit(gen.__anext__(), app=_app)
-                            generators_to_cleanup.append((gen, "worker", dep_scope))
-                        else:
-                            _anext_coro = gen.__anext__()
-                            _sync_ok = False
-                            try:
-                                _anext_coro.send(None)
-                            except StopIteration as _stop:
-                                result = _stop.value
-                                _sync_ok = True
-                            except BaseException:
-                                _anext_coro.close()
-                                raise
-                            if _sync_ok:
-                                generators_to_cleanup.append((gen, None, dep_scope))
-                            else:
-                                # Suspended on a real await — continue
-                                # the partial coro on the worker loop.
-                                # (Trace-fidelity tests with 5-middleware
-                                # + async yield-deps rely on this not
-                                # restarting a fresh __anext__.)
-                                import asyncio as _asyncio
-                                from fastapi_turbo._async_worker import get_loop as _get_loop
-                                _loop = _get_loop()
-                                _fut = _asyncio.run_coroutine_threadsafe(_anext_coro, _loop)
-                                result = _fut.result(timeout=30)
-                                generators_to_cleanup.append((gen, "worker", dep_scope))
-                    else:
-                        result = next(gen)
-                        generators_to_cleanup.append((gen, None, dep_scope))
-                else:
-                    result = actual_func(**dk)
-
-                resolved[name] = result
-                if use_cache and _cache_key is not None:
-                    cache[_cache_key] = result
-        except Exception as dep_exc:
-            # Dependency raised — route through exception_handlers like
-            # FastAPI/Starlette does. SGLang depends on this (route-level
-            # `dependencies=[Depends(...)]` that raise HTTPException).
-            _maybe_print_debug_traceback(_app, dep_exc)
-            # Capture non-HTTP dep failures so TestClient re-raises them
-            # (unless a SPECIFIC handler catches — ``Exception`` catch-all
-            # doesn't count, per Starlette's ``raise_server_exceptions``).
-            try:
-                from fastapi_turbo.exceptions import HTTPException as _HE
-                _handled_by_specific = False
-                if _app is not None and _app.exception_handlers:
-                    for _cls in _app.exception_handlers.keys():
-                        if _cls is Exception:
-                            continue
-                        if isinstance(_cls, type) and isinstance(dep_exc, _cls):
-                            _handled_by_specific = True
-                            break
-                if (
-                    _app is not None
-                    and not isinstance(dep_exc, _HE)
-                    and not _handled_by_specific
-                ):
-                    _app._captured_server_exceptions.append(dep_exc)
-            except ImportError:
-                pass
-            if _app is not None and _app.exception_handlers:
-                handler_result = _app._invoke_exception_handler(dep_exc)
-                if handler_result is not None:
-                    return handler_result
-            raise
-
-        # All deps succeeded without raising. If Rust queued any
-        # extraction errors (missing headers, unparseable path params,
-        # etc.) surface them now — matches FA's post-dep validation
-        # order. BUT when dependency_overrides replace deps whose input
-        # params are what triggered the 422, the override may have
-        # legitimately satisfied the handler — in that case swallow
-        # queued errors that don't correspond to a still-missing
-        # handler param.
-        if _pending_extraction_errors_json is not None:
-            from fastapi_turbo.responses import JSONResponse as _JSONResp
-            import json as _json
-            detail = _json.loads(_pending_extraction_errors_json)
-            # Filter: keep only errors whose first non-section loc item
-            # matches a handler param that's STILL unresolved. If the
-            # override made the dep succeed, the error isn't user-visible.
-            if _app is not None and _app.dependency_overrides:
-                kept = []
-                for err in detail:
-                    loc = err.get("loc") or []
-                    leaf = loc[-1] if loc else None
-                    if leaf in handler_param_names and leaf not in resolved:
-                        kept.append(err)
-                detail = kept
-            if detail:
-                # Route through ``@app.exception_handler(RequestValidationError)``
-                # if registered; otherwise fall back to the default
-                # ``{"detail": [...]}`` 422 body. Only capture for
-                # ``TestClient`` re-raise when the handler itself raised
-                # (matching FA's raise-propagates-out semantic).
-                try:
-                    from fastapi_turbo.exceptions import (
-                        RequestValidationError as _RVE,
-                    )
-                    _rve_body2 = None
-                    if _raw_body_str_pending is not None:
-                        try:
-                            _rve_body2 = _json.loads(_raw_body_str_pending)
-                        except Exception:
-                            _rve_body2 = _raw_body_str_pending
-                    exc = _RVE(detail, body=_rve_body2, endpoint_ctx=_endpoint_ctx)
-                    if _app is not None and _RVE in _app.exception_handlers:
-                        handler_raised = False
-                        try:
-                            handler_result = _app._invoke_exception_handler_strict(exc)
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                            handler_raised = True
-                            handler_result = None
-                        if handler_raised and _app is not None:
-                            _app._captured_server_exceptions.append(exc)
-                        if handler_result is not None:
-                            return handler_result
-                except ImportError:
-                    pass
-                return _JSONResp(content={"detail": detail}, status_code=422)
-
-        _raised_exc = None
-        _final_result_holder: list = [None]
-        try:
-            try:
-                _hkwargs = {k: resolved[k] for k in handler_param_names if k in resolved}
-                # Coerce raw strings to Enum types (FastAPI does this automatically)
-                for _ek, _ecls in _enum_coerce_deps.items():
-                    if _ek in _hkwargs and isinstance(_hkwargs[_ek], str):
-                        try:
-                            _hkwargs[_ek] = _ecls(_hkwargs[_ek])
-                        except (ValueError, KeyError):
-                            pass
-                try:
-                    _apply_container_coerce(_hkwargs)
-                except Exception as _ccexc2:
-                    from fastapi_turbo.exceptions import (
-                        RequestValidationError as _RVE3,
-                    )
-                    if isinstance(_ccexc2, _RVE3):
-                        from fastapi_turbo.responses import (
-                            JSONResponse as _JRx2,
-                        )
-                        return _JRx2(
-                            content={"detail": list(_ccexc2.errors())},
-                            status_code=422,
-                        )
-                    raise
-                result = handler_func(**_hkwargs)
-            except Exception as exc:
-                _raised_exc = exc
-                # In debug mode, surface the full traceback on non-HTTPException errors.
-                _maybe_print_debug_traceback(_app, exc)
-                # Route through app's exception_handlers if one is registered.
-                # Before handling, run yield-dep teardown with the
-                # exception THROWN in — this mirrors FA's behaviour,
-                # letting the yield-dep's ``except`` clause observe the
-                # error (the test suite asserts on this).
-                if generators_to_cleanup:
-                    try:
-                        _run_pending_teardowns(
-                            reversed(generators_to_cleanup), throw_exc=exc, app=_app
-                        )
-                    except Exception as _te_exc:
-                        # FA parity: yield-dep swallowed the handler's
-                        # exception and teardown raised ``FastAPIError``.
-                        # Capture & replace ``exc`` so downstream
-                        # capture + handler logic sees the FastAPIError.
-                        exc = _te_exc
-                        _raised_exc = _te_exc
-                    generators_to_cleanup.clear()
-                # Handler-response semantics, matching Starlette:
-                #   - specific exception class handled → NOT re-raised
-                #   - ``Exception`` catch-all handled → still re-raised
-                #     (Starlette's ``ServerErrorMiddleware`` returns a
-                #     response AND bubbles up so TestClient can re-raise)
-                handler_result = None
-                handler_raised = False
-                if _app is not None and _app.exception_handlers:
-                    try:
-                        handler_result = _app._invoke_exception_handler(exc)
-                    except Exception:
-                        handler_raised = True
-                # ``handled_by_specific`` = matched a handler that is NOT
-                # the generic ``Exception`` catch-all.
-                handled_by_specific = False
-                if handler_result is not None and not handler_raised:
-                    for exc_cls in _app.exception_handlers.keys() if _app else []:
-                        if exc_cls is Exception:
-                            continue
-                        if isinstance(exc_cls, type) and isinstance(exc, exc_cls):
-                            handled_by_specific = True
-                            break
-                try:
-                    from fastapi_turbo.exceptions import HTTPException as _HE
-                    if (
-                        _app is not None
-                        and not isinstance(exc, _HE)
-                        and not handled_by_specific
-                    ):
-                        _app._captured_server_exceptions.append(exc)
-                except ImportError:
-                    pass
-                if handler_result is not None and not handler_raised:
-                    return handler_result
-                raise exc
-            # Apply response_model filtering (P0 fix #5)
-            if response_model is not None:
-                try:
-                    result = _apply_response_model(
-                        result, response_model,
-                        include=_rm_include, exclude=_rm_exclude,
-                        exclude_unset=_rm_exclude_unset,
-                        exclude_defaults=_rm_exclude_defaults,
-                        exclude_none=_rm_exclude_none,
-                        endpoint_ctx=_endpoint_ctx,
-                    )
-                except Exception as _rve:  # noqa: BLE001
-                    from fastapi_turbo.exceptions import (
-                        ResponseValidationError as _RVE2,
-                    )
-                    if (
-                        _app is not None
-                        and _RVE2 in _app.exception_handlers
-                    ):
-                        handler_raised = False
-                        try:
-                            hdl_result = _app._invoke_exception_handler_strict(_rve)
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                            handler_raised = True
-                            hdl_result = None
-                        if handler_raised and _app is not None:
-                            _app._captured_server_exceptions.append(_rve)
-                            raise
-                        if hdl_result is not None:
-                            return hdl_result
-                    if _app is not None:
-                        _app._captured_server_exceptions.append(_rve)
-                    raise
-            # Wrap in response_class if set
-            if _response_class is not None:
-                result = _wrap_response_class(result, _response_class)
-            if status_code is not None:
-                result = _apply_status_code(result, status_code)
-            _final_result_holder[0] = result
-            return result
-        finally:
-            # Starlette parity: close any UploadFile passed to the handler
-            # once the request is done so server-side tests can assert
-            # ``.file.closed``. Matches Starlette's ``form.close()`` on
-            # ``ExceptionMiddleware``'s ``finally`` block.
-            try:
-                for _v in list(resolved.values()):
-                    if hasattr(_v, "close") and hasattr(_v, "filename"):
-                        try:
-                            _r = _v.close()
-                            if hasattr(_r, "__await__"):
-                                try:
-                                    _r.send(None)
-                                except (StopIteration, Exception):
-                                    pass
-                        except Exception:
-                            pass
-                    elif isinstance(_v, list):
-                        for _iv in _v:
-                            if hasattr(_iv, "close") and hasattr(_iv, "filename"):
-                                try:
-                                    _r = _iv.close()
-                                    if hasattr(_r, "__await__"):
-                                        try:
-                                            _r.send(None)
-                                        except (StopIteration, Exception):
-                                            pass
-                                except Exception:
-                                    pass
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("silent catch in applications: %r", _exc)
-            # Starlette/FastAPI semantics: yield-dep teardown runs AFTER
-            # the middleware chain unwinds, not before. That lets a
-            # middleware body read the state mutated during handler
-            # execution — e.g.
-            # ``response.headers[x] = state.copy()`` in
-            # ``test_dependency_contextmanager`` sees ``"started"`` not
-            # ``"completed"``. When middleware is present, we stash the
-            # teardowns on the middleware request and the outer wrapper
-            # drains them post-response. Otherwise run inline.
-            #
-            # FA 0.120+ scope split: ``function``-scope teardowns MUST run
-            # right here (before the response is finalized) — that way an
-            # HTTPException raised after ``yield`` bubbles out as the real
-            # response. ``request``-scope teardowns keep the legacy
-            # deferred behavior (after streaming body completes).
-            _function_scope_tds = [
-                t for t in generators_to_cleanup
-                if (len(t) == 3 and t[2] == "function")
-            ]
-            _request_scope_tds = [
-                t for t in generators_to_cleanup
-                if not (len(t) == 3 and t[2] == "function")
-            ]
-            # Function-scope always inline (including re-raising any
-            # HTTPException from a post-yield statement).
-            if _function_scope_tds:
-                _run_pending_teardowns(
-                    reversed(_function_scope_tds),
-                    propagate_exceptions=True,
-                    app=_app,
-                )
-            if _defer_teardown and _mw_req is not None:
-                _mw_req._pending_teardowns.extend(
-                    reversed(_request_scope_tds)
-                )
-            elif _request_scope_tds:
-                # FA 0.120+ ``scope="request"`` for a StreamingResponse must
-                # defer teardown until AFTER the body iterator is fully
-                # consumed (the body peeks at state mutated by the dep).
-                from fastapi_turbo.responses import StreamingResponse as _SR2
-                _final_result = _final_result_holder[0]
-                if isinstance(_final_result, _SR2):
-                    _orig_iter = _final_result.body_iterator
-                    _tds = list(reversed(_request_scope_tds))
-                    import inspect as _insp
-                    if _insp.isasyncgen(_orig_iter) or hasattr(_orig_iter, "__anext__"):
-                        async def _wrap_iter(orig=_orig_iter, tds=_tds, app_ref=_app):
-                            try:
-                                async for item in orig:
-                                    yield item
-                            finally:
-                                _run_pending_teardowns(tds, app=app_ref)
-                        _final_result.body_iterator = _wrap_iter()
-                    else:
-                        def _wrap_iter_sync(orig=_orig_iter, tds=_tds, app_ref=_app):
-                            try:
-                                for item in orig:
-                                    yield item
-                            finally:
-                                _run_pending_teardowns(tds, app=app_ref)
-                        _final_result.body_iterator = _wrap_iter_sync()
-                else:
-                    # FA parity: a post-yield ``raise`` in a yield-dep
-                    # bubbles up to the TestClient via
-                    # ``_captured_server_exceptions``. The handler's
-                    # response has already been computed, so collect
-                    # (don't raise) any teardown errors.
-                    _td_errs: list = []
-                    _run_pending_teardowns(
-                        reversed(_request_scope_tds),
-                        collected_errors=_td_errs,
-                        app=_app,
-                    )
-                    if _td_errs and _app is not None:
-                        for _td_exc in _td_errs:
-                            _app._captured_server_exceptions.append(_td_exc)
-
-    # Marker for the Rust router: this compiled handler knows how to
-    # consume a deferred extraction-errors blob, so Rust should stash
-    # (not raise) 422s and let dep bodies run first — matching FA's
-    # "HTTPException from Depends wins over param validation" rule.
-    _compiled._fastapi_turbo_original_endpoint = endpoint  # type: ignore[attr-defined]
-    _compiled._fastapi_turbo_defers_extraction_errors = True  # type: ignore[attr-defined]
-    # Mount-prefix patching hook — see ``_compiled_no_deps``.
-    _compiled._fastapi_turbo_endpoint_ctx = _endpoint_ctx  # type: ignore[attr-defined]
-
-    # ── Batched-submit fast path ──────────────────────────────────────────
-    # When the handler is async AND any dep in the chain is an async-gen
-    # (SQLAlchemy AsyncSession, asyncpg/redis.asyncio pools) the generic
-    # ``_compiled`` above hops the worker loop THREE times per request —
-    # dep setup, handler await, dep teardown. Each hop is a
-    # ``run_coroutine_threadsafe`` round-trip (~100 μs). uvicorn runs all
-    # three on one loop; that was our 25% deficit on the SQLA async row.
-    #
-    # Collapse the three hops into one by executing the async-dep setup +
-    # handler await + async-dep teardown INSIDE a single coroutine and
-    # submitting that once. Only activate when the chain is "easy": no
-    # security-scopes plumbing, no sync generators mixed in. If anything
-    # at call time smells complex (dep_overrides, SecurityScopes, etc.) we
-    # fall back to the generic ``_compiled`` closure.
-    _handler_is_coro = inspect.iscoroutinefunction(_orig_endpoint)
-    _chain_all_simple = all(
-        # async gen yield dep OK
-        (is_gen and inspect.isasyncgenfunction(func))
-        # plain async fn OK
-        or (not is_gen and inspect.iscoroutinefunction(
-            getattr(func, "_fastapi_turbo_original_async", func)
-        ))
-        # plain sync callable OK (after generator check)
-        or (not is_gen and not inspect.isasyncgenfunction(func))
-        for _name, func, _orig, _imap, _fid, is_gen, _uc, _ssi, _sc in dep_chain
-    )
-    _has_async_yield_dep = any(
-        is_gen and inspect.isasyncgenfunction(func)
-        for _name, func, _orig, _imap, _fid, is_gen, _uc, _ssi, _sc in dep_chain
-    )
-    _any_sec_scope = any(ssi is not None for *_x, ssi, _sc in dep_chain)
-    _any_sync_gen = any(
-        is_gen and not inspect.isasyncgenfunction(func)
-        for _name, func, _orig, _imap, _fid, is_gen, _uc, _ssi, _sc in dep_chain
-    )
-
-    if (
-        _handler_is_coro
-        and _has_async_yield_dep
-        and not _any_sec_scope
-        and not _any_sync_gen
-    ):
-        from fastapi_turbo._async_worker import submit as _worker_submit
-
-        # Precompute which deps are async (yield vs fn) vs plain sync.
-        # Tuple: (name, func, orig_func, input_map, func_id, kind, use_cache)
-        # kind ∈ {"async_gen", "async_fn", "sync_fn"}
-        _fp_chain: list[tuple] = []
-        for name, func, orig_func, input_map, func_id, is_gen, use_cache, _ssi, _sc in dep_chain:
-            orig_async = getattr(func, "_fastapi_turbo_original_async", None)
-            if is_gen:
-                kind = "async_gen"
-                call_fn = func  # async-gen fn
-            elif orig_async is not None:
-                kind = "async_fn"
-                call_fn = orig_async  # unwrapped async fn
-            elif inspect.iscoroutinefunction(func):
-                kind = "async_fn"
-                call_fn = func
-            else:
-                kind = "sync_fn"
-                call_fn = func
-            _fp_chain.append(
-                (name, call_fn, orig_func, input_map, func_id, kind, use_cache)
-            )
-
-        _fp_endpoint = _orig_endpoint  # the true async handler
-
-        def _compiled_fast(**kwargs):
-            # Stamp endpoint/route onto the request scope so Sentry can
-            # refine transaction names from URL to route / endpoint style.
-            _refine_request_scope_for_route(endpoint, path)
-            # Runtime escape hatches — fall back to the generic path.
-            if _app is not None and _app.dependency_overrides:
-                return _compiled(**kwargs)
-
-            kwargs.pop("__fastapi_turbo_raw_body_str__", None)
-            kwargs.pop("__fastapi_turbo_raw_body_bytes__", None)
-            _extract_err_json = kwargs.pop(
-                "__fastapi_turbo_extraction_errors__", None
-            )
-            _mw_req = kwargs.get("_middleware_request")
-            _defer_td = _mw_req is not None
-            if _defer_td and not hasattr(_mw_req, "_pending_teardowns"):
-                _mw_req._pending_teardowns = []
-
-            resolved = kwargs
-            _cache: dict = {}
-
-            # PHASE 1 (submitted): resolve deps + run handler. Produces a
-            # result snapshot AND the list of gens that need teardown.
-            # Teardown MUST run after the response is captured (FA sends
-            # the body / middleware reads state.copy() before teardown
-            # mutates state), so it runs in a separate submit below.
-            #
-            # When the handler raises, yield-dep ``finally`` blocks must
-            # still fire (in LIFO order) so DB connections close, state
-            # dicts record the "finished" transition, etc. That teardown
-            # has to run on the SAME loop as setup, so we perform it
-            # inside this coro before re-raising.
-            _async_gens_holder: list = []
-
-            async def _setup_and_handler():
-                async_gens = _async_gens_holder
-                for name, call_fn, _orig, input_map, func_id, kind, use_cache in _fp_chain:
-                    ck = (func_id, "request") if func_id is not None else None
-                    if use_cache and ck is not None and ck in _cache:
-                        resolved[name] = _cache[ck]
-                        continue
-                    dk = {
-                        target: resolved[src]
-                        for target, src in input_map
-                        if src in resolved
-                    }
-                    if kind == "async_gen":
-                        gen = call_fn(**dk)
-                        val = await gen.__anext__()
-                        async_gens.append(gen)
-                    elif kind == "async_fn":
-                        val = await call_fn(**dk)
-                    else:
-                        val = call_fn(**dk)
-                    resolved[name] = val
-                    if use_cache and ck is not None:
-                        _cache[ck] = val
-
-                if _extract_err_json:
-                    from fastapi_turbo.responses import JSONResponse as _JR
-                    import json as _json
-                    return (_JR(
-                        content={"detail": _json.loads(_extract_err_json)},
-                        status_code=422,
-                    ), async_gens)
-
-                _hkwargs = {
-                    k: resolved[k]
-                    for k in handler_param_names
-                    if k in resolved
-                }
-                for _ek, _ecls in _enum_coerce_deps.items():
-                    if _ek in _hkwargs and isinstance(_hkwargs[_ek], str):
-                        try:
-                            _hkwargs[_ek] = _ecls(_hkwargs[_ek])
-                        except (ValueError, KeyError):
-                            pass
-                try:
-                    _apply_container_coerce(_hkwargs)
-                except Exception as _ccexc:
-                    from fastapi_turbo.exceptions import (
-                        RequestValidationError as _RVEfp,
-                    )
-                    if isinstance(_ccexc, _RVEfp):
-                        from fastapi_turbo.responses import JSONResponse as _JRfp
-                        return (_JRfp(
-                            content={"detail": list(_ccexc.errors())},
-                            status_code=422,
-                        ), async_gens)
-                    raise
-
-                try:
-                    result = await _fp_endpoint(**_hkwargs)
-                except BaseException as _h_exc:
-                    # Handler raised. Drive each yield-dep's finally /
-                    # except via ``athrow`` in reverse order so the dep
-                    # can observe the exception and clean up on the
-                    # same loop. A dep re-raising ``_h_exc`` is normal
-                    # (the ``finally`` re-raises on exit); swallow that
-                    # and keep unwinding. Any other exception from a
-                    # dep's teardown also shouldn't mask the original.
-                    _gens = list(_async_gens_holder)
-                    _async_gens_holder.clear()
-                    for _gen in reversed(_gens):
-                        try:
-                            await _gen.athrow(_h_exc)
-                        except StopAsyncIteration:
-                            pass
-                        except BaseException as _td_exc:
-                            if _td_exc is _h_exc:
-                                pass  # finally re-raised the same exception
-                            # else: swallow — original exception wins
-                    raise
-                # Snapshot via response_model BEFORE returning — this
-                # decouples the result from the dep's shared-state dict
-                # so post-submit teardown can't mutate the body.
-                if response_model is not None and not hasattr(result, "status_code"):
-                    result = _apply_response_model(
-                        result,
-                        response_model,
-                        include=response_model_include,
-                        exclude=response_model_exclude,
-                        exclude_unset=response_model_exclude_unset,
-                        exclude_defaults=response_model_exclude_defaults,
-                        exclude_none=response_model_exclude_none,
-                        by_alias=response_model_by_alias,
-                        endpoint_ctx=_endpoint_ctx,
-                    )
-                return (result, async_gens)
-
-            async def _run_teardown(gens):
-                for gen in reversed(gens):
-                    try:
-                        await gen.__anext__()
-                    except StopAsyncIteration:
-                        pass
-
-            try:
-                # NOTE: do NOT catch & fall back here. The handler has side
-                # effects (DB INSERTs, sequence bumps, external calls); a
-                # fallback would re-run them, causing duplicated writes.
-                # Let HTTPException / RequestValidationError / user errors
-                # propagate — the outer handler turns them into responses.
-                try:
-                    result, _async_gens = _worker_submit(_setup_and_handler(), app=_app)
-                except BaseException as _exc_fast:
-                    # Capture non-HTTP handler errors so
-                    # ``TestClient(raise_server_exceptions=True)`` can
-                    # re-raise them in the test thread, matching
-                    # Starlette's ASGI TestClient semantics.
-                    try:
-                        from fastapi_turbo.exceptions import HTTPException as _HEfp
-                    except ImportError:
-                        _HEfp = ()  # type: ignore[assignment]
-                    if (
-                        _app is not None
-                        and not isinstance(_exc_fast, _HEfp)
-                    ):
-                        _app._captured_server_exceptions.append(_exc_fast)
-                    raise
-
-                # Post-process (response_class wrap / status_code) on main
-                # thread so it doesn't block the worker loop.
-                if (
-                    response_class is not None
-                    and not hasattr(result, "status_code")
-                ):
-                    try:
-                        _rc = response_class
-                        from fastapi_turbo.datastructures import DefaultPlaceholder as _DP
-                        if isinstance(_rc, _DP):
-                            _rc = getattr(_rc, "value", None)
-                        if _rc is not None:
-                            kwargs_rc = {}
-                            if status_code is not None:
-                                kwargs_rc["status_code"] = status_code
-                            result = _rc(result, **kwargs_rc)
-                    except Exception:
-                        pass
-                elif status_code is not None and not hasattr(result, "status_code"):
-                    from fastapi_turbo.responses import JSONResponse as _JRsc
-                    result = _JRsc(content=result, status_code=status_code)
-
-                # Teardown. If middleware is in the chain, defer — the
-                # outer MW wrapper drains ``_pending_teardowns`` AFTER the
-                # middleware unwinds (so MW can still see pre-teardown
-                # state via state.copy()). Otherwise fire-and-forget on
-                # the worker loop so the main thread returns immediately
-                # to Rust for response serialization. Teardown races in
-                # parallel with serialization + next request's setup,
-                # saving the ~120 μs synchronous teardown tail from our
-                # per-request p50.
-                #
-                # Safety: if teardown hasn't released the DB connection
-                # by the time the pool is empty, asyncpg/sqlalchemy will
-                # queue the next acquire — no corruption, only back-
-                # pressure. SQLAlchemy sessions with expire_on_commit=
-                # False (parity default) are safe to close in the
-                # background because their result objects are detached.
-                if _defer_td and _async_gens:
-                    for gen in reversed(_async_gens):
-                        _mw_req._pending_teardowns.append((gen, "worker", "request"))
-                elif _async_gens:
-                    import asyncio as _asyncio
-                    from fastapi_turbo._async_worker import get_loop as _get_loop_fast
-                    try:
-                        _asyncio.run_coroutine_threadsafe(
-                            _run_teardown(_async_gens), _get_loop_fast()
-                        )  # intentionally no .result() — fire-and-forget
-                    except Exception:
-                        pass
-
-                return result
-            finally:
-                pass
-
-        _compiled_fast._fastapi_turbo_original_endpoint = endpoint  # type: ignore[attr-defined]
-        _compiled_fast._fastapi_turbo_defers_extraction_errors = True  # type: ignore[attr-defined]
-        _compiled_fast._fastapi_turbo_endpoint_ctx = _endpoint_ctx  # type: ignore[attr-defined]
-        return _compiled_fast
-
-    return _compiled
 
 
 def _run_pending_teardowns(
@@ -1584,6 +257,7 @@ def _run_pending_teardowns(
 # Imports hoisted to module-level for the hot path (used by wrapped endpoints)
 from fastapi_turbo.requests import Request as _Request
 from fastapi_turbo.responses import JSONResponse as _JSONResponse
+from fastapi_turbo.responses import Response as _real_starlette_response
 
 
 async def _ws_entry_with_asgi_chain(app_self, ws, path_params, inner_ws_entry):
@@ -1679,6 +353,54 @@ from fastapi_turbo._middleware_wrap import (  # noqa: F401 — public-shape re-e
     _MiddlewareSuspendedError,
     _wrap_with_http_middlewares,
 )
+
+
+def _door_wrap_stream_teardown(app, stream_response, req_gens):
+    """Defer REQUEST-scope yield-dependency teardown to AFTER the streaming body is
+    fully sent (FastAPI ``request_stack`` order). The door owns the response, so it
+    wraps the ``StreamingResponse``'s ``body_iterator`` here; the teardown logic
+    itself stays in Python — drive each generator past its yield (LIFO), capturing
+    a post-yield raise onto the app since the response is already streaming."""
+    inner = stream_response.body_iterator
+
+    def _teardown():
+        for g in reversed(req_gens):
+            try:
+                g.send(None)
+            except StopIteration:
+                pass
+            except BaseException as exc:  # noqa: BLE001
+                if app is not None:
+                    try:
+                        app._captured_server_exceptions.append(exc)
+                    except Exception:  # noqa: BLE001
+                        pass
+            else:
+                try:
+                    g.close()
+                except BaseException:  # noqa: BLE001
+                    pass
+
+    if hasattr(inner, "__aiter__"):
+
+        async def _wrapped():
+            try:
+                async for chunk in inner:
+                    yield chunk
+            finally:
+                _teardown()
+
+    else:
+
+        def _wrapped():
+            try:
+                yield from inner
+            finally:
+                _teardown()
+
+    stream_response.body_iterator = _wrapped()
+
+
 def _collect_dependencies_from_markers(dependencies):
     """Convert a list of Depends markers into introspection-ready param dicts."""
     from fastapi_turbo.dependencies import Depends as DependsClass
@@ -1699,149 +421,6 @@ def _collect_dependencies_from_markers(dependencies):
                 "use_cache": dep.use_cache,
             })
     return result
-
-
-def _find_exception_handler(app, exc):
-    """Locate a custom exception handler for ``exc`` walking
-    ``app.exception_handlers`` by MRO. Returns ``(handler, matched_cls)``
-    where ``matched_cls`` is the class the handler was registered for
-    (so callers can distinguish a custom-subclass handler from a
-    catch-all ``Exception`` handler — only the latter re-raises after
-    running, mirroring Starlette's ServerErrorMiddleware vs
-    ExceptionMiddleware split). Returns ``(None, None)`` when no
-    user-registered handler matches."""
-    handlers = getattr(app, "exception_handlers", {}) or {}
-    for cls in type(exc).__mro__:
-        h = handlers.get(cls)
-        if h is not None:
-            return h, cls
-    return None, None
-
-
-async def _asgi_emit_exception(app, scope, send, exc):
-    """Turn an exception raised during in-process dispatch into an
-    ASGI response by (a) consulting ``app.exception_handlers`` for a
-    user-registered handler, (b) falling back to FA-compatible
-    defaults for HTTPException / RequestValidationError / other.
-
-    Re-raise policy mirrors Starlette's ``ServerErrorMiddleware`` /
-    ``ExceptionMiddleware`` split:
-
-      * HTTPException, RequestValidationError, WebSocketException
-        (and their subclasses) — these ARE the intended response
-        types FastAPI uses to encode 4xx / 5xx outcomes. The handler
-        sends a response and we return; never re-raise — even if the
-        match landed via a user-registered ``Exception`` catch-all
-        (Starlette's ExceptionMiddleware would have caught these
-        BEFORE ServerErrorMiddleware ever saw them).
-      * Generic ``Exception`` — the user may have registered a
-        catch-all ``@app.exception_handler(Exception)`` to render a
-        custom 500. Upstream Starlette runs that handler AND THEN
-        re-raises so ``httpx.ASGITransport(raise_app_exceptions=True)``
-        / ``TestClient(raise_server_exceptions=True)`` propagate the
-        original exception out of the test, instead of silently
-        masking a real failure as a successful 500. We match that
-        contract: re-raise after delivering the response.
-
-    Earlier impl gated the re-raise on ``matched_cls is Exception``
-    only, so a user-registered ``@app.exception_handler(Exception)``
-    that caught an HTTPException via MRO would re-raise it — uvicorn
-    saw the raise after the response was queued, dropped the
-    transport, and the client timed out with no response (issue #1).
-    Probe-confirmed divergence."""
-    from fastapi_turbo.requests import Request as _Req
-    from fastapi_turbo.responses import JSONResponse as _JR
-    from fastapi_turbo.exceptions import (
-        HTTPException as _HE,
-        RequestValidationError as _RVE,
-        WebSocketException as _WSE,
-    )
-
-    handler, matched_cls = _find_exception_handler(app, exc)
-    if handler is not None:
-        request = _Req(dict(scope))
-        try:
-            import inspect as _insp
-            if _insp.iscoroutinefunction(handler):
-                resp = await handler(request, exc)
-            else:
-                resp = handler(request, exc)
-                if _insp.iscoroutine(resp):
-                    resp = await resp
-            await _send_asgi_response(send, resp)
-            # Re-raise rule mirrors Starlette: a handler registered
-            # for ``Exception`` itself (catch-all) sits in
-            # ``ServerErrorMiddleware``, which RE-RAISES after running
-            # so ``raise_app_exceptions=True`` test transports
-            # propagate the original exception. Handlers registered
-            # for a more specific class (HTTPException,
-            # CustomError, etc.) live in ``ExceptionMiddleware``,
-            # which sends the response and stops there. Gate on BOTH
-            # the matched class AND the exception's actual type — a
-            # user-registered Exception handler that catches an
-            # HTTPException via MRO must NOT re-raise (Starlette's
-            # ExceptionMiddleware would have intercepted it first).
-            if matched_cls is Exception and not isinstance(
-                exc, (_HE, _RVE, _WSE)
-            ):
-                raise exc
-            return
-        except Exception as handler_exc:  # noqa: BLE001
-            if handler_exc is exc:
-                # The deliberate re-raise above; let it propagate.
-                raise
-            # Handler itself blew up — fall through to default
-            # rendering of the original exception.
-            pass
-
-    if isinstance(exc, _HE):
-        headers = getattr(exc, "headers", None) or {}
-        # Per RFC 9110 + Starlette: HTTP 1xx / 204 / 304 MUST NOT
-        # carry a body. Earlier we always emitted ``{"detail":null}``
-        # which broke ``test_starlette_exception::test_no_body_status_
-        # code_exception_handlers`` (response.content asserted empty).
-        from fastapi_turbo.responses import Response as _PlainResp
-        if exc.status_code in (204, 304) or 100 <= exc.status_code < 200:
-            resp = _PlainResp(status_code=exc.status_code)
-        else:
-            resp = _JR(content={"detail": exc.detail}, status_code=exc.status_code)
-        for k, v in headers.items():
-            resp.headers[k] = v
-        await _send_asgi_response(send, resp)
-        return
-    if isinstance(exc, _RVE):
-        # Pydantic ``ctx`` may carry ``Decimal`` / ``Path`` /
-        # other JSON-non-native types that explode in
-        # ``json.dumps``. Run the error list through ``jsonable_
-        # encoder`` first so Decimal → float, datetime → str, etc.
-        # Probe-confirmed against
-        # ``test_multi_body_errors::test_jsonable_encoder_requiring_error``.
-        from fastapi_turbo.encoders import jsonable_encoder as _je2
-        await _send_asgi_response(
-            send, _JR(
-                content={"detail": _je2(exc.errors())}, status_code=422
-            )
-        )
-        return
-    # Unhandled non-FA exception. Upstream Starlette's
-    # ``ServerErrorMiddleware`` ALWAYS sends a 500 with body
-    # ``Internal Server Error`` first, then re-raises so
-    # ``raise_server_exceptions=True`` tests still see the
-    # exception. With ``raise_server_exceptions=False``, the
-    # transport catches the re-raise and the rendered 500 body
-    # is what the test sees. Probe-confirmed against
-    # ``test_dependency_after_yield_streaming::test_broken_session_
-    # data_no_raise``: expects ``response.text == "Internal Server
-    # Error"`` under ``raise_server_exceptions=False``.
-    try:
-        from fastapi_turbo.responses import PlainTextResponse as _PTR
-        await _send_asgi_response(
-            send,
-            _PTR("Internal Server Error", status_code=500),
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    raise exc
 
 
 def _parse_range_header(header_val: str, total_len: int):
@@ -2317,66 +896,43 @@ def _load_real_starlette_class(submodule: str, classname: str):
         return cls
 
 
-_SENTRY_FASTAPI_HOOK_CACHE: dict = {"loaded": False, "fn": None, "integration_cls": None}
+# Real Starlette/FastAPI middleware class names → fastapi-turbo
+# middleware-type tag. Post-flip, ``app.add_middleware(...)`` is handed the
+# REAL middleware class, which lacks our ``_fastapi_turbo_middleware_type``
+# marker — so we resolve it by class name (distinctive across the Starlette
+# middleware suite) and match across the MRO so user subclasses resolve too.
+# Pre-flip these names ALSO match the clone classes, but the marker (checked
+# first in ``_tower_type_for``) wins there, keeping behaviour identical.
+_REAL_MW_NAME_TO_TYPE = {
+    "CORSMiddleware": "cors",
+    "GZipMiddleware": "gzip",
+    "HTTPSRedirectMiddleware": "httpsredirect",
+    "TrustedHostMiddleware": "trustedhost",
+    "SessionMiddleware": "python_http_session",
+    "AuthenticationMiddleware": "python_http_auth",
+    "BaseHTTPMiddleware": "base_http",
+}
 
 
-def _maybe_set_sentry_transaction_name(app, scope, matched_route) -> None:
-    """If Sentry's ``FastApiIntegration`` is loaded, set the
-    transaction name from ``scope['route'].path`` — replicating
-    what Sentry's monkey-patched ``fastapi.routing.get_request_handler``
-    would do on upstream FastAPI. Our dispatcher bypasses that
-    handler, so the patch never fires; without this call, Sentry's
-    legacy ``SentryAsgiMiddleware(app)`` setup falls back to the
-    concrete-URL transaction name and ``test_legacy_setup`` diffs
-    the URL against the expected route shape.
+def _tower_type_for(mw_cls):
+    """Resolve a middleware class (or string shorthand) to its
+    fastapi-turbo middleware-type tag, or ``None`` if unknown.
 
-    No-op when Sentry isn't installed or the integration isn't
-    loaded — the lookup is cached after the first call so the
-    common no-Sentry path stays at one dict read per request."""
-    cache = _SENTRY_FASTAPI_HOOK_CACHE
-    if not cache["loaded"]:
-        try:
-            import sentry_sdk
-            from sentry_sdk.integrations.fastapi import (
-                FastApiIntegration,
-                _set_transaction_name_and_source,
-            )
-            cache["sdk"] = sentry_sdk
-            cache["fn"] = _set_transaction_name_and_source
-            cache["integration_cls"] = FastApiIntegration
-        except Exception:  # noqa: BLE001
-            cache["fn"] = None
-        cache["loaded"] = True
-
-    fn = cache["fn"]
-    if fn is None:
-        return
-    try:
-        sentry_sdk = cache["sdk"]
-        client = sentry_sdk.get_client()
-        integration = client.get_integration(cache["integration_cls"])
-        if integration is None:
-            return
-        # Sentry's helper expects a request-like with a ``.scope``
-        # attribute; build a minimal shim around the live ASGI
-        # scope so the function can read ``scope['route'].path``
-        # / ``scope['endpoint']`` exactly as it would on upstream.
-        class _RequestShim:
-            __slots__ = ("scope",)
-
-            def __init__(self, asgi_scope):
-                self.scope = asgi_scope
-
-        fn(
-            sentry_sdk.get_current_scope(),
-            integration.transaction_style,
-            _RequestShim(scope),
-        )
-    except Exception:  # noqa: BLE001
-        # Defensive: any failure inside Sentry's helper must not
-        # affect the response. Sentry's own monkey-patches do the
-        # same thing.
-        pass
+    Recognises BOTH the clone's ``_fastapi_turbo_middleware_type`` marker
+    (which wins when present) AND real Starlette middleware classes by name,
+    so after the shim flip ``app.add_middleware(CORSMiddleware, ...)`` with
+    the *real* class still maps to the right Tower layer / Python-HTTP path.
+    A string is returned as-is (``app.add_middleware('cors', ...)``)."""
+    if isinstance(mw_cls, str):
+        return mw_cls
+    marker = getattr(mw_cls, "_fastapi_turbo_middleware_type", None)
+    if marker:
+        return marker
+    for base in getattr(mw_cls, "__mro__", ()):
+        tag = _REAL_MW_NAME_TO_TYPE.get(getattr(base, "__name__", ""))
+        if tag:
+            return tag
+    return None
 
 
 def _resolve_tower_bound_to_asgi_class(mw_cls):
@@ -2387,16 +943,14 @@ def _resolve_tower_bound_to_asgi_class(mw_cls):
     own. For the in-process / TestClient path we substitute the
     real Starlette class loaded around the shim.
 
-    Accepts both class markers (with ``_fastapi_turbo_middleware_type``
-    attribute) AND string-shorthand forms — ``app.add_middleware('cors',
-    ...)`` registers the string directly so we look it up here too.
+    Accepts class markers, real Starlette classes (resolved by name via
+    ``_tower_type_for``), AND string-shorthand forms — ``app.add_middleware(
+    'cors', ...)`` registers the string directly so we look it up here too.
 
     Returns ``None`` if the class / string isn't a Tower-bound marker
-    we know how to substitute."""
-    if isinstance(mw_cls, str):
-        mw_type = mw_cls
-    else:
-        mw_type = getattr(mw_cls, "_fastapi_turbo_middleware_type", None)
+    we know how to substitute (only CORS/GZip/HTTPSRedirect substitute —
+    TrustedHost runs through the raw-ASGI chain unchanged)."""
+    mw_type = _tower_type_for(mw_cls)
     if mw_type == "cors":
         return _load_real_starlette_class("middleware.cors", "CORSMiddleware")
     if mw_type == "gzip":
@@ -2406,176 +960,6 @@ def _resolve_tower_bound_to_asgi_class(mw_cls):
             "middleware.httpsredirect", "HTTPSRedirectMiddleware"
         )
     return None
-
-
-def _resolve_response_class(matched_route, app):
-    """Cascade: route.response_class →
-    route._fastapi_turbo_effective_response_class (stamped at
-    ``include_router`` time, carries the router-level or
-    include-level default) → app.default_response_class →
-    JSONResponse.
-
-    Mirrors upstream's resolution order so handlers on a router with
-    ``default_response_class=HTMLResponse`` (or included with
-    ``include_router(..., default_response_class=…)``) correctly
-    serialize string returns as HTML rather than JSON-quoting them."""
-    from fastapi_turbo.responses import JSONResponse as _JR_default
-    rc = getattr(matched_route, "response_class", None)
-    if rc is not None:
-        return rc
-    rc = getattr(matched_route, "_fastapi_turbo_effective_response_class", None)
-    if rc is not None:
-        return rc
-    rc = getattr(app, "default_response_class", None)
-    if rc is not None:
-        return rc
-    return _JR_default
-
-
-def _is_json_response_class(cls) -> bool:
-    """True when ``cls`` is a JSON-style Response that wants its
-    ``content`` to be a Python value (dict / list / Pydantic model
-    etc.) rather than a pre-rendered string. Used by the in-process
-    dispatch to decide whether to ``jsonable_encoder`` the raw
-    handler return before passing it to the response constructor."""
-    try:
-        from fastapi_turbo.responses import (
-            JSONResponse as _JR,
-            ORJSONResponse as _OR,
-            UJSONResponse as _UR,
-        )
-        return isinstance(cls, type) and issubclass(cls, (_JR, _OR, _UR))
-    except ImportError:
-        from fastapi_turbo.responses import JSONResponse as _JR
-        return isinstance(cls, type) and issubclass(cls, _JR)
-
-
-def _build_effective_body_plan(introspect_params, endpoint):
-    """Return a copy of ``introspect_params`` extended with a
-    ``_combined_body`` step covering handler + dep body fields when
-    multiple distinct body names are reachable through the dep tree.
-
-    FA's contract for ``Depends(d)`` where ``d`` declares a body param:
-    the body field becomes part of the *route's* request body. If the
-    handler has ``item: Item`` and a dep has ``item2: Item2``, the
-    wire format is ``{"item": ..., "item2": ...}``; if both share
-    name+type the body is shared (single field). Mirrors
-    ``build_resolution_plan``'s combining logic but produces only the
-    extraction step the in-process dispatcher needs.
-    """
-    from fastapi_turbo._introspect import (
-        introspect_endpoint as _ie_local,
-        _TypeAdapterProxy as _TAP_local,
-    )
-
-    handler_bodies = [
-        p for p in introspect_params
-        if p.get("kind") == "body" and p.get("name") != "_combined_body"
-    ]
-
-    dep_bodies: list[dict] = []
-    visited: set[int] = set()
-
-    def _walk(callable_):
-        if callable_ is None:
-            return
-        cid = id(callable_)
-        if cid in visited:
-            return
-        visited.add(cid)
-        try:
-            sub = _ie_local(callable_, "/")
-        except Exception:  # noqa: BLE001
-            return
-        for sp in sub:
-            sk = sp.get("kind")
-            if sk == "body":
-                dep_bodies.append(sp)
-            elif sk == "dependency":
-                _walk(sp.get("dep_callable"))
-
-    for p in introspect_params:
-        if p.get("kind") == "dependency":
-            _walk(p.get("dep_callable"))
-
-    # Dedup: same name → keep one. We accept the first occurrence
-    # (handler before deps; deps in walk order). FA's "duplicate"
-    # rule is name-based; types must match too, but the in-process
-    # dispatcher already enforces that via the chosen model_class.
-    seen_names: set[str] = set()
-    merged: list[dict] = []
-    for bp in handler_bodies + dep_bodies:
-        nm = bp.get("name")
-        if nm in seen_names:
-            continue
-        seen_names.add(nm)
-        merged.append(bp)
-
-    if len(merged) <= 1:
-        return introspect_params
-
-    # Build a synthetic ``_combined_body`` step. Replace handler body
-    # params with this single step.
-    try:
-        from pydantic import create_model
-    except ImportError:
-        return introspect_params
-
-    field_definitions: dict = {}
-    for bp in merged:
-        model_cls = bp.get("model_class")
-        if isinstance(model_cls, _TAP_local):
-            model_cls = model_cls._annotation
-        if model_cls is not None:
-            if bp.get("required", True):
-                field_definitions[bp["name"]] = (model_cls, ...)
-            else:
-                field_definitions[bp["name"]] = (model_cls, bp.get("default_value"))
-        else:
-            from typing import Any as _Any
-            type_map = {"int": int, "float": float, "bool": bool, "str": str}
-            py_type = type_map.get(bp.get("type_hint", ""), _Any)
-            field_definitions[bp["name"]] = (
-                py_type,
-                ... if bp.get("required", True) else bp.get("default_value"),
-            )
-
-    _endpoint_name = getattr(endpoint, "__name__", "endpoint")
-    try:
-        CombinedBody = create_model(f"Body_{_endpoint_name}", **field_definitions)
-    except Exception:  # noqa: BLE001
-        return introspect_params
-
-    body_names = [bp["name"] for bp in merged]
-    handler_body_names = {bp.get("name") for bp in handler_bodies}
-    _combined_required = any(bp.get("required", True) for bp in merged)
-    combined_step = {
-        "name": "_combined_body",
-        "kind": "body",
-        "type_hint": "model",
-        "required": _combined_required,
-        "default_value": None,
-        "has_default": not _combined_required,
-        "model_class": CombinedBody,
-        "alias": None,
-        "_embed": False,
-        "_body_param_names": body_names,
-        "_handler_body_names": list(handler_body_names),
-        "_is_handler_param": True,
-        "_is_combined_body_for_deps": True,
-    }
-    new_params: list = []
-    seen_combined = False
-    for p in introspect_params:
-        if p.get("kind") == "body":
-            if not seen_combined:
-                new_params.append(combined_step)
-                seen_combined = True
-            continue
-        new_params.append(p)
-    if not seen_combined:
-        new_params.append(combined_step)
-    return new_params
 
 
 async def _run_response_background(response) -> None:
@@ -2752,10 +1136,10 @@ def _response_from_asgi_messages(
     from fastapi_turbo.responses import Response as _Response
 
     resp = _Response(content=b"".join(body_parts), status_code=status_code)
-    resp.headers.clear()
+    # ``raw_headers.clear()`` resets the list the MutableHeaders view is bound
+    # to (real Starlette has no ``headers.clear()``); the append below
+    # repopulates from the inner app's headers.
     resp.raw_headers.clear()
-    if hasattr(resp.headers, "_extras"):
-        resp.headers._extras.clear()
     for raw_k, raw_v in headers:
         k = raw_k.decode("latin-1") if isinstance(raw_k, bytes) else str(raw_k)
         v = raw_v.decode("latin-1") if isinstance(raw_v, bytes) else str(raw_v)
@@ -2929,12 +1313,456 @@ async def _dispatch_to_subapp_route(subapp, request):
         return result
     if isinstance(result, (dict, list)) or result is None:
         return _JR(content=result)
-    return _JR(content=result)
+    # Raw model / dataclass / scalar — jsonable_encoder first (FA's
+    # default-return contract). Real Starlette JSONResponse passes no
+    # ``default=`` and would raise on a raw BaseModel.
+    from fastapi_turbo.encoders import jsonable_encoder as _je
+    return _JR(content=_je(result))
 
 
+def _wrap_with_exception_handlers(handler, app):
+    """Wrap a handler so exceptions it raises are dispatched to the app's CUSTOM
+    exception handlers — mirroring the clone's compiled handler. Without this, the
+    adapter's raw handler would hit the door's default handling instead of the
+    user's ``@app.exception_handler``. Returns the handler unchanged when the app
+    has no custom handlers (the door's defaults already apply)."""
+    if not getattr(app, "exception_handlers", None):
+        return handler
 
-class FastAPI:
-    """Drop-in replacement for ``fastapi.FastAPI``, backed by Rust Axum."""
+    def wrapped(**kwargs):
+        try:
+            return handler(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            result = None
+            raised = False
+            try:
+                result = app._invoke_exception_handler(exc)
+            except Exception:  # noqa: BLE001
+                raised = True
+            # Starlette parity bookkeeping: capture non-HTTPException exceptions
+            # not handled by a SPECIFIC handler (the ``Exception`` catch-all still
+            # re-raises) for raise_server_exceptions / Sentry.
+            handled_specific = False
+            if result is not None and not raised:
+                for exc_cls in app.exception_handlers:
+                    if exc_cls is Exception:
+                        continue
+                    if isinstance(exc_cls, type) and isinstance(exc, exc_cls):
+                        handled_specific = True
+                        break
+            try:
+                from fastapi_turbo.exceptions import HTTPException as _HE
+
+                if not isinstance(exc, _HE) and not handled_specific:
+                    captured = getattr(app, "_captured_server_exceptions", None)
+                    if captured is not None:
+                        captured.append(exc)
+            except Exception:  # noqa: BLE001
+                pass
+            if result is not None and not raised:
+                return result
+            raise
+
+    wrapped.__name__ = getattr(handler, "__name__", "handler")
+    return wrapped
+
+
+def _clone_framework_types() -> tuple:
+    """Clone framework types whose presence in a handler signature forces the
+    route onto the clone path. Request / HTTPConnection / BackgroundTasks /
+    Response are real starlette (sub)classes that real get_dependant recognizes —
+    and the door now shares ONE injected Response per request (handler + deps),
+    so a ``response: Response`` handler param is handled on the adapter. Only
+    UploadFile and WebSocket remain: UploadFile still has adapter edges (close
+    lifecycle / Form+File), and a ``ws: WebSocket`` param only appears on WS
+    routes (declined earlier via is_websocket; the entry also keeps the returned
+    tuple non-empty so _signature_uses_clone_framework_type doesn't decline all)."""
+    types = []
+    for mod, name in (
+        ("fastapi_turbo.websockets", "WebSocket"),
+    ):
+        try:
+            types.append(getattr(__import__(mod, fromlist=[name]), name))
+        except Exception:
+            pass
+    return tuple(types)
+
+
+def _resolved_hints(endpoint) -> dict | None:
+    """Resolved type hints (``include_extras=True``) for the endpoint, handling
+    ``from __future__ import annotations`` (string annotations). Returns None if
+    they can't be resolved — callers then conservatively decline."""
+    import typing
+
+    try:
+        hints = dict(typing.get_type_hints(endpoint, include_extras=True))
+        hints.pop("return", None)
+        return hints
+    except Exception:
+        return None
+
+
+def _signature_uses_clone_framework_type(endpoint) -> bool:
+    """True if the endpoint signature annotates a param with a clone framework type
+    (Request/Response/BackgroundTasks/UploadFile/WebSocket/HTTPConnection). Real
+    FastAPI can't introspect those clone reimplementations, so such routes stay on
+    the clone path (until the types are bridged to real starlette subclasses)."""
+    import typing
+
+    fw = _clone_framework_types()
+    if not fw:
+        return True
+    hints = _resolved_hints(endpoint)
+    if hints is None:
+        return True
+
+    def _bare(ann):
+        if typing.get_origin(ann) is typing.Annotated:
+            ann = typing.get_args(ann)[0]
+        origin = typing.get_origin(ann)
+        # Recurse through Union/Optional and container generics (list[UploadFile],
+        # Optional[UploadFile], etc.) — any framework type anywhere disqualifies.
+        if origin is not None:
+            return any(
+                a is not type(None) and _bare(a) for a in typing.get_args(ann)
+            )
+        return isinstance(ann, type) and issubclass(ann, fw)
+
+    return any(_bare(h) for h in hints.values())
+
+
+def _oa_stream_info(response_model, response_class, endpoint):
+    """For the real-OpenAPI route build: classify a streaming endpoint. Returns
+    ``(needs_response_model_none, is_sse, is_json, inner_model_or_None)``.
+
+    - ``needs_response_model_none``: the return is ``AsyncIterable[...]`` / a
+      generator that real ``get_dependant`` CAN'T field — build with
+      ``response_model=None`` (true for SSE, NDJSON, and raw StreamingResponse).
+    - ``is_sse`` (``response_class`` is ``EventSourceResponse``) / ``is_json``
+      (NDJSON: NO response_class + AsyncIterable/generator): set real's native
+      ``route.is_sse_stream`` / ``is_json_stream`` + ``stream_item_field`` AFTER the
+      build so real get_openapi emits the SSE envelope / jsonl itemSchema.
+    - A raw ``StreamingResponse`` (``response_class`` set, not SSE) needs
+      ``response_model=None`` but NO content schema (matches upstream: 200 with only
+      a description) — hence is_json is gated on ``response_class is None``."""
+    import collections.abc as _abc
+    import typing as _typing
+    import inspect as _insp
+
+    _ro = _typing.get_origin(response_model)
+    needs_none = _ro in (
+        _abc.AsyncIterable, _abc.AsyncIterator, _abc.AsyncGenerator,
+        _abc.Iterable, _abc.Iterator, _abc.Generator,
+    ) or _insp.isasyncgenfunction(endpoint) or _insp.isgeneratorfunction(endpoint)
+
+    is_sse = False
+    try:
+        from fastapi_turbo.responses import EventSourceResponse as _ESR
+        if isinstance(response_class, type) and issubclass(response_class, _ESR):
+            is_sse = True
+    except Exception:  # noqa: BLE001
+        pass
+    # NDJSON only when there's NO response_class (a raw StreamingResponse documents
+    # no content). EventSourceResponse already handled by is_sse.
+    is_json = (not is_sse) and (response_class is None) and bool(needs_none)
+
+    inner = None
+    if is_sse or is_json:
+        _args = _typing.get_args(response_model)
+        if _args:
+            inner = _args[0]
+        try:  # the SSE transport wrapper is not the content model
+            from fastapi_turbo.sse import ServerSentEvent as _SSE
+            if isinstance(inner, type) and issubclass(inner, _SSE):
+                inner = None
+        except Exception:  # noqa: BLE001
+            pass
+        if not (isinstance(inner, type) and hasattr(inner, "model_json_schema")):
+            inner = None
+    return (bool(needs_none) or is_sse, is_sse, is_json, inner)
+
+
+def _oa_apply_stream(real_route, is_sse, is_json, inner) -> None:
+    """Set the native streaming attrs on a real APIRoute (built with
+    response_model=None) so real get_openapi emits the SSE/jsonl itemSchema."""
+    if is_sse:
+        real_route.is_sse_stream = True
+    elif is_json:
+        real_route.is_json_stream = True
+    if inner is not None:
+        real_route.stream_item_field = _real_fastapi.utils.create_model_field(
+            name=getattr(inner, "__name__", "StreamItem"),
+            type_=inner,
+            mode="serialization",
+        )
+
+
+def _build_stream_handler(orig_endpoint, response_model, response_class, app):
+    """Wrap a generator endpoint (sync OR async) into a SYNC handler returning a
+    StreamingResponse — shared by the clone collection path AND the adapter so
+    generator routes ride the fast adapter path (off the clone). With a custom
+    ``response_class`` (EventSourceResponse / a StreamingResponse subclass) the
+    generator object is wrapped via the class; otherwise it auto-wraps to an
+    ``application/jsonl`` StreamingResponse (FA 0.136 native), validating each item
+    against an ``AsyncIterable[Item]`` response_model and surfacing
+    ``ResponseValidationError`` via ``app._captured_server_exceptions`` (TestClient
+    re-raise parity)."""
+    import inspect as _insp
+
+    is_async_gen = _insp.isasyncgenfunction(orig_endpoint)
+    # A custom response_class (a TYPE) wraps the generator object directly (SSE /
+    # raw StreamingResponse). The framework default is a DefaultPlaceholder
+    # INSTANCE (not a type) → fall through to the NDJSON auto-wrap.
+    rc = response_class if isinstance(response_class, type) else None
+    if rc is not None:
+        # EventSourceResponse is a MARKER — real FastAPI does the SSE encoding in
+        # the routing layer (here). Format each yielded item as an SSE event +
+        # keepalive pings + the SSE headers, returning a plain StreamingResponse the
+        # door streams. Mirrors fastapi/routing.py's is_sse_stream branch.
+        _is_sse = False
+        try:
+            from fastapi_turbo.responses import EventSourceResponse as _ESR
+
+            _is_sse = issubclass(rc, _ESR)
+        except Exception:  # noqa: BLE001
+            _is_sse = False
+        if _is_sse:
+
+            def _sse_wrap(_orig=orig_endpoint, _is_a=is_async_gen, **kwargs):
+                from fastapi_turbo.responses import StreamingResponse as _SR
+                from fastapi.encoders import jsonable_encoder as _je
+                import fastapi_turbo.sse as _sse_mod
+                import json as _json
+                import anyio as _anyio
+                from starlette.concurrency import iterate_in_threadpool
+
+                _SSEv = _sse_mod.ServerSentEvent
+                _fmt = _sse_mod.format_sse_event
+
+                def _serialize(item):
+                    if isinstance(item, _SSEv):
+                        if item.raw_data is not None:
+                            ds = item.raw_data
+                        elif item.data is not None:
+                            _mdj = getattr(item.data, "model_dump_json", None)
+                            ds = _mdj() if callable(_mdj) else _json.dumps(_je(item.data))
+                        else:
+                            ds = None
+                        return _fmt(
+                            data_str=ds, event=item.event, id=item.id,
+                            retry=item.retry, comment=item.comment,
+                        )
+                    return _fmt(data_str=_json.dumps(_je(item)))
+
+                gen = _orig(**kwargs)
+                sse_aiter = gen.__aiter__() if _is_a else iterate_in_threadpool(gen)
+
+                # Keepalive: real FastAPI decouples iteration from the ping timer
+                # with an anyio task group, but the door drives an async-gen with a
+                # NEW task per __anext__, so a task group spanning the generator's
+                # yields raises "exit cancel scope in a different task". Instead use
+                # an asyncio producer task feeding a Queue + per-item asyncio.wait_for
+                # — the timeout lives entirely within ONE __anext__ (no cross-task
+                # scope), and a missing item just re-waits (queue keeps it).
+                async def _stream():
+                    import asyncio as _asyncio
+
+                    _done = object()
+                    q: _asyncio.Queue = _asyncio.Queue()
+
+                    async def _producer():
+                        err = None
+                        try:
+                            async for raw in sse_aiter:
+                                await q.put((_serialize(raw), None))
+                        except BaseException as exc:  # noqa: BLE001
+                            err = exc
+                        await q.put((_done, err))
+
+                    # Ping interval is read where the tests monkeypatch it
+                    # (``fastapi.routing._PING_INTERVAL``), with the sse default.
+                    try:
+                        import fastapi.routing as _fr
+
+                        ping = getattr(_fr, "_PING_INTERVAL", _sse_mod._PING_INTERVAL)
+                    except Exception:  # noqa: BLE001
+                        ping = _sse_mod._PING_INTERVAL
+
+                    prod = _asyncio.ensure_future(_producer())
+                    try:
+                        while True:
+                            try:
+                                item, err = await _asyncio.wait_for(q.get(), ping)
+                            except (TimeoutError, _asyncio.TimeoutError):
+                                yield _sse_mod.KEEPALIVE_COMMENT
+                                continue
+                            if item is _done:
+                                if err is not None:
+                                    raise err
+                                break
+                            yield item
+                    finally:
+                        prod.cancel()
+
+                resp = _SR(_stream(), media_type="text/event-stream")
+                resp.headers["Cache-Control"] = "no-cache"
+                resp.headers["X-Accel-Buffering"] = "no"
+                return resp
+
+            return _sse_wrap
+
+        def _rc_wrap(_orig=orig_endpoint, _rc=rc, **kwargs):
+            return _rc(_orig(**kwargs))
+
+        return _rc_wrap
+
+    # NDJSON auto-wrap. Item validation when the return is ``AsyncIterable[Item]``.
+    item_adapter = None
+    import typing as _tp
+    import collections.abc as _cabc
+
+    if _tp.get_origin(response_model) in {
+        _cabc.AsyncIterable, _cabc.AsyncIterator, _cabc.AsyncGenerator,
+        _cabc.Iterable, _cabc.Iterator, _cabc.Generator,
+    }:
+        _args = _tp.get_args(response_model)
+        if _args:
+            try:
+                from pydantic import TypeAdapter as _TA
+                item_adapter = _TA(_args[0])
+            except Exception as _exc:  # noqa: BLE001
+                _log.debug("silent catch in applications: %r", _exc)
+                item_adapter = None
+
+    def _json_lines_wrap(
+        _orig=orig_endpoint, _is_a=is_async_gen,
+        _ta=item_adapter, _app=app, **kwargs,
+    ):
+        from fastapi_turbo.responses import StreamingResponse as _SR
+        from fastapi_turbo.encoders import jsonable_encoder as _je
+        from fastapi_turbo.exceptions import ResponseValidationError as _RVE
+        import json as _json
+
+        def _check(item):
+            if _ta is None:
+                return item
+            try:
+                return _ta.validate_python(item)
+            except Exception as exc:  # noqa: BLE001
+                from pydantic import ValidationError as _PyVE
+                if isinstance(exc, _PyVE):
+                    raise _RVE(errors=exc.errors(), body=item) from None
+                raise
+
+        if _is_a:
+            async def _iter_async():
+                try:
+                    async for item in _orig(**kwargs):
+                        validated = _check(item)
+                        yield (_json.dumps(_je(validated), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                except _RVE as exc:
+                    if _app is not None:
+                        _app._captured_server_exceptions.append(exc)
+                    return
+
+            return _SR(_iter_async(), media_type="application/jsonl")
+        else:
+            def _iter_sync():
+                try:
+                    for item in _orig(**kwargs):
+                        validated = _check(item)
+                        yield (_json.dumps(_je(validated), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                except _RVE as exc:
+                    if _app is not None:
+                        _app._captured_server_exceptions.append(exc)
+                    return
+
+            return _SR(_iter_sync(), media_type="application/jsonl")
+
+    return _json_lines_wrap
+
+
+def _shim_get_openapi(*, title, version, routes=None, webhooks=None, **kw):
+    """Shim for ``fastapi.openapi.utils.get_openapi`` — the clone ``_openapi.py``
+    generator is deleted, so user code doing
+    ``from fastapi.openapi.utils import get_openapi; get_openapi(routes=app.routes, ...)``
+    (e.g. a custom ``app.openapi``) must convert the CLONE route objects to real
+    ``APIRoute``s before calling REAL get_openapi. Builds from each route's own-level
+    attributes (mount/include prefixing is already baked into ``route.path``)."""
+    _RealRoute = _real_fastapi.routing.APIRoute
+    _http = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+
+    def _convert(route_list):
+        out = []
+        for route in route_list or []:
+            ep = getattr(route, "endpoint", None)
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None)
+            if ep is None or path is None or not methods:
+                continue  # Mount / WebSocket / non-API routes
+            rc = _unset_to_none(getattr(route, "response_class", None))
+            try:
+                rc_ok = isinstance(rc, type) and issubclass(rc, _real_starlette_response)
+            except TypeError:
+                rc_ok = False
+            rm = getattr(route, "response_model", None)
+            needs_none, is_sse, is_json, inner = _oa_stream_info(rm, rc, ep)
+            if needs_none:
+                rm = None
+            oe = dict(getattr(route, "openapi_extra", None) or {})
+            if getattr(route, "servers", None):
+                oe["servers"] = route.servers
+            if getattr(route, "external_docs", None):
+                oe["externalDocs"] = route.external_docs
+            if getattr(route, "security", None) is not None:
+                oe["security"] = route.security
+            rkw = dict(
+                methods=[m for m in methods if m in _http] or list(methods),
+                response_model=rm,
+                status_code=getattr(route, "status_code", None),
+                tags=getattr(route, "tags", None) or None,
+                summary=getattr(route, "summary", None),
+                description=getattr(route, "description", None) or "",
+                response_description=getattr(
+                    route, "response_description", "Successful Response"
+                ),
+                responses=getattr(route, "responses", None) or None,
+                deprecated=getattr(route, "deprecated", None),
+                operation_id=getattr(route, "operation_id", None),
+                dependencies=getattr(route, "dependencies", None) or None,
+                include_in_schema=getattr(route, "include_in_schema", True),
+                name=getattr(route, "name", None),
+                openapi_extra=oe or None,
+            )
+            if rc_ok:
+                rkw["response_class"] = rc
+            try:
+                rr = _RealRoute(path, ep, **rkw)
+            except Exception:  # noqa: BLE001
+                continue
+            if is_sse or is_json:
+                _oa_apply_stream(rr, is_sse, is_json, inner)
+            out.append(rr)
+        return out
+
+    return _real_fastapi.openapi.utils.get_openapi(
+        title=title,
+        version=version,
+        routes=_convert(routes),
+        webhooks=_convert(webhooks) if webhooks else None,
+        **kw,
+    )
+
+
+class FastAPI(_real_fastapi.FastAPI):
+    """Drop-in replacement for ``fastapi.FastAPI``, backed by Rust Axum.
+
+    Pivot: now SUBCLASSES real ``fastapi.FastAPI`` (which is a Starlette subclass).
+    During the staged migration the clone's own attributes/methods (set in
+    ``__init__`` and defined below) still shadow the real base; later steps delete
+    those overrides so real FastAPI's routing/OpenAPI/dependency machinery and
+    Starlette's ASGI app (via ``super().__call__()``) take over.
+    """
 
     def __init__(
         self,
@@ -2980,6 +1808,21 @@ class FastAPI:
         routes: Sequence | None = None,
         **kwargs: Any,
     ):
+        # Initialize the real FastAPI base first (its routing/openapi/middleware/
+        # lifespan machinery). The clone's own state set below currently shadows
+        # it during the staged migration; later steps delete the clone overrides.
+        super().__init__(
+            title=title,
+            summary=summary,
+            description=description,
+            version=version,
+            openapi_url=openapi_url,
+            docs_url=docs_url,
+            redoc_url=redoc_url,
+            root_path=root_path,
+            debug=debug,
+            lifespan=lifespan,
+        )
         self.title = title
         self.summary = summary
         self.description = description
@@ -3481,114 +2324,29 @@ class FastAPI:
                 joined = pfx.rstrip("/") + "/" + child.lstrip("/")
                 return joined or "/"
 
-            # default_response_class cascade — see the equivalent
-            # block in routing.py for the inheritance rules. The
-            # walker threads ``parent_default`` so nested routers
-            # without their own default still pick up an ancestor's.
-            outer_default = (
-                default_response_class
-                if default_response_class is not None
-                else getattr(router, "default_response_class", None)
-            )
-
-            # Outer-most include kwarg deps + the included router's
-            # own deps — every route below this include sees these
-            # before its own/intermediate deps.
-            outer_extra_deps = (
-                list(dependencies or [])
-                + list(getattr(router, "dependencies", []) or [])
-            )
-
-            def _mirror(src_router, pfx: str, parent_default, parent_deps) -> None:
-                own_default = getattr(src_router, "default_response_class", None)
-                eff_default = (
-                    own_default if own_default is not None else parent_default
-                )
-                # ``parent_deps`` is the deps chain accumulated from
-                # the outermost include down to (but not including)
-                # this router's own deps. Routes on THIS router get
-                # ``parent_deps`` (already includes outer include
-                # kwargs + ancestor router deps + intermediate include
-                # kwargs from upstream callers). The current router's
-                # own ``.dependencies`` are appended for the routes
-                # registered directly on it.
-                eff_extra_deps = list(parent_deps)
-                eff_extra_deps.extend(
-                    getattr(src_router, "dependencies", []) or []
-                )
+            # The shadow mirror exists ONLY for ``app.router.routes``
+            # parity (callers iterating routes see sub-routes at their
+            # final paths); the door's flatten walks
+            # ``_included_routers`` + include_meta for the real
+            # cascades. The old response-class / deps / owner-router
+            # stamps on the clones were write-only — nothing read them.
+            def _mirror(src_router, pfx: str) -> None:
                 for r in getattr(src_router, "routes", []):
                     if getattr(r, "_is_included_shadow", False):
                         continue
                     clone = _copy.copy(r)
                     clone.path = _stack_path(pfx, getattr(r, "path", ""))
                     clone._is_included_shadow = True
-                    if (
-                        eff_default is not None
-                        and getattr(clone, "response_class", None) is None
-                        and getattr(
-                            clone,
-                            "_fastapi_turbo_effective_response_class",
-                            None,
-                        )
-                        is None
-                    ):
-                        clone._fastapi_turbo_effective_response_class = (
-                            eff_default
-                        )
-                    if eff_extra_deps:
-                        clone._fastapi_turbo_include_deps = list(eff_extra_deps)
-                    # Stamp the owning router so the in-process
-                    # dispatcher can resolve closest-wins precedence
-                    # for ``strict_content_type`` (and any other
-                    # router-level setting) at request time without
-                    # having to walk the include tree.
-                    clone._fastapi_turbo_owner_router = src_router
                     self.router.routes.append(clone)
                 for entry in getattr(src_router, "_included_routers", []):
                     child_router, child_prefix = entry[0], entry[1]
-                    child_meta = entry[3] if len(entry) >= 4 else {}
-                    child_include_default = (
-                        child_meta.get("default_response_class")
-                        if isinstance(child_meta, dict)
-                        else None
-                    )
-                    nested_default = (
-                        child_include_default
-                        if child_include_default is not None
-                        else eff_default
-                    )
-                    # Carry forward parent + this router's own deps +
-                    # this child include's kwarg deps. The child router's
-                    # OWN deps are added by the recursive call's
-                    # ``eff_extra_deps`` extension.
-                    child_include_deps = (
-                        list(child_meta.get("dependencies", []) or [])
-                        if isinstance(child_meta, dict)
-                        else []
-                    )
-                    nested_parent_deps = (
-                        list(eff_extra_deps) + child_include_deps
-                    )
                     nested = _stack_path(
                         _stack_path(pfx, child_prefix or ""),
                         getattr(child_router, "prefix", "") or "",
                     )
-                    _mirror(
-                        child_router,
-                        nested,
-                        nested_default,
-                        nested_parent_deps,
-                    )
+                    _mirror(child_router, nested)
 
-            # Outer-most call: ``parent_deps`` is the include kwargs
-            # only — the included router's OWN deps are added by
-            # ``_mirror`` for each of its routes.
-            _mirror(
-                router,
-                full_prefix,
-                outer_default,
-                list(dependencies or []),
-            )
+            _mirror(router, full_prefix)
         except Exception as _exc:  # noqa: BLE001
             _log.debug("silent catch in applications: %r", _exc)
 
@@ -3667,7 +2425,7 @@ class FastAPI:
             _resolve_tower_bound_to_asgi_class(middleware_cls)
             return
 
-        mw_type = getattr(middleware_cls, "_fastapi_turbo_middleware_type", None)
+        mw_type = _tower_type_for(middleware_cls)
         if mw_type and mw_type.startswith("python_http_"):
             try:
                 if args:
@@ -3803,25 +2561,24 @@ class FastAPI:
         return decorator
 
     def _build_middleware_config(self) -> list[dict[str, Any]]:
-        """Convert the middleware stack into dicts the Rust core can consume."""
-        from fastapi_turbo.middleware.trustedhost import TrustedHostMiddleware
-        from fastapi_turbo.middleware.httpsredirect import HTTPSRedirectMiddleware
+        """Convert the middleware stack into dicts the Rust core can consume.
 
+        Resolves each entry via ``_tower_type_for`` so both the clone marker
+        classes AND the real Starlette classes (post-flip) — plus string
+        shorthand — map to the same Tower layer config."""
         config: list[dict[str, Any]] = []
         for cls, kwargs in self._middleware_stack:
-            if isinstance(cls, str):
-                # String shorthand: app.add_middleware("cors", allow_origins=["*"])
-                config.append({"type": cls, **kwargs})
-            elif isinstance(cls, type) and issubclass(cls, TrustedHostMiddleware):
+            mw_type = _tower_type_for(cls)
+            if mw_type == "trustedhost":
                 config.append({
                     "type": "trustedhost",
                     "allowed_hosts": kwargs.get("allowed_hosts", ["*"]),
                 })
-            elif isinstance(cls, type) and issubclass(cls, HTTPSRedirectMiddleware):
+            elif mw_type == "httpsredirect":
                 config.append({"type": "httpsredirect"})
-            elif hasattr(cls, "_fastapi_turbo_middleware_type"):
-                # fastapi-turbo middleware class with a known Tower mapping
-                config.append({"type": cls._fastapi_turbo_middleware_type, **kwargs})
+            elif mw_type:
+                # cors / gzip / string shorthand / other known Tower mapping
+                config.append({"type": mw_type, **kwargs})
             # else: unknown ASGI middleware — skip for now
         return config
 
@@ -3917,9 +2674,9 @@ class FastAPI:
         handler = self._lookup_exception_handler(exc)
         if handler is None:
             return None
-        from fastapi_turbo.requests import Request
+        from fastapi_turbo.requests import _door_make_request
         scope = _current_request_scope.get() or {}
-        request = Request({**scope, "type": "http", "app": self})
+        request = _door_make_request({**scope, "type": "http", "app": self})
         if inspect.iscoroutinefunction(handler):
             coro = handler(request, exc)
             try:
@@ -3949,9 +2706,9 @@ class FastAPI:
         handler = self._lookup_exception_handler(exc)
         if handler is None:
             return None
-        from fastapi_turbo.requests import Request
+        from fastapi_turbo.requests import _door_make_request
         scope = _current_request_scope.get() or {}
-        request = Request({**scope, "type": "http", "app": self})
+        request = _door_make_request({**scope, "type": "http", "app": self})
         try:
             if inspect.iscoroutinefunction(handler):
                 # Drive the coroutine via the send(None) trick (works for handlers
@@ -3975,6 +2732,44 @@ class FastAPI:
             return handler(request, exc)
         except Exception:
             return None
+
+    def _door_handle_dep_exception(self, exc: BaseException):
+        """Door dep-resolution error path: route a dependency-raised exception
+        through user ``@app.exception_handler`` handlers, mirroring the Python
+        dispatcher (which calls ``_invoke_exception_handler`` for dep raises).
+        The Rust door previously rendered the default 500 directly via
+        ``pyerr_to_response``, silently bypassing user handlers for exceptions
+        raised INSIDE a dependency (handler-body raises already go through the
+        compiled exception wrapper).
+
+        Returns a Response-like object to send, or None to let Rust render the
+        default (``pyerr_to_response`` — which also captures the exception for
+        TestClient re-raise). HTTPException keeps Rust's fast path.
+        """
+        from fastapi_turbo.exceptions import HTTPException as _HE
+
+        if isinstance(exc, _HE):
+            return None  # Rust pyerr_to_response renders HTTPException (parity)
+        if not self.exception_handlers:
+            return None
+        result = self._invoke_exception_handler(exc)
+        if result is None:
+            return None  # no matching handler → Rust default 500 (+ captures)
+        # A handler produced a response. Capture for TestClient re-raise UNLESS
+        # a SPECIFIC (non-Exception) handler matched — FA semantics: a specific
+        # handler means "handled, don't re-raise", while the bare
+        # ``Exception`` catch-all still re-raises (Starlette
+        # ServerErrorMiddleware parity). When we return None above, Rust's
+        # pyerr_to_response does the capture, so capture happens exactly once.
+        handled_by_specific = any(
+            isinstance(cls, type) and cls is not Exception and isinstance(exc, cls)
+            for cls in self.exception_handlers
+        )
+        if not handled_by_specific:
+            captured = getattr(self, "_captured_server_exceptions", None)
+            if captured is not None:
+                captured.append(exc)
+        return result
 
     # ------------------------------------------------------------------
     # Route collection & introspection
@@ -4131,7 +2926,7 @@ class FastAPI:
                 return TypeAdapter(ann).validate_python(val)
             except Exception as exc:
                 from fastapi_turbo.exceptions import (
-                    WebSocketRequestValidationError as _WRVE,
+                    _DoorWebSocketRequestValidationError as _WRVE,
                 )
                 errors = []
                 try:
@@ -4154,6 +2949,33 @@ class FastAPI:
             for m in _re.finditer(r"\{([^{}:]+)(?::[^{}]+)?\}", route_path):
                 path_params_names.add(m.group(1))
 
+        # Identify the WebSocket parameter. Prefer a ``WebSocket``-annotated
+        # param; otherwise fall back to the FIRST positional param (FastAPI
+        # tutorial style ``async def ws(websocket, ...)`` where the connection
+        # arg is often untyped). Mirrors the in-process dispatcher the door
+        # replaced — without this, an untyped ``websocket`` would be
+        # misclassified as a required Query param and close the socket 1008.
+        _ws_fallback_name = None
+        if sig is not None:
+            _has_annotated_ws = any(
+                _is_websocket_annotation(n, p.annotation)
+                for n, p in sig.parameters.items()
+            )
+            if not _has_annotated_ws:
+                for n, p in sig.parameters.items():
+                    if p.kind not in (
+                        _inspect.Parameter.POSITIONAL_ONLY,
+                        _inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    ):
+                        continue
+                    _r_ann = type_hints.get(n, p.annotation)
+                    if _extract_depends(_r_ann, p.default) is not None:
+                        continue
+                    if _extract_marker(_r_ann, p.default)[0] is not None:
+                        continue
+                    _ws_fallback_name = n
+                    break
+
         # Classify every handler parameter up-front.
         # Each entry: ("dep"|"scalar"|"ws"|"path"|"skip", name, meta)
         param_spec: list[tuple] = []
@@ -4172,7 +2994,7 @@ class FastAPI:
                     param_spec.append(("dep", name, dep_marker))
                     continue
 
-                if _is_websocket_annotation(name, raw_ann):
+                if _is_websocket_annotation(name, raw_ann) or name == _ws_fallback_name:
                     param_spec.append(("ws", name, None))
                     continue
 
@@ -4466,6 +3288,13 @@ class FastAPI:
                 app_ref._ws_server_exceptions.append(_WD(code=code, reason=reason))
             except Exception as _exc:  # noqa: BLE001
                 _log.debug("silent catch in applications: %r", _exc)
+            if getattr(ws, "_ws", None) is None:
+                # In-process ASGI door: emit the WS close with the REAL code
+                # regardless of accept state (a pre-accept close IS the
+                # handshake rejection here, and the TestClient reads this
+                # frame's code — so it must be 1008 etc., not the HTTP 403).
+                ws._asgi_queue_close(code, reason)
+                return
             if ws.application_state == _WSState.CONNECTING:
                 ws._reject(403)
                 return
@@ -4538,27 +3367,14 @@ class FastAPI:
         # Build a synthetic route object for ``ws.scope["route"]``. FA
         # exposes the matched ``APIWebSocketRoute`` here; third-party
         # code (e.g. route introspection in handlers) uses it to pull
-        # the path template.
-        try:
-            from fastapi_turbo.compat import fastapi_shim as _fa_shim
-            _APIWSRoute = getattr(
-                getattr(_fa_shim, "fastapi_routing", None) or object(),
-                "APIWebSocketRoute",
-                None,
-            )
-        except Exception as _exc:  # noqa: BLE001
-            _log.debug("silent catch in applications: %r", _exc)
-            _APIWSRoute = None
-        if _APIWSRoute is None:
-            class _APIWSRoute:  # type: ignore[no-redef]
-                def __init__(self, path, endpoint, name=None):
-                    self.path = path
-                    self.endpoint = endpoint
-                    self.name = name or getattr(endpoint, "__name__", "")
+        # the path template. ``WSRoute`` IS the class the shim binds as
+        # ``fastapi.routing.APIWebSocketRoute``, so isinstance checks
+        # see one consistent type.
+        from fastapi_turbo._ws_support import WSRoute as _APIWSRoute
         _synthetic_route = _APIWSRoute(
-            path=route_path,
-            endpoint=endpoint,
-            name=getattr(endpoint, "__name__", ""),
+            route_path,
+            endpoint,
+            name=getattr(endpoint, "__name__", "") or None,
         )
 
         async def _ws_entry(ws, **path_kwargs):
@@ -4767,7 +3583,9 @@ class FastAPI:
                         )
                     except Exception as _exc:  # noqa: BLE001
                         _log.debug("silent catch in applications: %r", _exc)
-                    if ws.application_state == _WSState.CONNECTING:
+                    if getattr(ws, "_ws", None) is None:
+                        ws._asgi_queue_close(1008, "validation error")
+                    elif ws.application_state == _WSState.CONNECTING:
                         ws._reject(403)
                     else:
                         try:
@@ -4827,7 +3645,12 @@ class FastAPI:
                 if not handled:
                     # Abort the handshake cleanly if still pre-accept so the
                     # client sees an HTTP 500 instead of hanging.
-                    if ws.application_state == _WSState.CONNECTING:
+                    if getattr(ws, "_ws", None) is None:
+                        # In-process ASGI door: close with 1011 (internal
+                        # error) regardless of accept state — matches the
+                        # generic-error close code the dispatcher emitted.
+                        ws._asgi_queue_close(1011, "")
+                    elif ws.application_state == _WSState.CONNECTING:
                         ws._reject(500)
                     else:
                         # Post-accept unhandled exception — close cleanly so
@@ -4930,7 +3753,10 @@ class FastAPI:
         try:
             return fn(route)
         except TypeError:
-            return fn(route, (route.methods or ["GET"])[0].lower())
+            # ``methods`` is normally a list (the turbo APIRoute re-stamps
+            # it), but guard with ``next(iter(...))`` in case a raw real
+            # APIRoute (set-typed methods) reaches this cascade.
+            return fn(route, next(iter(route.methods or ["GET"])).lower())
 
     def _collect_routes_from_router(
         self,
@@ -5097,7 +3923,6 @@ class FastAPI:
                     "handler_name": getattr(route, "name", None),
                     "tags": extra_tags + list(getattr(route, "tags", []) or []),
                     "params": [_request_injection_param()],
-                    "_all_params": [],
                     "is_websocket": False,
                     "status_code": getattr(route, "status_code", None) or 200,
                     "summary": getattr(route, "summary", None),
@@ -5114,7 +3939,9 @@ class FastAPI:
                         **getattr(route, "responses", {}),
                     },
                     "response_model": None,
-                    "response_class": getattr(route, "response_class", None),
+                    "response_class": _unset_to_none(
+                        getattr(route, "response_class", None)
+                    ),
                     "deprecated": (
                         bool(getattr(route, "deprecated", False))
                         or bool(getattr(router, "deprecated", False))
@@ -5145,6 +3972,30 @@ class FastAPI:
             # (via ``super().get_route_handler()``).
             if _has_overridden_get_route_handler(route):
                 custom_ep = _build_custom_route_handler_endpoint(route, self)
+                # Wrap the route-class endpoint in the SAME
+                # ``@app.middleware('http')`` chain the regular compile
+                # path applies at ``_wrap_with_http_middlewares``. Without
+                # this, headers added by ``app.middleware('http')`` (e.g.
+                # ``X-App-Mw``) are dropped on routes registered through a
+                # custom ``route_class`` — the oneshot door would bypass
+                # the app HTTP middleware entirely. The
+                # ``_wrap_with_http_middlewares`` helper speaks the
+                # Rust-synthesised-kwargs calling convention, so it can't wrap
+                # this ``(request) -> response`` adapter; we compose the
+                # ``(request, call_next)`` chain inline instead (declaration
+                # order, last-decorated outermost).
+                http_mws_for_custom = [
+                    m
+                    for m in (getattr(self, "_http_middlewares", None) or [])
+                    if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
+                ]
+                for _mw in http_mws_for_custom:
+                    _inner_ep = custom_ep
+
+                    async def _wrapped_custom(request, *, _mw=_mw, _inner=_inner_ep):
+                        return await _mw(request, _inner)
+
+                    custom_ep = _wrapped_custom
                 try:
                     custom_ep._fastapi_turbo_route_obj = route  # type: ignore[attr-defined]
                 except (AttributeError, TypeError):
@@ -5185,9 +4036,6 @@ class FastAPI:
                     "handler_name": route.name,
                     "tags": extra_tags + route.tags,
                     "params": custom_params,
-                    "_all_params": list(
-                        introspect_endpoint(route.endpoint, full_path)
-                    ),
                     "is_websocket": False,
                     "status_code": route.status_code or 200,
                     "summary": route.summary,
@@ -5200,7 +4048,9 @@ class FastAPI:
                         **getattr(route, "responses", {}),
                     },
                     "response_model": getattr(route, "response_model", None),
-                    "response_class": getattr(route, "response_class", None),
+                    "response_class": _unset_to_none(
+                        getattr(route, "response_class", None)
+                    ),
                     "deprecated": (
                         route.deprecated
                         or bool(getattr(router, "deprecated", False))
@@ -5227,182 +4077,28 @@ class FastAPI:
                 })
                 continue
 
-            params = introspect_endpoint(route.endpoint, full_path)
-
-            # Merge global/include/router-level/route-level dependencies
-            merged_deps = self._get_all_dependencies_for_route(router, route, include_deps=include_deps)
-
-            # Check if any params are dependencies (including merged ones)
-            has_deps = any(p["kind"] == "dependency" for p in params) or bool(merged_deps)
-
-            if has_deps:
-                params = build_resolution_plan(route.endpoint, full_path, extra_deps=merged_deps)
-            else:
-                for p in params:
-                    p["_is_handler_param"] = True
-
-            # Store original dep callable references for override lookup
-            for p in params:
-                if p["kind"] == "dependency" and "_original_dep_callable" not in p:
-                    p["_original_dep_callable"] = p.get("dep_callable")
-
-            # When the route has deps, inject a hidden Request param so the
-            # compiled handler can pull extra query/header values on demand —
-            # needed when ``dependency_overrides`` installs a replacement whose
-            # own sub-deps depend on params the original chain never declared
-            # (FA parity for ``test_dependency_overrides``). Only add if the
-            # route doesn't already expose a Request to the user.
-            if has_deps and not any(
-                p.get("kind") == "inject_request" for p in params
-            ):
-                params.append({
-                    "name": "__fastapi_turbo_override_request__",
-                    "kind": "inject_request",
-                    "type_hint": "any",
-                    "required": False,
-                    "default_value": None,
-                    "has_default": True,
-                    "model_class": None,
-                    "alias": None,
-                    "_embed": False,
-                    "media_type": None,
-                    "example": None,
-                    "examples": None,
-                    "openapi_examples": None,
-                    "title": None,
-                    "description": None,
-                    "include_in_schema": False,
-                    "deprecated": None,
-                    "scalar_validator": None,
-                    "enum_class": None,
-                    "container_type": None,
-                    "_is_optional": True,
-                    "_enum_values": None,
-                    "_unwrapped_annotation": None,
-                    "_raw_marker": None,
-                    "_raw_annotation": None,
-                    "_is_handler_param": False,
-                })
-
-            # Save all params (including deps) for OpenAPI security scheme detection
-            all_params_for_openapi = list(params)
-
+            # ── Pivot end-state: NO eager clone introspection/compile. Every
+            # normal HTTP route is served by the ADAPTER (real route.dependant →
+            # ParamInfo) or by real-FastAPI DELEGATION in _build_server_args
+            # (force-delegated if both first passes decline). The rd carries only
+            # the RAW endpoint + route metadata: nothing reads clone param dicts
+            # (OpenAPI uses the real route; the door fallback force-delegates).
+            merged_deps = self._get_all_dependencies_for_route(
+                router, route, include_deps=include_deps
+            )
             endpoint = route.endpoint
-
-            # FA 0.136+: handlers that are (async) generator functions
-            # auto-wrap into a StreamingResponse with JSON-lines content
-            # type. Encode each yielded item via jsonable_encoder so
-            # BaseModels / dataclasses / bytes / datetimes serialize
-            # correctly. Runs BEFORE dep compilation so downstream
-            # wrappers see a plain sync callable.
-            if (
-                inspect.isasyncgenfunction(endpoint)
-                or inspect.isgeneratorfunction(endpoint)
-            ) and not getattr(route, "response_class", None):
-                _orig_endpoint = endpoint
-                _is_async_gen = inspect.isasyncgenfunction(endpoint)
-                # FA parity: when the return annotation is
-                # ``AsyncIterable[Item]`` / ``Iterable[Item]``, validate
-                # each yielded item against ``Item`` and raise
-                # ``ResponseValidationError`` on mismatch — mirrors real
-                # FA's streaming validation path.
-                _item_adapter = None
-                _rm = getattr(route, "response_model", None)
-                import typing as _tp
-                import collections.abc as _cabc
-                if _tp.get_origin(_rm) in {
-                    _cabc.AsyncIterable, _cabc.AsyncIterator,
-                    _cabc.AsyncGenerator, _cabc.Iterable,
-                    _cabc.Iterator, _cabc.Generator,
-                }:
-                    _args = _tp.get_args(_rm)
-                    if _args:
-                        try:
-                            from pydantic import TypeAdapter as _TA
-                            _item_adapter = _TA(_args[0])
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                            _item_adapter = None
-
-                _app_for_stream = self
-
-                def _json_lines_wrap(
-                    _orig=_orig_endpoint, _is_a=_is_async_gen,
-                    _ta=_item_adapter, _app=_app_for_stream, **kwargs,
-                ):
-                    from fastapi_turbo.responses import StreamingResponse as _SR
-                    from fastapi_turbo.encoders import jsonable_encoder as _je
-                    from fastapi_turbo.exceptions import (
-                        ResponseValidationError as _RVE,
-                    )
-                    import json as _json
-                    def _check(item):
-                        if _ta is None:
-                            return item
-                        try:
-                            return _ta.validate_python(item)
-                        except Exception as exc:  # noqa: BLE001
-                            from pydantic import ValidationError as _PyVE
-                            if isinstance(exc, _PyVE):
-                                raise _RVE(errors=exc.errors(), body=item) from None
-                            raise
-                    if _is_a:
-                        async def _iter_async():
-                            try:
-                                async for item in _orig(**kwargs):
-                                    validated = _check(item)
-                                    yield (_json.dumps(_je(validated)) + "\n").encode("utf-8")
-                            except _RVE as exc:
-                                # FA parity: surface streaming-body
-                                # validation errors through
-                                # ``app._captured_server_exceptions``
-                                # so TestClient re-raises with
-                                # ``raise_server_exceptions=True``.
-                                if _app is not None:
-                                    _app._captured_server_exceptions.append(exc)
-                                return
-                        return _SR(_iter_async(), media_type="application/jsonl")
-                    else:
-                        def _iter_sync():
-                            try:
-                                for item in _orig(**kwargs):
-                                    validated = _check(item)
-                                    yield (_json.dumps(_je(validated)) + "\n").encode("utf-8")
-                            except _RVE as exc:
-                                if _app is not None:
-                                    _app._captured_server_exceptions.append(exc)
-                                return
-                        return _SR(_iter_sync(), media_type="application/jsonl")
-
-                endpoint = _json_lines_wrap
-
-            # Detect @wraps-wrapped async endpoints — a sync wrapper over an
-            # ``async def`` reports ``iscoroutinefunction = False`` but calling
-            # it returns a coroutine. Treat those as async so we drive them
-            # correctly.
-            _raw_async = inspect.iscoroutinefunction(endpoint)
-            _wrapped_async = (not _raw_async) and _is_async_callable(endpoint)
-            is_async = _raw_async or _wrapped_async
-            if _wrapped_async and not inspect.isasyncgenfunction(endpoint):
-                # Wrap so calling this endpoint returns a proper coroutine
-                # that awaits the inner coroutine (instead of returning one).
-                _user_ep = endpoint
-
-                async def _await_wrapped(_ep=_user_ep, **kwargs):
-                    result = _ep(**kwargs)
-                    if inspect.iscoroutine(result):
-                        return await result
-                    return result
-
-                endpoint = _await_wrapped
+            params: list = []
+            _endpoint_door = None
+            is_async = inspect.iscoroutinefunction(endpoint) or _is_async_callable(endpoint)
             response_model = getattr(route, "response_model", None)
-            rm_include = getattr(route, "response_model_include", None)
-            rm_exclude = getattr(route, "response_model_exclude", None)
-            rm_exclude_unset = getattr(route, "response_model_exclude_unset", False)
-            rm_exclude_defaults = getattr(route, "response_model_exclude_defaults", False)
-            rm_exclude_none = getattr(route, "response_model_exclude_none", False)
-            rm_by_alias = getattr(route, "response_model_by_alias", True)
-            response_class = getattr(route, "response_class", None)
+            # ``-> None`` (incl. stringified ``-> "None"``) is stored as NoneType by
+            # the decoration layer. Pass None to the real-route rebuild so real
+            # FastAPI infers it from the endpoint annotation itself — an EXPLICIT
+            # response_model=NoneType creates a response field, tripping FA's
+            # "no body for 204/304" assertion.
+            if response_model is type(None):
+                response_model = None
+            response_class = _unset_to_none(getattr(route, "response_class", None))
             # Cascade default_response_class: route → router → include-level → app
             if response_class is None:
                 response_class = getattr(router, "default_response_class", None)
@@ -5411,183 +4107,14 @@ class FastAPI:
             if response_class is None:
                 response_class = getattr(self, "default_response_class", None)
 
-            rm_kwargs = dict(
-                response_model_include=rm_include,
-                response_model_exclude=rm_exclude,
-                response_model_exclude_unset=rm_exclude_unset,
-                response_model_exclude_defaults=rm_exclude_defaults,
-                response_model_exclude_none=rm_exclude_none,
-                response_model_by_alias=rm_by_alias,
-                response_class=response_class,
+            # FA 0.120+ ``strict_content_type=False`` — closest-wins precedence:
+            # route → router → app. Carried on the rd (NOT stamped on the raw
+            # endpoint, which may be shared across apps); build_router copies it
+            # onto whichever handler (adapter / delegated) serves the route.
+            _route_strict = _unset_to_none(getattr(route, "strict_content_type", None))
+            _router_strict = _unset_to_none(
+                getattr(router, "strict_content_type", None)
             )
-
-            # KEY OPTIMIZATION: Compile deps + handler into a SINGLE Python function.
-            # This reduces N+1 PyO3 boundary crossings to just 1.
-            # Rust calls one function with extracted params -> gets back the response.
-            if has_deps:
-                compiled = _try_compile_handler(
-                    endpoint, params, app=self, response_model=response_model,
-                    status_code=route.status_code,
-                    path=full_path,
-                    route_obj=route,
-                    **rm_kwargs,
-                )
-                if compiled is not None:
-                    # Success — all deps resolved inline in one function.
-                    # Strip dep steps from params (Rust won't resolve them separately).
-                    params = [p for p in params if p["kind"] != "dependency"]
-                    for p in params:
-                        p["_is_handler_param"] = True
-                    endpoint = compiled
-                    is_async = False  # Compiled handler is sync
-                    has_deps = False  # No more dep steps for Rust
-                else:
-                    # Fallback: async wrapper for non-compilable deps
-                    if is_async and not inspect.isasyncgenfunction(endpoint):
-                        from fastapi_turbo._resolution import _make_sync_wrapper
-                        endpoint = _make_sync_wrapper(endpoint, for_handler=True, app=self)
-                        is_async = False
-            elif (
-                response_model is not None
-                or response_class is not None
-                or route.status_code
-                or self.exception_handlers
-                or self.debug
-                or any(p.get("enum_class") is not None for p in params)
-                or any(p.get("container_type") is not None for p in params)
-                or any(
-                    p.get("required") and p.get("kind") in ("body", "form", "file")
-                    for p in params
-                )
-            ):
-                # No deps but has response_model/response_class/status_code/
-                # exception_handlers/enum params — wrap handler via compile.
-                compiled = _try_compile_handler(
-                    endpoint, params, app=self, response_model=response_model,
-                    status_code=route.status_code,
-                    path=full_path,
-                    route_obj=route,
-                    **rm_kwargs,
-                )
-                if compiled is not None:
-                    endpoint = compiled
-                    is_async = False
-
-            # Per-app ``worker_timeout`` plumbing for pure-async
-            # endpoints: when the user has actually set a timeout AND
-            # ``_raw_asgi_middlewares`` isn't carrying a shim that
-            # already wrapped the handler, wrap in a thin sync caller
-            # so ``submit(coro, app=app)`` is called with the owning
-            # app. For the common case (no ``worker_timeout`` set),
-            # skip the wrap — Rust's ``submit_to_async_worker`` then
-            # handles the coro directly via its existing APP_INSTANCE
-            # plumbing, saving a Python hop per request.
-            needs_app_plumb = (
-                is_async
-                and inspect.iscoroutinefunction(endpoint)
-                and not inspect.isasyncgenfunction(endpoint)
-                and getattr(self, "worker_timeout", None) is not None
-                and os.environ.get("FASTAPI_TURBO_WORKER_TIMEOUT") is None
-            )
-            if needs_app_plumb:
-                from fastapi_turbo._resolution import _make_sync_wrapper
-                endpoint = _make_sync_wrapper(endpoint, for_handler=True, app=self)
-                is_async = False
-
-            # Wrap handler when multiple body params are combined.
-            # CRITICAL ORDERING:
-            #   - Rust sends kwargs containing `_combined_body` (never `item`,
-            #     `user` etc — the individual body params were removed from
-            #     introspection).
-            #   - The unwrap wrapper MUST run BEFORE the compiled handler so
-            #     that by the time the compiled handler receives kwargs, the
-            #     `_combined_body` has been split back into original body
-            #     names. However, the compiled handler's own filtering uses
-            #     handler_param_names which don't include the original body
-            #     names either.
-            #   - Simplest correct flow: unwrap wraps the USER endpoint
-            #     directly, NOT the compiled endpoint. And the unwrap gets
-            #     kwargs from Rust (which include `_combined_body` + non-body
-            #     params like query/path). It splits and calls user handler
-            #     with the original names.
-            #   - Then _compiled_no_deps (if any) wraps the unwrap, but its
-            #     filter check is satisfied because `_combined_body` is now
-            #     in handler_param_names (we marked _is_handler_param=True).
-            combined = [p for p in params if p.get("name") == "_combined_body" and p.get("_body_param_names")]
-            if combined:
-                body_param_names = combined[0]["_body_param_names"]
-                # Use the ORIGINAL user endpoint, not the compiled one — we
-                # unwrap the body first, then call the user's real function.
-                user_endpoint = route.endpoint
-                user_is_async = inspect.iscoroutinefunction(user_endpoint)
-
-                if user_is_async:
-                    async def _unwrap_combined_async(
-                        _body_names=body_param_names,
-                        _orig=user_endpoint,
-                        **kwargs,
-                    ):
-                        combined_body = kwargs.pop("_combined_body", None)
-                        kwargs.pop("__fastapi_turbo_override_request__", None)
-                        if combined_body is not None:
-                            for bname in _body_names:
-                                kwargs[bname] = getattr(combined_body, bname)
-                        return await _orig(**kwargs)
-
-                    endpoint = _unwrap_combined_async
-                    is_async = True
-                else:
-                    def _unwrap_combined_sync(
-                        _body_names=body_param_names,
-                        _orig=user_endpoint,
-                        **kwargs,
-                    ):
-                        combined_body = kwargs.pop("_combined_body", None)
-                        kwargs.pop("__fastapi_turbo_override_request__", None)
-                        if combined_body is not None:
-                            for bname in _body_names:
-                                kwargs[bname] = getattr(combined_body, bname)
-                        return _orig(**kwargs)
-
-                    endpoint = _unwrap_combined_sync
-                    is_async = False
-
-            # Apply @app.middleware("http") chain around the endpoint.
-            # The wrapper drives the chain SYNCHRONOUSLY (via coro.send) so we
-            # stay on the fast Rust sync path — same perf as an unwrapped route.
-            if self._http_middlewares:
-                endpoint = _wrap_with_http_middlewares(endpoint, self._http_middlewares, self)
-                is_async = False
-
-            # Async handlers must execute inside a real running event
-            # loop even when they have no Depends/body/response-model
-            # wrapper. The Rust probe path advances the coroutine with
-            # ``send(None)`` first; if user code catches
-            # ``RuntimeError: no running event loop`` internally (common
-            # in redis.asyncio/asyncpg health checks), fallback never
-            # triggers and the handler observes a bogus no-loop state.
-            # Route coroutine handlers through the Python wrapper here:
-            # no-await handlers still complete via its fast path, while
-            # real async handlers run on the worker loop from instruction
-            # one.
-            if (
-                is_async
-                and inspect.iscoroutinefunction(endpoint)
-                and not inspect.isasyncgenfunction(endpoint)
-            ):
-                from fastapi_turbo._resolution import (
-                    _has_await_in_source as _has_await,
-                    _make_sync_wrapper as _msw,
-                )
-                if _has_await(endpoint):
-                    endpoint = _msw(endpoint, for_handler=True, app=self)
-                    is_async = False
-
-            # FA 0.120+ ``strict_content_type=False`` — closest-wins
-            # precedence: route → router → app. A strict inner router
-            # overrides a lax app.
-            _route_strict = getattr(route, "strict_content_type", None)
-            _router_strict = getattr(router, "strict_content_type", None)
             if _route_strict is not None:
                 _strict_effective = _route_strict
             elif _router_strict is not None:
@@ -5595,11 +4122,6 @@ class FastAPI:
             else:
                 _strict_effective = self.strict_content_type
             _lax = _strict_effective is False
-            if _lax:
-                try:
-                    endpoint._fastapi_turbo_lax_content_type = True  # type: ignore[attr-defined]
-                except (AttributeError, TypeError):
-                    pass
             # Attach the original route object so Rust can populate
             # ``request.scope["route"]`` — ``test_route_scope`` asserts.
             try:
@@ -5611,11 +4133,17 @@ class FastAPI:
                     "path": full_path,
                     "methods": route.methods,
                     "endpoint": endpoint,
+                    "_endpoint_door": _endpoint_door,
                     "is_async": is_async,
                     "handler_name": route.name,
                     "tags": extra_tags + route.tags,
                     "params": params,
-                    "_all_params": all_params_for_openapi,
+                    # Combined global/include/router/route dependencies — lets the
+                    # pivot adapter rebuild a real FastAPI route with the correct
+                    # effective dependency graph (Stage D).
+                    "_combined_dependencies": merged_deps,
+                    "_route_obj": route,
+                    "_lax_content_type": _lax,
                     "is_websocket": False,
                     # OpenAPI metadata
                     "status_code": route.status_code or 200,
@@ -5927,8 +4455,8 @@ class FastAPI:
             )
             # Replace the default headers with the inner app's — content-
             # type etc. must come from the mounted app, not our JSON
-            # default.
-            resp.headers.clear()
+            # default. ``raw_headers.clear()`` resets the MutableHeaders view
+            # (real Starlette has no ``headers.clear()``).
             resp.raw_headers.clear()
             for raw_k, raw_v in status_holder["headers"]:
                 k = raw_k.decode("latin-1") if isinstance(raw_k, bytes) else str(raw_k)
@@ -6037,6 +4565,225 @@ class FastAPI:
     # OpenAPI schema
     # ------------------------------------------------------------------
 
+    def _openapi_real_callbacks(self, clone_callbacks) -> list | None:
+        """Rebuild clone callback ``APIRoute``s as real ones (recursively) so real
+        ``get_openapi`` documents the operation's ``callbacks`` (it can't process
+        clone routes). Callback paths are OpenAPI runtime expressions (e.g.
+        ``{$callback_url}/...``) — real ``APIRoute`` accepts them. Returns ``None``
+        on any failure so the caller falls back to the clone generator."""
+        _RealRoute = _real_fastapi.routing.APIRoute
+        _http = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+        out: list = []
+        for c in clone_callbacks or []:
+            # A callback list item may be a ROUTER (callbacks=[cb_router]) rather
+            # than a route — flatten it into its routes.
+            if not hasattr(c, "endpoint") and getattr(c, "routes", None) is not None:
+                nested_router = self._openapi_real_callbacks(c.routes)
+                if nested_router is None:
+                    return None
+                out.extend(nested_router)
+                continue
+            cp = getattr(c, "path", None)
+            cep = getattr(c, "endpoint", None)
+            if cp is None or cep is None:
+                return None
+            cm = [m for m in (getattr(c, "methods", None) or []) if m in _http] or getattr(
+                c, "methods", None
+            )
+            nested = getattr(c, "callbacks", None)
+            real_nested = self._openapi_real_callbacks(nested) if nested else None
+            if nested and real_nested is None:
+                return None
+            try:
+                out.append(
+                    _RealRoute(
+                        cp,
+                        cep,
+                        methods=cm,
+                        response_model=getattr(c, "response_model", None),
+                        status_code=getattr(c, "status_code", None),
+                        tags=getattr(c, "tags", None) or None,
+                        summary=getattr(c, "summary", None),
+                        description=getattr(c, "description", None) or "",
+                        response_description=getattr(
+                            c, "response_description", "Successful Response"
+                        ),
+                        responses=getattr(c, "responses", None) or None,
+                        deprecated=getattr(c, "deprecated", None),
+                        operation_id=getattr(c, "operation_id", None),
+                        include_in_schema=getattr(c, "include_in_schema", True),
+                        name=getattr(c, "name", None),
+                        openapi_extra=getattr(c, "openapi_extra", None),
+                        callbacks=real_nested,
+                    )
+                )
+            except Exception:
+                return None
+        return out
+
+    def _openapi_real_routes(self, route_dicts: list[dict], webhook: bool = False) -> list | None:
+        """Build a real ``fastapi.routing.APIRoute`` per clone route dict so real
+        ``fastapi.openapi.utils.get_openapi`` can generate the schema (the OpenAPI
+        pivot). Returns the route list, or ``None`` if ANY route can't be built
+        real (caller falls back to the clone generator) — so the real path is
+        never worse than the clone path. WebSocket routes are skipped (get_openapi
+        documents only HTTP ``APIRoute``s)."""
+        _RealRoute = _real_fastapi.routing.APIRoute
+        _http = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+        real_routes: list = []
+        for rd in route_dicts:
+            if rd.get("is_websocket"):
+                continue
+            route = rd.get("_route_obj")
+            endpoint = getattr(route, "endpoint", None) if route is not None else None
+            if route is None or endpoint is None:
+                # Internal/dynamic routes (/openapi.json, /docs, /redoc) carry no
+                # clone route object; they're include_in_schema=False so real
+                # get_openapi omits them anyway — skip, don't fall back.
+                continue
+            methods = [m for m in (rd.get("methods") or []) if m in _http] or rd.get(
+                "methods"
+            )
+            # response_class only when it's a real Starlette Response subclass
+            # (responses.py re-exports real, so clone routes carry real classes);
+            # else let real APIRoute use its default so the media type is canonical.
+            # rd["response_class"] is the RESOLVED class (route → router → app
+            # default_response_class); the route object alone may carry None.
+            rc = rd.get("response_class") or _unset_to_none(
+                getattr(route, "response_class", None)
+            )
+            try:
+                rc_ok = isinstance(rc, type) and issubclass(
+                    rc, _real_starlette_response
+                )
+            except TypeError:
+                rc_ok = False
+            # SSE / NDJSON streaming endpoints: the clone stores the return
+            # annotation (e.g. AsyncIterable[Item]) as response_model, which real
+            # get_dependant can't field. Build with response_model=None, then set
+            # real's native streaming attrs (is_sse_stream / is_json_stream +
+            # stream_item_field) AFTER the build so real get_openapi emits the
+            # spec SSE event envelope / jsonl itemSchema + lands the model.
+            _rm = getattr(route, "response_model", None)
+            _needs_none, _is_sse, _is_json, _inner = _oa_stream_info(_rm, rc, endpoint)
+            if _needs_none:
+                _rm = None
+            # Rebuild clone callback routes → real so real get_openapi documents
+            # the operation's ``callbacks`` (real can't process clone routes).
+            # rd["callbacks"] is the COMBINED set (route + include + app level); the
+            # route object alone only carries the route-level ones.
+            _cbs = rd.get("callbacks") or getattr(route, "callbacks", None)
+            _real_cbs = self._openapi_real_callbacks(_cbs) if _cbs else None
+            if _cbs and _real_cbs is None:
+                return None
+            kw: dict = dict(
+                methods=methods,
+                dependencies=(
+                    rd.get("_combined_dependencies")
+                    or getattr(route, "dependencies", None)
+                    or None
+                ),
+                response_model=_rm,
+                status_code=getattr(route, "status_code", None),
+                # rd["tags"]/["responses"] are the COMBINED include + route level
+                # (the route object alone carries only its own level).
+                tags=rd.get("tags") or getattr(route, "tags", None) or None,
+                summary=getattr(route, "summary", None),
+                description=getattr(route, "description", None) or "",
+                response_description=getattr(
+                    route, "response_description", "Successful Response"
+                ),
+                # App-level ``responses`` merge under the combined route/include
+                # responses (clone behavior; real reads only route-level). The
+                # more-specific (route/include) wins.
+                responses=(
+                    {**(getattr(self, "responses", None) or {}),
+                     **(rd.get("responses") or getattr(route, "responses", None) or {})}
+                    or None
+                ),
+                # rd["deprecated"] carries include_router(deprecated=...) inheritance;
+                # the route object alone has only its own level.
+                deprecated=rd.get("deprecated") or getattr(route, "deprecated", None),
+                # The clone already resolves the operationId via the full cascade
+                # (route → router → include → app generate_unique_id_function) and
+                # stamps it on rd; pass it through (real uses it verbatim). None →
+                # real's default generate_unique_id, which matches the clone default.
+                operation_id=rd.get("operation_id") or getattr(route, "operation_id", None),
+                response_model_include=getattr(route, "response_model_include", None),
+                response_model_exclude=getattr(route, "response_model_exclude", None),
+                response_model_by_alias=getattr(route, "response_model_by_alias", True),
+                response_model_exclude_unset=getattr(
+                    route, "response_model_exclude_unset", False
+                ),
+                response_model_exclude_defaults=getattr(
+                    route, "response_model_exclude_defaults", False
+                ),
+                response_model_exclude_none=getattr(
+                    route, "response_model_exclude_none", False
+                ),
+                include_in_schema=getattr(route, "include_in_schema", True),
+                name=getattr(route, "name", None),
+                callbacks=_real_cbs,
+            )
+            # Clone OpenAPI extensions the real fork's get_openapi has no route
+            # kwarg for → fold into openapi_extra (real deep_dict_updates it into
+            # the operation). servers/external_docs are operation-level; an
+            # explicit route ``security`` (incl. ``[]`` to disable) overrides the
+            # dep-derived security.
+            oe = dict(getattr(route, "openapi_extra", None) or {})
+            if getattr(route, "servers", None):
+                oe["servers"] = route.servers
+            if getattr(route, "external_docs", None):
+                oe["externalDocs"] = route.external_docs
+            if getattr(route, "security", None) is not None:
+                oe["security"] = route.security
+            kw["openapi_extra"] = oe or None
+            if rc_ok:
+                kw["response_class"] = rc
+            # Webhooks are keyed by NAME (no leading-slash normalization) — use the
+            # route's own path; regular routes use rd["path"] (mount-prefixed).
+            path = getattr(route, "path", None) if webhook else rd["path"]
+            try:
+                _real = _RealRoute(path or rd["path"], endpoint, **kw)
+            except Exception:
+                return None
+            if _is_sse or _is_json:
+                _oa_apply_stream(_real, _is_sse, _is_json, _inner)
+            real_routes.append(_real)
+        return real_routes
+
+    def _openapi_real(self, route_dicts: list[dict], webhook_dicts: list[dict],
+                      effective_servers) -> dict:
+        """Generate the OpenAPI schema via REAL ``fastapi.openapi.utils.get_openapi``
+        over real ``APIRoute``s rebuilt from the clone routes. This is the SOLE
+        generator (clone ``_openapi.py`` is deleted); errors propagate like real
+        FastAPI's. NOT ``from fastapi.openapi.utils import`` (the shim rebinds that);
+        ``_real_fastapi`` is the real module captured pre-shim."""
+        real_routes = self._openapi_real_routes(route_dicts)
+        real_webhooks = (
+            self._openapi_real_routes(webhook_dicts, webhook=True) if webhook_dicts else []
+        )
+        if real_routes is None or real_webhooks is None:
+            raise RuntimeError(
+                "fastapi-turbo: could not rebuild real OpenAPI routes for this app"
+            )
+        return _real_fastapi.openapi.utils.get_openapi(
+            title=self.title,
+            version=self.version,
+            openapi_version=self.openapi_version,
+            summary=self.summary,
+            description=self.description,
+            routes=real_routes,
+            webhooks=real_webhooks,
+            tags=self.openapi_tags,
+            servers=effective_servers,
+            terms_of_service=self.terms_of_service,
+            contact=self.contact,
+            license_info=self.license_info,
+            separate_input_output_schemas=self.separate_input_output_schemas,
+            external_docs=self.external_docs,
+        )
+
     def openapi(self) -> dict[str, Any]:
         """Return the OpenAPI schema dict (cached after first call).
 
@@ -6058,20 +4805,11 @@ class FastAPI:
             elif not any(s.get("url") == self.root_path for s in effective_servers):
                 effective_servers = [{"url": self.root_path}, *effective_servers]
         webhook_dicts = self._collect_routes_from_router(self.webhooks)
-        self.openapi_schema = generate_openapi_schema(
-            title=self.title,
-            version=self.version,
-            description=self.description,
-            routes=route_dicts,
-            servers=effective_servers,
-            terms_of_service=self.terms_of_service,
-            contact=self.contact,
-            license_info=self.license_info,
-            openapi_tags=self.openapi_tags,
-            webhooks=webhook_dicts,
-            external_docs=self.external_docs,
-            summary=self.summary,
-            separate_input_output_schemas=self.separate_input_output_schemas,
+        # OpenAPI is generated by REAL fastapi.openapi.utils.get_openapi over real
+        # APIRoutes rebuilt from the clone routes (the clone _openapi.py generator
+        # is deleted). Errors propagate like real FastAPI's.
+        self.openapi_schema = self._openapi_real(
+            route_dicts, webhook_dicts, effective_servers
         )
         return self.openapi_schema
 
@@ -6832,9 +5570,24 @@ class FastAPI:
 
         self._in_process_dynamic_routes_installed = True
 
-    def run(self, host: str = "127.0.0.1", port: int = 8000, **kwargs: Any) -> None:
-        """Collect routes, hand them to the Rust core, and start serving."""
-        from fastapi_turbo._fastapi_turbo_core import ParamInfo, RouteInfo, run_server
+    def run(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        workers: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Collect routes, hand them to the Rust core, and start serving.
+
+        ``workers`` defaults to one process per CPU (``os.cpu_count()``); pass
+        ``workers=1`` for a single process. Multi-worker forks an fd-passing
+        acceptor (this process) + N worker processes — each runs the full
+        router on fd-passed connections, covering every transport (HTTP/1,
+        HTTP/2, WebSocket, SSE). Auto-falls-back to a single process when
+        forking isn't safe (called off the main thread, e.g. ``TestClient``;
+        or a platform without ``os.fork``). ``FASTAPI_TURBO_WORKERS`` overrides.
+        """
+        from fastapi_turbo._fastapi_turbo_core import run_server
 
         # Soft DoS-footgun warning: a public-bind (0.0.0.0 / all-zeros
         # IPv6) with no body-size cap means a single client can stream
@@ -6859,6 +5612,15 @@ class FastAPI:
                 stacklevel=2,
             )
 
+        # Multi-worker (default = one per CPU): fork the fd-passing acceptor
+        # (this process) + N workers. Workers run their own startup/lifespan
+        # post-fork so loop-bound resources bind per-worker. Falls back to the
+        # single-process path below when forking isn't safe.
+        _effective_workers = self._resolve_worker_count(workers)
+        if _effective_workers > 1:
+            self._run_multiworker(host, port, _effective_workers)
+            return
+
         # Prefer the ASGI-middleware-chained path when raw ASGI middleware
         # is registered — that way Sentry/OTel-style MW that hooks
         # ``scope['type'] == 'lifespan'`` sees startup/shutdown events.
@@ -6875,6 +5637,523 @@ class FastAPI:
             self._run_startup_handlers()
             if self._collect_shutdown_handlers():
                 atexit.register(self._run_shutdown_handlers)
+
+        run_server(*self._build_server_args(host, port))
+
+    def _resolve_worker_count(self, workers: int | None) -> int:
+        """Resolve the effective worker count. Default = one process per CPU;
+        ``FASTAPI_TURBO_WORKERS`` overrides. Falls back to 1 when forking isn't
+        safe: no ``os.fork`` (e.g. Windows), or not on the main thread (e.g.
+        ``TestClient`` runs ``app.run()`` in a background thread — forking from
+        a non-main thread is unsafe)."""
+        import threading
+
+        env = os.environ.get("FASTAPI_TURBO_WORKERS")
+        if env is not None:
+            try:
+                workers = int(env)
+            except ValueError:
+                pass
+        if workers is None:
+            workers = os.cpu_count() or 1
+        try:
+            workers = max(1, int(workers))
+        except (TypeError, ValueError):
+            workers = 1
+        if workers > 1:
+            if not hasattr(os, "fork"):
+                workers = 1
+            elif threading.current_thread() is not threading.main_thread():
+                workers = 1
+        return workers
+
+    def _run_multiworker(self, host: str, port: int, n: int) -> None:
+        """Fork the fd-passing acceptor (this process) + ``n`` worker processes.
+        Each worker runs its own startup/lifespan, then serves fd-passed
+        connections via the Rust ``run_worker`` (all transports). The acceptor
+        binds the port and routes each connection to the least-loaded worker.
+        Ctrl-C drains the acceptor, then terminates + reaps the workers."""
+        import signal
+        import sys as _sys
+        import tempfile
+
+        from fastapi_turbo._fastapi_turbo_core import run_acceptor, run_worker
+
+        sock_path = os.path.join(
+            tempfile.gettempdir(), f"fastapi-turbo-{os.getpid()}-{port}.sock"
+        )
+        children: list[int] = []
+        for i in range(n):
+            pid = os.fork()
+            if pid == 0:
+                # ── child: one worker process ──
+                exit_code = 0
+                try:
+                    # Per-worker startup so loop-bound resources (asyncpg/redis
+                    # pools, asyncio primitives) are created in THIS process on
+                    # the handler loop — same ordering as single-process run().
+                    if self._collect_lifespans():
+                        self._run_lifespan_startup()
+                    self._run_startup_handlers()
+                    run_worker(sock_path, *self._build_server_args(host, port))
+                except BaseException as exc:  # noqa: BLE001
+                    _sys.stderr.write(f"fastapi-turbo worker {i} exited: {exc!r}\n")
+                    exit_code = 1
+                finally:
+                    os._exit(exit_code)
+            children.append(pid)
+
+        # ── parent: the acceptor ──
+        def _terminate_children(*_a: object) -> None:
+            for cpid in children:
+                try:
+                    os.kill(cpid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+        try:
+            run_acceptor(host, port, sock_path)
+        finally:
+            _terminate_children()
+            for cpid in children:
+                try:
+                    os.waitpid(cpid, 0)
+                except (ChildProcessError, OSError):
+                    pass
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+
+    def _adapter_route_info(self, rd: dict, for_door_mix: bool = False):
+        """Stage D (DEFAULT-ON; opt OUT via ``FASTAPI_TURBO_ADAPTER=0``): drive a
+        route's door params off REAL FastAPI introspection instead of the clone's
+        ``_introspect``.
+
+        Rebuilds a real ``fastapi.routing.APIRoute`` from the route's effective
+        config (full path, original endpoint, combined dependencies, response_model
+        + flags) and maps it through the pivot adapter. Returns
+        ``(params, handler, is_async)`` for the Rust door, or ``None`` to fall back
+        to the clone path — for WebSocket/mounted routes, non-default response
+        classes (the adapter applies response_model but not a custom response_class),
+        or anything the adapter declines (e.g. async-generator deps)."""
+        import os
+
+        if os.environ.get("FASTAPI_TURBO_ADAPTER") == "0":
+            return None
+        if rd.get("is_websocket") or rd.get("_from_mount"):
+            return None
+        # dependency_overrides (a testing feature) is resolved at request time by
+        # the clone path; the adapter bakes the real callable into ParamInfo and
+        # can't honor a runtime override. Delegate everything while any override is
+        # registered. Also covers a non-default response class (custom rendering).
+        if getattr(self, "dependency_overrides", None):
+            return None
+        route = rd.get("_route_obj")
+        if route is None:
+            return None
+        # The ORIGINAL user endpoint — rd["endpoint"] is the clone-compiled
+        # ``(**kwargs)`` wrapper for dep routes, which real FastAPI would
+        # mis-introspect as a ``kwargs`` query param.
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None:
+            return None
+        # Bare generator endpoints (sync/async) auto-wrap into a streaming
+        # response (NDJSON, or the custom response_class for SSE). The adapter
+        # introspects the generator's params off real FastAPI and builds the wrap
+        # via _build_stream_handler (below) — so generators ride the fast adapter
+        # path (the door streams the result, 7.3a) instead of the clone.
+        import inspect as _insp_gen
+
+        _is_gen = _insp_gen.isgeneratorfunction(endpoint) or _insp_gen.isasyncgenfunction(
+            endpoint
+        )
+        # Param markers (Depends/Query/Header/...) are now bridged to real FastAPI's
+        # (see param_functions / dependencies), so real introspection recognizes
+        # them. The generic name->kind net below still catches any clone TYPE real
+        # FastAPI can't see yet (UploadFile/Request/Response/BackgroundTasks), so a
+        # mis-introspected route delegates rather than mis-serves.
+        # Route/router/global dependencies are now ENGAGED: rd["_combined_dependencies"]
+        # is the full effective set (app + include + router + route via
+        # _get_all_dependencies_for_route) and is passed to the real APIRoute below;
+        # the adapter emits route-level deps (name=None) as non-handler-params so they
+        # run for side effects (auth) without being passed to the handler.
+        # A custom status_code IS now carried on RouteInfo (the door applies it as
+        # the default status for non-Response results, overridable by a handler/dep
+        # ``response.status_code``), so custom-status routes ride the adapter — EXCEPT
+        # when the app has @app.middleware("http"): the chain renders the handler's
+        # result into a Response, past the door's default-status hook, so keep those
+        # on the clone path (which bakes the status into that Response).
+        if rd.get("status_code") not in (None, 200) and getattr(
+            self, "_http_middlewares", None
+        ):
+            return None
+        # Custom response_class is now applied by build_handler (it renders the
+        # endpoint result via the class) + the door merges any dep-injected
+        # Response, so these routes ride the fast adapter path (~32K) not the clone.
+        # Clone framework TYPES (Request/Response/BackgroundTasks/UploadFile/
+        # WebSocket) are reimplementations, NOT real starlette subclasses, so real
+        # FastAPI's introspection can't see them. Check the SIGNATURE and decline
+        # BEFORE building the real route — building it runs real get_dependant which
+        # can mutate the shared endpoint/markers, corrupting the clone path even for
+        # a route that ultimately declines.
+        if _signature_uses_clone_framework_type(endpoint):
+            return None
+        try:
+            import inspect as _inspect
+
+            # Must be REAL FastAPI's APIRoute (the shim rebinds ``fastapi.routing``
+            # to the clone) — it builds the real ``dependant`` the adapter reads.
+            _RealRoute = _real_fastapi.routing.APIRoute
+
+            from fastapi_turbo._introspect_from_real_fastapi import (
+                Undelegable,
+                build_handler,
+                extract_params_from_route,
+            )
+        except Exception:
+            return None
+        try:
+            _http_methods = [
+                m
+                for m in rd["methods"]
+                if m in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+            ]
+            real = _RealRoute(
+                rd["path"],
+                endpoint,
+                methods=_http_methods or rd["methods"],
+                dependencies=rd.get("_combined_dependencies") or None,
+                # A generator return is AsyncIterable[Item] / Iterable[Item] which
+                # real get_dependant can't field — build with response_model=None;
+                # item validation happens in _build_stream_handler instead.
+                response_model=None if _is_gen else rd.get("response_model"),
+                status_code=(
+                    rd["status_code"] if rd.get("status_code") not in (None, 200) else None
+                ),
+                response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
+                    _real_fastapi.responses.JSONResponse
+                ),
+                response_model_include=getattr(route, "response_model_include", None),
+                response_model_exclude=getattr(route, "response_model_exclude", None),
+                response_model_by_alias=getattr(route, "response_model_by_alias", True),
+                response_model_exclude_unset=getattr(route, "response_model_exclude_unset", False),
+                response_model_exclude_defaults=getattr(
+                    route, "response_model_exclude_defaults", False
+                ),
+                response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
+            )
+            # SecurityScopes: the adapter accumulates the ``Security(...,
+            # scopes=[...])`` chain into each dependant's ``oauth_scopes`` and the
+            # door builds ``SecurityScopes(scopes=...)`` from it (with scope-aware
+            # per-request dep caching), so these routes run on the fast adapter path.
+            params = extract_params_from_route(real, app=self)
+            # Generators: build the streaming wrap (NDJSON or the custom
+            # response_class for SSE) instead of build_handler's await-the-endpoint
+            # path (which can't await an async-generator function).
+            if _is_gen:
+                handler = _build_stream_handler(
+                    endpoint, rd.get("response_model"), rd.get("response_class"), self
+                )
+            else:
+                handler = build_handler(real)
+        except Undelegable:
+            return None
+        except Exception:
+            return None
+        # A leaked ``**kwargs``/``*args`` dep-input means real FastAPI couldn't
+        # introspect a callable — e.g. a clone security scheme whose ``__call__`` is
+        # ``(self, *args, **kwargs)`` and which isn't a real ``SecurityBase``.
+        # Delegate those routes to the clone path.
+        if any(p.name.endswith("__kwargs") or p.name.endswith("__args") for p in params):
+            return None
+        # The adapter's handler-facing params must exactly cover the endpoint's own
+        # signature (a dep contributes its result name; its extracted inputs are
+        # is_handler_param=False). A divergence means something was dropped or
+        # mis-mapped — delegate.
+        try:
+            sig_names = {
+                name
+                for name, p in _inspect.signature(endpoint).parameters.items()
+                if p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+            }
+        except (TypeError, ValueError):
+            return None
+        adapter_names = {p.name for p in params if p.is_handler_param}
+        if adapter_names != sig_names:
+            return None
+        # Match the clone's compile order so the door drives the adapter handler
+        # identically: async → SYNC submit-caller (running loop from the first
+        # instruction), then wrap in the ``@app.middleware("http")`` chain so those
+        # middlewares (which the clone applies by wrapping the handler) still run.
+        if _inspect.iscoroutinefunction(handler):
+            from fastapi_turbo._door_support import _make_sync_wrapper
+
+            handler = _make_sync_wrapper(handler, for_handler=True, app=self)
+        # Dispatch handler-raised exceptions to the app's custom exception handlers
+        # (the clone does this in its compiled handler) — innermost, so middleware
+        # below still wraps the resulting response.
+        handler = _wrap_with_exception_handlers(handler, self)
+        http_mws = getattr(self, "_http_middlewares", None)
+        if http_mws:
+            from fastapi_turbo._middleware_wrap import _wrap_with_http_middlewares
+
+            # Door mixed Tower+raw-MW path: strip the raw-ASGI shims here too —
+            # the door composes them as an OUTER ASGI chain, so baking them in
+            # would double-apply. @app.middleware / BaseHTTPMiddleware stay.
+            if for_door_mix:
+                http_mws = [
+                    m
+                    for m in http_mws
+                    if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
+                ]
+            if http_mws:
+                handler = _wrap_with_http_middlewares(handler, http_mws, self)
+                try:
+                    handler._has_http_middleware = True  # door → inject metadata kwargs
+                except (AttributeError, TypeError):
+                    pass
+        return params, handler, False
+
+    def _delegated_route_info(
+        self, rd: dict, for_door_mix: bool = False, force: bool = False
+    ):
+        """Fallback for routes the lean adapter declines (custom response_class,
+        custom status_code, UploadFile/Response edges, SecurityScopes, ...): serve
+        them via REAL FastAPI's own route handler so the clone-compiled
+        ``_introspect`` / ``_resolution`` path isn't needed.
+
+        ``force=True`` is the END-STATE safety net (the clone-compiled fallback is
+        gone): skip the opt-out flag and the narrow proving declines (sync-gen
+        endpoints, async-gen deps, mounted sub-FastAPI routes) and RAISE on a
+        construction failure instead of returning None — a loud startup error
+        beats silently mis-serving a route.
+
+        ``route.get_route_handler()`` returns ``async (request) -> Response`` that
+        runs real FastAPI's full pipeline (validation, dependency resolution,
+        ``response_model`` serialization, status/headers). We register it as a
+        single ``inject_request`` param handler — the door builds the Request
+        (``needs_body`` includes ``has_inject_request``, so the body is read and
+        available for real FastAPI's ``request.form()``/``.json()``), the handler
+        returns a real Response the door renders.
+
+        Gated behind ``FASTAPI_TURBO_DELEGATE=1`` (default off) while it's proven
+        end-to-end — EXCEPT override-active apps, which ALWAYS delegate: real
+        FastAPI's ``solve_dependencies`` + ``dependency_overrides_provider`` (set
+        below) resolves ``app.dependency_overrides`` at REQUEST time, including
+        different-signature overrides, so overrides no longer need the
+        clone-compiled path. WebSocket / mounted routes decline (different
+        protocols). Returns ``(params, handler, is_async)`` or ``None``."""
+        import os
+
+        # DEFAULT-ON (opt out via FASTAPI_TURBO_DELEGATE=0): adapter declines drain
+        # to real FastAPI's own route handler, NOT the clone-compiled path. Override-
+        # active apps delegate even under the opt-out (correctness: the clone's
+        # override machinery mis-resolves complex different-signature overrides).
+        if not force and not getattr(self, "dependency_overrides", None):
+            if os.environ.get("FASTAPI_TURBO_DELEGATE") == "0":
+                return None
+        if rd.get("is_websocket"):
+            return None
+        if rd.get("_from_mount") and not force:
+            return None
+        route = rd.get("_route_obj")
+        if route is None:
+            return None
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None:
+            return None
+        # Bare ASYNC-generator endpoints: real FastAPI 0.136 natively auto-wraps them
+        # into an ``application/jsonl`` StreamingResponse (same as the clone), so
+        # delegation handles them — the door streams the returned StreamingResponse.
+        # SYNC generators are declined to the clone: real FA wraps them via
+        # iterate_in_threadpool, and the door doesn't propagate a mid-stream
+        # ResponseValidationError raised from that threadpool iterator (async gens
+        # propagate fine). Sync streaming is uncommon and was on the clone already.
+        if inspect.isgeneratorfunction(endpoint) and not force:
+            return None
+        try:
+            from fastapi_turbo._fastapi_turbo_core import ParamInfo
+
+            _RealRoute = _real_fastapi.routing.APIRoute
+            _http_methods = [
+                m
+                for m in rd["methods"]
+                if m in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+            ]
+            real = _RealRoute(
+                rd["path"],
+                endpoint,
+                methods=_http_methods or rd["methods"],
+                dependencies=rd.get("_combined_dependencies") or None,
+                response_model=rd.get("response_model"),
+                status_code=(
+                    rd["status_code"] if rd.get("status_code") not in (None, 200) else None
+                ),
+                response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
+                    _real_fastapi.responses.JSONResponse
+                ),
+                response_model_include=getattr(route, "response_model_include", None),
+                response_model_exclude=getattr(route, "response_model_exclude", None),
+                response_model_by_alias=getattr(route, "response_model_by_alias", True),
+                response_model_exclude_unset=getattr(route, "response_model_exclude_unset", False),
+                response_model_exclude_defaults=getattr(
+                    route, "response_model_exclude_defaults", False
+                ),
+                response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
+            )
+            # Async-generator yield-dependencies: their teardown ordering relative
+            # to an outer @app.middleware can't be replicated at the handler level
+            # (the door applies middleware outside the delegated handler, and a
+            # deferred teardown breaks exception propagation + leaks temp files — see
+            # the handler comment below). The clone path orders these correctly, so
+            # decline them to it (the adapter already declines async-gen deps too).
+            def _has_async_gen_dep(dep) -> bool:
+                call = getattr(dep, "call", None)
+                if call is not None and inspect.isasyncgenfunction(call):
+                    return True
+                return any(
+                    _has_async_gen_dep(s) for s in getattr(dep, "dependencies", []) or []
+                )
+
+            if _has_async_gen_dep(real.dependant) and not force:
+                return None
+            # The standalone route has no provider, so real FastAPI's
+            # solve_dependencies can't see ``app.dependency_overrides``. Point it at
+            # this app (a real FastAPI subclass) so overrides — added at startup OR
+            # at request time (TestClient) — are honored, matching the clone path.
+            real.dependency_overrides_provider = self
+            real_handler = real.get_route_handler()  # async (request) -> Response
+        except Exception:
+            if force:
+                # End-state: no clone fallback exists — surface the construction
+                # failure loudly at startup instead of mis-serving the route.
+                raise
+            return None
+
+        from contextlib import AsyncExitStack as _AsyncExitStack
+        import fastapi.exception_handlers as _fa_eh
+        from fastapi.exceptions import RequestValidationError as _RVE
+
+        async def handler(**kwargs):
+            request = kwargs["request"]
+            # Real FastAPI's route handler reads three nested AsyncExitStacks from the
+            # scope (``fastapi_middleware_astack`` files ⊃ ``fastapi_inner_astack``
+            # request-scoped deps ⊃ ``fastapi_function_astack`` function-scoped deps),
+            # normally set by AsyncExitStackMiddleware + the request_response wrapper —
+            # both bypassed when we call get_route_handler() directly. ``async with
+            # A, B, C`` tears them down C→B→A INSIDE the request (so file/temp cleanup
+            # runs and a yield-dep's after-yield raise propagates to the caller) AND
+            # propagates a handler exception into the yield-dep finalizers (so their
+            # except/finally observe it) — matching FA's semantics. (Teardown can't be
+            # deferred past send to mirror FA's middleware/bg dep-observation ordering:
+            # the door owns send, and deferring breaks teardown-exception propagation +
+            # leaks temp files. We instead run background tasks before teardown below,
+            # which covers the common case.)
+            async with (
+                _AsyncExitStack() as _file_stack,
+                _AsyncExitStack() as _inner_stack,
+                _AsyncExitStack() as _function_stack,
+            ):
+                request.scope["fastapi_middleware_astack"] = _file_stack
+                request.scope["fastapi_inner_astack"] = _inner_stack
+                request.scope["fastapi_function_astack"] = _function_stack
+                try:
+                    response = await real_handler(request)
+                except _RVE as exc:
+                    # The door validates in Rust → 422; a real-FastAPI-raised
+                    # RequestValidationError would otherwise be captured as a SERVER
+                    # exception (re-raised). Render 422 via a user-registered handler
+                    # (specific RVE only — matches FA, where RVE's registered handler
+                    # beats the Exception catch-all) or FA's default. HTTPException
+                    # propagates (Rust renders it).
+                    _uh = (self.exception_handlers or {}).get(_RVE)
+                    _res = (_uh or _fa_eh.request_validation_exception_handler)(
+                        request, exc
+                    )
+                    if inspect.isawaitable(_res):
+                        _res = await _res
+                    return _res
+                # Run background tasks before yield-dep teardown (FA order: they
+                # observe deps in their pre-teardown state), then clear so the door
+                # doesn't double-run them.
+                _bg = getattr(response, "background", None)
+                if _bg is not None:
+                    _bgr = _bg()
+                    if inspect.isawaitable(_bgr):
+                        await _bgr
+                    response.background = None
+                return response
+
+        handler.__name__ = getattr(endpoint, "__name__", "endpoint")
+
+        # Mirror _adapter_route_info's wrapping order: async → SYNC submit-caller
+        # (the door drives sync handlers), then exception handlers (innermost, so
+        # real FastAPI's RequestValidationError/HTTPException dispatch to the app's
+        # handlers), then the @app.middleware("http") chain.
+        from fastapi_turbo._door_support import _make_sync_wrapper
+
+        handler = _make_sync_wrapper(handler, for_handler=True, app=self)
+        handler = _wrap_with_exception_handlers(handler, self)
+        http_mws = getattr(self, "_http_middlewares", None)
+        if http_mws:
+            from fastapi_turbo._middleware_wrap import _wrap_with_http_middlewares
+
+            if for_door_mix:
+                http_mws = [
+                    m
+                    for m in http_mws
+                    if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
+                ]
+            if http_mws:
+                handler = _wrap_with_http_middlewares(handler, http_mws, self)
+                try:
+                    handler._has_http_middleware = True
+                except (AttributeError, TypeError):
+                    pass
+
+        try:
+            handler._fastapi_turbo_route_obj = route
+        except (AttributeError, TypeError):
+            pass
+
+        params = [
+            ParamInfo(
+                name="request",
+                kind="inject_request",
+                type_hint="any",
+                required=False,
+                default_value=None,
+                has_default=False,
+                model_class=None,
+                alias=None,
+                is_handler_param=True,
+                scalar_validator=None,
+            )
+        ]
+        return params, handler, False
+
+    def _build_server_args(self, host: str, port: int, for_door: bool = False) -> tuple:
+        """Build the full positional argument tuple for ``run_server`` and
+        ``register_app_router`` from the app's routes + config, so BOTH
+        request doors (the ``app.run()`` socket server and the in-process
+        ASGI ``oneshot`` door) drive a byte-identical router. Registers the
+        dynamic ``/openapi.json`` route and renders docs HTML, but runs NO
+        lifespan/startup handlers — those stay in ``run()`` / the ASGI
+        lifespan protocol.
+
+        ``for_door=True`` + a mixed Tower+raw-ASGI middleware app (H2):
+        register handlers WITHOUT the raw-ASGI shims and with NO Tower Rust
+        layers (``middleware_config=[]``); the door composes the full
+        Tower+raw chain itself in registration order via
+        ``_asgi_oneshot_http_with_mw``. For every other app this is a no-op
+        (the door and ``app.run()`` build identical args)."""
+        from fastapi_turbo._fastapi_turbo_core import ParamInfo, RouteInfo
+
+        # Only the mixed Tower+raw-MW case re-routes middleware through the
+        # door's outer ASGI chain; pure-Tower / pure-raw / no-MW apps keep the
+        # default (byte-identical to ``app.run()``) build.
+        _use_door_eps = for_door and self._door_has_tower_raw_mix()
 
         # Register ``/openapi.json`` as a Python handler BEFORE route
         # collection so ``run_server`` hands it to Rust. The handler
@@ -6942,6 +6221,82 @@ class FastAPI:
         route_infos: list[RouteInfo] = []
 
         for rd in route_dicts:
+            # Stage D: when the adapter (opt-in) can drive this route off real
+            # FastAPI introspection, use its ParamInfo + handler directly.
+            _adapted = self._adapter_route_info(rd, for_door_mix=_use_door_eps)
+            if _adapted is None:
+                # The lean adapter declined — try full delegation to real FastAPI's
+                # route handler (default-on) before the clone path.
+                _adapted = self._delegated_route_info(rd, for_door_mix=_use_door_eps)
+            if (
+                _adapted is None
+                and not rd.get("is_websocket")
+                and rd.get("_route_obj") is not None
+            ):
+                # End-state safety net: a normal HTTP route (incl. mounted
+                # sub-FastAPI routes) NEVER falls to the deleted clone-compiled
+                # path — FORCE real-FastAPI delegation, skipping the narrow
+                # proving declines. rds WITHOUT a _route_obj (raw-ASGI mount
+                # proxies, custom-route/passthrough endpoints, WS) carry
+                # self-contained handlers and register below as before.
+                _adapted = self._delegated_route_info(
+                    rd, for_door_mix=_use_door_eps, force=True
+                )
+            _trace_path = os.environ.get("FASTAPI_TURBO_TRACE_CLONE")
+            if _adapted is None and _trace_path:
+                # Clone-deletion telemetry: name every route that still falls back
+                # to the clone-compiled handler (both adapter+delegation declined).
+                # Appends to the file named by the env var (stderr is swallowed by
+                # pytest's per-test capture for passing tests).
+                try:
+                    with open(_trace_path, "a") as _tf:
+                        _tf.write(
+                            f"{sorted(rd.get('methods') or [])} {rd.get('path')} "
+                            f"ws={bool(rd.get('is_websocket'))} "
+                            f"mount={bool(rd.get('_from_mount'))} "
+                            f"route_obj={'y' if rd.get('_route_obj') is not None else 'n'}\n"
+                        )
+                except OSError:
+                    pass
+            if _adapted is not None:
+                _ap, _ah, _aasync = _adapted
+                # Stamp the real FastAPI route so the Rust bridge can expose
+                # ``request.scope["route"]`` (handler route introspection) AND
+                # resolve the route pattern for the per-request scope — which
+                # refines the Sentry transaction name from URL- to route-source
+                # on the door path (route_obj is otherwise None for adapter
+                # routes). See set_request_scope_ctxvar (router.rs).
+                _rt_obj = rd.get("_route_obj")
+                if _rt_obj is not None:
+                    try:
+                        _ah._fastapi_turbo_route_obj = _rt_obj
+                    except (AttributeError, TypeError):
+                        pass
+                # The door reads ``_fastapi_turbo_lax_content_type`` off the
+                # RouteInfo.handler; collection resolves the strict cascade into
+                # rd["_lax_content_type"], so copy it onto whichever handler
+                # (adapter / delegated) serves the route (else a lax route with
+                # a body validator wrongly 422s a no-Content-Type body).
+                if rd.get("_lax_content_type") or getattr(
+                    rd.get("endpoint"), "_fastapi_turbo_lax_content_type", False
+                ):
+                    try:
+                        _ah._fastapi_turbo_lax_content_type = True
+                    except (AttributeError, TypeError):
+                        pass
+                route_infos.append(
+                    RouteInfo(
+                        path=rd["path"],
+                        methods=rd["methods"],
+                        handler=_ah,
+                        is_async=_aasync,
+                        handler_name=rd["handler_name"],
+                        params=_ap,
+                        is_websocket=False,
+                        status_code=rd.get("status_code"),
+                    )
+                )
+                continue
             param_infos = []
             for p in rd["params"]:
                 pi = ParamInfo(
@@ -6963,11 +6318,14 @@ class FastAPI:
                 )
                 param_infos.append(pi)
 
+            _handler = rd["endpoint"]
+            if _use_door_eps and rd.get("_endpoint_door") is not None:
+                _handler = rd["_endpoint_door"]
             route_infos.append(
                 RouteInfo(
                     path=rd["path"],
                     methods=rd["methods"],
-                    handler=rd["endpoint"],
+                    handler=_handler,
                     is_async=rd["is_async"],
                     handler_name=rd["handler_name"],
                     params=param_infos,
@@ -7000,7 +6358,9 @@ class FastAPI:
             openapi_json = None
         _openapi_url_for_rust = self.openapi_url
 
-        middleware_config = self._build_middleware_config()
+        # Door mixed-MW path composes Tower as part of its outer ASGI chain,
+        # so DON'T also apply it as Rust router layers (it'd run twice).
+        middleware_config = [] if _use_door_eps else self._build_middleware_config()
 
         # Collect static file mounts for Rust-side ServeDir
         static_mounts = []
@@ -7027,7 +6387,7 @@ class FastAPI:
         _app_self = self
 
         def _build_404_request(method, path, query, headers):
-            from fastapi_turbo.requests import Request
+            from fastapi_turbo.requests import _door_make_request
             # Normalize headers to list[(bytes, bytes)] for ASGI scope.
             hdr_list = []
             for k, v in headers or []:
@@ -7037,13 +6397,12 @@ class FastAPI:
                     v = v.encode("latin-1")
                 hdr_list.append((k, v))
             qs = query if isinstance(query, bytes) else (query or "").encode()
-            return Request({
+            return _door_make_request({
                 "type": "http",
                 "method": method,
                 "path": path,
                 "headers": hdr_list,
                 "query_string": qs,
-                "root_path": getattr(_app_self, "root_path", "") or "",
                 "app": _app_self,
                 "path_params": {},
             })
@@ -7107,8 +6466,18 @@ class FastAPI:
                 return _JR(content={"detail": "Not Found"}, status_code=404)
 
             # Build the same chain _wrap_with_http_middlewares does but
-            # with our synthetic handler as the innermost call.
-            middlewares = list(reversed(_app_self._http_middlewares))
+            # with our synthetic handler as the innermost call. In the door
+            # mixed-MW case the raw-ASGI shims are handled by the outer ASGI
+            # chain (the 404 response flows back out through it), so strip them
+            # here to avoid double-application — @app.middleware/BaseHTTP stay.
+            _nf_mws = _app_self._http_middlewares
+            if _use_door_eps:
+                _nf_mws = [
+                    m
+                    for m in _nf_mws
+                    if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
+                ]
+            middlewares = list(reversed(_nf_mws))
 
             req = _build_404_request(method, path, query, headers)
 
@@ -7169,9 +6538,12 @@ class FastAPI:
         # @exception_handler(RequestValidationError), let the Rust validation
         # error paths route the detail through it.
         validation_handler = None
-        from fastapi_turbo.exceptions import RequestValidationError as _RVE
+        from fastapi_turbo.exceptions import (
+            RequestValidationError as _RVE,
+            _DoorRequestValidationError as _DRVE,
+        )
         if _RVE in self.exception_handlers:
-            from fastapi_turbo.requests import Request as _Req
+            from fastapi_turbo.requests import _door_make_request as _Req
             import json as _json
             _user_handler = self.exception_handlers[_RVE]
 
@@ -7193,7 +6565,24 @@ class FastAPI:
                 # validation errors. ``test_handling_errors/test_tutorial005``
                 # asserts ``exc.body`` equals the original request body.
                 _body_for_rve = detail_obj.get("body") if isinstance(detail_obj, dict) else None
-                exc = _RVE(errors_list, body=_body_for_rve)
+                # FA parity: carry endpoint_ctx (function/file/line/path) so a
+                # user RequestValidationError handler can log which endpoint the
+                # bad request hit, and ``str(exc)`` renders ``in <function>``.
+                # The matched endpoint is stamped on the per-request scope by
+                # the Rust bridge (set_request_scope_ctxvar) before validation.
+                _ep_ctx = None
+                try:
+                    _scope = _current_request_scope.get() or {}
+                    _ep = _scope.get("endpoint")
+                    if _ep is not None:
+                        from fastapi_turbo._introspect_from_real_fastapi import (
+                            endpoint_ctx_for as _ep_ctx_for,
+                        )
+                        _rt = _scope.get("route")
+                        _ep_ctx = _ep_ctx_for(_ep, getattr(_rt, "path", None))
+                except Exception:
+                    _ep_ctx = None
+                exc = _DRVE(errors_list, body=_body_for_rve, endpoint_ctx=_ep_ctx)
                 req = _Req({
                     "type": "http",
                     "method": "POST",
@@ -7274,7 +6663,33 @@ class FastAPI:
                 _log.debug("silent catch in applications: %r", _exc)
                 redoc_html_str = None
 
-        run_server(
+        # Static-file Content-Type map derived from Python's ``mimetypes`` —
+        # Starlette's source of truth (``StaticFiles`` → ``FileResponse`` →
+        # ``guess_type(name)[0] or "text/plain"``, then ``; charset=utf-8`` iff
+        # the type is ``text/*``). A hardcoded Rust table / ``mime_guess``
+        # cannot match this across Python versions + OS mime files (``.js`` is
+        # ``text/javascript`` on 3.12+ but ``application/javascript`` on
+        # 3.10/3.11; ``.yaml`` / ``.xml`` / ``.otf`` also differ), so we compute
+        # the ext→content-type map here and hand it to Rust. Keys are lowercase
+        # extensions WITHOUT the dot. Bound unconditionally so the run_server
+        # call below always has it (empty when no static mounts).
+        _static_content_types: list[tuple[str, str]] = []
+        if static_mounts:
+            import mimetypes as _mimetypes
+            _mimetypes.init()
+            _ct_by_ext: dict[str, str] = {}
+            for _ext, _mtype in _mimetypes.types_map.items():
+                _e = _ext.lstrip(".").lower()
+                if not _e:
+                    continue
+                _ct_by_ext[_e] = (
+                    f"{_mtype}; charset=utf-8"
+                    if _mtype.startswith("text/")
+                    else _mtype
+                )
+            _static_content_types = list(_ct_by_ext.items())
+
+        return (
             route_infos,
             host,
             port,
@@ -7293,31 +6708,513 @@ class FastAPI:
             self.swagger_ui_oauth2_redirect_url,
             swagger_ui_html_str,
             redoc_html_str,
+            _static_content_types,
         )
 
     # ------------------------------------------------------------------
     # ASGI __call__ — enables ``uvicorn myapp:app`` compatibility
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # In-process ASGI door (door B): drive the SAME assembled axum::Router
+    # via tower::Service::oneshot — no socket, no double-hop. DEFAULT-ON and
+    # the sole in-process engine for HTTP + WebSocket; the Python dispatchers
+    # it replaced are deleted (Phase 7). FASTAPI_TURBO_ONESHOT_DOOR=0 opts out
+    # to the loopback Rust socket server.
+    # ------------------------------------------------------------------
+
+    def _oneshot_door_enabled(self) -> bool:
+        """The oneshot door is THE Rust HTTP engine for the ASGI path (uvicorn
+        / TestClient in-process / httpx.ASGITransport) — DEFAULT-ON, and the
+        only in-process HTTP engine now that the Python dispatcher is deleted
+        (Phase 7). Opt OUT via ``FASTAPI_TURBO_ONESHOT_DOOR=0`` to fall back to
+        the loopback Rust socket server (``app.run()``-style) — note that needs
+        to bind a port, so it won't work in socket-restricted sandboxes (the
+        door does). See CLONE_DELETION_PLAN.md."""
+        return os.environ.get("FASTAPI_TURBO_ONESHOT_DOOR", "1") != "0"
+
+    def _door_has_tower_raw_mix(self) -> bool:
+        """True when the app registered BOTH a raw-ASGI middleware and a
+        Tower-bound marker (CORS/GZip/HTTPSRedirect). That's the one case
+        where the door's default split — Tower as Rust router layers
+        (outer), raw-ASGI as inner per-handler shims — can't reproduce
+        Starlette's registration order (a raw MW added AFTER an
+        HTTPSRedirect must wrap its 307). For the mix, the door instead
+        composes ALL Tower+raw MW as one OUTER ASGI chain
+        (``_door_outer_mw_list``) around handlers built WITHOUT the raw
+        shims and WITHOUT Tower layers (``_build_server_args(for_door=
+        True)``). Pure-Tower / pure-raw / no-MW apps keep the default
+        (byte-identical) path."""
+        if not getattr(self, "_raw_asgi_middlewares", None):
+            return False
+        return any(
+            _k == "tower"
+            for (_k, *_rest) in (getattr(self, "_mw_registration_log", None) or [])
+        )
+
+    def _door_outer_mw_list(self) -> list:
+        """Registration-ordered ``[(real_asgi_class, kwargs), ...]`` for the
+        Tower-bound + raw-ASGI middlewares, used to compose the door's outer
+        ASGI chain for the mixed-MW case. Empty unless
+        ``_door_has_tower_raw_mix()``. Mirrors the (now-removed) Python
+        dispatcher's composer: Tower markers are inert as ASGI on their own,
+        so they're substituted with the real Starlette class; raw-ASGI
+        classes are user-provided and used as-is. ``@app.middleware`` /
+        ``BaseHTTPMiddleware`` are NOT here — they stay inner (baked into the
+        handler), matching the dispatcher."""
+        if not self._door_has_tower_raw_mix():
+            return []
+        out: list = []
+        for kind, mw_cls, mw_kwargs, _seq in (
+            getattr(self, "_mw_registration_log", None) or []
+        ):
+            if kind == "tower":
+                resolved = _resolve_tower_bound_to_asgi_class(mw_cls)
+                if resolved is not None:
+                    out.append((resolved, mw_kwargs))
+            elif kind == "raw":
+                out.append((mw_cls, mw_kwargs))
+        return out
+
+    def _oneshot_needs_disconnect_watch(self) -> bool:
+        """True when any route endpoint streams (constructs a
+        ``StreamingResponse`` / ``FileResponse`` / ``EventSourceResponse``) or
+        polls ``request.is_disconnected()`` (SSE / long-poll), so
+        ``_asgi_oneshot_http`` wires a disconnect ``Event`` + receive-poller —
+        an SSE poll then observes the drop AND an otherwise-infinite stream is
+        cancelled (the door drops the body stream → the generator's
+        ``GeneratorExit`` cleanup runs). Static, AST-free, best-effort (False on
+        inspection failure). Cached — routes are fixed after startup."""
+        cached = getattr(self, "_oneshot_disconnect_watch", None)
+        if cached is not None:
+            return cached
+        import inspect as _inspect
+
+        _WATCH_MARKERS = (
+            "is_disconnected",
+            "StreamingResponse",
+            "FileResponse",
+            "EventSourceResponse",
+        )
+        needs_watch = False
+        for route in getattr(getattr(self, "router", None), "routes", None) or ():
+            endpoint = getattr(route, "endpoint", None)
+            if endpoint is None:
+                continue
+            # Bare generator endpoints (door streams them as NDJSON) keep the
+            # prior behaviour of not arming the watch from their own source.
+            if _inspect.isasyncgenfunction(endpoint) or _inspect.isgeneratorfunction(
+                endpoint
+            ):
+                continue
+            try:
+                src = _inspect.getsource(endpoint)
+            except (OSError, TypeError):
+                continue
+            if any(m in src for m in _WATCH_MARKERS):
+                needs_watch = True
+                break
+        self._oneshot_disconnect_watch = needs_watch
+        return needs_watch
+
+    def _door_fingerprint(self) -> tuple:
+        """Cheap structural fingerprint of the routes + middleware that the
+        door's Rust router and WS table are built from. Used to detect routes /
+        middleware / mounts added AFTER the first in-process request (e.g. lazy
+        ``app.mount`` / plugin registration) so the door re-registers instead of
+        serving a stale router (or 1000-closing a freshly-added WS route)."""
+        router = getattr(self, "router", None)
+        # dependency_overrides are a testing feature set at RUNTIME (after the door
+        # registered). Include the current override key-set so the door re-registers
+        # when it changes — override-active routes then decline to the clone path
+        # (which resolves overrides per request, incl. different-signature ones).
+        _ov = getattr(self, "dependency_overrides", None)
+        return (
+            len(getattr(router, "routes", None) or ()),
+            len(getattr(self, "_http_middlewares", None) or ()),
+            len(getattr(self, "_middleware_stack", None) or ()),
+            len(getattr(self, "_raw_asgi_middlewares", None) or ()),
+            len(getattr(self, "_mounts", None) or ()),
+            frozenset(id(k) for k in _ov) if _ov else None,
+        )
+
+    def _ensure_oneshot_registered(self, scope: dict) -> None:
+        """Register the assembled router for this app, using the same
+        full-fidelity args as ``app.run()``. Re-registers when the route /
+        middleware fingerprint changes (routes added after the first request),
+        so the door never serves a stale router."""
+        fp = self._door_fingerprint()
+        if (
+            getattr(self, "_oneshot_registered", False)
+            and getattr(self, "_oneshot_reg_fingerprint", None) == fp
+        ):
+            return
+        from fastapi_turbo._fastapi_turbo_core import register_app_router
+
+        server = scope.get("server") or ("127.0.0.1", 0)
+        host = str(server[0] or "127.0.0.1")
+        port = int(server[1] or 0)
+        register_app_router(id(self), *self._build_server_args(host, port, for_door=True))
+        self._oneshot_registered = True
+        # Store the fingerprint AFTER ``_build_server_args`` — it normalises the
+        # dynamic ``/openapi.json`` route into ``router.routes``, so capturing
+        # it post-registration keeps the value stable across later requests
+        # (otherwise every request would see a changed count and re-register).
+        self._oneshot_reg_fingerprint = self._door_fingerprint()
+        # A structural change also invalidates the cached WS route table and
+        # the disconnect-watch scan, which are derived from the same routes.
+        self._ws_door_route_table = None
+        self._oneshot_disconnect_watch = None
+
+    def _oneshot_mutate_outer_scope(self, scope: dict) -> None:
+        """Populate ``scope['route']`` / ``scope['path_params']`` /
+        ``scope['endpoint']`` on the OUTER ASGI scope, mirroring Starlette's
+        in-place router mutation. Outer ASGI middleware that wraps the
+        whole app (legacy ``SentryAsgiMiddleware(app)``, OTel, rate-limit)
+        reads ``scope['route'].path`` at response-start time to template
+        the transaction name — without this it records the concrete path
+        (``/message/123456``) instead of the route shape
+        (``/message/{message_id}``). R25 regression: the oneshot door
+        dispatches entirely in Rust and never touched the outer scope.
+
+        Best-effort: a lightweight regex match reusing the per-route
+        ``_fastapi_turbo_asgi_regex`` cache the dispatcher already
+        populates. Any failure is swallowed — the scope decoration is a
+        compatibility nicety, never load-bearing for the response."""
+        import re as _re
+
+        try:
+            method = scope.get("method", "GET").upper()
+            path = scope.get("path", "/")
+            router = getattr(self, "router", None)
+            for route in getattr(router, "routes", None) or ():
+                r_path = getattr(route, "path", None)
+                if not r_path:
+                    continue
+                regex = getattr(route, "_fastapi_turbo_asgi_regex", None)
+                if regex is None:
+                    pattern = "^"
+                    idx = 0
+                    for m in _re.finditer(r"\{([^{}:]+)(?::([^{}]+))?\}", r_path):
+                        pattern += _re.escape(r_path[idx:m.start()])
+                        pname = m.group(1)
+                        if m.group(2) == "path":
+                            pattern += f"(?P<{pname}>.+)"
+                        else:
+                            pattern += f"(?P<{pname}>[^/]+)"
+                        idx = m.end()
+                    pattern += _re.escape(r_path[idx:]) + "$"
+                    regex = _re.compile(pattern)
+                    try:
+                        route._fastapi_turbo_asgi_regex = regex  # type: ignore[attr-defined]
+                    except (AttributeError, TypeError):
+                        pass
+                match = regex.match(path)
+                if match is None:
+                    continue
+                r_methods = {
+                    m.upper() for m in (getattr(route, "methods", None) or ())
+                }
+                if method not in r_methods:
+                    continue
+                scope["route"] = route
+                scope["path_params"] = match.groupdict()
+                scope["endpoint"] = getattr(route, "endpoint", None)
+                return
+        except Exception as _exc:  # noqa: BLE001
+            _log.debug("oneshot outer-scope decoration skipped: %r", _exc)
+
+    async def _asgi_try_http_mount(
+        self, scope: dict, receive: Callable, send: Callable
+    ) -> bool:
+        """In-process HTTP mount dispatch for the door path. If the request
+        path falls under a registered ``app.mount(prefix, subapp)`` or a
+        Starlette ``Mount`` route (and no top-level literal route shadows it),
+        strip the prefix and recurse into the sub-app's ASGI ``__call__`` —
+        all in-process, no dispatcher and no loopback socket. Returns True
+        when a mount handled the request. Mirrors the (now-legacy) dispatcher
+        Mount-dispatch block so mounts keep working once the door is the only
+        ASGI engine."""
+        path = scope.get("path", "/")
+        method = scope.get("method", "GET")
+        # app.mount(prefix, subapp)
+        for mount_path, mounted_app, _mname in getattr(self, "_mounts", []) or []:
+            prefix = (mount_path or "").rstrip("/")
+            if not prefix:
+                continue  # root mount: defer to the normal matcher
+            if path == prefix or path.startswith(prefix + "/"):
+                top_level_hit = any(
+                    getattr(r, "path", None) == path
+                    and method in {m.upper() for m in (getattr(r, "methods", None) or ())}
+                    for r in self.router.routes
+                )
+                if top_level_hit:
+                    continue
+                sub_path = path[len(prefix):] or "/"
+                sub_scope = dict(scope)
+                sub_scope["path"] = sub_path
+                sub_scope["raw_path"] = sub_path.encode("latin-1")
+                sub_scope["root_path"] = scope.get("root_path", "") + prefix
+                # APIRouter FIRST: it is now a real Starlette Router
+                # subclass (callable as ASGI), but turbo routers must be
+                # served through a wrapping app (deferred include + AES
+                # scopes), not raw Router.__call__.
+                from fastapi_turbo.routing import APIRouter as _APIRouter
+                if isinstance(mounted_app, _APIRouter):
+                    sub_app = type(self)()
+                    try:
+                        sub_app.include_router(mounted_app)
+                    except Exception as _exc:  # noqa: BLE001
+                        _log.debug("in-process APIRouter mount: %r", _exc)
+                    await sub_app(sub_scope, receive, send)
+                    return True
+                if callable(mounted_app):
+                    await mounted_app(sub_scope, receive, send)
+                    return True
+        # Starlette Mount routes declared via FastAPI(routes=[Mount(...)])
+        for route in getattr(self.router, "routes", []) or []:
+            if not _looks_like_starlette_mount(route):
+                continue
+            prefix = (getattr(route, "path", "") or "").rstrip("/")
+            if not prefix:
+                continue
+            if not (path == prefix or path.startswith(prefix + "/")):
+                continue
+            top_level_hit = any(
+                r is not route
+                and not _looks_like_starlette_mount(r)
+                and getattr(r, "path", None) == path
+                and method in {m.upper() for m in (getattr(r, "methods", None) or ())}
+                for r in self.router.routes
+            )
+            if top_level_hit:
+                continue
+            mounted_app = _mounted_route_asgi_app(type(self), route)
+            if mounted_app is None:
+                continue
+            sub_path = path[len(prefix):] or "/"
+            sub_scope = dict(scope)
+            sub_scope["path"] = sub_path
+            sub_scope["raw_path"] = sub_path.encode("latin-1")
+            sub_scope["root_path"] = scope.get("root_path", "") + prefix
+            # APIRouter FIRST (see the _mounts branch above): turbo
+            # routers are real Starlette Routers now, hence callable.
+            from fastapi_turbo.routing import APIRouter as _APIRouter
+            if isinstance(mounted_app, _APIRouter):
+                sub_app = type(self)(docs_url=None, redoc_url=None, openapi_url=None)
+                sub_app.include_router(mounted_app)
+                await sub_app(sub_scope, receive, send)
+                return True
+            if callable(mounted_app):
+                await mounted_app(sub_scope, receive, send)
+                return True
+        return False
+
+    async def _asgi_oneshot_http_with_mw(
+        self, scope: dict, receive: Callable, send: Callable
+    ) -> bool:
+        """Drive the oneshot door, composing the Tower-bound + raw-ASGI
+        middlewares as an OUTER ASGI chain in registration order (last
+        registered = outermost) so they wrap the Rust-produced response —
+        INCLUDING a short-circuit (e.g. an HTTPSRedirect 307) — exactly like
+        the (removed) Python dispatcher. Active only for the mixed Tower+raw
+        case (``_door_outer_mw_list`` is empty otherwise); the door's
+        registered handlers are then built WITHOUT the raw-ASGI shims and
+        WITHOUT Tower Rust layers (``_build_server_args(for_door=True)``), so
+        nothing double-applies. @app.middleware / BaseHTTPMiddleware stay
+        inner (baked into the handler)."""
+        outer_mws = self._door_outer_mw_list()
+        if not outer_mws:
+            return await self._asgi_oneshot_http(scope, receive, send)
+
+        async def _leaf(inner_scope, inner_receive, inner_send):
+            # ``_asgi_oneshot_http`` drives process_request_streaming and emits
+            # the status/headers/body ASGI frames, so the outer chain can
+            # observe and decorate them. It always handles HTTP (returns True).
+            await self._asgi_oneshot_http(inner_scope, inner_receive, inner_send)
+
+        composed = _leaf
+        # Forward order: ``add_middleware(X)`` then ``add_middleware(Y)`` ⇒ Y
+        # outermost. forward-wrap gives ``Y(X(leaf))`` so Y.__call__ runs first.
+        for mw_cls, mw_kwargs in outer_mws:
+            try:
+                composed = mw_cls(app=composed, **mw_kwargs)
+            except TypeError:
+                composed = mw_cls(**mw_kwargs)
+        await composed(scope, receive, send)
+        return True
+
+    async def _asgi_oneshot_http(self, scope: dict, receive: Callable, send: Callable) -> bool:
+        """Drive one HTTP request through the Rust engine in-process via
+        ``process_request_streaming`` and emit the ASGI response (status +
+        headers, then the body streamed chunk-by-chunk). Returns True when
+        handled. The blocking dispatch runs in a thread so the asyncio loop is
+        not blocked (the GIL is released inside the Rust call)."""
+        import asyncio
+
+        from fastapi_turbo._fastapi_turbo_core import process_request_streaming
+
+        self._ensure_oneshot_registered(scope)
+        # Decorate the outer scope with the matched route shape so
+        # app-wrapping ASGI middleware (Sentry/OTel) sees it — same as
+        # the dispatcher / Starlette's router. R25 parity.
+        self._oneshot_mutate_outer_scope(scope)
+
+        # Drain the request body from the ASGI ``receive`` channel.
+        body = b""
+        more_body = True
+        while more_body:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return True  # client gone before we could respond
+            body += message.get("body", b"") or b""
+            more_body = message.get("more_body", False)
+
+        method = scope.get("method", "GET")
+        path = scope.get("path", "/")
+        query_string = scope.get("query_string", b"") or b""
+        if isinstance(query_string, (bytes, bytearray)):
+            query_string = bytes(query_string).decode("latin-1")
+        headers = [(bytes(k), bytes(v)) for k, v in scope.get("headers", [])]
+        client = scope.get("client") or ("127.0.0.1", 0)
+        client_host = str(client[0] or "127.0.0.1")
+        client_port = int(client[1] or 0)
+
+        # Disconnect signal for handlers that poll ``request.is_disconnected()``
+        # (SSE / long-poll). The Rust request has no live ASGI receive, so hand
+        # it a ``threading.Event`` and set it from a background receive-poller —
+        # only for apps that actually poll (no per-request overhead otherwise).
+        disconnect_event = None
+        disconnect_task = None
+        if self._oneshot_needs_disconnect_watch():
+            import threading
+
+            disconnect_event = threading.Event()
+
+            async def _watch_disconnect():
+                try:
+                    while True:
+                        m = await receive()
+                        if m.get("type") == "http.disconnect":
+                            disconnect_event.set()
+                            return
+                except Exception:  # noqa: BLE001
+                    pass
+
+            disconnect_task = asyncio.ensure_future(_watch_disconnect())
+
+        loop = asyncio.get_running_loop()
+        status, resp_headers, body_stream = await loop.run_in_executor(
+            None,
+            process_request_streaming,
+            id(self),
+            method,
+            path,
+            query_string,
+            headers,
+            body,
+            client_host,
+            client_port,
+            disconnect_event,
+        )
+
+        # Bodiless statuses (1xx, 204 No Content, 304 Not Modified) MUST
+        # NOT carry a Content-Length per RFC 7230 §3.3.2. The assembled
+        # axum router emits ``content-length: 0`` for a bodiless 204
+        # (hyper would strip it at wire-serialize time, but the oneshot
+        # door bypasses hyper and returns headers verbatim). The Python
+        # dispatcher + upstream Starlette omit it, so strip it here to
+        # keep parity. ``GET /no-content`` returned ``content-length: 0``
+        # via the door vs nothing upstream (R55 204-parity finding).
+        out_headers = [[bytes(k), bytes(v)] for k, v in resp_headers]
+        if status < 200 or status in (204, 304):
+            out_headers = [
+                (k, v)
+                for k, v in out_headers
+                if k.lower() != b"content-length"
+            ]
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": out_headers,
+            }
+        )
+        # Pump body chunks lazily off Axum's BodyDataStream. For a buffered
+        # response this is a single chunk; for a StreamingResponse / SSE it
+        # streams frame-by-frame with no 32 MiB cap and no hang on large or
+        # infinite bodies. ``next_chunk`` blocks on the shared oneshot runtime
+        # inside the executor so the asyncio loop stays free.
+        disconnected = False
+        try:
+            while True:
+                # Client gone? Stop draining and DROP the body stream so the
+                # server-side generator is cancelled (GeneratorExit) — otherwise
+                # an infinite stream would run forever.
+                if disconnect_event is not None and disconnect_event.is_set():
+                    await loop.run_in_executor(None, body_stream.close)
+                    disconnected = True
+                    break
+                chunk = await loop.run_in_executor(None, body_stream.next_chunk)
+                if chunk is None:
+                    break
+                try:
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": bytes(chunk),
+                            "more_body": True,
+                        }
+                    )
+                except Exception:  # noqa: BLE001
+                    # Send failed mid-stream (client dropped) — cancel the generator.
+                    await loop.run_in_executor(None, body_stream.close)
+                    disconnected = True
+                    break
+            if not disconnected:
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            if disconnect_task is not None:
+                disconnect_task.cancel()
+
+        # Re-raise an unhandled server exception AFTER the 500 response is
+        # sent (Starlette ServerErrorMiddleware semantics).
+        # The Rust dispatch core renders the 500 (running any catch-all
+        # ``@app.exception_handler(Exception)``) and records the original
+        # exception on ``_captured_server_exceptions`` — via the compiled
+        # handler wrapper for the with-handler case, and via
+        # ``pyerr_to_response`` (responses.rs) for the no-handler case.
+        # Re-raising it here propagates it out of ``__call__`` so
+        # ``httpx.ASGITransport(raise_app_exceptions=True)`` /
+        # ``TestClient(raise_server_exceptions=True)`` surface the original
+        # exception; under ``raise_app_exceptions=False`` httpx swallows the
+        # raise and the rendered 500 response is what the caller observes.
+        # Drain (pop+clear) so the list is empty for the next request and
+        # TestClient's ``_check_raised`` doesn't double-raise.
+        captured = getattr(self, "_captured_server_exceptions", None)
+        if captured:
+            exc = captured.pop(0)
+            captured.clear()
+            raise exc
+        return True
+
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
         """ASGI entry point.
 
         Dispatch rules:
           * ``lifespan``   → drive startup/shutdown handlers directly.
-          * ``http``       → TRY in-process dispatch (match path, run the
-                             route's Python endpoint, serialize the
-                             Response to ``send`` messages). Falls back
-                             to a loopback-proxy path only when the
-                             request needs a feature the in-process
-                             path doesn't cover (mounts, raw-ASGI
-                             middleware, etc.) or an unexpected error
-                             bubbles up. This makes the app usable in
-                             socket-restricted / sandboxed environments
-                             (``httpx.ASGITransport(app=app)``, hermetic
-                             test runners) without binding a real port.
-          * ``websocket``  → proxy via a loopback server (``websockets``
-                             library). In-process WebSocket dispatch is
-                             tracked separately.
+          * ``http``       → the in-process Rust oneshot door
+                             (``_asgi_oneshot_http_with_mw`` →
+                             ``process_request_streaming``) serves the request
+                             in-process — no socket needed, so the app works
+                             under ``httpx.ASGITransport(app=app)`` / hermetic
+                             test runners. ``FASTAPI_TURBO_ONESHOT_DOOR=0`` (or
+                             a ``_fastapi_turbo_force_proxy`` scope flag) opts
+                             out to the loopback Rust socket server.
+          * ``websocket``  → the in-process WebSocket door (``_asgi_ws_door``)
+                             drives a Python ``WebSocket`` over the ASGI
+                             receive/send channels, reusing the same wrapped
+                             endpoint ``app.run()`` uses; same opt-out applies.
         """
         if scope["type"] == "lifespan":
             await self._asgi_lifespan(scope, receive, send)
@@ -7363,16 +7260,30 @@ class FastAPI:
 
             if not getattr(self, "_in_process_dynamic_routes_installed", False):
                 self._install_in_process_dynamic_routes()
-            # Honour an explicit opt-out for the (rare) cases where the
-            # caller wants the proxy path (existing regression workflows,
-            # tests that specifically validate the proxy code path).
+
+            # In-process HTTP mount dispatch (door path): recurse into mounted
+            # sub-apps with the prefix stripped, before the door tries the
+            # assembled router (which doesn't host mounts). Keeps mounts on the
+            # in-process path — no dispatcher, no loopback socket.
+            if await self._asgi_try_http_mount(scope, receive, send):
+                return
+
+            # In-process oneshot door — THE Rust HTTP engine for the ASGI
+            # path (uvicorn / TestClient in-process / httpx.ASGITransport). It
+            # hosts the entire HTTP surface: params/body/deps/validation,
+            # streaming + client-disconnect, mounts, and the full middleware
+            # surface including mixed Tower+raw-ASGI (_asgi_oneshot_http_with_mw
+            # composes them as one registration-ordered chain). The ~3.3K-line
+            # Python in-process dispatcher this replaced has been DELETED
+            # (Phase 7). ``_fastapi_turbo_force_proxy`` (scope) or
+            # ``FASTAPI_TURBO_ONESHOT_DOOR=0`` opt OUT to the loopback Rust
+            # socket server.
             force_proxy = bool(scope.get("_fastapi_turbo_force_proxy"))
-            if not force_proxy:
-                dispatched = await self._asgi_dispatch_in_process(scope, receive, send)
-                if dispatched:
+            if not force_proxy and self._oneshot_door_enabled():
+                if await self._asgi_oneshot_http_with_mw(scope, receive, send):
                     return
-            # In-process couldn't handle it (or was disabled) — fall
-            # back to the loopback Rust server.
+            # Door opted out (or forced proxy) — fall back to the loopback
+            # Rust server (real socket).
             await self._asgi_ensure_server()
             await self._asgi_proxy_http(scope, receive, send)
             return
@@ -7392,7 +7303,11 @@ class FastAPI:
                     ws_path_local == _mp_strip
                     or ws_path_local.startswith(_mp_strip + "/")
                 ):
-                    if not callable(_ma):
+                    if not callable(_ma) or isinstance(_ma, APIRouter):
+                        # Mounted bare APIRouters are callable now (real
+                        # Starlette Router) but their WS routes are
+                        # WSRoute holders the raw Router can't dispatch —
+                        # fall through to the in-process WS door.
                         continue
                     sub_ws_scope = dict(scope)
                     sub_ws_path = ws_path_local[len(_mp_strip):] or "/"
@@ -7416,7 +7331,7 @@ class FastAPI:
                 ):
                     continue
                 _ma = _mounted_route_asgi_app(type(self), _route)
-                if not callable(_ma):
+                if not callable(_ma) or isinstance(_ma, APIRouter):
                     continue
                 sub_ws_scope = dict(scope)
                 sub_ws_path = ws_path_local[len(_mp_strip):] or "/"
@@ -7426,59 +7341,108 @@ class FastAPI:
                 await _ma(sub_ws_scope, receive, send)
                 return
 
-            # WS middleware: Starlette-style ASGI middleware
-            # registered via ``Middleware(websocket_middleware)`` /
-            # ``add_middleware(callable)`` wraps the dispatch chain
-            # so user middleware can ``try/except`` errors raised by
-            # WS deps. Mirrors FA's
-            # ``test_ws_router::test_depend_err_middleware``.
-            ws_mw_factories = []
-            try:
-                for _cls, _kw in getattr(self, "_middleware_stack", []) or []:
-                    # Function-style middleware (callable but not a
-                    # type) — Starlette accepts these as factory:
-                    # ``cls(app) -> wrapped_app``.
-                    if callable(_cls) and not isinstance(_cls, type):
-                        ws_mw_factories.append((_cls, _kw))
-            except Exception:  # noqa: BLE001
-                pass
-
-            # Try in-process WS dispatch first (sandbox-friendly),
-            # fall back to the loopback proxy when the in-process
-            # path can't satisfy the request.
+            # In-process WebSocket door: route-match against the app's WS
+            # routes and drive the SAME wrapped endpoint ``app.run()`` uses
+            # (``_wrap_websocket_endpoint`` — deps / validation / WS- and
+            # raw-ASGI-middleware / exception routing) over a Python
+            # ``WebSocket`` backed by the ASGI receive/send channels. The
+            # caller's event loop already drives everything, so no loopback
+            # socket and no Rust channel bridge are needed. WS middleware and
+            # raw-ASGI middleware are applied INSIDE the wrapped endpoint, so
+            # we don't wrap them here. ``_fastapi_turbo_force_proxy`` (or
+            # ``FASTAPI_TURBO_ONESHOT_DOOR=0``) opts OUT to the loopback Rust
+            # WS server.
             force_proxy = bool(scope.get("_fastapi_turbo_force_proxy"))
-            if not force_proxy:
-                if ws_mw_factories:
-                    async def _ws_inner_app(_s, _r, _sd):
-                        # Mark scope so the dispatcher knows a
-                        # middleware will catch errors — skip the
-                        # default 1011 close so the middleware's
-                        # ``websocket.close(code=…, reason=…)`` is
-                        # the one delivered to the client.
-                        _ms = dict(_s) if not _s.get(
-                            "_fastapi_turbo_ws_in_mw"
-                        ) else _s
-                        _ms["_fastapi_turbo_ws_in_mw"] = True
-                        await self._asgi_dispatch_ws_in_process(_ms, _r, _sd)
-                    _ws_app = _ws_inner_app
-                    for _mc, _mk in reversed(ws_mw_factories):
-                        try:
-                            _ws_app = _mc(_ws_app, **_mk)
-                        except TypeError:
-                            try:
-                                _ws_app = _mc(_ws_app)
-                            except Exception:  # noqa: BLE001
-                                pass
-                    await _ws_app(scope, receive, send)
-                    return
-                dispatched = await self._asgi_dispatch_ws_in_process(
-                    scope, receive, send
-                )
-                if dispatched:
+            if not force_proxy and self._oneshot_door_enabled():
+                if await self._asgi_ws_door(scope, receive, send):
                     return
             await self._asgi_ensure_server()
             await self._asgi_proxy_websocket(scope, receive, send)
             return
+
+    def _ws_door_table(self) -> list:
+        """Cached ``[(regex, wrapped_endpoint, route_path, route_obj), ...]``
+        for the app's WebSocket routes. ``wrapped_endpoint`` is the SAME
+        ``_wrap_websocket_endpoint`` output the Rust ``app.run()`` door
+        registers (built by ``_collect_all_routes`` with the full effective
+        dependency set), so the in-process door applies identical
+        deps/validation/middleware/exception handling. Cached, but rebuilt when
+        the route/middleware fingerprint changes (a WS route added after the
+        first WS request would otherwise 1000-close)."""
+        fp = self._door_fingerprint()
+        cached = getattr(self, "_ws_door_route_table", None)
+        if cached is not None and getattr(self, "_ws_door_table_fingerprint", None) == fp:
+            return cached
+        import re as _re
+        table: list = []
+        for rd in self._collect_all_routes():
+            if not rd.get("is_websocket"):
+                continue
+            r_path = rd.get("path") or ""
+            if not r_path:
+                continue
+            pattern = "^"
+            idx = 0
+            for m in _re.finditer(r"\{([^{}:]+)(?::([^{}]+))?\}", r_path):
+                pattern += _re.escape(r_path[idx:m.start()])
+                pname = m.group(1)
+                pattern += (
+                    f"(?P<{pname}>.+)" if m.group(2) == "path"
+                    else f"(?P<{pname}>[^/]+)"
+                )
+                idx = m.end()
+            pattern += _re.escape(r_path[idx:]) + "$"
+            table.append(
+                (_re.compile(pattern), rd["endpoint"], r_path, rd.get("_route_obj"))
+            )
+        self._ws_door_route_table = table
+        self._ws_door_table_fingerprint = fp
+        return table
+
+    async def _asgi_ws_door(
+        self, scope: dict, receive: Callable, send: Callable
+    ) -> bool:
+        """Serve an ASGI ``websocket`` scope in-process: match a WS route,
+        build a Python ``WebSocket`` over the ASGI receive/send channels, and
+        drive the shared wrapped endpoint on the caller's event loop. Always
+        returns True (handled): on no match it closes with 1000, matching
+        Starlette. Replaces the deleted ~900-line Python WS dispatcher."""
+        from fastapi_turbo.websockets import WebSocket as _WS
+
+        path = scope.get("path", "/")
+        wrapped = None
+        route_obj = None
+        path_params: dict = {}
+        for regex, _wrapped, _route_path, _route_obj in self._ws_door_table():
+            m = regex.match(path)
+            if m is None:
+                continue
+            wrapped = _wrapped
+            route_obj = _route_obj
+            path_params = m.groupdict()
+            break
+
+        if wrapped is None:
+            # No matching WS route — Starlette closes with 1000 (normal).
+            try:
+                await send({"type": "websocket.close", "code": 1000})
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        if route_obj is not None:
+            scope["route"] = route_obj
+        scope["path_params"] = path_params
+        scope["app"] = self
+        ws = _WS(scope, receive=receive, send=send)
+        ws._app = self
+        await wrapped(ws, **path_params)
+        # Flush a terminal close queued from a SYNC code path (``_reject`` /
+        # ``_handle_ws_exc`` can't await); no-ops if already closed.
+        pc = getattr(ws, "_asgi_pending_close", None)
+        if pc is not None:
+            await ws._asgi_send_close(*pc)
+        return True
 
     # ── lifespan ──────────────────────────────────────────────────────
 
@@ -7492,22 +7456,46 @@ class FastAPI:
         # the worker thread's loop instead — first request from a
         # handler awaiting that resource then hits "Future attached to
         # a different loop". Issue #1.
+        # When the oneshot door is the active HTTP path for this app,
+        # async handlers run on the ``_async_worker`` loop (the Rust
+        # engine routes a suspending coroutine through
+        # ``submit_to_async_worker`` — exactly as under ``app.run()``).
+        # So lifespan MUST also run on the worker loop, or an asyncio
+        # primitive created at startup (asyncpg pool, ``redis.asyncio``
+        # client, ``asyncio.Lock``/``Event``) binds to the caller's
+        # loop and the first request that awaits it hits "got Future
+        # attached to a different loop". The sync ``_run_*`` helpers
+        # submit through ``_async_worker.submit`` (see
+        # ``_run_lifespan_startup``), giving the worker-loop affinity
+        # the door needs — this mirrors ``app.run()``'s startup path
+        # rather than the async-dispatcher's caller-loop path. Issue #1.
+        _door_owns_http = self._oneshot_door_enabled()
         while True:
             message = await receive()
             if message["type"] == "lifespan.startup":
                 try:
-                    if self._collect_lifespans():
-                        await self._async_run_lifespan_startup()
-                    await self._async_run_startup_handlers()
+                    if _door_owns_http:
+                        if self._collect_lifespans():
+                            self._run_lifespan_startup()
+                        self._run_startup_handlers()
+                    else:
+                        if self._collect_lifespans():
+                            await self._async_run_lifespan_startup()
+                        await self._async_run_startup_handlers()
                     await send({"type": "lifespan.startup.complete"})
                 except Exception as exc:
                     await send({"type": "lifespan.startup.failed", "message": str(exc)})
                     return
             elif message["type"] == "lifespan.shutdown":
                 try:
-                    if getattr(self, "_lifespan_cms", None):
-                        await self._async_run_lifespan_shutdown()
-                    await self._async_run_shutdown_handlers()
+                    if _door_owns_http:
+                        if getattr(self, "_lifespan_cms", None):
+                            self._run_lifespan_shutdown()
+                        self._run_shutdown_handlers()
+                    else:
+                        if getattr(self, "_lifespan_cms", None):
+                            await self._async_run_lifespan_shutdown()
+                        await self._async_run_shutdown_handlers()
                 except Exception as exc:
                     # Surface the failure to the ASGI server (matches
                     # Starlette / upstream FastAPI). Earlier impl
@@ -7536,4241 +7524,6 @@ class FastAPI:
                     return
                 await send({"type": "lifespan.shutdown.complete"})
                 return
-
-    # ── in-process ASGI dispatch ──────────────────────────────────────
-    # Helper lives at module scope below (``_send_asgi_response``) so
-    # it can be unit-tested without an app instance.
-
-    async def _asgi_dispatch_in_process(
-        self, scope: dict, receive: Callable, send: Callable
-    ) -> bool:
-        """Route an ASGI ``http`` scope through the Python handler
-        pipeline without needing a loopback socket.
-
-        Returns ``True`` when the response was delivered (``send``
-        emitted ``http.response.start`` + ``http.response.body``);
-        ``False`` when we deliberately gave up so the caller can fall
-        back to the proxy path (e.g. request has form/file parts, uses
-        a mounted sub-app, or raises a feature we haven't implemented).
-
-        Scope: covers the dispatch surface that matters for ASGI test
-        clients and serverless adapters — path + method match, query
-        params, JSON body, basic Query/Path/Header params, Pydantic
-        body validation, ``Request`` / ``Response`` / ``BackgroundTasks``
-        injection, and Starlette-style Response serialization.
-        """
-        import re as _re
-        from fastapi_turbo.requests import Request as _Req
-        from fastapi_turbo.responses import (
-            JSONResponse as _JR,
-            Response as _Resp,
-        )
-        from fastapi_turbo.encoders import jsonable_encoder as _je
-        from fastapi_turbo.exceptions import (
-            HTTPException as _HE,
-            RequestValidationError as _RVE,
-        )
-
-        method = scope.get("method", "GET").upper()
-        path = scope.get("path", "/")
-
-        # ── Host dispatch ──
-        # ``app.host("subapp", subapp)`` — when a request's Host header
-        # matches a registered host, recurse into the sub-app's
-        # ``__call__``. Done HERE (before mount dispatch and route
-        # match) because the host middleware installed via
-        # ``app.host()`` only fires inside an endpoint's wrapper
-        # chain — when no main-app route matches, the dispatcher
-        # would return False and fall back to the loopback Rust
-        # server, which can't bind under ``ASGITransport`` /
-        # serverless / sandbox runs (probe-confirmed: bare
-        # ``httpx.ASGITransport(app=app)`` raised
-        # ``PermissionError`` instead of routing to the sub-app).
-        hosts = getattr(self, "_hosts", None)
-        if hosts:
-            host_header = ""
-            for hk, hv in scope.get("headers", []) or []:
-                hkl = (hk.decode("latin-1") if isinstance(hk, bytes) else hk).lower()
-                if hkl == "host":
-                    host_header = (
-                        hv.decode("latin-1") if isinstance(hv, bytes) else hv
-                    )
-                    break
-            hs = host_header.split(":", 1)[0].lower()
-            for entry in hosts:
-                hn = entry[0].lower()
-                sub = entry[1]
-                if sub is None:
-                    continue
-                hit = (hn == hs) or ("." not in hn and hs.split(".", 1)[0] == hn)
-                if hit:
-                    # Forward the (unchanged) scope to the sub-app's
-                    # ASGI ``__call__``. Sub-app keeps its own route
-                    # table; the path on the scope is whatever the
-                    # client sent (Starlette's ``Host`` doesn't strip
-                    # a prefix — that's what ``mount`` is for).
-                    await sub(scope, receive, send)
-                    return True
-
-        # ── Mount dispatch ──
-        # ``app.mount("/v1", subapp)`` — if the incoming path starts
-        # with a registered mount prefix AND no top-level route matches
-        # the path verbatim, recurse into the sub-app with the prefix
-        # stripped. Top-level literal routes win over mount dispatch
-        # (a user-registered ``/status`` beats a mount at ``/`` that
-        # would also match).
-        for mount_path, mounted_app, _mname in getattr(self, "_mounts", []) or []:
-            prefix = mount_path.rstrip("/")
-            if not prefix:
-                # Mount at root ``/`` — only match when no top-level
-                # route exists for this path; defer that check to the
-                # normal matcher below so root mounts fall through
-                # naturally.
-                continue
-            if path == prefix or path.startswith(prefix + "/"):
-                # Don't shadow a top-level literal route. Only redirect
-                # to the sub-app when NO top-level route matches.
-                top_level_hit = False
-                for r in self.router.routes:
-                    if getattr(r, "path", None) == path and method in (
-                        {m.upper() for m in (getattr(r, "methods", None) or ())}
-                    ):
-                        top_level_hit = True
-                        break
-                if not top_level_hit:
-                    sub_path = path[len(prefix):] or "/"
-                    sub_scope = dict(scope)
-                    sub_scope["path"] = sub_path
-                    sub_scope["raw_path"] = sub_path.encode("latin-1")
-                    sub_scope["root_path"] = scope.get("root_path", "") + prefix
-                    # Sub-apps implement ASGI via __call__; delegate.
-                    if callable(mounted_app):
-                        await mounted_app(sub_scope, receive, send)
-                        return True
-                    # APIRouter mount: ``app.mount('/v2', router)`` where
-                    # ``router`` is a bare APIRouter (no ``__call__``).
-                    # Build a transient FastAPI app, ``include_router``
-                    # the user's router, and delegate to it once.
-                    from fastapi_turbo.routing import APIRouter as _APIRouter
-                    if isinstance(mounted_app, _APIRouter):
-                        sub_app = type(self)()
-                        try:
-                            sub_app.include_router(mounted_app)
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug(
-                                "in-process APIRouter mount: %r", _exc
-                            )
-                        await sub_app(sub_scope, receive, send)
-                        return True
-
-        for route in getattr(self.router, "routes", []) or []:
-            if not _looks_like_starlette_mount(route):
-                continue
-            prefix = (getattr(route, "path", "") or "").rstrip("/")
-            if not prefix:
-                continue
-            if not (path == prefix or path.startswith(prefix + "/")):
-                continue
-            top_level_hit = False
-            for r in self.router.routes:
-                if r is route or _looks_like_starlette_mount(r):
-                    continue
-                if getattr(r, "path", None) == path and method in (
-                    {m.upper() for m in (getattr(r, "methods", None) or ())}
-                ):
-                    top_level_hit = True
-                    break
-            if top_level_hit:
-                continue
-            mounted_app = _mounted_route_asgi_app(type(self), route)
-            if mounted_app is None:
-                continue
-            sub_path = path[len(prefix):] or "/"
-            sub_scope = dict(scope)
-            sub_scope["path"] = sub_path
-            sub_scope["raw_path"] = sub_path.encode("latin-1")
-            sub_scope["root_path"] = scope.get("root_path", "") + prefix
-            if callable(mounted_app):
-                await mounted_app(sub_scope, receive, send)
-                return True
-            from fastapi_turbo.routing import APIRouter as _APIRouter
-            if isinstance(mounted_app, _APIRouter):
-                sub_app = type(self)(
-                    docs_url=None,
-                    redoc_url=None,
-                    openapi_url=None,
-                )
-                sub_app.include_router(mounted_app)
-                await sub_app(sub_scope, receive, send)
-                return True
-
-        if not hasattr(self, "router") or not getattr(self.router, "routes", None):
-            return False
-
-        # Pre-assemble a Starlette-like request scope for downstream
-        # consumers (the user's endpoint may inject ``Request``).
-        # Enforce ``FastAPI(max_request_size=…)`` for the in-process
-        # path so TestClient / ASGITransport fallback rejects
-        # oversized bodies the same way the Tower layer does on the
-        # Rust server. Without this a request that would 413 in
-        # production would silently succeed in fallback tests.
-        _max_body = getattr(self, "max_request_size", None)
-
-        class _BodyTooLarge(Exception):
-            pass
-
-        async def _drain_body() -> bytes:
-            body = b""
-            while True:
-                msg = await receive()
-                body += msg.get("body", b"")
-                if _max_body is not None and _max_body > 0 and len(body) > _max_body:
-                    raise _BodyTooLarge()
-                if not msg.get("more_body", False):
-                    break
-            return body
-
-        # ── Raw-ASGI middleware chain ──
-        # If the app has registered raw-ASGI middlewares via
-        # ``add_middleware(MWClass, ...)``, we wrap our in-process
-        # endpoint dispatch in a leaf ASGI app and compose the MW
-        # chain around it (LIFO per add_middleware order — matches
-        # Starlette / FastAPI semantics). This lets Sentry / CORS /
-        # GZip / TrustedHost / Session / user-custom ASGI MWs observe
-        # and mutate the request without requiring loopback access.
-        #
-        # Compose the in-process middleware chain in REGISTRATION
-        # order, spanning both Tower-bound markers
-        # (CORS/GZip/HTTPSRedirect) and raw ASGI middlewares. Without
-        # this, Tower markers would always be outermost regardless of
-        # ``add_middleware`` order — breaking the case where a user
-        # adds a custom ASGI middleware AFTER ``HTTPSRedirectMiddleware``
-        # to decorate the redirect response.
-        #
-        # Tower marker classes are inert as ASGI on their own; we
-        # substitute the real Starlette implementation around the
-        # shim. Raw ASGI classes are user-provided so we use them
-        # as-is.
-        log = list(getattr(self, "_mw_registration_log", None) or [])
-        raw_mws: list[tuple[type, dict[str, Any]]] = []
-        for kind, mw_cls, mw_kwargs, _seq in log:
-            if kind == "tower":
-                resolved = _resolve_tower_bound_to_asgi_class(mw_cls)
-                if resolved is not None:
-                    raw_mws.append((resolved, mw_kwargs))
-            else:
-                raw_mws.append((mw_cls, mw_kwargs))
-        # Fallback for apps registered before ``_mw_registration_log``
-        # was introduced (e.g. internal compat shims that bypass
-        # ``add_middleware``): merge what's in the legacy lists.
-        if not log:
-            for mw_cls, mw_kwargs in (
-                getattr(self, "_raw_asgi_middlewares", None) or []
-            ):
-                raw_mws.append((mw_cls, mw_kwargs))
-            for mw_cls, mw_kwargs in (
-                getattr(self, "_middleware_stack", None) or []
-            ):
-                resolved = _resolve_tower_bound_to_asgi_class(mw_cls)
-                if resolved is not None:
-                    raw_mws.append((resolved, mw_kwargs))
-        if raw_mws:
-            # Build a leaf ASGI app that re-enters ``_asgi_dispatch_in_process``
-            # with a flag signalling we've already applied the MW chain.
-            flagged_scope = dict(scope)
-            flagged_scope["_fastapi_turbo_mw_applied"] = True
-
-            async def _leaf(inner_scope, inner_receive, inner_send):
-                dispatched = await self._asgi_dispatch_in_process(
-                    inner_scope, inner_receive, inner_send
-                )
-                if not dispatched:
-                    # No route matched the inner-stripped scope; emit
-                    # a 404 via ASGI so the MW chain can observe the
-                    # response shape.
-                    await _send_asgi_response(
-                        inner_send,
-                        _JR(content={"detail": "Not Found"}, status_code=404),
-                    )
-
-            # Iterate forward (NOT reversed): ``add_middleware(X)``
-            # then ``add_middleware(Y)`` means Y is the outermost.
-            # forward-wrap gives ``Y(X(leaf))`` → Y.__call__ runs first.
-            composed = _leaf
-            for mw_cls, mw_kwargs in raw_mws:
-                try:
-                    composed = mw_cls(app=composed, **mw_kwargs)
-                except TypeError:
-                    composed = mw_cls(**mw_kwargs)
-            if not scope.get("_fastapi_turbo_mw_applied"):
-                await composed(flagged_scope, receive, send)
-                return True
-            # Else fall through — we're inside the chain recursion
-            # and should dispatch the actual endpoint.
-
-        # Two-phase route match: first find a method-matching route;
-        # if none, collect the set of methods declared for the same
-        # path so we can emit 405 + Allow (FA parity) instead of
-        # falling through to 404 or the proxy.
-        matched_route = None
-        path_params: dict = {}
-        # ``methods_for_path`` holds the methods of the FIRST route
-        # whose path matches (regardless of method). Starlette's
-        # matcher reports only the first-matching route's methods
-        # in the 405 Allow header — accumulating across all routes
-        # diverges from upstream when the user registers
-        # ``@app.get("/r")`` and ``@app.post("/r")`` as two separate
-        # routes (which produces two distinct route objects in
-        # Starlette and ``Allow: GET`` for a PUT to /r).
-        methods_for_path: set[str] = set()
-        for route in self.router.routes:
-            r_path = getattr(route, "path", None)
-            if not r_path:
-                continue
-            regex = getattr(route, "_fastapi_turbo_asgi_regex", None)
-            if regex is None:
-                pattern = "^"
-                idx = 0
-                for m in _re.finditer(r"\{([^{}:]+)(?::([^{}]+))?\}", r_path):
-                    pattern += _re.escape(r_path[idx:m.start()])
-                    pname = m.group(1)
-                    if m.group(2) == "path":
-                        pattern += f"(?P<{pname}>.+)"
-                    else:
-                        pattern += f"(?P<{pname}>[^/]+)"
-                    idx = m.end()
-                pattern += _re.escape(r_path[idx:]) + "$"
-                regex = _re.compile(pattern)
-                try:
-                    route._fastapi_turbo_asgi_regex = regex  # type: ignore[attr-defined]
-                except (AttributeError, TypeError):
-                    pass
-            match = regex.match(path)
-            if match is None:
-                continue
-            r_methods = {m.upper() for m in (getattr(route, "methods", None) or ())}
-            # Only the FIRST matching route contributes to the 405
-            # Allow header — matches Starlette's first-hit semantics.
-            if not methods_for_path:
-                methods_for_path = r_methods
-            if method in r_methods:
-                matched_route = route
-                path_params = match.groupdict()
-                break
-
-        if matched_route is None:
-            # Trailing-slash redirect (Starlette ``redirect_slashes=True``
-            # default). Only fires when NO route matches the path for
-            # ANY method — i.e. ``methods_for_path`` is empty. If some
-            # method matches the path, fall through to 405 so we don't
-            # bounce OPTIONS / unsupported methods through a redirect
-            # loop on ``{full_path:path}`` style routes (which would
-            # match both ``/files/x`` AND ``/files/x/``, ping-ponging
-            # forever).
-            if (
-                getattr(self, "redirect_slashes", True)
-                and path != "/"
-                and not methods_for_path
-            ):
-                if path.endswith("/"):
-                    candidate = path[:-1]
-                else:
-                    candidate = path + "/"
-                for route in self.router.routes:
-                    r_path = getattr(route, "path", None)
-                    if not r_path:
-                        continue
-                    regex = getattr(
-                        route, "_fastapi_turbo_asgi_regex", None
-                    )
-                    if regex is None:
-                        # Lazy compile mirrors the matcher block above.
-                        pattern = "^"
-                        idx = 0
-                        for m in _re.finditer(
-                            r"\{([^{}:]+)(?::([^{}]+))?\}", r_path
-                        ):
-                            pattern += _re.escape(r_path[idx:m.start()])
-                            pname = m.group(1)
-                            if m.group(2) == "path":
-                                pattern += f"(?P<{pname}>.+)"
-                            else:
-                                pattern += f"(?P<{pname}>[^/]+)"
-                            idx = m.end()
-                        pattern += _re.escape(r_path[idx:]) + "$"
-                        regex = _re.compile(pattern)
-                        try:
-                            route._fastapi_turbo_asgi_regex = regex
-                        except (AttributeError, TypeError):
-                            pass
-                    if regex.match(candidate) is not None:
-                        # Build an ABSOLUTE Location URL — Starlette's
-                        # redirect_slashes middleware constructs the
-                        # full request.url with the path swapped, so
-                        # downstream HTTP clients that require an
-                        # absolute Location see the same shape as
-                        # upstream. Reconstructed from scope's scheme
-                        # + host header.
-                        qs = scope.get("query_string", b"")
-                        scheme = scope.get("scheme", "http")
-                        host = ""
-                        for hk, hv in scope.get("headers", []) or []:
-                            hkn = (
-                                hk.decode("latin-1")
-                                if isinstance(hk, bytes)
-                                else hk
-                            ).lower()
-                            if hkn == "host":
-                                host = (
-                                    hv.decode("latin-1")
-                                    if isinstance(hv, bytes)
-                                    else hv
-                                )
-                                break
-                        if not host:
-                            server = scope.get("server")
-                            if server:
-                                host = (
-                                    f"{server[0]}:{server[1]}"
-                                    if server[1]
-                                    else server[0]
-                                )
-                        target = candidate
-                        if qs:
-                            qs_str = (
-                                qs.decode("latin-1")
-                                if isinstance(qs, bytes)
-                                else str(qs)
-                            )
-                            target = f"{target}?{qs_str}"
-                        if host:
-                            target = f"{scheme}://{host}{target}"
-                        await send({
-                            "type": "http.response.start",
-                            "status": 307,
-                            "headers": [
-                                (b"location", target.encode("latin-1")),
-                                (b"content-length", b"0"),
-                            ],
-                        })
-                        await send({
-                            "type": "http.response.body",
-                            "body": b"",
-                        })
-                        return True
-
-            # Path matched but method didn't → 405 with Allow; else 404.
-            # Emitted IN-PROCESS so sandboxed envs don't fall through to
-            # the loopback proxy for normal FA behaviour.
-            if methods_for_path:
-                from fastapi_turbo.responses import JSONResponse as _JR_err
-                allow = ", ".join(sorted(methods_for_path))
-                resp = _JR_err(
-                    content={"detail": "Method Not Allowed"}, status_code=405
-                )
-                resp.headers["allow"] = allow
-                await _send_asgi_response(send, resp)
-            else:
-                # Build a 404 via the app's exception_handlers so custom
-                # handlers fire — fall back to {"detail": "Not Found"} 404.
-                from fastapi_turbo.exceptions import HTTPException as _HE404
-                await _asgi_emit_exception(
-                    self, scope, send, _HE404(status_code=404, detail="Not Found")
-                )
-            return True
-
-        # Confirm we can handle every param on this endpoint. If the
-        # signature uses a feature we don't cover (Form, File, Depends,
-        # OAuth scopes, …) bail NOW — before draining the body — so the
-        # proxy can serve it.
-        #
-        # Custom APIRoute subclass with overridden ``get_route_handler``
-        # (e.g. ``GzipRoute``, ``TimedRoute``, projects that wrap every
-        # response with auth/CSRF/observability headers). The wrapper
-        # is the user's API for intercepting the request pipeline; if
-        # we silently unwrap to the bare endpoint we'd skip it and
-        # break drop-in parity with FastAPI.
-        #
-        # ``_build_custom_route_handler_endpoint`` wires up
-        # ``_fastapi_turbo_build_default_handler`` on the route (as a
-        # side effect) AND returns a ``(request) -> response`` adapter
-        # that:
-        #   1. Calls ``route.get_route_handler()`` — invokes user's
-        #      override (e.g. WrappedRoute), which can call
-        #      ``super().get_route_handler()`` to get the default
-        #      pipeline and wrap its result.
-        #   2. Drives the resulting handler with the Request.
-        #   3. Routes HTTPException / RequestValidationError through
-        #      the app's exception_handlers.
-        # Idempotent — safe to call once per request; the lazy build
-        # is cheap and the resulting endpoint isn't cached on the
-        # route (only the builder attribute is, which is what
-        # ``super().get_route_handler()`` needs).
-        if _has_overridden_get_route_handler(matched_route):
-            try:
-                custom_endpoint = _build_custom_route_handler_endpoint(
-                    matched_route, self
-                )
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("custom route handler build failed: %r", _exc)
-            else:
-                # Build a Starlette-shaped Request scope inline (the
-                # main dispatcher builds one further down, but we
-                # need it here BEFORE the unwrap branch). Pre-drain
-                # the receive channel and stash it so
-                # ``request.body()`` inside the user's wrapper or
-                # endpoint reads from the buffer rather than
-                # re-receiving.
-                custom_req_scope = dict(scope)
-                custom_req_scope["type"] = "http"
-                custom_req_scope["path_params"] = path_params
-                custom_req_scope["app"] = self
-                custom_req_scope["route"] = matched_route
-                buffered_body = b""
-                while True:
-                    msg = await receive()
-                    buffered_body += msg.get("body", b"")
-                    if not msg.get("more_body", False):
-                        break
-                custom_req_scope["_fastapi_turbo_prebuffered_body"] = buffered_body
-                custom_req_scope["_body"] = buffered_body
-                # Wrap the route-class endpoint in the SAME
-                # ``@app.middleware('http')`` chain the regular path
-                # uses. Without this, ``X-App-Mw`` headers added by
-                # ``app.middleware('http')`` would be missing on
-                # routes registered through a custom ``route_class``.
-                http_mws_for_custom = [
-                    m
-                    for m in (getattr(self, "_http_middlewares", None) or [])
-                    if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
-                ]
-                current_call = custom_endpoint
-                for mw in http_mws_for_custom:
-                    _inner = current_call
-
-                    async def _wrapped_custom(req, *, _mw=mw, _inner=_inner):
-                        return await _mw(req, _inner)
-
-                    current_call = _wrapped_custom
-                req_obj = _Req(custom_req_scope)
-                try:
-                    result = await current_call(req_obj)
-                except Exception as exc:
-                    await _asgi_emit_exception(self, scope, send, exc)
-                    return True
-                await _send_asgi_response(send, result, scope=scope)
-                return True
-
-        # ``FastAPI(routes=[...])`` / ``APIRouter(routes=[...])``:
-        # routes constructed from Starlette ``Route`` / similar
-        # are tagged ``_fastapi_turbo_starlette_passthrough = True``
-        # at registration time. Their endpoint is a
-        # ``(request) -> Response`` callable (Starlette convention),
-        # NOT the FastAPI ``def hi(item: Item, q: int): ...`` shape
-        # the rest of the dispatcher introspects. Dispatch via the
-        # Starlette protocol: build a ``Request`` from the scope,
-        # call ``endpoint(request)``, send the resulting response.
-        # Probe-confirmed: ``upstream 200, turbo 404`` for
-        # ``FastAPI(routes=[Route('/hi', hi)])`` (R52 finding 1).
-        if getattr(matched_route, "_fastapi_turbo_starlette_passthrough", False):
-            _ep_pt = getattr(matched_route, "endpoint", None)
-            if _ep_pt is not None:
-                from fastapi_turbo.requests import Request as _Req_pt
-                _scope_pt = dict(scope)
-                _scope_pt["path_params"] = path_params
-                _scope_pt.setdefault("router", self.router)
-                _scope_pt.setdefault("app", self)
-                req_pt = _Req_pt(_scope_pt, receive=receive, send=send)
-                _resp_pt = await _run_starlette_http_endpoint(_ep_pt, req_pt)
-                if _resp_pt is not None:
-                    # Send the Response via the in-process helper —
-                    # our Response classes don't expose ASGI ``__call__``.
-                    await _send_asgi_response(send, _resp_pt, scope=_scope_pt)
-                return True
-
-        # The route's ``endpoint`` is the ``_try_compile_handler``
-        # wrapper that expects Rust-synthesised kwargs
-        # (``_combined_body``, ``_request_*`` metadata, etc.). The
-        # in-process path builds user-shape kwargs (``a=A(...)``), so
-        # we dispatch to the UNWRAPPED user function via the
-        # ``_fastapi_turbo_original_endpoint`` breadcrumb set at
-        # compile time.
-        raw_endpoint = getattr(matched_route, "endpoint", None)
-        if raw_endpoint is None:
-            return False
-        endpoint = getattr(raw_endpoint, "_fastapi_turbo_original_endpoint", raw_endpoint)
-        import inspect as _insp
-        # PEP 649 (py3.14+): some annotations reference names defined
-        # only under ``if TYPE_CHECKING:``. Eager evaluation of
-        # ``inspect.signature(endpoint)`` raises ``NameError`` then.
-        # Use ``Format.FORWARDREF`` so unresolved names become
-        # opaque ``ForwardRef`` objects (we only need the param
-        # NAMES + KINDS here; the user dependency runs unbothered).
-        try:
-            import annotationlib as _al_local
-            try:
-                sig = _insp.signature(
-                    endpoint, annotation_format=_al_local.Format.FORWARDREF
-                )
-            except (TypeError, ValueError, NameError):
-                try:
-                    sig = _insp.signature(endpoint)
-                except (TypeError, ValueError, NameError):
-                    return False
-        except ImportError:
-            try:
-                sig = _insp.signature(endpoint)
-            except (TypeError, ValueError, NameError):
-                return False
-
-        # ── Build the param plan via ``_introspect.introspect_endpoint`` ──
-        # Same introspection the Rust hot path uses, so we get Pydantic-
-        # full semantics (ge/le constraints, list[T] aggregation, alias
-        # + convert_underscores, Annotated[T, marker] unwrapping,
-        # Body(embed=True), multi-body combination, scalar_validator
-        # TypeAdapters) without maintaining a second resolver.
-        from fastapi_turbo._introspect import introspect_endpoint
-        from fastapi_turbo.responses import Response as _Resp_cls
-        from fastapi_turbo.background import BackgroundTasks as _BGT
-        from fastapi_turbo.requests import HTTPConnection as _HC
-
-        _plan_cache_attr = "_fastapi_turbo_asgi_param_plan"
-        introspect_params = getattr(matched_route, _plan_cache_attr, None)
-        if introspect_params is None:
-            try:
-                introspect_params = introspect_endpoint(
-                    endpoint, getattr(matched_route, "path", "/") or "/"
-                )
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("introspect_endpoint failed: %r", _exc)
-                return False
-            try:
-                setattr(matched_route, _plan_cache_attr, introspect_params)
-            except (AttributeError, TypeError):
-                pass
-
-        # FA's "dependency duplicates" semantics: when the handler and any
-        # sub-dep declare body params, FA computes a UNION of their body
-        # fields. Same name+type → shared (one body field). Different
-        # names → combined into one body model with all fields. Walk the
-        # dep tree to collect dep-level body params and, if necessary,
-        # synthesise a ``_combined_body`` step that supersedes the
-        # handler-only body. Cache the effective plan separately so the
-        # route's own ``introspect_params`` cache stays untouched.
-        _eff_plan_attr = "_fastapi_turbo_asgi_effective_plan"
-        _effective_plan = getattr(matched_route, _eff_plan_attr, None)
-        if _effective_plan is None:
-            _effective_plan = _build_effective_body_plan(
-                introspect_params, endpoint
-            )
-            try:
-                setattr(matched_route, _eff_plan_attr, _effective_plan)
-            except (AttributeError, TypeError):
-                pass
-        introspect_params = _effective_plan
-
-        # Pre-scan: does the endpoint need a body? (so we know whether
-        # to drain receive.)
-        survey_needs_body = any(
-            p.get("kind") in ("body", "form", "file") for p in introspect_params
-        )
-
-        # Build a FastAPI-ish Request scope.
-        req_scope = dict(scope)
-        req_scope["type"] = "http"
-        req_scope["path_params"] = path_params
-        req_scope["app"] = self
-        req_scope["route"] = matched_route
-        # Also mutate the OUTER scope so middleware that wraps the
-        # ASGI app (legacy ``SentryAsgiMiddleware(app)``, OTel,
-        # rate-limit) sees the matched route at response-time.
-        # Sentry's transaction name uses ``scope["route"].path`` to
-        # template the URL — without this it records the concrete
-        # path (``/message/123456``) instead of the route shape
-        # (``/message/{message_id}``). Starlette's router does the
-        # same in-place mutation; we previously only updated the
-        # copied ``req_scope`` so the outer scope stayed empty.
-        try:
-            scope["route"] = matched_route
-            scope["path_params"] = path_params
-            scope["endpoint"] = getattr(matched_route, "endpoint", None)
-        except (TypeError, AttributeError):
-            # Some upstream wrappers hand us a frozen / mapping-only
-            # scope; in that case the in-place mutation isn't possible
-            # and the legacy-Sentry shape stays untemplated. Not an
-            # error — most middleware uses ``scope`` as a plain dict.
-            pass
-        # Sentry's ``FastApiIntegration`` patches
-        # ``fastapi.routing.get_request_handler`` to set the
-        # transaction name from ``scope["route"].path`` on every
-        # request. Our dispatcher doesn't go through that handler,
-        # so the patch never fires — Sentry falls back to the
-        # concrete-URL transaction name and ``test_legacy_setup``
-        # diffs ``http://testserver:None/message/123456`` against
-        # the expected ``/message/{message_id}``. Replicate the
-        # transaction-name update inline when Sentry's
-        # ``FastApiIntegration`` is loaded; cheap import probe
-        # (cached after the first run), no-op when Sentry isn't
-        # installed.
-        _maybe_set_sentry_transaction_name(self, scope, matched_route)
-        try:
-            body_bytes = await _drain_body()
-        except _BodyTooLarge:
-            # Mirror the Tower layer's 413 with a short text body —
-            # Starlette / FastAPI surface oversized requests with a
-            # plain text response and no JSON envelope.
-            _msg = b"Request Entity Too Large"
-            await send({
-                "type": "http.response.start",
-                "status": 413,
-                "headers": [
-                    (b"content-type", b"text/plain; charset=utf-8"),
-                    (b"content-length", str(len(_msg)).encode("ascii")),
-                ],
-            })
-            await send({
-                "type": "http.response.body",
-                "body": _msg,
-            })
-            return True
-        except Exception as _drain_exc:  # noqa: BLE001
-            # A user-supplied raw-ASGI middleware can wrap ``receive``
-            # to raise ``HTTPException`` (e.g. content-size limits).
-            # Route through the standard exception emit path —
-            # without this the exception escaped past the dispatcher
-            # and the test client saw a network-level failure rather
-            # than the user's intended 422. Probe-confirmed against
-            # ``test_custom_middleware_exception``.
-            await _asgi_emit_exception(self, scope, send, _drain_exc)
-            return True
-        req_scope["_fastapi_turbo_prebuffered_body"] = body_bytes
-        req_scope["_body"] = body_bytes
-
-        # ── Parse form / multipart body if any ``Form(...)`` or
-        # ``File(...)`` params are present on the endpoint. Done once
-        # up-front so subsequent kwarg assembly is O(1) per param.
-        # Also fire the parser when a ``Depends(...)`` callable has
-        # form params nested inside its own ``__init__`` (e.g.
-        # ``OAuth2PasswordRequestFormStrict``) — checking only the
-        # outer plan would miss those and the dep resolver later sees
-        # an empty form_fields, raising spurious 422 missing errors.
-        form_fields: dict[str, object] = {}
-        _outer_has_form = any(
-            p.get("kind") in ("form", "file") for p in introspect_params
-        )
-        _form_ct_match = False
-        if not _outer_has_form and body_bytes:
-            for _hk, _hv in scope.get("headers", []) or []:
-                _hkl = (
-                    _hk.decode("latin-1") if isinstance(_hk, bytes) else _hk
-                ).lower()
-                if _hkl == "content-type":
-                    _hvl = (
-                        _hv.decode("latin-1") if isinstance(_hv, bytes) else _hv
-                    ).lower()
-                    if (
-                        _hvl.startswith("application/x-www-form-urlencoded")
-                        or _hvl.startswith("multipart/form-data")
-                    ):
-                        # Only parse if a Depends(...) anywhere on the
-                        # route has at least one form param — content-
-                        # type alone isn't enough (a JSON endpoint with
-                        # a wrong CT shouldn't waste cycles parsing).
-                        for _pp in introspect_params:
-                            if _pp.get("kind") != "dependency":
-                                continue
-                            _dc = _pp.get("dep_callable")
-                            if _dc is None:
-                                continue
-                            try:
-                                _dplan_probe = introspect_endpoint(_dc, "/")
-                            except Exception:  # noqa: BLE001
-                                continue
-                            if any(
-                                _dpp.get("kind") in ("form", "file")
-                                for _dpp in _dplan_probe
-                            ):
-                                _form_ct_match = True
-                                break
-                    break
-        if (_outer_has_form or _form_ct_match) and body_bytes:
-            import io
-            content_type = ""
-            for hk, hv in scope.get("headers", []) or []:
-                hkl = (hk.decode("latin-1") if isinstance(hk, bytes) else hk).lower()
-                if hkl == "content-type":
-                    content_type = hv.decode("latin-1") if isinstance(hv, bytes) else hv
-                    break
-            ct_lower = content_type.lower()
-            try:
-                if ct_lower.startswith("application/x-www-form-urlencoded"):
-                    from urllib.parse import parse_qsl
-                    for k, v in parse_qsl(body_bytes.decode("utf-8"), keep_blank_values=True):
-                        # Repeated keys ⇒ list (matches Starlette's
-                        # ``FormData`` semantics). Without this a
-                        # ``list[str]`` form param only saw the LAST
-                        # value of a multi-value submission.
-                        _existing_uf = form_fields.get(k)
-                        if _existing_uf is None:
-                            form_fields[k] = v
-                        elif isinstance(_existing_uf, list):
-                            _existing_uf.append(v)
-                        else:
-                            form_fields[k] = [_existing_uf, v]
-                elif ct_lower.startswith("multipart/form-data"):
-                    import email.parser as _email_parser
-                    # RFC 2045 §5.1: param names case-insensitive,
-                    # values case-sensitive — ``Boundary=AaB03x`` is
-                    # valid. Lowercase the lookup key, preserve value.
-                    boundary = None
-                    for part in content_type.split(";"):
-                        part = part.strip()
-                        if "=" in part:
-                            k, v = part.split("=", 1)
-                            if k.strip().lower() == "boundary":
-                                boundary = v.strip().strip('"')
-                                break
-                    if boundary is not None:
-                        from fastapi_turbo.param_functions import UploadFile as _UF
-                        # Starlette's MultiPartParser defaults — exceeding
-                        # either bounds the request to a 400, defending the
-                        # endpoint against unbounded form expansion.
-                        _max_files = 1000
-                        _max_fields = 1000
-                        _files_seen = 0
-                        _fields_seen = 0
-                        raw = (
-                            f"Content-Type: multipart/form-data; boundary={boundary}\r\n\r\n"
-                        ).encode("utf-8") + body_bytes
-                        msg = _email_parser.BytesParser().parsebytes(raw)
-                        for part_msg in msg.walk():
-                            if part_msg.is_multipart():
-                                continue
-                            cd = part_msg.get("content-disposition", "")
-                            if not cd:
-                                continue
-                            # Param NAMES case-insensitive (RFC 2045
-                            # §5.1) — lowercase keys, preserve values.
-                            # ``Content-Disposition: form-data;
-                            # Name="x"; FileName="y.txt"`` parses to
-                            # the same fields as the canonical case.
-                            params: dict[str, str] = {}
-                            for seg in cd.split(";"):
-                                seg = seg.strip()
-                                if "=" in seg:
-                                    k, v = seg.split("=", 1)
-                                    params[k.strip().lower()] = v.strip().strip('"')
-                            fname = params.get("name")
-                            if fname is None:
-                                continue
-                            if "filename" in params:
-                                _files_seen += 1
-                                if _files_seen > _max_files:
-                                    from fastapi_turbo.exceptions import (
-                                        MultiPartException as _MPE,
-                                    )
-                                    raise _MPE(
-                                        "Too many files. Maximum number of "
-                                        f"files is {_max_files}."
-                                    )
-                                payload = part_msg.get_payload(decode=True) or b""
-                                _new_uf = _UF(
-                                    filename=params["filename"],
-                                    file=io.BytesIO(payload),
-                                    content_type=part_msg.get_content_type(),
-                                    # Match Starlette's MultiPartParser:
-                                    # initialise ``size`` so subsequent
-                                    # ``await file.write(b)`` increments
-                                    # it (otherwise size stays None and
-                                    # ``UploadFile.size`` reports None
-                                    # forever — diverges from upstream).
-                                    size=len(payload),
-                                )
-                                _existing = form_fields.get(fname)
-                                if _existing is None:
-                                    form_fields[fname] = _new_uf
-                                elif isinstance(_existing, list):
-                                    _existing.append(_new_uf)
-                                else:
-                                    form_fields[fname] = [_existing, _new_uf]
-                            else:
-                                _fields_seen += 1
-                                if _fields_seen > _max_fields:
-                                    from fastapi_turbo.exceptions import (
-                                        MultiPartException as _MPE,
-                                    )
-                                    raise _MPE(
-                                        "Too many fields. Maximum number of "
-                                        f"fields is {_max_fields}."
-                                    )
-                                val = part_msg.get_payload(decode=True) or b""
-                                if isinstance(val, bytes):
-                                    val = val.decode("utf-8", errors="replace")
-                                _existing = form_fields.get(fname)
-                                if _existing is None:
-                                    form_fields[fname] = val
-                                elif isinstance(_existing, list):
-                                    _existing.append(val)
-                                else:
-                                    form_fields[fname] = [_existing, val]
-            except Exception as _exc:  # noqa: BLE001
-                # Body has already been drained; we cannot fall back to
-                # the proxy (it would see an empty body). Surface the
-                # error in-process so the client gets a FA-shaped 422
-                # and the server doesn't silently re-run the handler
-                # against a stripped payload.
-                _log.debug("in-process form parse: %r", _exc)
-                from fastapi_turbo.exceptions import (
-                    MultiPartException as _MPE_check,
-                    RequestValidationError as _RVE_form,
-                )
-                if isinstance(_exc, _MPE_check):
-                    # Starlette/FastAPI map MultiPartException to a
-                    # plain 400 with ``{"detail": <msg>}`` — not the
-                    # 422 RequestValidationError envelope. Match that
-                    # so over-limit uploads get the same response.
-                    import json as _j
-                    _payload = _j.dumps({"detail": _exc.message}).encode("utf-8")
-                    await send({
-                        "type": "http.response.start",
-                        "status": 400,
-                        "headers": [
-                            (b"content-type", b"application/json"),
-                            (b"content-length", str(len(_payload)).encode("ascii")),
-                        ],
-                    })
-                    await send({"type": "http.response.body", "body": _payload})
-                    return True
-                await _asgi_emit_exception(
-                    self, scope, send,
-                    _RVE_form([{
-                        "type": "form_parse_error",
-                        "loc": ["body"],
-                        "msg": f"form parse failed: {_exc}",
-                        "input": None,
-                    }]),
-                )
-                return True
-
-        # ── Shared helpers used by dep resolution + kwarg assembly ──
-        from fastapi_turbo.exceptions import RequestValidationError as _RVE_err
-
-        def _missing(loc, pname):
-            return {
-                "type": "missing",
-                "loc": [loc, pname],
-                "msg": "Field required",
-                "input": None,
-            }
-
-        def _bad_type(loc, pname, expected, raw):
-            return {
-                "type": f"{expected}_parsing",
-                "loc": [loc, pname],
-                "msg": f"Input should be a valid {expected}",
-                "input": raw,
-            }
-
-        # ``_PARAM_MODEL_MISSING`` is the sentinel
-        # ``_maybe_expand_param_models`` puts in ``default_value`` for
-        # synthesized list-shaped extraction params. The builder dep
-        # later checks ``is _PARAM_MODEL_MISSING`` to decide whether
-        # the field was supplied — passing it through unchanged keeps
-        # that contract. For ``Optional[list[X]] = None`` the user's
-        # actual default is ``None`` and they want ``None`` back; only
-        # fall through to ``[]`` when there is no explicit default
-        # (which currently can't happen on a non-required list, but
-        # the third branch is defensive).
-        from fastapi_turbo._introspect import (
-            _PARAM_MODEL_MISSING as _PMM_local,
-        )
-
-        def _list_default_for_missing(_pdesc, dv, has_dflt):
-            if dv is _PMM_local:
-                return _PMM_local
-            if has_dflt:
-                if isinstance(dv, (list, tuple, set, frozenset)):
-                    return list(dv)
-                return dv
-            return []
-
-        def _coerce(raw, target_ann):
-            if target_ann is int:
-                return int(raw)
-            if target_ann is float:
-                return float(raw)
-            if target_ann is bool:
-                if isinstance(raw, bool):
-                    return raw
-                rs = str(raw).lower()
-                if rs in ("true", "1", "yes", "on"):
-                    return True
-                if rs in ("false", "0", "no", "off"):
-                    return False
-                raise ValueError(f"not a bool: {raw!r}")
-            return raw
-
-        def _is_required_default(default):
-            """True when a ``Query(...) / Header(...) / Cookie(...)``
-            marker signals "required". Pydantic v2 uses
-            ``PydanticUndefined`` as the sentinel; older FA also
-            treated ``...`` as required; we accept both."""
-            if default is ...:
-                return True
-            # Pydantic v2 sentinel — avoid importing at module load.
-            _type_name = type(default).__name__
-            return _type_name == "PydanticUndefinedType"
-
-        # Parse query string once so deps + params share the same view.
-        qp: dict = {}
-        _qs_bytes = scope.get("query_string", b"")
-        if _qs_bytes:
-            from urllib.parse import parse_qsl
-            qp = dict(parse_qsl(_qs_bytes.decode("latin-1")))
-
-        # Parse request headers/cookies once so deps can read them.
-        from fastapi_turbo.datastructures import Headers as _Hdrs_cls
-        _scope_headers = _Hdrs_cls(scope.get("headers", []))
-        _scope_cookies: dict[str, str] = {}
-        for _ck_name, _ck_val in [
-            (k, v) for k, v in _scope_headers.items() if k.lower() == "cookie"
-        ]:
-            for pair in _ck_val.split(";"):
-                pair = pair.strip()
-                if "=" in pair:
-                    ck_k, ck_v = pair.split("=", 1)
-                    _scope_cookies[ck_k.strip()] = ck_v.strip()
-
-        # ── Depends / Security resolution ──
-        # Resolve any ``= Depends(fn)`` or ``= Security(fn, scopes=...)``
-        # params (including nested deps, async deps, yield-deps,
-        # dependency_overrides) before we build kwargs. Teardowns are
-        # collected and run after the response. ``Security`` scopes
-        # accumulate along the resolution path so an inner dep that
-        # asks for ``ss: SecurityScopes`` sees the full scope list.
-        from fastapi_turbo.dependencies import Depends as _Dep_marker
-        from fastapi_turbo.dependencies import Security as _Sec_marker
-        from fastapi_turbo.security import SecurityScopes as _SS_cls
-
-        dep_teardowns: list = []  # (gen, is_async) pairs
-
-        # Lazily-allocated single ``Response`` instance shared between
-        # the handler and any deps that ask for a ``response: Response``
-        # parameter. FastAPI's contract: deps mutating ``response.headers``
-        # must affect the FINAL response the user sees (e.g. an auth
-        # dep that adds an ``X-Auth-Source`` header to every reply).
-        # The handler-level resolver below allocates this on first
-        # use; the dep resolver pulls from the same slot.
-        _shared_response_holder: list = [None]
-        # Same shared-state pattern for ``BackgroundTasks`` so a dep
-        # that calls ``bg.add_task(...)`` and the handler that does
-        # the same end up scheduling against ONE container.
-        _bg_holder: list = [None]
-
-        def _get_or_create_response_inject():
-            if _shared_response_holder[0] is None:
-                _shared_response_holder[0] = _Resp_cls()
-            return _shared_response_holder[0]
-
-        async def _resolve_dep(marker_or_fn, cache, accumulated_scopes, dep_scope=None, use_cache=True, _own_scopes_for_key=None):
-            """Resolve ``marker_or_fn`` recursively. ``cache`` dedups
-            calls for the same dep within one request (FA caching).
-            ``accumulated_scopes`` is the list of OAuth2 scopes
-            collected along the resolution path (consumed by any
-            ``SecurityScopes`` param deeper in the chain).
-            """
-            # FA 0.120+ ``scope`` carries through Depends/Security
-            # markers — capture before unwrapping so the inner
-            # generator's teardown is queued on the right list. Same
-            # for ``use_cache``. The Security marker's OWN
-            # ``scopes`` argument also matters for the cache key
-            # (FA's ``own_oauth_scopes`` triggers ``_uses_scopes``
-            # → cache by scope list).
-            _marker_scope = None
-            _marker_use_cache = use_cache
-            _marker_own_scopes: list = []
-            if isinstance(marker_or_fn, (_Sec_marker, _Dep_marker)):
-                _marker_scope = getattr(marker_or_fn, "scope", None)
-                _marker_use_cache = getattr(marker_or_fn, "use_cache", True)
-                if isinstance(marker_or_fn, _Sec_marker):
-                    _marker_own_scopes = list(
-                        getattr(marker_or_fn, "scopes", []) or []
-                    )
-            # Unwrap Security marker → extend scopes + resolve its callable.
-            if isinstance(marker_or_fn, _Sec_marker):
-                next_scopes = list(accumulated_scopes) + list(
-                    getattr(marker_or_fn, "scopes", []) or []
-                )
-                dep_fn = marker_or_fn.dependency
-                if dep_fn is None:
-                    return None
-                return await _resolve_dep(
-                    dep_fn, cache, next_scopes,
-                    dep_scope=_marker_scope, use_cache=_marker_use_cache,
-                    _own_scopes_for_key=_marker_own_scopes,
-                )
-            if isinstance(marker_or_fn, _Dep_marker):
-                dep_fn = marker_or_fn.dependency
-                if dep_fn is None:
-                    return None
-                return await _resolve_dep(
-                    dep_fn, cache, accumulated_scopes,
-                    dep_scope=_marker_scope, use_cache=_marker_use_cache,
-                )
-            dep_fn = marker_or_fn
-            # Honour dependency_overrides.
-            override = (getattr(self, "dependency_overrides", None) or {}).get(dep_fn)
-            actual_fn = override if override is not None else dep_fn
-            # FA 0.120+: ``Depends(dep, scope='function')`` and
-            # ``Depends(dep, scope='request')`` resolve to DIFFERENT
-            # instances within one request (the function-scope copy
-            # is torn down pre-response while request-scope persists
-            # past it). The cache key includes ``dep_scope`` to keep
-            # them separate. ``accumulated_scopes`` participate ONLY
-            # when the dep callable's signature actually consumes
-            # ``SecurityScopes`` — otherwise the same callable
-            # caches once per request regardless of which Security
-            # scope chain reached it. Probe-confirmed against
-            # ``test_security_scopes_dependency_called_once`` (no
-            # SecurityScopes → 1 call) and
-            # ``test_security_scopes_sub_dependency_caching`` (uses
-            # SecurityScopes → distinct calls per scope chain).
-            # Walk the dep callable's signature transitively; if it
-            # OR any nested dep consumes ``SecurityScopes``, the
-            # cache key includes the accumulated scope tuple.
-            # Otherwise the dep caches by callable alone — same dep
-            # called from two scope chains hits the same entry.
-            _dep_uses_security_scopes = False
-            _seen_for_scope_check: set = set()
-
-            def _consumes_security_scopes(_fn):
-                if _fn in _seen_for_scope_check:
-                    return False
-                _seen_for_scope_check.add(_fn)
-                try:
-                    _s = _insp.signature(_fn)
-                except (TypeError, ValueError):
-                    return False
-                from fastapi_turbo.dependencies import (
-                    Depends as _D2,
-                    Security as _S2,
-                )
-                for _pp in _s.parameters.values():
-                    _ann = _pp.annotation
-                    if isinstance(_ann, type) and issubclass(_ann, _SS_cls):
-                        return True
-                    # Walk into nested Depends/Security default markers.
-                    _dft = _pp.default
-                    if isinstance(_dft, (_D2, _S2)) and _dft.dependency is not None:
-                        if _consumes_security_scopes(_dft.dependency):
-                            return True
-                    # Walk into ``Annotated[T, Depends(...)]`` markers.
-                    if hasattr(_ann, "__metadata__"):
-                        for _m in getattr(_ann, "__metadata__", ()):
-                            if isinstance(_m, (_D2, _S2)) and _m.dependency is not None:
-                                if _consumes_security_scopes(_m.dependency):
-                                    return True
-                return False
-            try:
-                _dep_uses_security_scopes = _consumes_security_scopes(actual_fn)
-            except Exception:  # noqa: BLE001
-                _dep_uses_security_scopes = False
-            # FA's ``_uses_scopes`` is also True when THIS
-            # Dependant's own_oauth_scopes is non-empty — i.e. the
-            # IMMEDIATE Security marker had ``scopes=[...]``.
-            if _marker_own_scopes or _own_scopes_for_key:
-                _dep_uses_security_scopes = True
-            if _dep_uses_security_scopes:
-                cache_key = (
-                    actual_fn,
-                    tuple(sorted(accumulated_scopes)),
-                    (dep_scope or "request").lower(),
-                )
-            else:
-                cache_key = (
-                    actual_fn,
-                    (dep_scope or "request").lower(),
-                )
-            # When the caller asked for ``use_cache=False``, skip the
-            # cache lookup AND don't write back. FA's contract: each
-            # ``Depends(d, use_cache=False)`` runs the dep fresh.
-            _do_cache = use_cache
-            if _do_cache and cache_key in cache:
-                return cache[cache_key]
-            # PEP 649: forward refs (TYPE_CHECKING-only names) need
-            # ``Format.FORWARDREF`` so signature() doesn't raise
-            # NameError. We only consume param NAMES + KINDS for
-            # routing.
-            try:
-                import annotationlib as _al_dep
-                try:
-                    sub_sig = _insp.signature(
-                        actual_fn,
-                        annotation_format=_al_dep.Format.FORWARDREF,
-                    )
-                except (TypeError, ValueError, NameError):
-                    try:
-                        sub_sig = _insp.signature(actual_fn)
-                    except (TypeError, ValueError, NameError):
-                        sub_sig = None
-            except ImportError:
-                try:
-                    sub_sig = _insp.signature(actual_fn)
-                except (TypeError, ValueError, NameError):
-                    sub_sig = None
-            sub_hints = {}
-            try:
-                sub_hints = _tp.get_type_hints(actual_fn)
-            except Exception:  # noqa: BLE001
-                pass
-            # First try to use the SAME introspect plan for the dep
-            # that we use for the top-level endpoint — this covers
-            # ``Annotated[int, Query(ge=10, alias=...)]`` and every
-            # other Pydantic-constraint case correctly.
-            try:
-                _dep_plan = introspect_endpoint(actual_fn, "/")
-            except Exception:  # noqa: BLE001
-                _dep_plan = None
-            sub_kwargs = {}
-            # Accumulate per-dep validation errors so a dep callable
-            # whose ``__init__`` declares 3 required ``Form(...)`` params
-            # (e.g. ``OAuth2PasswordRequestFormStrict``) emits all 3
-            # ``missing`` entries in one 422 — matches FA. Without
-            # this we raised on the first missing and the user only
-            # saw one of the three.
-            _form_missing_errs: list = []
-            if _dep_plan is not None and sub_sig is not None:
-                for dp in _dep_plan:
-                    dname = dp["name"]
-                    dkind = dp.get("kind")
-                    dalias = dp.get("alias") or dname
-                    drequired = dp.get("required", False)
-                    ddefault = dp.get("default_value")
-                    dscalar = dp.get("scalar_validator")
-                    dann = dp.get("_unwrapped_annotation")
-                    if dkind == "dependency":
-                        # Nested Depends/Security inside the dep.
-                        inner_call = dp.get("dep_callable")
-                        if inner_call is None:
-                            sub_kwargs[dname] = None
-                            continue
-                        # Accumulate scopes from any Security markers
-                        # attached to this sub-dep (captured in
-                        # ``_security_scopes_top``).
-                        next_scopes = list(accumulated_scopes) + list(
-                            dp.get("_security_scopes_top") or []
-                        )
-                        sub_kwargs[dname] = await _resolve_dep(
-                            inner_call, cache, next_scopes,
-                            dep_scope=dp.get("_dep_scope"),
-                            use_cache=dp.get("use_cache", True),
-                        )
-                        continue
-                    if dkind == "query":
-                        # FA contract: a bare ``param: int`` on a
-                        # dep (no Query/Header/etc marker) takes its
-                        # value from the route's PATH params if the
-                        # name matches a path placeholder. Falls
-                        # back to query otherwise. Probe-confirmed
-                        # against ``test_param_in_path_and_dependency``.
-                        if dalias in path_params:
-                            sub_kwargs[dname] = _validate(
-                                dscalar, path_params[dalias], "path",
-                                dalias, annotation=dann,
-                            )
-                            continue
-                        raw_q = None
-                        for qk, qv in _qp_items:
-                            if qk == dalias:
-                                raw_q = qv
-                                break
-                        if raw_q is None:
-                            if drequired:
-                                raise _RVE_err([_missing("query", dalias)])
-                            sub_kwargs[dname] = ddefault
-                        else:
-                            sub_kwargs[dname] = _validate(
-                                dscalar, raw_q, "query", dalias, annotation=dann
-                            )
-                        continue
-                    if dkind == "header":
-                        raw_h = _scope_headers.get(dalias)
-                        if raw_h is None:
-                            if drequired:
-                                raise _RVE_err([_missing("header", dalias)])
-                            sub_kwargs[dname] = ddefault
-                        else:
-                            sub_kwargs[dname] = _validate(
-                                dscalar, raw_h, "header", dalias, annotation=dann
-                            )
-                        continue
-                    if dkind == "cookie":
-                        raw_c = _scope_cookies.get(dalias)
-                        if raw_c is None:
-                            if drequired:
-                                raise _RVE_err([_missing("cookie", dalias)])
-                            sub_kwargs[dname] = ddefault
-                        else:
-                            sub_kwargs[dname] = _validate(
-                                dscalar, raw_c, "cookie", dalias, annotation=dann
-                            )
-                        continue
-                    if dkind == "body":
-                        # FA "dependency duplicates": a dep that takes a
-                        # body param shares it with the handler.
-                        # ``_combined_body`` (when synthesised) was
-                        # already split into kwargs[<field_name>] —
-                        # look up the dep's body name there. For the
-                        # single-body shared case the handler's body
-                        # value is in kwargs[<handler_body_name>] under
-                        # the same model_class — use that when name+
-                        # type match.
-                        from fastapi_turbo._introspect import (
-                            _TypeAdapterProxy as _TAP_dep,
-                        )
-                        if dname in kwargs:
-                            sub_kwargs[dname] = kwargs[dname]
-                            continue
-                        # Single-body case: find a handler body of the
-                        # same model_class.
-                        d_model = dp.get("model_class")
-                        if isinstance(d_model, _TAP_dep):
-                            d_model = d_model._annotation
-                        _matched_handler = None
-                        for _hp in introspect_params:
-                            if _hp.get("kind") != "body":
-                                continue
-                            if _hp.get("name") == "_combined_body":
-                                continue
-                            _hm = _hp.get("model_class")
-                            if isinstance(_hm, _TAP_dep):
-                                _hm = _hm._annotation
-                            if _hm is d_model and _hp.get("name") in kwargs:
-                                _matched_handler = _hp.get("name")
-                                break
-                        if _matched_handler is not None:
-                            sub_kwargs[dname] = kwargs[_matched_handler]
-                            continue
-                        # Fallback: parse body directly. ``parsed_body``
-                        # is the raw decoded body (dict / value). When
-                        # the dep has a model_class, validate against
-                        # it; else use raw.
-                        if parsed_body is None:
-                            if drequired:
-                                raise _RVE_err([_missing("body", dalias)])
-                            sub_kwargs[dname] = ddefault
-                            continue
-                        if d_model is not None and hasattr(
-                            d_model, "model_validate"
-                        ):
-                            try:
-                                sub_kwargs[dname] = d_model.model_validate(
-                                    parsed_body
-                                )
-                            except Exception:  # noqa: BLE001
-                                if drequired:
-                                    raise _RVE_err(
-                                        [_missing("body", dalias)]
-                                    )
-                                sub_kwargs[dname] = ddefault
-                        else:
-                            sub_kwargs[dname] = parsed_body
-                        continue
-                    if dkind in ("form", "file"):
-                        # Form / file params on a dep callable
-                        # (typically FA's ``OAuth2PasswordRequestForm``
-                        # / ``OAuth2PasswordRequestFormStrict`` whose
-                        # ``__init__`` declares ``grant_type`` /
-                        # ``username`` / ``password`` / ``scope`` etc.
-                        # as ``Form(...)`` markers). Earlier they fell
-                        # through to the parameter-default fallback
-                        # and required fields raised
-                        # ``TypeError: missing keyword-only argument``
-                        # when the dep was instantiated.
-                        d_is_list = dp.get("container_type") is not None or (
-                            _tp_local.get_origin(dann) is list
-                        )
-                        d_val = form_fields.get(dalias)
-                        if d_is_list:
-                            if d_val is None:
-                                if drequired:
-                                    _form_missing_errs.append(
-                                        _missing("body", dalias)
-                                    )
-                                    continue
-                                sub_kwargs[dname] = _list_default_for_missing(
-                                    dp, ddefault, dp.get("has_default", False)
-                                )
-                                continue
-                            d_vals = d_val if isinstance(d_val, list) else [d_val]
-                            if dkind == "file":
-                                sub_kwargs[dname] = d_vals
-                            else:
-                                sub_kwargs[dname] = _validate(
-                                    dscalar, d_vals, "body", dalias, annotation=dann
-                                )
-                            continue
-                        if d_val is None:
-                            if drequired:
-                                _form_missing_errs.append(
-                                    _missing("body", dalias)
-                                )
-                                continue
-                            sub_kwargs[dname] = ddefault
-                        else:
-                            if isinstance(d_val, list):
-                                d_val = d_val[0]
-                            if dkind == "file":
-                                sub_kwargs[dname] = d_val
-                            else:
-                                sub_kwargs[dname] = _validate(
-                                    dscalar, d_val, "body", dalias, annotation=dann
-                                )
-                        continue
-                    # SecurityScopes → inject.
-                    raw_ann = dp.get("_raw_annotation")
-                    if isinstance(raw_ann, type) and issubclass(raw_ann, _SS_cls):
-                        sub_kwargs[dname] = _SS_cls(scopes=list(accumulated_scopes))
-                        continue
-                    # Response / Request / BackgroundTasks injection
-                    # for deps. Earlier the dep resolver only handled
-                    # query / header / cookie / dependency / SecurityScopes
-                    # — params like ``response: Response`` fell through
-                    # to the query fallback and got None. Probe-confirmed
-                    # against upstream's
-                    # ``test_include_router_defaults_overrides`` (43
-                    # tests): a dep mutating ``response.headers``
-                    # crashed because response was None. Now we share
-                    # one Response instance with the handler-level
-                    # resolver via ``_shared_response_holder`` so
-                    # mutations propagate to the final response.
-                    if dkind == "inject_response":
-                        sub_kwargs[dname] = _get_or_create_response_inject()
-                        continue
-                    if dkind == "inject_request":
-                        sub_kwargs[dname] = _Req(req_scope, receive=receive)
-                        continue
-                    if dkind == "inject_background_tasks":
-                        # Reuse the request's BG container so deps and
-                        # handler share one ``add_task`` queue.
-                        nonlocal_bg = _bg_holder[0]
-                        if nonlocal_bg is None:
-                            nonlocal_bg = _BGT()
-                            nonlocal_bg._app = self
-                            _bg_holder[0] = nonlocal_bg
-                        sub_kwargs[dname] = nonlocal_bg
-                        continue
-                    # Fallback: parameter default.
-                    if drequired:
-                        # Legacy non-marker scalar; no sensible fallback.
-                        pass
-                    else:
-                        sub_kwargs[dname] = ddefault
-                # Skip the legacy sub_sig-walk below; the introspect
-                # plan has already populated ``sub_kwargs``.
-                sub_sig = None
-                if _form_missing_errs:
-                    raise _RVE_err(_form_missing_errs)
-            if sub_sig is not None:
-                from fastapi_turbo.param_functions import _ParamMarker as _PM_dep
-                for sname, sp in sub_sig.parameters.items():
-                    sdefault = sp.default
-                    sann = sub_hints.get(sname, sp.annotation)
-                    # SecurityScopes injection.
-                    if isinstance(sann, type) and issubclass(sann, _SS_cls):
-                        sub_kwargs[sname] = _SS_cls(scopes=list(accumulated_scopes))
-                        continue
-                    if isinstance(sdefault, _Sec_marker):
-                        next_scopes = list(accumulated_scopes) + list(
-                            getattr(sdefault, "scopes", []) or []
-                        )
-                        inner = sdefault.dependency or sann
-                        sub_kwargs[sname] = await _resolve_dep(
-                            inner, cache, next_scopes
-                        )
-                        continue
-                    if isinstance(sdefault, _Dep_marker):
-                        inner = sdefault.dependency or sann
-                        sub_kwargs[sname] = await _resolve_dep(
-                            inner, cache, accumulated_scopes
-                        )
-                        continue
-                    # Query/Header/Cookie markers inside a dep signature.
-                    sdefault_marker = None
-                    if isinstance(sdefault, _PM_dep):
-                        sdefault_marker = sdefault
-                    if sdefault_marker is not None:
-                        _pm_kind_sub = getattr(sdefault_marker, "_kind", None)
-                        alias = getattr(sdefault_marker, "alias", None) or sname
-                        raw = None
-                        if _pm_kind_sub == "query":
-                            raw = qp.get(alias)
-                        elif _pm_kind_sub == "header":
-                            raw = _scope_headers.get(alias.replace("_", "-"))
-                        elif _pm_kind_sub == "cookie":
-                            raw = _scope_cookies.get(alias)
-                        if raw is None:
-                            default = getattr(sdefault_marker, "default", ...)
-                            if default is ...:
-                                raise _RVE_err([_missing(_pm_kind_sub, alias)])
-                            sub_kwargs[sname] = default
-                        else:
-                            try:
-                                sub_kwargs[sname] = _coerce(raw, sann)
-                            except (ValueError, TypeError):
-                                raise _RVE_err(
-                                    [_bad_type(
-                                        _pm_kind_sub, alias,
-                                        getattr(sann, "__name__", "str"), raw
-                                    )]
-                                ) from None
-                        continue
-                    # Fallback: query by name with type coercion /
-                    # default value from the parameter itself.
-                    if sname in qp:
-                        try:
-                            sub_kwargs[sname] = _coerce(qp[sname], sann)
-                        except (ValueError, TypeError):
-                            raise _RVE_err(
-                                [_bad_type(
-                                    "query", sname,
-                                    getattr(sann, "__name__", "str"), qp[sname]
-                                )]
-                            ) from None
-                    elif sdefault is not _insp.Parameter.empty:
-                        sub_kwargs[sname] = sdefault
-                    elif isinstance(sann, type) and issubclass(sann, (_Req, _HC)):
-                        sub_kwargs[sname] = _Req(req_scope)
-                    # else: leave unset; the dep may have **kwargs etc.
-            # FA 0.120+ scope semantics: ``function`` teardowns run
-            # IMMEDIATELY after the handler returns (before the
-            # response is sent — they CAN raise to abort the
-            # response with a 503). ``request`` (default) teardowns
-            # run AFTER the response is flushed.
-            _scope_for_gen = (dep_scope or "request").lower()
-            if _insp.isasyncgenfunction(actual_fn):
-                gen = actual_fn(**sub_kwargs)
-                val = await gen.__anext__()
-                dep_teardowns.append((gen, True, _scope_for_gen))
-            elif _insp.isgeneratorfunction(actual_fn):
-                gen = actual_fn(**sub_kwargs)
-                val = next(gen)
-                dep_teardowns.append((gen, False, _scope_for_gen))
-            elif _insp.iscoroutinefunction(actual_fn):
-                val = await actual_fn(**sub_kwargs)
-            else:
-                val = actual_fn(**sub_kwargs)
-                # Detect generators / coroutines / async generators
-                # produced by callables that don't trip the function-
-                # level introspection: class instances whose ``__call__``
-                # is async / a generator (FA's ``OAuth2``,
-                # ``ClassInstanceGenDep``), or callables wrapped in
-                # ``functools.wraps`` (a plain ``def wrapper`` returning
-                # the inner generator). Inspect the return value.
-                if _insp.iscoroutine(val):
-                    val = await val
-                elif _insp.isasyncgen(val):
-                    gen = val
-                    val = await gen.__anext__()
-                    dep_teardowns.append((gen, True, _scope_for_gen))
-                elif _insp.isgenerator(val):
-                    gen = val
-                    val = next(gen)
-                    dep_teardowns.append((gen, False, _scope_for_gen))
-            if _do_cache:
-                cache[cache_key] = val
-            return val
-
-        import typing as _tp
-
-        kwargs: dict = {}
-        response_injected = None  # Track so we can fold its cookies back.
-        bg_injected = None
-        dep_cache: dict = {}
-
-        # Pre-compute the full query-params multi-dict (preserves
-        # repeats for list[T] aggregation).
-        from urllib.parse import parse_qsl
-        _qp_items: list[tuple[str, str]] = []
-        if _qs_bytes:
-            _qp_items = parse_qsl(_qs_bytes.decode("latin-1"), keep_blank_values=True)
-
-        def _alias_for_header(marker, pname):
-            """Honour ``validation_alias`` / ``alias`` /
-            ``convert_underscores`` on Header(...). FA precedence:
-            ``validation_alias`` wins over ``alias``, both win over
-            the dash-converted python name."""
-            va = getattr(marker, "validation_alias", None)
-            if isinstance(va, str) and va:
-                return va
-            if getattr(marker, "alias", None):
-                return marker.alias
-            convert = getattr(marker, "convert_underscores", True)
-            return pname.replace("_", "-") if convert else pname
-
-        def _extract_list_from_query(alias):
-            return [v for k, v in _qp_items if k == alias]
-
-        # Cache auto-built TypeAdapters for primitive annotations so
-        # we don't re-construct one per request for `int` / `float` /
-        # `bool` params that ``introspect`` left with
-        # ``scalar_validator = None``.
-        _auto_adapters: dict = {}
-
-        def _get_adapter(adapter, annotation):
-            """Pick the adapter to use: ``adapter`` if present, else
-            build one on the fly for primitive annotations that need
-            string→T coercion (int / float / bool / etc.)."""
-            if adapter is not None:
-                return adapter
-            if annotation in _auto_adapters:
-                return _auto_adapters[annotation]
-            if annotation in (None, inspect.Parameter.empty, _insp.Parameter.empty):
-                return None
-            try:
-                from pydantic import TypeAdapter as _TA
-                built = _TA(annotation)
-            except Exception:  # noqa: BLE001
-                built = None
-            _auto_adapters[annotation] = built
-            return built
-
-        def _validate(adapter, raw, loc_kind, loc_name, annotation=None):
-            """Run a Pydantic TypeAdapter against a raw value. Errors
-            become FA-shaped 422 RequestValidationErrors. When
-            ``adapter`` is None and ``annotation`` is a primitive, we
-            auto-build an adapter so ``?n=42`` coerces to int."""
-            eff = _get_adapter(adapter, annotation)
-            if eff is None:
-                return raw
-            from pydantic import ValidationError as _PyVE
-            try:
-                return eff.validate_python(raw)
-            except _PyVE as pve:
-                errs = []
-                for e in pve.errors():
-                    # Strip ``url`` (pydantic doc-link, not in upstream
-                    # FastAPI's response shape) but PRESERVE ``ctx``
-                    # (constraint values like ``{min_length: 1}``) —
-                    # upstream FastAPI emits ctx in its 422 response
-                    # bodies. R39 audit caught us silently dropping
-                    # it across ~888 upstream tests.
-                    new = {k: v for k, v in e.items() if k != "url"}
-                    loc = list(new.get("loc", ()))
-                    new["loc"] = [loc_kind, loc_name, *loc] if loc else [loc_kind, loc_name]
-                    errs.append(new)
-                raise _RVE_err(errs) from None
-
-        try:
-            import typing as _tp_local
-            from fastapi_turbo.dependencies import Depends as _Dep_marker2
-
-            # Collect every Body()-kind param so we can support
-            # multi-body (implicit embed) and explicit embed=True.
-            body_params = [p for p in introspect_params if p.get("kind") == "body"]
-            body_embed_single = (
-                len(body_params) == 1
-                and body_params[0].get("_embed")
-            )
-            multi_body = len(body_params) > 1
-
-            # Parse the body once (if any body param exists). Dispatch
-            # on the request Content-Type AND the body param's own
-            # ``media_type`` (set via ``Body(..., media_type=…)``):
-            #   * JSON-shaped bodies (default, or ``application/json``)
-            #     → ``json.loads`` → 422 on decode error.
-            #   * Body params whose declared media_type is non-JSON
-            #     (e.g. ``application/octet-stream``) AND whose
-            #     declared annotation is bytes-shaped → pass raw bytes
-            #     to the param without JSON parsing.
-            # Without this, a binary upload handler that takes
-            # ``payload: bytes = Body(..., media_type='application/
-            # octet-stream')`` would 422 because the binary payload
-            # isn't valid UTF-8 / JSON.
-            parsed_body: object = None
-            body_parsed = False
-            # Pull the request's Content-Type once (lower-cased,
-            # parameter-stripped) for dispatch.
-            _req_ct = ""
-            for hk, hv in scope.get("headers", []) or []:
-                if (hk.decode("latin-1") if isinstance(hk, bytes) else hk).lower() == "content-type":
-                    _req_ct = (
-                        (hv.decode("latin-1") if isinstance(hv, bytes) else hv)
-                        .split(";", 1)[0]
-                        .strip()
-                        .lower()
-                    )
-                    break
-
-            def _body_param_wants_raw_bytes(bp) -> bool:
-                """A body param wants raw bytes if EITHER the
-                declared annotation is ``bytes``/``bytearray`` OR
-                the marker carries a non-JSON ``media_type``
-                (e.g. ``application/octet-stream``)."""
-                ann = bp.get("_unwrapped_annotation")
-                if ann is bytes or ann is bytearray:
-                    return True
-                mt = bp.get("media_type") or ""
-                if mt and not mt.lower().startswith("application/json"):
-                    return True
-                return False
-
-            wants_raw_bytes = (
-                len(body_params) == 1
-                and _body_param_wants_raw_bytes(body_params[0])
-            ) or (
-                _req_ct
-                and not _req_ct.startswith("application/json")
-                and len(body_params) == 1
-                and body_params[0].get("_unwrapped_annotation") in (bytes, bytearray)
-            )
-
-            # FA 0.120+ ``strict_content_type=True`` (default): the
-            # body is rejected with 422 if the request's Content-Type
-            # doesn't match the param's declared media type. The Rust
-            # path enforces this at compile time; the in-process
-            # dispatcher needs the same check. Closest-wins
-            # precedence: route → router → app.
-            #
-            # Strict mode rejects BOTH missing CT and wrong CT; lax
-            # mode accepts missing CT but still rejects a present-
-            # but-wrong CT (probe-confirmed against
-            # ``test_lax_post_with_text_plain_is_still_rejected``).
-            _route_strict_eff = getattr(matched_route, "strict_content_type", None)
-            if _route_strict_eff is None:
-                _router_for_route = getattr(matched_route, "_fastapi_turbo_owner_router", None)
-                if _router_for_route is not None:
-                    _route_strict_eff = getattr(_router_for_route, "strict_content_type", None)
-            if _route_strict_eff is None:
-                _route_strict_eff = getattr(self, "strict_content_type", True)
-            _strict_active = _route_strict_eff is True
-            _lax_active = _route_strict_eff is False
-            if (
-                (_strict_active or _lax_active)
-                and body_params
-                and body_bytes
-                and not wants_raw_bytes
-            ):
-                # Determine the expected content-type family from the
-                # body params' kinds. Form/File → form/multipart;
-                # otherwise JSON. Mixed body+form is illegal — the
-                # introspect plan would surface that earlier.
-                _has_form_param = any(
-                    p.get("kind") in ("form", "file") for p in introspect_params
-                )
-                if _has_form_param:
-                    _ok_cts = (
-                        "application/x-www-form-urlencoded",
-                        "multipart/form-data",
-                    )
-                else:
-                    _ok_cts = ("application/json",)
-                _req_ct_full = ""
-                for _hk, _hv in scope.get("headers", []) or []:
-                    if (
-                        _hk.decode("latin-1")
-                        if isinstance(_hk, bytes)
-                        else _hk
-                    ).lower() == "content-type":
-                        _req_ct_full = (
-                            _hv.decode("latin-1")
-                            if isinstance(_hv, bytes)
-                            else _hv
-                        ).lower()
-                        break
-                _ct_type_ok = bool(_req_ct_full) and any(
-                    _req_ct_full.startswith(_c)
-                    or (_c == "application/json" and "+json" in _req_ct_full)
-                    for _c in _ok_cts
-                )
-                # Strict mode: require Content-Type to be PRESENT.
-                # Don't check the type — let body parsing proceed
-                # and surface Pydantic's ``model_attributes_type``
-                # (or similar) on a wrong CT so the client sees the
-                # real type mismatch. Probe-confirmed against
-                # ``test_post_form_for_json``.
-                # Lax mode: don't require CT presence. But if CT IS
-                # present, it must be a JSON-compatible type — text/
-                # plain with a JSON-shaped body should still 422
-                # because the user EXPLICITLY declared the wrong CT.
-                # Probe-confirmed against
-                # ``test_lax_post_with_text_plain_is_still_rejected``.
-                if _strict_active and not _req_ct_full:
-                    raise _RVE_err([{
-                        "type": "missing",
-                        "loc": ["header", "content-type"],
-                        "msg": "Field required",
-                        "input": None,
-                    }])
-                if _lax_active and _req_ct_full and not _ct_type_ok:
-                    raise _RVE_err([{
-                        "type": "missing",
-                        "loc": ["header", "content-type"],
-                        "msg": f"Unexpected Content-Type: {_req_ct_full}",
-                        "input": _req_ct_full,
-                    }])
-
-            if body_params and body_bytes:
-                if wants_raw_bytes:
-                    parsed_body = bytes(body_bytes)
-                    body_parsed = True
-                else:
-                    import json as _json
-                    # Detect the request's content-type to drive the
-                    # body-parse strategy. When CT is anything OTHER
-                    # than JSON (e.g. text/plain, form-encoded for a
-                    # JSON endpoint), DON'T parse JSON — pass the raw
-                    # body string to Pydantic so it surfaces a
-                    # ``model_attributes_type`` error with the raw
-                    # body in ``input``. FA's contract: the user
-                    # explicitly set the wrong CT, so the parse step
-                    # is skipped; the model validator rejects with a
-                    # Pydantic error rather than us silently coercing
-                    # JSON-shaped text/plain. Probe-confirmed against
-                    # ``test_tutorial/test_body/test_tutorial001::test_
-                    # wrong_headers``.
-                    _ct_for_parse = ""
-                    for _hk_p, _hv_p in scope.get("headers", []) or []:
-                        if (
-                            _hk_p.decode("latin-1")
-                            if isinstance(_hk_p, bytes)
-                            else _hk_p
-                        ).lower() == "content-type":
-                            _ct_for_parse = (
-                                _hv_p.decode("latin-1")
-                                if isinstance(_hv_p, bytes)
-                                else _hv_p
-                            ).lower()
-                            break
-                    _ct_main = _ct_for_parse.split(";", 1)[0].strip()
-                    _ct_is_json = (
-                        not _ct_for_parse
-                        or _ct_main == "application/json"
-                        or (
-                            _ct_main.startswith("application/")
-                            and _ct_main.endswith("+json")
-                        )
-                    )
-                    _has_form_param_for_parse = any(
-                        p.get("kind") in ("form", "file")
-                        for p in introspect_params
-                    )
-                    if not _ct_is_json and not _has_form_param_for_parse:
-                        # Pass raw body string to body validation —
-                        # model_class type-check at line 8830 surfaces
-                        # ``model_attributes_type``.
-                        try:
-                            parsed_body = body_bytes.decode("utf-8")
-                        except Exception:  # noqa: BLE001
-                            parsed_body = repr(body_bytes)
-                        body_parsed = True
-                    else:
-                        try:
-                            parsed_body = _json.loads(body_bytes)
-                            body_parsed = True
-                        except _json.JSONDecodeError as jde:
-                            # FA shape: ``msg`` is the bare ``"JSON
-                            # decode error"`` and the position-
-                            # specific detail lives in
-                            # ``ctx={"error": jde.msg}``.
-                            raise _RVE_err([{
-                                "type": "json_invalid",
-                                "loc": ["body", jde.pos],
-                                "msg": "JSON decode error",
-                                "input": {},
-                                "ctx": {"error": jde.msg},
-                            }]) from None
-                        except Exception as _other_je:  # noqa: BLE001
-                            # FA contract: a non-JSONDecodeError from
-                            # ``json.loads`` (e.g. ``json`` patched
-                            # out in tests, MemoryError, etc.) → 400
-                            # via HTTPException so the test sees a
-                            # graceful failure rather than a 500.
-                            # Probe-confirmed against
-                            # ``test_tutorial/test_body/test_tutorial001
-                            # ::test_other_exceptions``.
-                            from fastapi_turbo.exceptions import (
-                                HTTPException as _HE_je,
-                            )
-                            raise _HE_je(
-                                status_code=400,
-                                detail="There was an error parsing the body",
-                            ) from _other_je
-            elif body_params and not body_bytes:
-                # Body expected but empty — emit a missing-body 422
-                # matching FA's shape. For an embedded single body
-                # (``Annotated[Item, Body(embed=True)]``) the loc is
-                # ``["body", "item"]`` — earlier we always emitted
-                # ``["body"]`` and dropped the field name. The
-                # combined-body path handles its own multi-field
-                # missing emission downstream.
-                _missing_body_errs: list = []
-                for _bp in body_params:
-                    if not _bp.get("required"):
-                        continue
-                    _bp_name = _bp.get("name")
-                    if _bp_name == "_combined_body":
-                        # Defer to the combined-body branch which
-                        # emits one missing per field.
-                        continue
-                    _bp_alias = _bp.get("alias") or _bp_name
-                    _bp_embed = _bp.get("_embed", False)
-                    if _bp_embed:
-                        _missing_body_errs.append({
-                            "type": "missing",
-                            "loc": ["body", _bp_alias],
-                            "msg": "Field required",
-                            "input": None,
-                        })
-                    else:
-                        _missing_body_errs.append({
-                            "type": "missing",
-                            "loc": ["body"],
-                            "msg": "Field required",
-                            "input": None,
-                        })
-                if _missing_body_errs:
-                    raise _RVE_err(_missing_body_errs)
-
-            # Run app/router/route-level extra dependencies (those
-            # declared via ``FastAPI(dependencies=[...])`` /
-            # ``APIRouter(dependencies=[...])`` /
-            # ``@app.get(..., dependencies=[...])``) BEFORE the handler
-            # params are resolved. Their return values are discarded
-            # (matches FA — extra deps run for side effects: auth,
-            # metrics, audit logging). Errors propagate so HTTP
-            # exceptions / 422s surface correctly.
-            #
-            # Skips routes flagged ``_fastapi_turbo_bypass_deps`` —
-            # the docs / openapi.json endpoints opt out of all
-            # user-registered deps so a misconfigured auth dep
-            # doesn't lock you out of the schema.
-            if not getattr(matched_route, "_fastapi_turbo_bypass_deps", False):
-                _extra_dep_markers: list = []
-                _extra_dep_markers.extend(
-                    getattr(self, "dependencies", []) or []
-                )
-                _extra_dep_markers.extend(
-                    getattr(self.router, "dependencies", []) or []
-                )
-                # Route-level deps stamped on the shadow clone via
-                # ``include_router`` (or directly on the Route).
-                _extra_dep_markers.extend(
-                    getattr(matched_route, "dependencies", []) or []
-                )
-                # Include-time deps: the shadow clone may carry
-                # ``_fastapi_turbo_include_deps`` from the include_router
-                # walker (see routing.py / FastAPI.include_router).
-                _extra_dep_markers.extend(
-                    getattr(matched_route, "_fastapi_turbo_include_deps", [])
-                    or []
-                )
-                # Accumulate validation errors across multiple extra
-                # deps (app-level, router-level, route-level). FA
-                # contract: when 2+ extra deps EACH miss a required
-                # query/header/cookie/form param, ALL of them surface
-                # in one 422 response. Earlier we raised on the first
-                # dep's miss and the client only saw 1 of N errors —
-                # mismatch with upstream's bigger-applications tutorial
-                # snapshots.
-                _xdep_accum_errs: list = []
-                for _xdep in _extra_dep_markers:
-                    try:
-                        await _resolve_dep(_xdep, dep_cache, [])
-                    except _RVE_err as _rve:
-                        _xdep_accum_errs.extend(_rve.errors())
-                if _xdep_accum_errs:
-                    # Convert tuple ``loc`` (returned by ``.errors()``)
-                    # back to list shape that other emit sites use.
-                    _xdep_norm = [
-                        {**e, "loc": list(e["loc"])}
-                        if isinstance(e.get("loc"), tuple)
-                        else e
-                        for e in _xdep_accum_errs
-                    ]
-                    raise _RVE_err(_xdep_norm)
-
-            # Accumulate per-endpoint form/file ``missing`` errors so a
-            # request body that omits multiple required form fields
-            # surfaces ALL of them in one 422 — matches FA. Earlier we
-            # raised on the first missing and the client only saw a
-            # single entry. Same accumulator covers query / header /
-            # cookie / path missing + bad-type so a request that
-            # supplies multiple invalid params shows them all in one
-            # 422 (FA's contract — ``test_foo_no_needy`` expects 3
-            # entries: 1 missing + 2 int_parsing).
-            _outer_form_missing_errs: list = []
-            for p in introspect_params:
-                name = p["name"]
-                kind = p.get("kind")
-                alias = p.get("alias") or name
-                required = p.get("required", False)
-                has_default = p.get("has_default", False)
-                default_val = p.get("default_value")
-                scalar_validator = p.get("scalar_validator")
-                model_class = p.get("model_class")
-                container_type = p.get("container_type")
-                _ann_for_list = p.get("_unwrapped_annotation")
-                _ann_origin = _tp_local.get_origin(_ann_for_list)
-                # Pydantic ``Json[T]`` (``Annotated[T, pydantic.Json]``)
-                # is a JSON-encoded SCALAR — wire value is a single
-                # string. Don't trip the multi-value list path even
-                # if the inner T is ``list[X]``. Probe-confirmed
-                # against ``test_json_type::test_form_json_list`` /
-                # ``test_query_json_list`` / ``test_header_json_list``.
-                _raw_ann = p.get("_raw_annotation")
-                _is_json_marker = False
-                try:
-                    if _raw_ann is not None and hasattr(_raw_ann, "__metadata__"):
-                        for _m in getattr(_raw_ann, "__metadata__", ()):
-                            # Pydantic ``Json`` is a class whose
-                            # parameterised forms (``Json[list[str]]``)
-                            # produce subclasses with the same
-                            # ``__name__``. ``m is pydantic.Json``
-                            # fails for those; match on class name +
-                            # module instead.
-                            _mc = _m if isinstance(_m, type) else type(_m)
-                            if (
-                                getattr(_mc, "__name__", None) == "Json"
-                                and getattr(_mc, "__module__", "").startswith("pydantic")
-                            ):
-                                _is_json_marker = True
-                                break
-                except Exception:  # noqa: BLE001
-                    pass
-                is_list_param = (not _is_json_marker) and (
-                    container_type is not None
-                    or _ann_origin in (list, set, frozenset, tuple)
-                    # Bare ``list`` / ``set`` / ``tuple`` annotations
-                    # (no parametrization) are still sequence params —
-                    # FA collects repeated values into the appropriate
-                    # container. ``test_forms_from_non_typing_sequences``
-                    # asserts ``items: list = Form()`` returns
-                    # ``["first", "second", "third"]`` for a 3-value
-                    # form submission.
-                    or _ann_for_list in (list, set, frozenset, tuple)
-                )
-
-                if kind == "dependency":
-                    dep_callable = p.get("dep_callable")
-                    if dep_callable is None:
-                        kwargs[name] = None
-                        continue
-                    # FA 0.115+ parameter-model synthetic builder:
-                    # ``_maybe_expand_param_models`` flattens
-                    # ``p: Annotated[MyModel, Query()]`` into N synthetic
-                    # extraction params (one per model field) plus this
-                    # builder dep that reconstructs the model from those
-                    # extracted values. Its ``dep_input_map`` pre-wires
-                    # the builder's kwargs to the synthesized field
-                    # names — running it through ``_resolve_dep`` would
-                    # introspect the wrapper closure (no params) and
-                    # drop the mapping. The Rust+resolver path handles
-                    # this via ``_resolution.py:624``; the in-process
-                    # dispatcher used to fall through to ``_resolve_dep``
-                    # and produce ``unexpected keyword argument
-                    # 'pm_p__p'`` 422s when the synthesized fields then
-                    # leaked into the user handler call.
-                    if p.get("_is_param_model_builder"):
-                        dep_in_map = p.get("dep_input_map") or []
-                        builder_kwargs = {}
-                        for dest_key, src_key in dep_in_map:
-                            if src_key == "__fastapi_turbo_raw_query__":
-                                # FA's ``model_validate(raw_query_dict)``
-                                # contract: hand the model the wire-key
-                                # → raw-value (last-occurrence wins for
-                                # scalar, list for repeated). Pydantic
-                                # then runs its own validator on the
-                                # whole model and surfaces FA-shaped
-                                # ``loc=["query","f"]`` errors.
-                                rd: dict = {}
-                                for qk, qv in _qp_items:
-                                    _ex = rd.get(qk)
-                                    if _ex is None:
-                                        rd[qk] = qv
-                                    elif isinstance(_ex, list):
-                                        _ex.append(qv)
-                                    else:
-                                        rd[qk] = [_ex, qv]
-                                builder_kwargs[dest_key] = rd
-                            elif src_key == "__fastapi_turbo_raw_headers__":
-                                rd_h: dict = {}
-                                for hk_, hv_ in scope.get("headers", []) or []:
-                                    _hk = (
-                                        hk_.decode("latin-1")
-                                        if isinstance(hk_, bytes)
-                                        else hk_
-                                    ).lower()
-                                    _hv = (
-                                        hv_.decode("latin-1")
-                                        if isinstance(hv_, bytes)
-                                        else hv_
-                                    )
-                                    _exh = rd_h.get(_hk)
-                                    if _exh is None:
-                                        rd_h[_hk] = _hv
-                                    elif isinstance(_exh, list):
-                                        _exh.append(_hv)
-                                    else:
-                                        rd_h[_hk] = [_exh, _hv]
-                                builder_kwargs[dest_key] = rd_h
-                            elif src_key == "__fastapi_turbo_raw_cookies__":
-                                builder_kwargs[dest_key] = dict(_scope_cookies)
-                            elif src_key == "__fastapi_turbo_raw_form__":
-                                builder_kwargs[dest_key] = dict(form_fields)
-                            else:
-                                # Normal extraction-step source — pull
-                                # from the kwargs we've already populated.
-                                if src_key in kwargs:
-                                    builder_kwargs[dest_key] = kwargs[src_key]
-                        # Builders are sync; ``model_validate`` is sync.
-                        kwargs[name] = dep_callable(**builder_kwargs)
-                        continue
-                    # Seed with scopes from a top-level ``Security(...)``
-                    # marker so the inner-dep ``SecurityScopes`` param
-                    # sees them (matches FA semantics). ``_dep_scope``
-                    # carries FA 0.120+'s ``Depends(..., scope=...)``
-                    # selector so the resolver appends the dep's
-                    # generator to the right teardown bucket
-                    # (function-scope drains pre-response, request-
-                    # scope drains post-response).
-                    top_scopes = list(p.get("_security_scopes_top") or [])
-                    kwargs[name] = await _resolve_dep(
-                        dep_callable, dep_cache, top_scopes,
-                        dep_scope=p.get("_dep_scope"),
-                        use_cache=p.get("use_cache", True),
-                        # Forward the IMMEDIATE Security marker's own
-                        # scopes so the cache key flips into "scope-
-                        # aware" mode at the leaf — required for
-                        # ``test_security_cache`` where two
-                        # ``Security(dep, scopes=["scope"])`` should
-                        # cache as the same entry but a third
-                        # ``Security(dep)`` (no scopes) should be
-                        # distinct.
-                        _own_scopes_for_key=top_scopes,
-                    )
-                    continue
-
-                if kind == "path":
-                    raw = path_params.get(alias, "")
-                    kwargs[name] = _validate(
-                        scalar_validator, raw, "path", alias,
-                        annotation=p.get("_unwrapped_annotation"),
-                    )
-                    continue
-
-                if kind == "query":
-                    try:
-                        # Synthesized field-extraction params for
-                        # ``Annotated[Model, Query()]`` skip per-field
-                        # scalar validation — the builder dep runs
-                        # ``model_validate`` on the raw-string dict
-                        # so Pydantic emits all errors with ORIGINAL
-                        # raw inputs (FA contract:
-                        # ``test_query_param_model_invalid`` expects
-                        # ``input: "150"`` not ``input: 150``).
-                        _is_synth_field = bool(p.get("_param_model_field_name"))
-                        if is_list_param:
-                            vals = _extract_list_from_query(alias)
-                            if not vals:
-                                if required:
-                                    _outer_form_missing_errs.append(
-                                        _missing("query", alias)
-                                    )
-                                    continue
-                                kwargs[name] = _list_default_for_missing(p, default_val, has_default)
-                                continue
-                            if _is_synth_field:
-                                kwargs[name] = vals
-                            else:
-                                kwargs[name] = _validate(
-                                    scalar_validator, vals, "query", alias,
-                                    annotation=p.get("_unwrapped_annotation"),
-                                )
-                            continue
-                        # Scalar query: first occurrence wins.
-                        raw = None
-                        for k, v in _qp_items:
-                            if k == alias:
-                                raw = v
-                                break
-                        if raw is None:
-                            if required:
-                                _outer_form_missing_errs.append(
-                                    _missing("query", alias)
-                                )
-                                continue
-                            kwargs[name] = default_val
-                            continue
-                        if _is_synth_field:
-                            kwargs[name] = raw
-                        else:
-                            kwargs[name] = _validate(
-                                scalar_validator, raw, "query", alias,
-                                annotation=p.get("_unwrapped_annotation"),
-                            )
-                    except _RVE_err as _ve:
-                        _outer_form_missing_errs.extend(
-                            [
-                                {**_e, "loc": list(_e.get("loc") or ())}
-                                if isinstance(_e.get("loc"), tuple)
-                                else _e
-                                for _e in _ve.errors()
-                            ]
-                        )
-                    continue
-
-                if kind == "header":
-                    marker = p.get("_raw_marker")
-                    hdr_alias = alias
-                    if marker is not None and not getattr(marker, "alias", None):
-                        hdr_alias = _alias_for_header(marker, name)
-                    try:
-                        if is_list_param:
-                            vals = _scope_headers.getlist(hdr_alias)
-                            if not vals:
-                                if required:
-                                    _outer_form_missing_errs.append(
-                                        _missing("header", hdr_alias)
-                                    )
-                                    continue
-                                kwargs[name] = _list_default_for_missing(p, default_val, has_default)
-                                continue
-                            kwargs[name] = _validate(
-                                scalar_validator, vals, "header", hdr_alias,
-                                annotation=p.get("_unwrapped_annotation"),
-                            )
-                            continue
-                        raw = _scope_headers.get(hdr_alias)
-                        if raw is None:
-                            if required:
-                                _outer_form_missing_errs.append(
-                                    _missing("header", hdr_alias)
-                                )
-                                continue
-                            kwargs[name] = default_val
-                            continue
-                        kwargs[name] = _validate(
-                            scalar_validator, raw, "header", hdr_alias,
-                            annotation=p.get("_unwrapped_annotation"),
-                        )
-                    except _RVE_err as _ve:
-                        _outer_form_missing_errs.extend(
-                            [
-                                {**_e, "loc": list(_e.get("loc") or ())}
-                                if isinstance(_e.get("loc"), tuple)
-                                else _e
-                                for _e in _ve.errors()
-                            ]
-                        )
-                    continue
-
-                if kind == "cookie":
-                    try:
-                        raw = _scope_cookies.get(alias)
-                        if raw is None:
-                            if required:
-                                _outer_form_missing_errs.append(
-                                    _missing("cookie", alias)
-                                )
-                                continue
-                            kwargs[name] = default_val
-                            continue
-                        kwargs[name] = _validate(
-                            scalar_validator, raw, "cookie", alias,
-                            annotation=p.get("_unwrapped_annotation"),
-                        )
-                    except _RVE_err as _ve:
-                        _outer_form_missing_errs.extend(
-                            [
-                                {**_e, "loc": list(_e.get("loc") or ())}
-                                if isinstance(_e.get("loc"), tuple)
-                                else _e
-                                for _e in _ve.errors()
-                            ]
-                        )
-                    continue
-
-                if kind == "body":
-                    # ``introspect_endpoint`` collapses multi-body or
-                    # ``Body(embed=True)`` endpoints to a single synthetic
-                    # ``_combined_body`` param whose ``model_class`` is a
-                    # Pydantic model with one field per original body
-                    # param. We validate the incoming JSON against that
-                    # model, then split the instance back into per-param
-                    # kwargs matching the user function signature.
-                    from pydantic import ValidationError as _PyVE2
-                    is_combined = name == "_combined_body" and model_class is not None
-                    if is_combined:
-                        # Combined body needs a dict-shaped wire
-                        # payload. ``parsed_body=[]`` (empty list) /
-                        # other non-dict shapes have no field
-                        # mapping — emit per-field missing errors
-                        # rather than letting Pydantic produce a
-                        # ``model_attributes_type``. Probe-confirmed
-                        # against
-                        # ``test_body_multiple_params/test_post_body_empty_list``.
-                        if parsed_body is not None and not isinstance(parsed_body, dict):
-                            _cb_fields_nd = getattr(
-                                model_class, "model_fields", {}
-                            ) or {}
-                            if _cb_fields_nd:
-                                raise _RVE_err([
-                                    _missing("body", _fn) for _fn in _cb_fields_nd
-                                ])
-                            raise _RVE_err([_missing("body", name)])
-                        if parsed_body is None:
-                            if required:
-                                # Emit one ``missing`` per body field.
-                                # The combined model's ``model_fields``
-                                # has exactly the original body param
-                                # names ('item', 'user', 'importance',
-                                # ...), which is what FA expects in the
-                                # 422 detail. Earlier we used
-                                # ``sig.parameters`` (the FULL endpoint
-                                # signature) which produced a single
-                                # ``["body"]`` entry instead.
-                                _cb_fields = getattr(
-                                    model_class, "model_fields", {}
-                                ) or {}
-
-                                def _cb_alias_or_name(_fn):
-                                    _fi = _cb_fields.get(_fn)
-                                    if _fi is None:
-                                        return _fn
-                                    _va = getattr(_fi, "validation_alias", None)
-                                    if isinstance(_va, str) and _va:
-                                        return _va
-                                    return getattr(_fi, "alias", None) or _fn
-                                if _cb_fields:
-                                    raise _RVE_err([
-                                        _missing("body", _cb_alias_or_name(_fn))
-                                        for _fn in _cb_fields
-                                    ])
-                                raise _RVE_err([_missing("body", name)])
-                            continue
-                        try:
-                            if hasattr(model_class, "model_validate"):
-                                instance = model_class.model_validate(parsed_body)
-                            elif hasattr(model_class, "validate_python"):
-                                instance = model_class.validate_python(parsed_body)
-                            else:
-                                instance = parsed_body
-                        except _PyVE2 as pve:
-                            errs = []
-                            def _cb_field_alias_for(_fi, _fn):
-                                _va = getattr(_fi, "validation_alias", None)
-                                if isinstance(_va, str) and _va:
-                                    return _va
-                                return getattr(_fi, "alias", None) or _fn
-                            _cb_field_aliases = {
-                                _fn: _cb_field_alias_for(_fi, _fn)
-                                for _fn, _fi in (
-                                    getattr(model_class, "model_fields", {}) or {}
-                                ).items()
-                            }
-                            for e in pve.errors():
-                                # Preserve ``ctx`` (R39). Remap each
-                                # leading loc segment from the
-                                # synthetic-model field NAME to the FA
-                                # ALIAS so 422 ``loc`` matches the
-                                # wire shape — ``["body", "p_alias"]``
-                                # for ``Body(alias="p_alias")``, not
-                                # the python-side ``["body", "p"]``.
-                                new = {k: v for k, v in e.items() if k != "url"}
-                                loc = list(new.get("loc", ()))
-                                if loc and isinstance(loc[0], str):
-                                    loc[0] = _cb_field_aliases.get(loc[0], loc[0])
-                                new["loc"] = ["body", *loc] if loc else ["body"]
-                                # FA contract: ``input`` is ``None``
-                                # ONLY for top-level missing fields
-                                # (e.g. ``loc=["body", "user"]`` where
-                                # ``user`` is absent from the payload).
-                                # Nested missing (``loc=["body", "item",
-                                # "price"]``) keeps Pydantic's input —
-                                # the partial parent dict — so the
-                                # client can see what WAS supplied.
-                                # Detect via the original ``loc`` depth
-                                # before we prepended ``"body"``.
-                                _orig_loc_len = len(list(e.get("loc", ())))
-                                if (
-                                    new.get("type") == "missing"
-                                    and _orig_loc_len <= 1
-                                ):
-                                    new["input"] = None
-                                errs.append(new)
-                            raise _RVE_err(errs, body=parsed_body) from None
-                        # Split fields back into user-signature kwargs.
-                        field_names = getattr(model_class, "model_fields", {}) or {}
-                        for field_name in field_names:
-                            kwargs[field_name] = getattr(instance, field_name)
-                        continue
-
-                    # Simple single body. If no body was provided AND
-                    # this param has a default value, use the default
-                    # (matches upstream — ``def _i(t: list[str] = []):``
-                    # serves an empty request as ``t=[]``, not 422).
-                    val = parsed_body
-                    if val is None and not required:
-                        kwargs[name] = default_val
-                        continue
-                    # Single-body required missing emits ``loc=["body"]``
-                    # (FA's contract: the field name lives in the
-                    # endpoint signature, not the wire payload — there
-                    # is no aliased "body root" name). The combined-
-                    # body path handles the embedded multi-field case.
-                    if val is None and required:
-                        raise _RVE_err([{
-                            "type": "missing",
-                            "loc": ["body"],
-                            "msg": "Field required",
-                            "input": None,
-                        }])
-                    if model_class is not None:
-                        # Pre-check: if the request's content-type
-                        # was non-JSON AND val is a raw body string,
-                        # AND the target is a Pydantic ``BaseModel``
-                        # subclass, raise FA's
-                        # ``model_attributes_type`` directly.
-                        # Pydantic would emit ``model_type`` with a
-                        # different ``msg`` and ``ctx.class_name``
-                        # that doesn't match upstream's snapshot.
-                        # Probe-confirmed against
-                        # ``test_post_form_for_json``. We gate on
-                        # the non-JSON CT path only; JSON-shaped
-                        # values like a JSON-encoded string or
-                        # number must still flow through Pydantic
-                        # (which accepts them for str/int/float
-                        # typed bodies).
-                        try:
-                            from pydantic import BaseModel as _PBM_local
-                            _mc_is_basemodel = isinstance(model_class, type) and issubclass(model_class, _PBM_local)
-                        except Exception:  # noqa: BLE001
-                            _mc_is_basemodel = False
-                        if (
-                            _mc_is_basemodel
-                            and not _ct_is_json
-                            and isinstance(val, (str, bytes))
-                        ):
-                            raise _RVE_err([{
-                                "type": "model_attributes_type",
-                                "loc": ["body"],
-                                "msg": (
-                                    "Input should be a valid dictionary or "
-                                    "object to extract fields from"
-                                ),
-                                "input": val,
-                            }], body=val)
-                        try:
-                            if hasattr(model_class, "model_validate"):
-                                kwargs[name] = model_class.model_validate(val)
-                            elif hasattr(model_class, "validate_python"):
-                                kwargs[name] = model_class.validate_python(val)
-                            else:
-                                kwargs[name] = val
-                        except _PyVE2 as pve:
-                            errs = []
-                            for e in pve.errors():
-                                # Preserve ``ctx`` (R39).
-                                new = {k: v for k, v in e.items() if k != "url"}
-                                loc = list(new.get("loc", ()))
-                                new["loc"] = ["body", *loc] if loc else ["body"]
-                                errs.append(new)
-                            raise _RVE_err(errs, body=val) from None
-                        continue
-                    kwargs[name] = _validate(
-                        scalar_validator, val, "body", alias,
-                        annotation=p.get("_unwrapped_annotation"),
-                    )
-                    continue
-
-                if kind in ("form", "file"):
-                    val = form_fields.get(alias)
-                    # FA emits form/file errors under the ``body`` loc
-                    # prefix (forms are classified as body in 422s) —
-                    # ``["body", "p"]``, not ``["form", "p"]``.
-                    # When the user annotates the file param as
-                    # ``bytes`` / ``list[bytes]`` (rather than
-                    # ``UploadFile`` / ``list[UploadFile]``), FA reads
-                    # the upload content and hands the user the raw
-                    # bytes. Detect via the unwrapped annotation.
-                    _file_inner_ann = p.get("_unwrapped_annotation")
-                    _file_wants_bytes = False
-                    if kind == "file":
-                        _f_origin = _tp_local.get_origin(_file_inner_ann)
-                        if _f_origin is list:
-                            _f_args = _tp_local.get_args(_file_inner_ann)
-                            if _f_args and _f_args[0] in (bytes, bytearray):
-                                _file_wants_bytes = True
-                        elif _file_inner_ann in (bytes, bytearray):
-                            _file_wants_bytes = True
-
-                    def _uf_to_bytes(uf):
-                        # ``UploadFile.file`` is a SpooledTemporaryFile
-                        # / BytesIO with the upload contents.
-                        f = getattr(uf, "file", None)
-                        if f is None:
-                            return b""
-                        try:
-                            f.seek(0)
-                            return f.read()
-                        except Exception:  # noqa: BLE001
-                            return b""
-
-                    if is_list_param:
-                        # List form/file: collect into a list. The
-                        # parser stores repeated keys as a list, single
-                        # values as scalars; normalize so the param
-                        # always receives a list.
-                        if val is None:
-                            if required:
-                                _outer_form_missing_errs.append(
-                                    _missing("body", alias)
-                                )
-                                continue
-                            kwargs[name] = _list_default_for_missing(p, default_val, has_default)
-                            continue
-                        vals = val if isinstance(val, list) else [val]
-                        if kind == "file":
-                            if _file_wants_bytes:
-                                kwargs[name] = [_uf_to_bytes(_v) for _v in vals]
-                            else:
-                                kwargs[name] = vals
-                        else:
-                            kwargs[name] = _validate(
-                                p.get("scalar_validator"),
-                                vals,
-                                "body",
-                                alias,
-                                annotation=p.get("_unwrapped_annotation"),
-                            )
-                        continue
-                    if val is None:
-                        if required:
-                            _outer_form_missing_errs.append(
-                                _missing("body", alias)
-                            )
-                            continue
-                        kwargs[name] = default_val
-                    else:
-                        # FA contract: an empty form / file value with
-                        # an Optional annotation falls back to the
-                        # param's default (``age: Optional[int] =
-                        # Form() = None`` returns ``None``, not 422).
-                        # Probe-confirmed against
-                        # ``test_form_default_url_encoded`` /
-                        # ``_multi_part``.
-                        _is_empty = val == "" or val == b""
-                        if _is_empty and not required:
-                            kwargs[name] = default_val
-                            continue
-                        if kind == "file":
-                            # File uploads stay raw — they're already
-                            # an ``UploadFile`` object. If the parser
-                            # produced a list (multiple files under
-                            # the same field name) but the param is
-                            # scalar, take the first to preserve FA
-                            # parity.
-                            if isinstance(val, list):
-                                val = val[0]
-                            if _file_wants_bytes:
-                                kwargs[name] = _uf_to_bytes(val)
-                            else:
-                                kwargs[name] = val
-                        else:
-                            # Coerce the form value to the parameter's
-                            # declared type via Pydantic. Without this
-                            # ``age: int = Form(...)`` would receive
-                            # the string ``"30"`` rather than ``30``.
-                            if isinstance(val, list):
-                                val = val[0]
-                            kwargs[name] = _validate(
-                                p.get("scalar_validator"),
-                                val,
-                                "body",
-                                alias,
-                                annotation=p.get("_unwrapped_annotation"),
-                            )
-                    continue
-
-                if kind in ("inject_request",):
-                    # Pass ``receive`` so ``request.is_disconnected()``
-                    # can peek the ASGI channel for ``http.disconnect``
-                    # messages. Without this, every Request injected
-                    # as a kwarg has ``_receive=None`` and
-                    # ``is_disconnected`` is unconditionally ``False``.
-                    kwargs[name] = _Req(req_scope, receive=receive)
-                    continue
-                if kind in ("inject_response",):
-                    # Share the SAME instance with any deps that asked
-                    # for ``response: Response``. ``_get_or_create_
-                    # response_inject`` lazy-allocates and stores in
-                    # ``_shared_response_holder[0]``; the dep resolver
-                    # reads from the same slot. Without this, deps had
-                    # their own (different) Response instance and any
-                    # headers they set didn't reach the handler's
-                    # response.
-                    resp_inst = _get_or_create_response_inject()
-                    response_injected = resp_inst
-                    kwargs[name] = resp_inst
-                    continue
-                if kind in ("inject_background_tasks",):
-                    if _bg_holder[0] is None:
-                        bg_inst = _BGT()
-                        bg_inst._app = self
-                        _bg_holder[0] = bg_inst
-                    bg_injected = _bg_holder[0]
-                    kwargs[name] = bg_injected
-                    continue
-
-                # Unknown kind — skip (defer to endpoint default).
-            if _outer_form_missing_errs:
-                raise _RVE_err(_outer_form_missing_errs)
-        except Exception as exc:
-            # Any param-resolution failure → route through the app's
-            # exception handlers. This includes RequestValidationError
-            # (→ 422) and HTTPException from a dep (→ its status).
-            # If the exception is a RequestValidationError raised
-            # without endpoint context, augment it so user
-            # ``@app.exception_handler(RequestValidationError)``
-            # implementations can log file / line / function alongside
-            # the validation errors. Matches FA's behaviour and
-            # upstream's ``test_validation_error_context`` suite.
-            if isinstance(exc, _RVE_err) and not getattr(exc, "endpoint_ctx", None):
-                try:
-                    _ep_for_ctx = endpoint
-                    _ep_func = getattr(_ep_for_ctx, "__name__", None)
-                    _ep_file = getattr(
-                        getattr(_ep_for_ctx, "__code__", None), "co_filename", None
-                    )
-                    _ep_line = getattr(
-                        getattr(_ep_for_ctx, "__code__", None), "co_firstlineno", None
-                    )
-                    # Mounted apps: the route's local ``path`` is
-                    # ``/items/`` but the user-facing URL includes the
-                    # mount prefix (``/sub``). Prepend ``root_path``
-                    # from scope so error handlers see the full path.
-                    _route_local = getattr(matched_route, "path", None) or ""
-                    _root_local = scope.get("root_path", "") or ""
-                    _full_path = (_root_local + _route_local) if _route_local else _route_local
-                    exc.endpoint_ctx = {
-                        "function": _ep_func,
-                        "file": _ep_file,
-                        "line": _ep_line,
-                        "path": _full_path,
-                    }
-                    exc.endpoint_function = _ep_func
-                    exc.endpoint_file = _ep_file
-                    exc.endpoint_line = _ep_line
-                    exc.endpoint_path = _full_path
-                except Exception:  # noqa: BLE001
-                    pass
-            await _asgi_emit_exception(self, scope, send, exc)
-            # Teardown any deps already committed.
-            for gen, is_async, _td_scope in reversed(dep_teardowns):
-                try:
-                    if is_async:
-                        try:
-                            await gen.__anext__()
-                        except StopAsyncIteration:
-                            pass
-                    else:
-                        try:
-                            next(gen)
-                        except StopIteration:
-                            pass
-                except Exception:  # noqa: BLE001
-                    pass
-            return True
-
-        # Invoke the endpoint, wrapped in any ``@app.middleware('http')``
-        # functions. ``_http_middlewares`` is stored in declaration
-        # order; FA semantics: last-decorated is outermost. We mirror
-        # that by wrapping innermost first.
-        #
-        # Skip entries that are ASGI-middleware shims — those are
-        # ``(request, call_next)`` adapters around raw-ASGI classes
-        # that already ran via the ``_raw_asgi_middlewares`` chain
-        # at the top of this function. Running the shim here would
-        # fire the MW a second time.
-        http_mws = [
-            m
-            for m in (getattr(self, "_http_middlewares", None) or [])
-            if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
-        ]
-
-        # Pull response_model + options off the matched route so we
-        # filter + alias the return value the same way the Rust hot
-        # path does. The route object carries everything _try_compile_
-        # handler would normally honour.
-        _route = matched_route
-        _resp_model = getattr(_route, "response_model", None)
-        _rm_opts = {
-            "include": getattr(_route, "response_model_include", None),
-            "exclude": getattr(_route, "response_model_exclude", None),
-            "exclude_unset": getattr(_route, "response_model_exclude_unset", False),
-            "exclude_defaults": getattr(_route, "response_model_exclude_defaults", False),
-            "exclude_none": getattr(_route, "response_model_exclude_none", False),
-            "by_alias": getattr(_route, "response_model_by_alias", True),
-            # Carry endpoint context (function name / file / line /
-            # path) into the response_model validator so any
-            # ``ResponseValidationError`` it raises shows ``in
-            # <endpoint>`` in the user's exception_handler — matches
-            # FA's ``test_validation_error_context`` suite.
-            "endpoint_ctx": {
-                "function": getattr(endpoint, "__name__", None),
-                "file": getattr(
-                    getattr(endpoint, "__code__", None), "co_filename", None
-                ),
-                "line": getattr(
-                    getattr(endpoint, "__code__", None), "co_firstlineno", None
-                ),
-                # Mounted apps: prepend ``scope['root_path']`` so the
-                # full URL surfaces in ``ResponseValidationError`` —
-                # otherwise sub-app handlers report ``/items/`` and
-                # the user's exception handler sees a stripped path.
-                "path": (scope.get("root_path", "") or "") + (
-                    getattr(_route, "path", None) or ""
-                ),
-            },
-        }
-        _status_code = getattr(_route, "status_code", None)
-
-        # Filter ``kwargs`` to ONLY the keys the user handler actually
-        # takes. The synthesized field-extraction params from
-        # ``_maybe_expand_param_models`` (``pm_p__p`` etc.) feed the
-        # builder dep, not the handler. Without this filter the user
-        # function got hit with ``unexpected keyword argument
-        # 'pm_p__p'``. The endpoint signature is the source of truth —
-        # introspect_params has placeholders like ``_combined_body``
-        # that don't appear on the user fn, while the body splitter
-        # writes back to the original names (``qty`` etc.) that DO.
-        try:
-            try:
-                import annotationlib as _al_filter
-                try:
-                    _ep_sig_local = _insp.signature(
-                        endpoint,
-                        annotation_format=_al_filter.Format.FORWARDREF,
-                    )
-                except (TypeError, ValueError, NameError):
-                    _ep_sig_local = _insp.signature(endpoint)
-            except ImportError:
-                _ep_sig_local = _insp.signature(endpoint)
-            _accepts_var_kw = any(
-                _pp.kind is _insp.Parameter.VAR_KEYWORD
-                for _pp in _ep_sig_local.parameters.values()
-            )
-            if not _accepts_var_kw:
-                _ep_param_names = set(_ep_sig_local.parameters.keys())
-                kwargs = {
-                    _kk: _vv for _kk, _vv in kwargs.items()
-                    if _kk in _ep_param_names
-                }
-        except (TypeError, ValueError, NameError):
-            # Builtin / C function with no introspectable signature
-            # OR a still-NameError (forward-ref fallback failed) —
-            # leave kwargs as-is so the runtime call still surfaces a
-            # meaningful error.
-            pass
-
-        async def _call_endpoint(_request):
-            """Invoke the endpoint + apply response_model. Exceptions
-            propagate — the outer envelope routes them through the
-            app's exception_handlers."""
-            from fastapi_turbo._route_helpers import _apply_response_model
-            # We assign to ``response_injected`` below if a dep
-            # injected one but the handler didn't take a Response
-            # parameter. Mark it nonlocal so the assignment doesn't
-            # turn the name into a fresh local (which would shadow
-            # the outer scope's value and trip UnboundLocalError on
-            # the read-before-assign at line 8423).
-            nonlocal response_injected
-
-            if _insp.iscoroutinefunction(endpoint):
-                r = await endpoint(**kwargs)
-            else:
-                r = endpoint(**kwargs)
-                if _insp.iscoroutine(r):
-                    r = await r
-            if isinstance(r, _Resp):
-                return r
-            # FA 0.110+ async-generator / generator handlers are auto-
-            # wrapped. Respect ``response_class`` if the user pinned a
-            # streaming-friendly one (e.g. ``EventSourceResponse`` for
-            # SSE) — pass the generator through unchanged so the
-            # response class can drive its own framing. Otherwise
-            # default to NDJSON (FA's stream_json_lines tutorial). The
-            # Rust hot path detects this at compile time; the
-            # in-process dispatcher used to fall through to
-            # ``jsonable_encoder`` which raised ``'async_generator'
-            # object is not iterable``.
-            if _insp.isasyncgen(r) or _insp.isgenerator(r):
-                from fastapi_turbo.responses import StreamingResponse as _SR
-                _route_resp_class = getattr(
-                    matched_route, "response_class", None
-                )
-                _has_custom_resp_class = (
-                    _route_resp_class is not None
-                    and _route_resp_class is not _Resp
-                    and _route_resp_class is not _JR
-                    and not _is_json_response_class(_route_resp_class)
-                )
-                if _has_custom_resp_class:
-                    # Hand the generator to the user-pinned response
-                    # class; SSE / custom streamers know what to do.
-                    return _route_resp_class(r)
-                import json as _json_for_ndjson
-
-                # FA: when the handler's return annotation is
-                # ``AsyncIterable[Item]`` / ``Iterable[Item]``,
-                # validate each yielded item against ``Item`` and
-                # raise ``ResponseValidationError`` on mismatch.
-                # Mirrors the Rust-handler-compilation path.
-                _stream_item_adapter = None
-                try:
-                    import typing as _tp_strm
-                    import collections.abc as _cabc_strm
-                    _ret_ann = (
-                        _tp_strm.get_type_hints(endpoint).get("return")
-                        if endpoint is not None else None
-                    )
-                    if _tp_strm.get_origin(_ret_ann) in {
-                        _cabc_strm.AsyncIterable,
-                        _cabc_strm.AsyncIterator,
-                        _cabc_strm.AsyncGenerator,
-                        _cabc_strm.Iterable,
-                        _cabc_strm.Iterator,
-                        _cabc_strm.Generator,
-                    }:
-                        _ret_args = _tp_strm.get_args(_ret_ann)
-                        if _ret_args:
-                            from pydantic import TypeAdapter as _TA_strm
-                            try:
-                                _stream_item_adapter = _TA_strm(_ret_args[0])
-                            except Exception:  # noqa: BLE001
-                                _stream_item_adapter = None
-                except Exception:  # noqa: BLE001
-                    _stream_item_adapter = None
-
-                _app_for_strm = self
-
-                def _strm_check(item):
-                    if _stream_item_adapter is None:
-                        return item
-                    from pydantic import ValidationError as _PyVE_strm
-                    from fastapi_turbo.exceptions import (
-                        ResponseValidationError as _RVE_strm,
-                    )
-                    try:
-                        return _stream_item_adapter.validate_python(item)
-                    except _PyVE_strm as _ve_strm:
-                        _rve = _RVE_strm(
-                            errors=_ve_strm.errors(), body=item
-                        )
-                        if _app_for_strm is not None:
-                            _app_for_strm._captured_server_exceptions.append(_rve)
-                        raise _rve from None
-
-                async def _ndjson_iter(_gen):
-                    if _insp.isasyncgen(_gen):
-                        async for _item in _gen:
-                            _v = _strm_check(_item)
-                            yield (
-                                _json_for_ndjson.dumps(
-                                    _je(_v), separators=(",", ":"),
-                                ).encode("utf-8") + b"\n"
-                            )
-                    else:
-                        for _item in _gen:
-                            _v = _strm_check(_item)
-                            yield (
-                                _json_for_ndjson.dumps(
-                                    _je(_v), separators=(",", ":"),
-                                ).encode("utf-8") + b"\n"
-                            )
-                return _SR(
-                    _ndjson_iter(r),
-                    media_type="application/jsonl",
-                )
-            # Fast-path snapshot: when no filtering/aliasing options
-            # apply, the route uses the default JSONResponse, and the
-            # handler returned a BaseModel matching ``response_model``,
-            # we can serialise via Pydantic's ``__pydantic_serializer__
-            # .to_json`` directly. ``test_dump_json_fast_path`` asserts
-            # ``json.dumps`` is NOT called on this path.
-            _fast_json_ok = False
-            try:
-                from pydantic import BaseModel as _PBM_fastpath
-                _has_filters_fast = (
-                    _rm_opts.get("include") is not None
-                    or _rm_opts.get("exclude") is not None
-                    or _rm_opts.get("exclude_unset")
-                    or _rm_opts.get("exclude_defaults")
-                    or _rm_opts.get("exclude_none")
-                    or _rm_opts.get("by_alias") is False
-                )
-                _route_explicit_rc = getattr(
-                    matched_route, "response_class", None
-                )
-                if (
-                    not _has_filters_fast
-                    and _route_explicit_rc is None
-                    and isinstance(_resp_model, type)
-                    and issubclass(_resp_model, _PBM_fastpath)
-                    and isinstance(r, _PBM_fastpath)
-                    and type(r) is _resp_model
-                ):
-                    _fast_json_ok = True
-            except Exception:  # noqa: BLE001
-                _fast_json_ok = False
-            _fast_json_bytes: bytes | None = None
-            if _fast_json_ok:
-                try:
-                    # FA defaults ``response_model_by_alias=True`` —
-                    # honour Pydantic ``Field(alias=...)``. Without
-                    # this, fields like ``aliased_name`` would emit
-                    # under their python-side ``name`` key.
-                    _fast_json_bytes = r.__pydantic_serializer__.to_json(
-                        r, by_alias=True,
-                    )
-                except Exception:  # noqa: BLE001
-                    _fast_json_bytes = None
-            # Apply response_model filtering / aliasing / exclude-unset.
-            # Errors from this path must propagate — FA surfaces
-            # ResponseValidationError as a 500; silently returning the
-            # unvalidated payload is a security hole (we'd leak fields
-            # the schema intended to strip).
-            if _resp_model is not None and _fast_json_bytes is None:
-                r = _apply_response_model(r, _resp_model, **_rm_opts)
-            status_code = _status_code or 200
-            # Resolve response class: route → app default → JSONResponse.
-            # Without this cascade, ``default_response_class=HTMLResponse``
-            # on a FastAPI app would silently fall back to JSONResponse
-            # for handlers that return raw strings.
-            response_class = _resolve_response_class(matched_route, self)
-            # If a dep / handler injected ``response: Response`` and
-            # set ``response.status_code`` to a body-bearing code,
-            # the override beats the route's default. Probe-confirmed
-            # against ``test_reponse_set_reponse_code_empty``: a
-            # route with ``status_code=204`` whose handler does
-            # ``response.status_code = 400`` must serve the body
-            # (not the empty 204 path).
-            _eff_status = status_code
-            _ri_for_status = response_injected
-            if _ri_for_status is None and _shared_response_holder[0] is not None:
-                _ri_for_status = _shared_response_holder[0]
-            if _ri_for_status is not None:
-                _ri_status = getattr(_ri_for_status, "status_code", None)
-                if _ri_status:
-                    _eff_status = _ri_status
-            # No-body status codes (1xx / 204 / 304): RFC 9110 forbids
-            # a body. FA returns an empty Response regardless of what
-            # the handler returned (typically ``None`` / ``pass``).
-            # Probe-confirmed: ``test_response_code_no_body`` expects
-            # ``response.content == b""`` and no ``content-length``
-            # header.
-            if _eff_status in (204, 304) or 100 <= _eff_status < 200:
-                from fastapi_turbo.responses import Response as _PR
-                out = _PR(status_code=_eff_status)
-                # Strip default content-type/length so the assertion
-                # ``"content-length" not in response.headers`` holds.
-                try:
-                    if "content-length" in out.headers:
-                        del out.headers["content-length"]
-                except Exception:  # noqa: BLE001
-                    pass
-            elif response_class is _JR or _is_json_response_class(response_class):
-                if _fast_json_bytes is not None:
-                    # Fast path: build a bare Response with pre-
-                    # serialised JSON bytes so ``JSONResponse.render``
-                    # / ``json.dumps`` is never invoked. Probe-
-                    # confirmed against
-                    # ``test_dump_json_fast_path::test_default_
-                    # response_class_skips_json_dumps``.
-                    from fastapi_turbo.responses import Response as _Resp_fast
-                    out = _Resp_fast(
-                        content=_fast_json_bytes,
-                        status_code=_eff_status,
-                        media_type="application/json",
-                    )
-                else:
-                    out = response_class(
-                        content=_je(r), status_code=_eff_status,
-                    )
-            else:
-                # Some response classes don't take ``content=`` —
-                # ``RedirectResponse`` takes ``url=``, ``FileResponse``
-                # takes ``path=``. The handler returns the URL /
-                # path string. Detect via the constructor signature
-                # and re-route the kwarg.
-                _rc_sig_params = ()
-                try:
-                    _rc_sig_params = tuple(
-                        _insp.signature(response_class).parameters.keys()
-                    )
-                except (TypeError, ValueError):
-                    pass
-                # Pass ``status_code`` only when the route
-                # explicitly set one; otherwise let the response
-                # class use its own default (``RedirectResponse``
-                # defaults to 307, ``FileResponse`` to 200).
-                _explicit_status_kwargs = (
-                    {"status_code": _eff_status}
-                    if _status_code or (_ri_for_status is not None and getattr(_ri_for_status, "status_code", None))
-                    else {}
-                )
-                if "content" in _rc_sig_params:
-                    out = response_class(content=r, **_explicit_status_kwargs)
-                elif "url" in _rc_sig_params:
-                    out = response_class(url=r, **_explicit_status_kwargs)
-                elif "path" in _rc_sig_params:
-                    out = response_class(path=r, **_explicit_status_kwargs)
-                else:
-                    out = response_class(r, **_explicit_status_kwargs)
-            # Pull any dep-mutated Response even when the handler itself
-            # didn't take one — deps often add headers via
-            # ``response: Response`` while the handler returns a
-            # plain dict. Without this fold, those header mutations
-            # got dropped on the floor.
-            if response_injected is None and _shared_response_holder[0] is not None:
-                response_injected = _shared_response_holder[0]
-            if response_injected is not None:
-                # Iterate ``headers`` (the dict view) AND ``raw_headers``
-                # so we catch both ``response.headers["k"] = "v"``
-                # (which only updates the dict) AND
-                # ``response.headers.append("k", "v")`` (which also
-                # appends to raw_headers).
-                _seen_dup = set()
-                for k, v in (
-                    getattr(response_injected, "headers", {}) or {}
-                ).items():
-                    out.headers[k] = v
-                    _seen_dup.add((k, str(v)))
-                for k, v in getattr(response_injected, "raw_headers", []) or []:
-                    if (k, v) in _seen_dup:
-                        continue
-                    out.raw_headers.append((k, v))
-                if getattr(response_injected, "status_code", None):
-                    out.status_code = response_injected.status_code
-            return out
-
-        # Build the middleware chain. Each element is
-        # ``async def mw(request, call_next) -> Response``. We compose
-        # so ``call_next`` invokes the next inner MW, or finally the
-        # endpoint.
-        #
-        # FA convention: last-registered middleware is outermost
-        # (handles the request first). ``_http_middlewares`` is
-        # appended-to in registration order, so iterating FORWARD
-        # gets us there: the last item processed becomes the
-        # outermost wrapper. Iterating reversed (the previous code)
-        # made FIRST-registered outermost, breaking ordering parity.
-        current_call = _call_endpoint
-        if http_mws:
-            for mw in http_mws:
-                _inner = current_call
-
-                async def _wrapped(req, *, _mw=mw, _inner=_inner):
-                    return await _mw(req, _inner)
-
-                current_call = _wrapped
-
-        # Wrap ``receive`` so the body bytes the dispatcher already
-        # drained aren't redelivered (the handler reads them via
-        # ``request.body()`` / ``request._body`` from
-        # ``_fastapi_turbo_prebuffered_body``). Subsequent ``receive``
-        # calls (e.g. from ``request.is_disconnected()``) pass through
-        # to the real ASGI receive, surfacing
-        # ``{"type": "http.disconnect"}`` when the client drops.
-        async def _ws_aware_receive():
-            return await receive()
-
-        req_obj = _Req(req_scope, receive=_ws_aware_receive)
-        try:
-            # Honour ``FastAPI(worker_timeout=…)`` for the in-process
-            # dispatch path. Without this the dispatcher just awaited
-            # the endpoint forever, returning a spurious 200 with the
-            # slow handler's eventual output. ``asyncio.wait_for``
-            # cancels the task at the deadline and raises
-            # ``TimeoutError`` — we surface that as 504 below.
-            _wt = getattr(self, "worker_timeout", None)
-            if _wt is not None and _wt > 0:
-                result = await asyncio.wait_for(current_call(req_obj), timeout=_wt)
-            else:
-                result = await current_call(req_obj)
-            # FA 0.120+: drain ``scope='function'`` teardowns
-            # IMMEDIATELY after the handler returns, before the
-            # response is built. Function-scope teardowns are allowed
-            # to raise (e.g. an HTTPException from
-            # ``raise_after_yield``) and the new exception aborts the
-            # response with the user's status code.
-            _func_scope_remaining: list = []
-            _request_scope_remaining: list = []
-            for _t in dep_teardowns:
-                if _t[2] == "function":
-                    _func_scope_remaining.append(_t)
-                else:
-                    _request_scope_remaining.append(_t)
-            for gen, is_async, _td_scope in reversed(_func_scope_remaining):
-                if is_async:
-                    try:
-                        await gen.__anext__()
-                    except StopAsyncIteration:
-                        pass
-                else:
-                    try:
-                        next(gen)
-                    except StopIteration:
-                        pass
-            # The drained teardowns should not run again post-
-            # response — keep only request-scope on the deferred list.
-            dep_teardowns[:] = _request_scope_remaining
-        except asyncio.TimeoutError:
-            # Drain dep teardowns then surface 504.
-            for gen, is_async, _td_scope in reversed(dep_teardowns):
-                try:
-                    if is_async:
-                        try:
-                            await gen.__anext__()
-                        except StopAsyncIteration:
-                            pass
-                    else:
-                        try:
-                            next(gen)
-                        except StopIteration:
-                            pass
-                except Exception:  # noqa: BLE001
-                    pass
-            await send({
-                "type": "http.response.start",
-                "status": 504,
-                "headers": [
-                    (b"content-type", b"text/plain; charset=utf-8"),
-                    (b"content-length", b"15"),
-                ],
-            })
-            await send({"type": "http.response.body", "body": b"Gateway Timeout"})
-            return True
-        except Exception as exc:
-            # Endpoint / middleware / response_model raised. Route
-            # through the app's exception_handlers — this honours a
-            # user's `@app.exception_handler(HTTPException)` override
-            # and surfaces ResponseValidationError / RequestValidationError
-            # with FA-shaped bodies.
-            #
-            # IMPORTANT: do dep teardowns BEFORE
-            # ``_asgi_emit_exception`` because that helper re-raises
-            # for the unhandled-Exception case (so
-            # ``raise_server_exceptions=True`` propagates), which
-            # would otherwise unwind us past the teardown loop. Push
-            # the original exception into each active yield-dep via
-            # ``gen.throw(...)`` / ``gen.athrow(...)`` so a dep
-            # wrapping the request in ``try / except / finally`` sees
-            # the failure and runs its cleanup code. Earlier impl
-            # drove plain ``__anext__()`` AFTER ``_asgi_emit_exception``
-            # — finally blocks never fired in the unhandled-error
-            # case (probe-confirmed against upstream's
-            # ``test_dependency_contextmanager`` suite, ~16 tests).
-            # FA 0.110+ contract: a yield-dep that catches the
-            # handler's exception WITHOUT re-raising must trip a
-            # ``FastAPIError("...raising an exception and a dependency
-            # with yield...")``. Detect by the throw outcome:
-            #   * ``StopIteration`` / ``StopAsyncIteration`` (or
-            #     ``StopIteration`` raised by ``athrow`` returning
-            #     normally on a fully-exhausted gen) means the dep's
-            #     except arm swallowed the exception silently — raise
-            #     ``FastAPIError`` so the user can see the bug.
-            #   * The original exception type (or any other) means the
-            #     dep re-raised; the original exception propagates as
-            #     intended.
-            from fastapi_turbo.exceptions import FastAPIError as _FAPIErr
-            _yielddep_swallowed = False
-            # If a dep's ``except`` arm raises a NEW exception (e.g.
-            # ``except CustomError: raise HTTPException(418)``), that
-            # new exception SUPERSEDES the original handler exception.
-            # FA's contract: the response uses the most-recent thrown
-            # exception, not the handler's. Probe-confirmed against
-            # ``test_dependency_after_yield_raise::test_catching``.
-            _replacement_exc = None
-            for gen, is_async, _td_scope in reversed(dep_teardowns):
-                try:
-                    if is_async:
-                        try:
-                            await gen.athrow(exc)
-                        except StopAsyncIteration:
-                            _yielddep_swallowed = True
-                        except BaseException as _new_exc:  # noqa: BLE001
-                            if _new_exc is exc or isinstance(_new_exc, type(exc)):
-                                pass
-                            else:
-                                _replacement_exc = _new_exc
-                    else:
-                        try:
-                            gen.throw(exc)
-                        except StopIteration:
-                            _yielddep_swallowed = True
-                        except BaseException as _new_exc:  # noqa: BLE001
-                            if _new_exc is exc or isinstance(_new_exc, type(exc)):
-                                pass
-                            else:
-                                _replacement_exc = _new_exc
-                except Exception:  # noqa: BLE001
-                    pass
-            dep_teardowns.clear()
-            if _replacement_exc is not None:
-                exc = _replacement_exc
-            elif _yielddep_swallowed:
-                exc = _FAPIErr(
-                    "Dependency raising an exception and a dependency with"
-                    " yield without raising again the same exception or"
-                    " a new one"
-                )
-            await _asgi_emit_exception(self, scope, send, exc)
-            for gen, is_async, _td_scope in reversed(dep_teardowns):
-                try:
-                    if is_async:
-                        try:
-                            await gen.__anext__()
-                        except StopAsyncIteration:
-                            pass
-                    else:
-                        try:
-                            next(gen)
-                        except StopIteration:
-                            pass
-                except Exception:  # noqa: BLE001
-                    pass
-            return True
-
-        # ``result`` is already a Response (either the MW-wrapped or
-        # the raw endpoint return converted by ``_call_endpoint``).
-        # Thread scope through so FileResponse can honour ``Range:``.
-        if isinstance(result, _Resp):
-            await _send_asgi_response(send, result, scope=scope)
-        else:
-            # Resolve the response class via the same cascade used in
-            # ``_call_endpoint`` above (route → router → include →
-            # app → JSONResponse). No try/except — the response_class
-            # constructor's failure must surface as a real exception
-            # (handled by the app's exception_handlers as a 500),
-            # never as a silent 200 JSON envelope.
-            response_class = _resolve_response_class(matched_route, self)
-            if response_class is _JR or _is_json_response_class(response_class):
-                final = response_class(content=_je(result))
-            else:
-                final = response_class(content=result)
-            # Pull any dep-mutated Response even when the handler itself
-            # didn't take one — deps often add headers via
-            # ``response: Response`` while the handler returns a
-            # plain dict. Without this fold, those header mutations
-            # got dropped on the floor.
-            if response_injected is None and _shared_response_holder[0] is not None:
-                response_injected = _shared_response_holder[0]
-            if response_injected is not None:
-                # Iterate ``headers`` (the dict view) AND ``raw_headers``
-                # so we catch both ``response.headers["k"] = "v"``
-                # (which only updates the dict) AND
-                # ``response.headers.append("k", "v")`` (which also
-                # appends to raw_headers).
-                _seen_dup = set()
-                for k, v in (
-                    getattr(response_injected, "headers", {}) or {}
-                ).items():
-                    final.headers[k] = v
-                    _seen_dup.add((k, str(v)))
-                for k, v in getattr(response_injected, "raw_headers", []) or []:
-                    if (k, v) in _seen_dup:
-                        continue
-                    final.raw_headers.append((k, v))
-                if getattr(response_injected, "status_code", None):
-                    final.status_code = response_injected.status_code
-            await _send_asgi_response(send, final, scope=scope)
-        # FA / Starlette ordering: BG tasks run BEFORE yield-dep
-        # teardowns. The contract is that ``BackgroundTasks`` see the
-        # request's deps still in their pre-yield ("started") state —
-        # tests that read state inside the bg task expect ``a:
-        # started a / b: started b``, not ``a: finished a / b:
-        # finished b``. Reversed earlier (teardowns first) made bg see
-        # post-finalised state and broke
-        # ``test_dependency_contextmanager::test_background_tasks``.
-        # Pull the shared BG holder if a dep injected it (e.g. via
-        # ``Annotated[BackgroundTasks, Depends(add_bg)]``) — without
-        # this, ``bg_injected`` is only set when the handler took
-        # ``BackgroundTasks`` directly, and dep-added tasks would
-        # never run. Probe-confirmed against
-        # ``test_response_dependency::test_background_tasks_with_
-        # depends_annotated``.
-        if bg_injected is None and _bg_holder[0] is not None:
-            bg_injected = _bg_holder[0]
-        if bg_injected is not None:
-            # Await the BG run on the request loop instead of submitting
-            # through ``_async_worker``. Same loop = the asyncpg pool /
-            # ``redis.asyncio`` client / aiohttp session created in
-            # lifespan stays reachable; ``run_sync()`` would otherwise
-            # fan async tasks to the worker thread's loop and produce
-            # "another operation is in progress" / "Timeout context
-            # manager should be used inside a task" errors. Issue #1.
-            try:
-                await bg_injected._run()
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("in-process background task: %r", _exc)
-            finally:
-                bg_injected._tasks.clear()
-        # Close any ``UploadFile`` instances that were injected as
-        # form params. Starlette's contract: once the response is
-        # sent, the underlying file handle is closed so subsequent
-        # reads see ``.closed=True``. Probe-confirmed against
-        # ``test_datastructures::test_upload_file_is_closed``.
-        try:
-            from fastapi_turbo.param_functions import UploadFile as _UF_close
-            for _ufv in kwargs.values():
-                if isinstance(_ufv, _UF_close):
-                    try:
-                        _f_close = getattr(_ufv, "file", None)
-                        if _f_close is not None:
-                            _f_close.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                elif isinstance(_ufv, list):
-                    for _v in _ufv:
-                        if isinstance(_v, _UF_close):
-                            try:
-                                _fc = getattr(_v, "file", None)
-                                if _fc is not None:
-                                    _fc.close()
-                            except Exception:  # noqa: BLE001
-                                pass
-        except Exception:  # noqa: BLE001
-            pass
-        # Run yield-dep teardowns in reverse order (LIFO — FA semantics).
-        # These fire after the response has been sent. FA's contract:
-        # the FIRST exception raised by a teardown propagates out of
-        # the dispatcher so the TestClient's ``raise_server_
-        # exceptions=True`` path sees it (the response is already
-        # flushed; this is purely for in-process error visibility).
-        # Probe-confirmed against
-        # ``test_dependency_after_yield_raise::test_broken_raise``.
-        _post_teardown_exc: BaseException | None = None
-        for gen, is_async, _td_scope in reversed(dep_teardowns):
-            try:
-                if is_async:
-                    try:
-                        await gen.__anext__()
-                    except StopAsyncIteration:
-                        pass
-                else:
-                    try:
-                        next(gen)
-                    except StopIteration:
-                        pass
-            except BaseException as _exc:  # noqa: BLE001
-                _log.debug("in-process yield-dep teardown: %r", _exc)
-                if _post_teardown_exc is None:
-                    _post_teardown_exc = _exc
-        if _post_teardown_exc is not None:
-            raise _post_teardown_exc
-        return True
-
-    # ── in-process WebSocket dispatch ────────────────────────────────
-
-    async def _asgi_dispatch_ws_in_process(
-        self, scope: dict, receive: Callable, send: Callable
-    ) -> bool:
-        """Route an ASGI ``websocket`` scope to a matching @app.websocket
-        endpoint without binding a loopback socket.
-
-        Builds a minimal ``WebSocket`` object that bridges the user
-        endpoint's ``accept / receive_text / send_text / close`` calls
-        to the ASGI ``receive`` / ``send`` channels. Supports the
-        common user-facing API (accept headers/subprotocol, text/bytes
-        send+receive, receive_json, close codes).
-
-        Returns True when dispatched (the user endpoint ran); False
-        when we couldn't match a WS route — caller falls back to the
-        loopback proxy.
-        """
-        import re as _re_ws
-        import inspect as _insp_ws
-
-        path = scope.get("path", "/")
-
-        # Route match — scan router routes for websocket entries.
-        # Our APIRouter marks WS routes with ``_is_websocket = True``.
-        matched_route = None
-        path_params: dict = {}
-        for route in getattr(self.router, "routes", []) or []:
-            if not (
-                getattr(route, "_is_websocket", False)
-                or _looks_like_starlette_websocket_route(route)
-            ):
-                continue
-            r_path = getattr(route, "path", None)
-            if not r_path:
-                continue
-            regex = getattr(route, "_fastapi_turbo_asgi_ws_regex", None)
-            if regex is None:
-                pattern = "^"
-                idx = 0
-                for m in _re_ws.finditer(r"\{([^{}:]+)(?::([^{}]+))?\}", r_path):
-                    pattern += _re_ws.escape(r_path[idx:m.start()])
-                    pname = m.group(1)
-                    if m.group(2) == "path":
-                        pattern += f"(?P<{pname}>.+)"
-                    else:
-                        pattern += f"(?P<{pname}>[^/]+)"
-                    idx = m.end()
-                pattern += _re_ws.escape(r_path[idx:]) + "$"
-                regex = _re_ws.compile(pattern)
-                try:
-                    route._fastapi_turbo_asgi_ws_regex = regex  # type: ignore[attr-defined]
-                except (AttributeError, TypeError):
-                    pass
-            match = regex.match(path)
-            if match is None:
-                continue
-            matched_route = route
-            path_params = match.groupdict()
-            break
-
-        if matched_route is None:
-            # No matching WS route — Starlette closes with 1000
-            # (normal closure) when no matching endpoint accepts.
-            # Probe-confirmed against
-            # ``test_route_scope::test_websocket_invalid_path_doesnt_match``
-            # AND ``test_ws_router::test_no_router``.
-            try:
-                await send({"type": "websocket.close", "code": 1000})
-            except Exception:  # noqa: BLE001
-                pass
-            return True
-
-        endpoint = getattr(matched_route, "endpoint", None)
-        if endpoint is None:
-            return False
-        endpoint = _adapt_websocket_endpoint_class(endpoint)
-        # Surface the matched route on the WS scope so handlers can
-        # read ``websocket.scope["route"].path`` (FA contract — used
-        # by Sentry tracing and ``test_route_scope::test_websocket``).
-        scope["route"] = matched_route
-
-        # WebSocket shim built on the ASGI receive/send channels. Now
-        # supports:
-        #   * ``state`` backed by ``scope['state']`` (so middleware /
-        #     endpoint share state, matching Starlette).
-        #   * ``query_params`` parsed from the scope query_string.
-        #   * ``iter_text`` / ``iter_bytes`` / ``iter_json`` async
-        #     generators that yield until the client disconnects.
-        #   * ``url`` exposed as ``URL`` so ``websocket.url.path``
-        #     works (FA tests use that).
-        # The user endpoint dispatch path now goes through a minimal
-        # introspection-driven param resolver that handles
-        # ``Depends(...)``, ``Query(...)``, ``Header(...)``, ``Cookie(...)``,
-        # path params, and the WebSocket-typed param itself. That
-        # closes the gap with FA where ``websocket: WebSocket, room:
-        # str, token=Depends(get_token)`` is a common pattern.
-        from fastapi_turbo.exceptions import (
-            WebSocketDisconnect as _WSD,
-            WebSocketException as _WSE,
-        )
-
-        class _InProcessWS:
-            def __init__(ws_self):
-                ws_self._asgi_receive = receive
-                ws_self._asgi_send = send
-                ws_self._scope = scope
-                ws_self.path_params = path_params
-                ws_self._accepted = False
-                ws_self._closed = False
-                from fastapi_turbo.datastructures import (
-                    Headers as _Hdr,
-                    URL as _URL,
-                    QueryParams as _QP,
-                    State as _State,
-                )
-                ws_self.headers = _Hdr(scope.get("headers", []))
-                # Build a Starlette-compatible URL object so
-                # ``ws.url.path`` / ``ws.url.query`` work.
-                _path = scope.get("path", "/")
-                _qs = scope.get("query_string", b"")
-                if isinstance(_qs, (bytes, bytearray)):
-                    _qs_str = _qs.decode("latin-1")
-                else:
-                    _qs_str = str(_qs)
-                _url_str = f"ws://testserver{_path}"
-                if _qs_str:
-                    _url_str = f"{_url_str}?{_qs_str}"
-                try:
-                    ws_self.url = _URL(_url_str)
-                except Exception:  # noqa: BLE001
-                    ws_self.url = _path
-                ws_self.query_params = _QP(_qs_str)
-                ws_self.scope = scope
-                ws_self._state_cls = _State
-
-            @property
-            def state(ws_self):
-                """``websocket.state`` shared with the scope so
-                middleware mutations propagate (Starlette parity)."""
-                existing = ws_self._scope.get("state")
-                if isinstance(existing, ws_self._state_cls):
-                    return existing
-                s = ws_self._state_cls()
-                ws_self._scope["state"] = s
-                return s
-
-            @property
-            def app(ws_self):
-                return ws_self._scope.get("app")
-
-            async def accept(ws_self, subprotocol=None, headers=None):
-                msg = await ws_self._asgi_receive()
-                if msg.get("type") != "websocket.connect":
-                    ws_self._closed = True
-                    return
-                await ws_self._asgi_send({
-                    "type": "websocket.accept",
-                    "subprotocol": subprotocol,
-                    "headers": headers or [],
-                })
-                ws_self._accepted = True
-
-            async def receive(ws_self):
-                return await ws_self._asgi_receive()
-
-            async def receive_text(ws_self):
-                msg = await ws_self._asgi_receive()
-                if msg.get("type") == "websocket.disconnect":
-                    raise _WSD(code=msg.get("code", 1000))
-                return msg.get("text", "")
-
-            async def receive_bytes(ws_self):
-                msg = await ws_self._asgi_receive()
-                if msg.get("type") == "websocket.disconnect":
-                    raise _WSD(code=msg.get("code", 1000))
-                return msg.get("bytes", b"")
-
-            async def receive_json(ws_self, mode: str = "text"):
-                import json as _json
-                if mode == "binary":
-                    return _json.loads(await ws_self.receive_bytes())
-                return _json.loads(await ws_self.receive_text())
-
-            async def iter_text(ws_self):
-                try:
-                    while True:
-                        yield await ws_self.receive_text()
-                except _WSD:
-                    return
-
-            async def iter_bytes(ws_self):
-                try:
-                    while True:
-                        yield await ws_self.receive_bytes()
-                except _WSD:
-                    return
-
-            async def iter_json(ws_self):
-                try:
-                    while True:
-                        yield await ws_self.receive_json()
-                except _WSD:
-                    return
-
-            async def send_text(ws_self, text):
-                await ws_self._asgi_send({
-                    "type": "websocket.send",
-                    "text": text,
-                })
-
-            async def send_bytes(ws_self, data):
-                await ws_self._asgi_send({
-                    "type": "websocket.send",
-                    "bytes": data,
-                })
-
-            async def send_json(ws_self, obj, mode: str = "text"):
-                import json as _json
-                encoded = _json.dumps(obj)
-                if mode == "binary":
-                    await ws_self.send_bytes(encoded.encode("utf-8"))
-                else:
-                    await ws_self.send_text(encoded)
-
-            async def close(ws_self, code=1000, reason=""):
-                if ws_self._closed:
-                    return
-                await ws_self._asgi_send({
-                    "type": "websocket.close",
-                    "code": code,
-                    "reason": reason,
-                })
-                ws_self._closed = True
-
-        ws_obj = _InProcessWS()
-
-        # Build kwargs from the endpoint signature using the same
-        # introspection the HTTP dispatcher uses, so ``Depends(...)`` /
-        # ``Query(...)`` / ``Header(...)`` / ``Cookie(...)`` / path
-        # params all work — not just bare WebSocket + path positional.
-        from fastapi_turbo._introspect import introspect_endpoint
-        from fastapi_turbo.dependencies import Depends as _Dep_marker_ws
-        from fastapi_turbo.websockets import WebSocket as _WS_cls
-
-        try:
-            ws_introspect_params = introspect_endpoint(
-                getattr(endpoint, "_fastapi_turbo_original_endpoint", endpoint),
-                getattr(matched_route, "path", "/") or "/",
-            )
-        except Exception:  # noqa: BLE001
-            ws_introspect_params = []
-
-        try:
-            sig = _insp_ws.signature(
-                getattr(endpoint, "_fastapi_turbo_original_endpoint", endpoint)
-            )
-        except (TypeError, ValueError):
-            return False
-
-        kwargs: dict = {}
-        # Identify which parameter is the WebSocket itself (by
-        # annotation or by name fallback).
-        ws_param_name = None
-        for pname, p in sig.parameters.items():
-            ann = p.annotation
-            if isinstance(ann, type) and issubclass(ann, _WS_cls):
-                ws_param_name = pname
-                break
-        if ws_param_name is None:
-            # First positional parameter convention (FastAPI tutorial
-            # style: ``async def ws(websocket: WebSocket, ...)``).
-            for pname, p in sig.parameters.items():
-                if p.kind in (
-                    _insp_ws.Parameter.POSITIONAL_ONLY,
-                    _insp_ws.Parameter.POSITIONAL_OR_KEYWORD,
-                ):
-                    ws_param_name = pname
-                    break
-        if ws_param_name is not None:
-            kwargs[ws_param_name] = ws_obj
-
-        # Header / cookie scope for query helpers.
-        from fastapi_turbo.datastructures import (
-            Headers as _Hdr_ws,
-            QueryParams as _QP_ws,
-        )
-        _ws_headers = _Hdr_ws(scope.get("headers", []))
-        _ws_qp = ws_obj.query_params
-
-        # Pydantic-driven scalar coercion for path / query / header
-        # params: ``room: int`` should arrive as ``int``, not the
-        # raw ``str`` from the URL template / query string. Mirrors
-        # the HTTP path's behaviour and matches upstream FastAPI.
-        from pydantic import (
-            TypeAdapter as _WS_TA,
-            ValidationError as _WS_PyVE,
-        )
-        from fastapi_turbo.param_functions import _ParamMarker as _PM_ws
-
-        def _coerce_to(ann, raw):
-            """Coerce ``raw`` to ``ann`` via a Pydantic TypeAdapter.
-            ``ann is None`` / ``str`` / ``inspect.Parameter.empty``
-            short-circuits to ``raw``. ``ValidationError`` propagates
-            so the outer try block closes the WS with 1008."""
-            if ann is None or ann is str or ann is _insp_ws.Parameter.empty:
-                return raw
-            try:
-                return _WS_TA(ann).validate_python(raw)
-            except _WS_PyVE:
-                raise
-
-        def _ws_coerce(p, raw):
-            """Apply the param's ``scalar_validator`` (a Pydantic
-            ``TypeAdapter``) to ``raw``. Falls back to the unwrapped
-            annotation if introspect didn't pre-build one."""
-            adapter = p.get("scalar_validator")
-            ann = p.get("_unwrapped_annotation")
-            if adapter is None and ann is not None and ann not in (str, type(None)):
-                try:
-                    adapter = _WS_TA(ann)
-                except Exception:  # noqa: BLE001
-                    adapter = None
-            if adapter is None:
-                return raw
-            return adapter.validate_python(raw)
-
-        def _ws_required_missing(name: str) -> "_WSE":
-            """Build a ``WebSocketException(1008)`` for a missing
-            required parameter. Caller raises so the outer try
-            closes with the user-facing close code."""
-            return _WSE(code=1008, reason=f"missing required parameter: {name}")
-
-        def _marker_kind(marker) -> str | None:
-            """Return ``"query"`` / ``"header"`` / ``"path"`` /
-            ``"cookie"`` for a Query / Header / Path / Cookie
-            marker; ``None`` for anything else."""
-            if not isinstance(marker, _PM_ws):
-                return None
-            return getattr(marker, "_kind", None)
-
-        def _marker_is_required(marker) -> bool:
-            """``Query(...)`` / ``Header(...)`` with no default — the
-            marker's ``default`` attribute is ``Ellipsis`` or
-            ``PydanticUndefined``. Anything else means the user
-            supplied a default (``Query(7)`` etc.)."""
-            d = getattr(marker, "default", None)
-            if d is ... or d is _insp_ws.Parameter.empty:
-                return True
-            try:
-                from pydantic_core import PydanticUndefined
-                if d is PydanticUndefined:
-                    return True
-            except ImportError:
-                pass
-            return False
-
-        def _resolve_marker_value(marker, alias_or_name: str, ann):
-            """Resolve a Query/Header/Path/Cookie marker from the
-            current WS scope. Coerces via ``ann`` (the dep param's
-            annotation). Raises ``WebSocketException(1008)`` when
-            the marker is required and the value is absent."""
-            kind = _marker_kind(marker)
-            alias = getattr(marker, "alias", None) or alias_or_name
-            raw = None
-            if kind == "query":
-                raw = _ws_qp.get(alias)
-            elif kind == "header":
-                # Header alias convert_underscores semantics: turn
-                # ``user_agent`` → ``user-agent``.
-                hdr_name = alias
-                if isinstance(hdr_name, str):
-                    hdr_name = hdr_name.replace("_", "-")
-                raw = _ws_headers.get(hdr_name)
-            elif kind == "path":
-                raw = path_params.get(alias)
-            elif kind == "cookie":
-                # Parse cookies from the Host header.
-                cookie_hdr = _ws_headers.get("cookie", "") or ""
-                from http.cookies import SimpleCookie
-                jar = SimpleCookie()
-                try:
-                    jar.load(cookie_hdr)
-                except Exception:  # noqa: BLE001
-                    pass
-                morsel = jar.get(alias)
-                raw = morsel.value if morsel is not None else None
-            if raw is None:
-                if _marker_is_required(marker):
-                    raise _ws_required_missing(alias_or_name)
-                # Use marker's default (if any).
-                d = getattr(marker, "default", None)
-                if d is ... or d is _insp_ws.Parameter.empty:
-                    return None
-                return d
-            return _coerce_to(ann, raw)
-
-        ws_dep_teardowns: list = []  # (gen, is_async, scope)
-
-        async def _ws_resolve_dep(dep_callable, dep_cache, use_cache=True, dep_scope=None):
-            """Recursive ``Depends`` resolver for the WS path.
-
-            Handles per-param resolution the way upstream FastAPI
-            does for WS dependencies:
-
-              * ``Depends(other)`` → recurse.
-              * ``Query(...)`` / ``Header(...)`` / ``Path(...)`` /
-                ``Cookie(...)`` markers → pull from the matching
-                scope, coerce via the dep's annotation, raise
-                ``WebSocketException(1008)`` when required and
-                missing.
-              * ``WebSocket`` annotation → inject the connection.
-              * Bare param with a name that's a path param → inject
-                that path param (coerced).
-              * Bare scalar with no marker → fall back to query
-                string lookup (Starlette WS-dep convention).
-              * Bare param with a default → use the default verbatim.
-
-            Honour ``app.dependency_overrides`` first so WS deps
-            obey the same override contract as HTTP deps.
-
-            ``use_cache`` mirrors ``Depends(..., use_cache=...)``:
-            when False, the resolver re-runs the dep on every
-            usage within one WS session. Earlier this resolver
-            unconditionally consulted ``dep_cache``, so two
-            ``Depends(d, use_cache=False)`` params in one handler
-            both got the FIRST call's value — broke FA's
-            ``no-cache`` contract (probe-confirmed: turbo returned
-            ``a=1, b=1, calls=1`` where upstream returns
-            ``a=1, b=2, calls=2``).
-            """
-            _ws_overrides = getattr(self, "dependency_overrides", None) or {}
-            _ws_orig_callable = dep_callable
-            dep_callable = _ws_overrides.get(dep_callable, dep_callable)
-            _scope_norm = (dep_scope or "request").lower()
-            _cache_key_ws = (_ws_orig_callable, _scope_norm)
-            if use_cache and _cache_key_ws in dep_cache:
-                return dep_cache[_cache_key_ws]
-            try:
-                dep_sig = _insp_ws.signature(dep_callable)
-            except (TypeError, ValueError):
-                dep_sig = None
-            dep_kwargs: dict = {}
-            if dep_sig is not None:
-                # Look up Depends() markers stashed in
-                # ``Annotated[T, Depends(...)]`` metadata as well as
-                # as the parameter ``default``. Without this, an
-                # ``Annotated[Session, Depends(dep_session, scope=
-                # 'request')]`` param would fall through to "treat
-                # as path/query" and 422 the WS handshake.
-                import typing as _tp_ws_local
-                try:
-                    _dep_hints = _tp_ws_local.get_type_hints(
-                        dep_callable, include_extras=True,
-                    )
-                except Exception:  # noqa: BLE001
-                    _dep_hints = {}
-                for dpname, dp in dep_sig.parameters.items():
-                    default = dp.default
-                    ann = dp.annotation
-                    # Pull from Annotated metadata if no default-form
-                    # marker was supplied.
-                    _ann_marker = None
-                    _hint = _dep_hints.get(dpname)
-                    if _hint is not None and hasattr(_hint, "__metadata__"):
-                        for _m in getattr(_hint, "__metadata__", ()):
-                            if isinstance(_m, _Dep_marker_ws):
-                                _ann_marker = _m
-                                break
-                    if _ann_marker is not None and not isinstance(default, _Dep_marker_ws):
-                        default = _ann_marker
-                    # Nested Depends.
-                    if isinstance(default, _Dep_marker_ws):
-                        nested = default.dependency
-                        if nested is not None:
-                            dep_kwargs[dpname] = await _ws_resolve_dep(
-                                nested,
-                                dep_cache,
-                                use_cache=getattr(default, "use_cache", True),
-                                dep_scope=getattr(default, "scope", None),
-                            )
-                        continue
-                    # Query / Header / Path / Cookie markers — coerce
-                    # AND raise 1008 if required and missing.
-                    if isinstance(default, _PM_ws):
-                        dep_kwargs[dpname] = _resolve_marker_value(
-                            default, dpname, ann
-                        )
-                        continue
-                    # WebSocket / HTTPConnection injection. WS deps
-                    # commonly take ``HTTPConnection`` (parent of
-                    # ``WebSocket`` — Starlette parity) so a single
-                    # dep works for both HTTP and WS routes. The
-                    # WebSocket itself satisfies that annotation.
-                    try:
-                        from fastapi_turbo.requests import (
-                            HTTPConnection as _HC_local,
-                        )
-                    except ImportError:
-                        _HC_local = None
-                    if isinstance(ann, type) and (
-                        issubclass(ann, _WS_cls)
-                        or (
-                            _HC_local is not None and issubclass(ann, _HC_local)
-                        )
-                    ):
-                        dep_kwargs[dpname] = ws_obj
-                        continue
-                    # Bare path-param shorthand.
-                    if dpname in path_params:
-                        dep_kwargs[dpname] = _coerce_to(ann, path_params[dpname])
-                        continue
-                    # Bare scalar → query lookup with coercion.
-                    if dpname in _ws_qp:
-                        dep_kwargs[dpname] = _coerce_to(ann, _ws_qp[dpname])
-                        continue
-                    if default is not _insp_ws.Parameter.empty:
-                        dep_kwargs[dpname] = default
-                        continue
-                    # No source for this param. Treat as required and
-                    # close the socket — better to surface than to
-                    # let the dep run with a missing kwarg (TypeError).
-                    raise _ws_required_missing(dpname)
-            # Handle generator / async-generator yield-deps so the
-            # FA contract works: dep yields the value, then the
-            # teardown runs after the WS handler completes (request
-            # scope) or before it returns (function scope, FA
-            # 0.120+).
-            # Use the resolver-arg ``dep_scope`` (passed by callers).
-            _scope_for_gen_ws = (dep_scope or "request").lower()
-            if _insp_ws.isasyncgenfunction(dep_callable):
-                _gen = dep_callable(**dep_kwargs)
-                val = await _gen.__anext__()
-                ws_dep_teardowns.append((_gen, True, _scope_for_gen_ws))
-            elif _insp_ws.isgeneratorfunction(dep_callable):
-                _gen = dep_callable(**dep_kwargs)
-                val = next(_gen)
-                ws_dep_teardowns.append((_gen, False, _scope_for_gen_ws))
-            elif _insp_ws.iscoroutinefunction(dep_callable):
-                val = await dep_callable(**dep_kwargs)
-            else:
-                val = dep_callable(**dep_kwargs)
-                if _insp_ws.iscoroutine(val):
-                    val = await val
-                elif _insp_ws.isasyncgen(val):
-                    _gen = val
-                    val = await _gen.__anext__()
-                    ws_dep_teardowns.append((_gen, True, _scope_for_gen_ws))
-                elif _insp_ws.isgenerator(val):
-                    _gen = val
-                    val = next(_gen)
-                    ws_dep_teardowns.append((_gen, False, _scope_for_gen_ws))
-            # Cache under the ORIGINAL callable so subsequent
-            # ``Depends(orig_callable)`` requests in the same WS
-            # session hit the cache regardless of any
-            # dependency_overrides indirection. Only store when
-            # the caller asked us to cache — ``use_cache=False``
-            # callers want a fresh value next time. Cache key
-            # includes ``dep_scope`` to keep function/request copies
-            # of the same callable separate (FA 0.120+).
-            if use_cache:
-                dep_cache[(_ws_orig_callable, _scope_for_gen_ws)] = val
-            return val
-
-        try:
-            # Param resolution + endpoint call live in the SAME try
-            # block so a ``Depends(auth)`` that raises
-            # ``WebSocketException(1008)`` is caught by the WSE
-            # handler below and closes the socket with the user's
-            # code — instead of escaping the dispatcher entirely
-            # (or worse, being silently swallowed). Same for
-            # ``ValidationError`` from a typed path/query coercion:
-            # bad-type input closes with 1008 rather than passing a
-            # raw string where the user expects an int.
-            ws_dep_cache: dict = {}
-            # Run app/router/route-level extra dependencies BEFORE
-            # the handler params resolve. Their return values are
-            # discarded (FA contract — extra deps are for side
-            # effects: auth, audit, append-to-list). Probe-confirmed
-            # against ``test_ws_dependencies::test_index`` etc.
-            _ws_extra_deps: list = []
-            _ws_extra_deps.extend(getattr(self, "dependencies", []) or [])
-            _ws_extra_deps.extend(getattr(self.router, "dependencies", []) or [])
-            # FA's order: app → include-time deps (passed via
-            # ``app.include_router(router, dependencies=[...])``) →
-            # router's own deps → route's own deps. ``include_deps``
-            # is stamped by ``include_router`` from the kwargs.
-            _ws_extra_deps.extend(
-                getattr(matched_route, "_fastapi_turbo_include_deps", []) or []
-            )
-            _ws_owner_router = getattr(
-                matched_route, "_fastapi_turbo_owner_router", None
-            )
-            if _ws_owner_router is not None:
-                _ws_extra_deps.extend(
-                    getattr(_ws_owner_router, "dependencies", []) or []
-                )
-            _ws_extra_deps.extend(
-                getattr(matched_route, "dependencies", []) or []
-            )
-            from fastapi_turbo.dependencies import Depends as _Dep_marker_ws_extra
-            for _xd in _ws_extra_deps:
-                if isinstance(_xd, _Dep_marker_ws_extra):
-                    _xd_call = _xd.dependency
-                    if _xd_call is None:
-                        continue
-                    await _ws_resolve_dep(
-                        _xd_call,
-                        ws_dep_cache,
-                        use_cache=getattr(_xd, "use_cache", True),
-                        dep_scope=getattr(_xd, "scope", None),
-                    )
-
-            for p in ws_introspect_params:
-                pname = p.get("name")
-                kind = p.get("kind")
-                if pname == ws_param_name:
-                    continue
-                if kind == "dependency":
-                    dep_callable = p.get("dep_callable")
-                    if dep_callable is not None:
-                        kwargs[pname] = await _ws_resolve_dep(
-                            dep_callable,
-                            ws_dep_cache,
-                            use_cache=p.get("use_cache", True),
-                            dep_scope=p.get("_dep_scope"),
-                        )
-                    continue
-                if kind == "path":
-                    if pname in path_params:
-                        kwargs[pname] = _ws_coerce(p, path_params[pname])
-                    continue
-                if kind == "query":
-                    alias = p.get("alias") or pname
-                    if alias in _ws_qp:
-                        kwargs[pname] = _ws_coerce(p, _ws_qp[alias])
-                    elif p.get("required", False):
-                        # Required ``Query(...)`` with no value:
-                        # close 1008 instead of passing the marker
-                        # object through as the kwarg (which would
-                        # let the endpoint run with the marker as
-                        # the value — a real auth bypass for
-                        # ``token: str = Query(...)`` patterns).
-                        raise _ws_required_missing(alias)
-                    elif p.get("has_default", False):
-                        kwargs[pname] = p.get("default_value")
-                    continue
-                if kind == "header":
-                    alias = p.get("alias") or pname
-                    if isinstance(alias, str):
-                        alias = alias.replace("_", "-")
-                    val = _ws_headers.get(alias)
-                    if val is not None:
-                        kwargs[pname] = _ws_coerce(p, val)
-                    elif p.get("required", False):
-                        raise _ws_required_missing(alias)
-                    elif p.get("has_default", False):
-                        kwargs[pname] = p.get("default_value")
-                    continue
-                # Path params not surfaced by introspection (e.g.
-                # when the param has no marker but appears in the
-                # URL template) still need to land on kwargs.
-                if pname in path_params and pname not in kwargs:
-                    kwargs[pname] = path_params[pname]
-
-            # Last-mile: any signature param still unbound that
-            # appears in path_params should land on kwargs (covers
-            # users who name a path param without annotating it).
-            for pname in sig.parameters:
-                if pname in kwargs:
-                    continue
-                if pname in path_params:
-                    kwargs[pname] = path_params[pname]
-
-            if _insp_ws.iscoroutinefunction(endpoint):
-                await endpoint(**kwargs)
-            else:
-                result = endpoint(**kwargs)
-                if _insp_ws.iscoroutine(result):
-                    await result
-            # Drain ALL dep teardowns (function-scope first, then
-            # request-scope — same order as HTTP, LIFO within each).
-            # WS doesn't have a "post-response" phase distinct from
-            # the handler returning, so all teardowns flush here.
-            # The cache key already separates function/request copies
-            # of the same callable, so the handler reads correct
-            # ``func_is_open`` / ``req_is_open`` snapshots BEFORE
-            # this drain. Errors propagate to the WS dispatcher's
-            # outer envelope so the test client surfaces them
-            # (matches FA's
-            # ``test_websocket_dependency_after_yield_broken``).
-            _ws_post_teardown_exc: BaseException | None = None
-            for _g, _is_a, _sc in reversed(ws_dep_teardowns):
-                try:
-                    if _is_a:
-                        try:
-                            await _g.__anext__()
-                        except StopAsyncIteration:
-                            pass
-                    else:
-                        try:
-                            next(_g)
-                        except StopIteration:
-                            pass
-                except BaseException as _exc:  # noqa: BLE001
-                    if _ws_post_teardown_exc is None:
-                        _ws_post_teardown_exc = _exc
-            ws_dep_teardowns.clear()
-            if _ws_post_teardown_exc is not None:
-                raise _ws_post_teardown_exc
-        except _WSE as _wsex:
-            # Endpoint raised ``WebSocketException(code=…)`` — Starlette
-            # closes the WS with the user's code rather than the
-            # generic 1011. This is what FA tests assert on
-            # (``assert exc_info.value.code == 1008``).
-            if not ws_obj._closed:
-                try:
-                    await ws_obj.close(
-                        code=_wsex.code,
-                        reason=getattr(_wsex, "reason", "") or "",
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-        except _WSD as _wsd:
-            # Disconnects propagate from receive helpers when the
-            # client closes mid-handler. Starlette stores this on
-            # the task so the test client can surface it via
-            # ``pytest.raises(WebSocketDisconnect)`` — match that
-            # contract by re-raising. Probe-confirmed against
-            # ``test_tutorial/test_websockets/test_tutorial002``.
-            raise
-        except _WS_PyVE as _vex:
-            # Bad input type for a path / query / header (e.g.
-            # ``room: int`` with ``/ws/abc``). Close with 1008
-            # (policy violation) — closer to FA's 422 semantic than
-            # the generic 1011 "internal error" which the client
-            # would interpret as a server-side bug.
-            _log.debug("in-process WS coercion failed: %r", _vex)
-            # FA: route through ``WebSocketRequestValidationError``
-            # exception handler if one is registered. The handler
-            # captures ``exc`` (with ``endpoint_ctx``), then re-
-            # raises (or closes the WS itself). Mirrors HTTP path's
-            # validation-error contract for parity with
-            # ``test_validation_error_context``.
-            try:
-                from fastapi_turbo.exceptions import (
-                    WebSocketRequestValidationError as _WRVE_local,
-                )
-            except ImportError:
-                _WRVE_local = None
-            _ws_endpoint_ctx_local: dict = {}
-            try:
-                import inspect as _ins_local
-                _ws_endpoint_ctx_local["function"] = getattr(
-                    endpoint, "__name__", None
-                )
-                _ws_endpoint_ctx_local["file"] = _ins_local.getsourcefile(
-                    endpoint
-                )
-                _ws_endpoint_ctx_local["line"] = _ins_local.getsourcelines(
-                    endpoint
-                )[1]
-            except (TypeError, OSError):
-                pass
-            # Use the FULL mounted path so sub-app endpoints surface
-            # the user-visible URL (``/sub/ws/...``), not the local
-            # one (``/ws/...``). ``scope['root_path']`` carries the
-            # mount prefix when the request was routed through
-            # ``app.mount("/sub", sub_app)``.
-            _route_path_local = (
-                getattr(matched_route, "path", None) or "/"
-            )
-            _root_path_for_ctx = scope.get("root_path", "") or ""
-            _ws_endpoint_ctx_local["path"] = (
-                _root_path_for_ctx + _route_path_local
-            )
-            if _WRVE_local is not None:
-                try:
-                    _wrve = _WRVE_local(
-                        errors=getattr(_vex, "errors", lambda: [])(),
-                        endpoint_ctx=_ws_endpoint_ctx_local,
-                    )
-                except Exception:  # noqa: BLE001
-                    _wrve = None
-                if _wrve is not None:
-                    _wrve_handler = (
-                        getattr(self, "exception_handlers", {}) or {}
-                    ).get(_WRVE_local)
-                    if _wrve_handler is not None:
-                        try:
-                            _r = _wrve_handler(ws_obj, _wrve)
-                            if _insp_ws.iscoroutine(_r):
-                                await _r
-                        except Exception:  # noqa: BLE001
-                            pass
-            if not ws_obj._closed:
-                try:
-                    await ws_obj.close(code=1008)
-                except Exception:  # noqa: BLE001
-                    pass
-        except Exception as _exc:  # noqa: BLE001
-            _log.debug("in-process WS endpoint raised: %r", _exc)
-            # Honour ``app.exception_handlers`` for the matched
-            # exception type. The handler signature is ``(websocket,
-            # exc)`` — same as Starlette. The handler typically calls
-            # ``websocket.close(code, reason)`` with a custom code,
-            # which our test client surfaces to ``pytest.raises``.
-            # Probe-confirmed against
-            # ``test_ws_router::test_depend_err_handler``.
-            _ws_handler, _ws_matched_cls = _find_exception_handler(self, _exc)
-            if _ws_handler is not None and _ws_matched_cls is not Exception:
-                try:
-                    if _insp_ws.iscoroutinefunction(_ws_handler):
-                        await _ws_handler(ws_obj, _exc)
-                    else:
-                        _r = _ws_handler(ws_obj, _exc)
-                        if _insp_ws.iscoroutine(_r):
-                            await _r
-                except Exception:  # noqa: BLE001
-                    pass
-                # Drain teardowns and return — the handler took care
-                # of closing the WS.
-                for _g2, _is_a2, _sc2 in reversed(ws_dep_teardowns):
-                    try:
-                        if _is_a2:
-                            try:
-                                await _g2.__anext__()
-                            except StopAsyncIteration:
-                                pass
-                        else:
-                            try:
-                                next(_g2)
-                            except StopIteration:
-                                pass
-                    except Exception:  # noqa: BLE001
-                        pass
-                ws_dep_teardowns.clear()
-                return True
-            # Skip the default 1011 close when an outer WS
-            # middleware will observe the raised exception — the
-            # middleware's own ``websocket.close(...)`` should be
-            # the one delivered. Probe-confirmed against
-            # ``test_ws_router::test_depend_err_middleware`` (a
-            # custom middleware closes with 1006/repr(exc)).
-            _ws_in_mw_flag = scope.get("_fastapi_turbo_ws_in_mw", False)
-            if not _ws_in_mw_flag and not ws_obj._closed:
-                try:
-                    await ws_obj.close(code=1011)
-                except Exception:  # noqa: BLE001
-                    pass
-            # Surface unhandled server-side exceptions to the test
-            # client (FA's contract — ``raise_server_exceptions=
-            # True`` propagates). The TestClient's ``__exit__`` on
-            # the WS session re-raises any task exception caught
-            # here. Probe-confirmed against
-            # ``test_dependency_after_yield_websockets::test_websocket
-            # _dependency_after_yield_broken``.
-            try:
-                _raise_se = getattr(self, "_fastapi_turbo_raise_server_exceptions", True)
-            except Exception:  # noqa: BLE001
-                _raise_se = True
-            # Drain teardowns BEFORE re-raising so dep finalisers
-            # run cleanly first.
-            for _g2, _is_a2, _sc2 in reversed(ws_dep_teardowns):
-                try:
-                    if _is_a2:
-                        try:
-                            await _g2.__anext__()
-                        except StopAsyncIteration:
-                            pass
-                    else:
-                        try:
-                            next(_g2)
-                        except StopIteration:
-                            pass
-                except Exception:  # noqa: BLE001
-                    pass
-            ws_dep_teardowns.clear()
-            if _raise_se:
-                raise
-        # Drain any teardowns left over after error paths so dep
-        # finalisers run on every exit (including WS close
-        # failures). Mirrors the HTTP post-response drain.
-        for _g, _is_a, _sc in reversed(ws_dep_teardowns):
-            try:
-                if _is_a:
-                    try:
-                        await _g.__anext__()
-                    except StopAsyncIteration:
-                        pass
-                else:
-                    try:
-                        next(_g)
-                    except StopIteration:
-                        pass
-            except Exception:  # noqa: BLE001
-                pass
-        ws_dep_teardowns.clear()
-        return True
 
     # ── server bootstrap ──────────────────────────────────────────────
 

@@ -138,46 +138,12 @@ fn drain_one_sync_chunk(iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
         Ok(val) => Some(python_val_to_bytes(&val)),
         Err(e) => {
             if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
-                if let Ok(app_lock) = crate::router::APP_INSTANCE.read() {
-                    if let Some(ref app_obj) = *app_lock {
-                        if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-                            let _ = lst.call_method1(py, "append", (e.value(py),));
-                        }
+                if let Some(app_obj) = crate::router::current_app(py) {
+                    if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+                        let _ = lst.call_method1(py, "append", (e.value(py),));
                     }
                 }
             }
-            None
-        }
-    }
-}
-
-/// Drive a single `__anext__` against an async generator without entering an
-/// event loop. Only safe when the object already has `__anext__` — for true
-/// async generators (`async def gen(): yield x`) this advances the generator
-/// state, and the body task's subsequent `__aiter__()` returns `self`, so we
-/// continue from chunk 2 without duplicating chunk 1. If the coroutine
-/// suspends we return None WITHOUT closing the coro — closing would propagate
-/// GeneratorExit to the async generator, destroying it.
-#[allow(dead_code)] // Unused fast-path — kept for a future TTFB optimization.
-fn drain_one_async_chunk_sync(
-    py: Python<'_>,
-    iter_bound: &Bound<'_, PyAny>,
-) -> Option<bytes::Bytes> {
-    let anext_name = pyo3::intern!(py, "__anext__");
-    if !iter_bound.hasattr(anext_name).unwrap_or(false) {
-        return None;
-    }
-    let coro = iter_bound.call_method0(anext_name).ok()?;
-    match coro.call_method1("send", (py.None(),)) {
-        Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
-            let v = e.value(py);
-            v.getattr("value").ok().map(|val| python_val_to_bytes(&val))
-        }
-        Err(_) => None,
-        Ok(_) => {
-            // Coroutine suspended — do NOT close it (closing propagates
-            // GeneratorExit to the async generator). Just return None and
-            // let iterate_async_generator handle it via run_until_complete.
             None
         }
     }
@@ -210,7 +176,12 @@ fn iterate_sync_generator(
                 // the interpreter for seconds.
                 let send_err = py.detach(|| tx.blocking_send(Ok(chunk)).is_err());
                 if send_err {
-                    break; // Client disconnected
+                    // Receiver dropped (client disconnected / door closed the
+                    // stream) — run the generator's GeneratorExit cleanup so
+                    // its try/finally + ``except GeneratorExit`` fire (parity
+                    // with the dispatcher's streaming-cancellation).
+                    let _ = py_iter.call_method0("close");
+                    break;
                 }
             }
             Err(e) => {
@@ -223,11 +194,9 @@ fn iterate_sync_generator(
                 // surfaces it to the caller (FA parity — streaming-body
                 // failures must reach the test just like synchronous
                 // handler failures).
-                if let Ok(app_lock) = crate::router::APP_INSTANCE.read() {
-                    if let Some(ref app_obj) = *app_lock {
-                        if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-                            let _ = lst.call_method1(py, "append", (e.value(py),));
-                        }
+                if let Some(app_obj) = crate::router::current_app(py) {
+                    if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+                        let _ = lst.call_method1(py, "append", (e.value(py),));
                     }
                 }
                 break;
@@ -311,12 +280,27 @@ fn iterate_async_generator(
                 // block on backpressure — see sync path for rationale.
                 let send_err = py.detach(|| tx.blocking_send(Ok(chunk)).is_err());
                 if send_err {
+                    // Receiver dropped — drive the async generator's GeneratorExit
+                    // cleanup (``aclose``) so try/finally + ``except
+                    // GeneratorExit`` fire (streaming-cancellation parity).
+                    if let Ok(aclose_coro) = aiter.call_method0(py, "aclose") {
+                        let _ = loop_obj
+                            .call_method1(py, "run_until_complete", (aclose_coro.bind(py),));
+                    }
                     break;
                 }
             }
             Err(e) => {
                 if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
                     break;
+                }
+                // Capture onto the app so TestClient(raise_server_exceptions=True)
+                // surfaces a streaming-body failure (parity with the sync path) —
+                // e.g. a request-scope dep whose session errors mid-stream.
+                if let Some(app_obj) = crate::router::current_app(py) {
+                    if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+                        let _ = lst.call_method1(py, "append", (e.value(py),));
+                    }
                 }
                 eprintln!("fastapi-turbo: run_until_complete streaming error: {e}");
                 break;

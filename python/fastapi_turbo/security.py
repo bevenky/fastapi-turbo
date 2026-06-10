@@ -18,13 +18,45 @@ from typing import Annotated, Optional
 from pydantic import BaseModel
 
 from fastapi_turbo.exceptions import HTTPException
-from fastapi_turbo.param_functions import (
-    Header as _Header,
-    Query as _Query,
-    Cookie as _Cookie,
-    Form as _Form,
-)
+from fastapi_turbo.param_functions import Form as _Form
 from fastapi_turbo.requests import Request
+
+# Real FastAPI marks a ``Depends(scheme)`` as a SECURITY dependency (→ OpenAPI
+# securitySchemes + the route's ``security`` requirement) only when the scheme is
+# an instance of the real ``SecurityBase``. The scheme classes below subclass it
+# so real ``get_dependant`` / ``get_openapi`` (the OpenAPI pivot + the adapter)
+# recognize them — while KEEPING the clone's ``.model`` dict (real
+# ``get_openapi`` serializes it via ``jsonable_encoder`` just the same, and the
+# clone ``_openapi.py`` + ``scheme.model["type"]`` tests stay valid). Imported
+# before the compat shim (``__init__.py``), so this resolves to REAL FastAPI.
+from fastapi.security.base import SecurityBase as _SecurityBase
+
+import inspect as _inspect
+
+# Real FastAPI's get_dependant introspects a security scheme via
+# inspect.signature(scheme). Our schemes' __call__ is (request, *args, **kwargs)
+# for runtime flexibility, which leaks a phantom kwargs/args param into the pivot
+# adapter (real FastAPI then mis-classifies it). Pin every scheme INSTANCE's
+# introspected signature to a single ``request: Request`` param — the real schemes'
+# shape — so the adapter sees a clean inject_request. The actual __call__ runtime
+# is unchanged, and Request is now a real starlette subclass (the type bridge), so
+# real get_dependant recognizes it.
+_REQUEST_ONLY_SIGNATURE = _inspect.Signature(
+    [_inspect.Parameter("request", _inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Request)]
+)
+
+
+def _request_sig(cls):
+    """Class decorator: after ``__init__``, pin ``__signature__`` to ``(request: Request)``."""
+    _orig_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        self.__signature__ = _REQUEST_ONLY_SIGNATURE
+
+    __init__.__wrapped__ = _orig_init
+    cls.__init__ = __init__
+    return cls
 
 
 # ── Credential models ──────────────────────────────────────────────
@@ -131,7 +163,8 @@ def _get_authorization(request_or_str=None, **kwargs) -> str | None:
 # ── OAuth2 base class ────────────────────────────────────────────
 
 
-class OAuth2:
+@_request_sig
+class OAuth2(_SecurityBase):
     """Base OAuth2 security scheme (matches FastAPI's OAuth2 base class).
 
     Can be used directly with custom flows or subclassed for specific
@@ -169,7 +202,8 @@ class OAuth2:
 # ── Security schemes ───────────────────────────────────────────────
 
 
-class OAuth2PasswordBearer:
+@_request_sig
+class OAuth2PasswordBearer(_SecurityBase):
     """OAuth2 password bearer scheme.
 
     Extracts the bearer token from the Authorization header.
@@ -214,7 +248,8 @@ class OAuth2PasswordBearer:
         return None
 
 
-class HTTPBase:
+@_request_sig
+class HTTPBase(_SecurityBase):
     """Base class for HTTP-scheme security dependencies (``HTTPBearer``,
     ``HTTPDigest``, ``HTTPBasic``). FastAPI exports this as
     ``fastapi.security.http.HTTPBase`` and third-party auth libraries
@@ -267,6 +302,7 @@ class HTTPBase:
         return None
 
 
+@_request_sig
 class HTTPBearer(HTTPBase):
     """HTTP Bearer scheme.
 
@@ -316,7 +352,8 @@ class HTTPBearer(HTTPBase):
         return None
 
 
-class HTTPDigest:
+@_request_sig
+class HTTPDigest(_SecurityBase):
     """HTTP Digest authentication scheme.
 
     Extracts a ``Digest`` Authorization header and returns
@@ -357,7 +394,8 @@ class HTTPDigest:
         return None
 
 
-class HTTPBasic:
+@_request_sig
+class HTTPBasic(_SecurityBase):
     """HTTP Basic authentication scheme."""
 
     def __init__(
@@ -410,41 +448,17 @@ class HTTPBasic:
         return HTTPBasicCredentials(username=username, password=password)
 
 
-def _make_api_key_call(location: str, name: str, auto_error: bool, self_ref):
-    """Factory: build a __call__ with an instance-specific marker default.
+@_request_sig
+class _APIKeyBase(_SecurityBase):
+    """API-key scheme base. Extracts the key from the request INTERNALLY (header /
+    query / cookie by ``name``) — matching real FastAPI's ``APIKeyBase``, which is
+    a ``SecurityBase`` that declares NO parameter (the key is documented under
+    ``components.securitySchemes``, not the operation's ``parameters``). The
+    previous clone declared an ``api_key`` Header/Query/Cookie marker param, which
+    made real ``get_openapi`` emit a phantom 422 + validation components. The
+    ``@_request_sig`` decorator pins the introspected signature to
+    ``(request: Request)`` so real ``get_dependant`` injects the request only."""
 
-    Each APIKey* instance has its own `name` -- we synthesize an async def
-    whose default value is an instance-bound Header/Query/Cookie marker so
-    the dep resolver knows where to pull the value from. The marker is
-    excluded from the OpenAPI schema (``include_in_schema=False``) because
-    FastAPI documents these values under ``components.securitySchemes``,
-    not under the operation's ``parameters`` list.
-    """
-    if location == "header":
-        marker = _Header(default=None, alias=name, include_in_schema=False)
-    elif location == "query":
-        marker = _Query(default=None, alias=name, include_in_schema=False)
-    elif location == "cookie":
-        marker = _Cookie(default=None, alias=name, include_in_schema=False)
-    else:
-        marker = None
-
-    # Shadow-default used by inspect.signature -- the default VALUE is the
-    # marker itself, which the introspector recognises.
-    async def _call(api_key: str | None = marker, **_kwargs) -> str | None:
-        if api_key:
-            return api_key
-        if auto_error:
-            raise HTTPException(
-                status_code=401,
-                detail="Not authenticated",
-                headers={"WWW-Authenticate": "APIKey"},
-            )
-        return None
-    return _call
-
-
-class _APIKeyBase:
     _location: str = "header"
 
     def __init__(self, *, name: str, scheme_name: str | None = None,
@@ -456,12 +470,32 @@ class _APIKeyBase:
         self.model = {"type": "apiKey", "in": self._location, "name": name}
         if description:
             self.model["description"] = description
-        self._call = _make_api_key_call(self._location, name, auto_error, self)
-        import inspect as _inspect
-        self.__signature__ = _inspect.signature(self._call)
 
-    async def __call__(self, *args, **kwargs):
-        return await self._call(*args, **kwargs)
+    def _extract(self, request, kwargs) -> str | None:
+        # Backward compat: an explicit value handed in by a caller / legacy DI.
+        if kwargs.get("api_key") is not None:
+            return kwargs["api_key"]
+        if request is None:
+            return None
+        if self._location == "header":
+            return request.headers.get(self.name)
+        if self._location == "query":
+            return request.query_params.get(self.name)
+        if self._location == "cookie":
+            return request.cookies.get(self.name)
+        return None
+
+    async def __call__(self, request: Request = None, **kwargs) -> str | None:
+        api_key = self._extract(request, kwargs)
+        if api_key:
+            return api_key
+        if self.auto_error:
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "APIKey"},
+            )
+        return None
 
 
 class APIKeyHeader(_APIKeyBase):
@@ -479,18 +513,20 @@ class APIKeyCookie(_APIKeyBase):
     _location = "cookie"
 
 
-class SecurityScopes:
-    """Holds the scopes required by a security dependency."""
-
-    def __init__(self, scopes: list[str] | None = None):
-        self.scopes = scopes or []
-        self.scope_str = " ".join(self.scopes)
+# Real SecurityScopes (pre-shim import → REAL). Real ``get_dependant`` detects it
+# by identity (sets ``security_scopes_param_name``); a clone reimplementation isn't
+# recognized, so real ``get_openapi`` would fail to build its field. Behaviorally
+# identical (``scopes`` / ``scope_str``). Routes taking SecurityScopes stay on the
+# clone door path (declined in ``_adapter_route_info``), which accumulates the
+# ``Security(..., scopes=[...])`` chain; OpenAPI generation uses the real class.
+from fastapi.security import SecurityScopes
 
 
 # ── OAuth2 additional flows ─────────────────────────────────────────
 
 
-class OAuth2ClientCredentials:
+@_request_sig
+class OAuth2ClientCredentials(_SecurityBase):
     """OAuth2 client-credentials flow (server-to-server auth).
 
     The OAuth2 flow where a client authenticates with its own credentials
@@ -544,7 +580,8 @@ class OAuth2ClientCredentials:
         return None
 
 
-class OAuth2AuthorizationCodeBearer:
+@_request_sig
+class OAuth2AuthorizationCodeBearer(_SecurityBase):
     """OAuth2 authorization-code flow (user-delegated auth)."""
 
     def __init__(
@@ -604,7 +641,8 @@ class OAuth2AuthorizationCodeBearer:
 # ── OpenID Connect ─────────────────────────────────────────────────
 
 
-class OpenIdConnect:
+@_request_sig
+class OpenIdConnect(_SecurityBase):
     """OpenID Connect discovery-URL based auth scheme."""
 
     def __init__(

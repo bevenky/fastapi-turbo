@@ -60,24 +60,6 @@ class _ImmediateNone:
 _IMMEDIATE_NONE = _ImmediateNone()
 
 
-class _RecvAwaitable:
-    """Wraps a Rust awaitable; translates its RuntimeError into
-    WebSocketDisconnect on the way out, and flips self._ws._app_state."""
-    __slots__ = ("_inner", "_ws")
-
-    def __init__(self, inner, ws):
-        self._inner = inner
-        self._ws = ws
-
-    def __await__(self):
-        try:
-            return (yield from self._inner.__await__())
-        except RuntimeError as e:
-            self._ws._app_state = WebSocketState.DISCONNECTED
-            code, reason = _extract_close_info_from_error(str(e))
-            raise WebSocketDisconnect(code=code, reason=reason) from e
-
-
 class WebSocket:
     """Wraps the Rust PyWebSocket for FastAPI/Starlette compatibility.
 
@@ -112,6 +94,39 @@ class WebSocket:
         self._app_state = WebSocketState.CONNECTING
         # Cached reference to the owning FastAPI app; not always set.
         self._app = None
+        # In-process ASGI door bookkeeping (``self._ws is None`` mode):
+        # terminal closes raised from SYNC code paths (``_reject`` /
+        # ``_handle_ws_exc``) can't await, so they queue here and the door
+        # flushes after the handler returns. ``_asgi_closed`` guards against
+        # double-sending a close frame.
+        self._asgi_pending_close: tuple | None = None
+        self._asgi_closed = False
+
+    @property
+    def _is_asgi(self) -> bool:
+        """In-process ASGI door mode: no Rust ws, driven over the ASGI
+        ``receive``/``send`` channels on the caller's event loop."""
+        return self._ws is None and self._send is not None
+
+    async def _asgi_send_close(self, code: int = 1000, reason: str = "") -> None:
+        """Emit a single ``websocket.close`` over the ASGI ``send`` channel."""
+        if self._asgi_closed:
+            return
+        self._asgi_closed = True
+        try:
+            await self._send({
+                "type": "websocket.close",
+                "code": code,
+                "reason": reason or "",
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _asgi_queue_close(self, code: int = 1000, reason: str = "") -> None:
+        """Queue a terminal close from a SYNC path; the door flushes it."""
+        if self._asgi_closed or self._asgi_pending_close is not None:
+            return
+        self._asgi_pending_close = (code, reason or "")
 
     # ── Scope + HTTPConnection-like properties ─────────────────────
 
@@ -137,20 +152,21 @@ class WebSocket:
         """Case-insensitive headers view (Starlette-compatible Headers)."""
         from fastapi_turbo.datastructures import Headers
 
-        raw = self.scope.get("headers", [])
-        # ASGI headers are list[tuple[bytes, bytes]]; Headers class handles it.
-        if raw and isinstance(raw, list) and raw and isinstance(raw[0], tuple):
-            if isinstance(raw[0][0], (bytes, bytearray)):
-                # Convert to str pairs for the Headers class
-                raw = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in raw]
-        return Headers(raw)
+        # Real Starlette Headers takes ``raw=list[(bytes,bytes)]`` — normalize the
+        # scope headers (may be str or bytes pairs) to bytes.
+        norm = []
+        for k, v in self.scope.get("headers", []) or []:
+            kb = k if isinstance(k, (bytes, bytearray)) else str(k).encode("latin-1")
+            vb = v if isinstance(v, (bytes, bytearray)) else str(v).encode("latin-1")
+            norm.append((bytes(kb), bytes(vb)))
+        return Headers(raw=norm)
 
     @property
     def url(self):
         """WebSocket URL (Starlette-compatible URL)."""
         from fastapi_turbo.datastructures import URL
 
-        return URL(self.scope)
+        return URL(scope=self.scope)
 
     @property
     def base_url(self):
@@ -160,7 +176,7 @@ class WebSocket:
         scope = dict(self.scope)
         scope["path"] = "/"
         scope["query_string"] = b""
-        return URL(scope)
+        return URL(scope=scope)
 
     @property
     def query_params(self):
@@ -195,8 +211,8 @@ class WebSocket:
 
         c = self.scope.get("client")
         if c is None:
-            return Address(("0.0.0.0", 0))
-        return Address(c)
+            return Address("0.0.0.0", 0)
+        return Address(*c)
 
     @property
     def app(self):
@@ -273,6 +289,18 @@ class WebSocket:
                     v_s = v.decode("latin-1") if isinstance(v, (bytes, bytearray)) else str(v)
                     rust_headers.append((k_s, v_s))
             self._ws.accept(subprotocol, rust_headers if rust_headers else None)
+        elif self._is_asgi and self._receive is not None:
+            # In-process ASGI door: consume the client's
+            # ``websocket.connect`` then emit ``websocket.accept``.
+            msg = await self._receive()
+            if msg.get("type") != "websocket.connect":
+                self._app_state = WebSocketState.DISCONNECTED
+                return
+            await self._send({
+                "type": "websocket.accept",
+                "subprotocol": subprotocol,
+                "headers": headers or [],
+            })
         self._app_state = WebSocketState.CONNECTED
 
     def _reject(self, status: int = 403) -> None:
@@ -288,6 +316,10 @@ class WebSocket:
                 self._ws.reject(status)
             except Exception:
                 pass
+        elif self._is_asgi:
+            # In-process ASGI: a close sent before accept refuses the
+            # connection. Queue it (this method is sync) for the door to flush.
+            self._asgi_queue_close(1006, "")
 
     async def close(self, code: int = 1000, reason: str | None = None) -> None:
         """Close the WebSocket and wait for the frame to flush.
@@ -295,10 +327,14 @@ class WebSocket:
         Uses the Rust-side close_and_wait() so the caller is guaranteed the
         close frame has been handed to the underlying sink before returning.
 
-        Starlette parity: ``close()`` called BEFORE ``accept()`` accepts
-        the handshake first, then sends the close frame with the given
-        code — otherwise the queued close message would never flush
-        because the writer task isn't running yet.
+        Starlette parity: ``close()`` called BEFORE ``accept()`` does NOT
+        accept — Starlette sends ``websocket.close`` while still CONNECTING,
+        which the server maps to refusing the handshake (the client sees an
+        HTTP 403, not a completed upgrade + WS close frame). So we route a
+        pre-accept close through the same handshake-refuse path as
+        ``_reject()`` rather than accepting first. (Previously we accepted
+        then closed, which made the client see WS close code 4401 instead of
+        HTTP 403 — a real divergence caught by parity test P155.)
         """
         if self._app_state == WebSocketState.DISCONNECTED:
             return
@@ -307,13 +343,21 @@ class WebSocket:
         self._last_close_code = code
         self._last_close_reason = reason or ""
         pre_accept = self._app_state == WebSocketState.CONNECTING
-        if pre_accept and self._ws is not None:
-            # Accept the upgrade first so the writer task starts.
-            try:
-                self._ws.accept(None, None)
-                self._app_state = WebSocketState.CONNECTED
-            except Exception:  # noqa: BLE001
-                pass
+        if pre_accept:
+            if self._is_asgi:
+                # In-process ASGI: a pre-accept close IS the rejection — emit
+                # it with the caller's own code (the TestClient reads this
+                # frame's code), rather than the Rust handshake-refuse path.
+                self._app_state = WebSocketState.DISCONNECTED
+                self._last_close_code = code
+                self._last_close_reason = reason or ""
+                await self._asgi_send_close(code, reason or "")
+                return
+            # Refuse the handshake (HTTP 403) — matches Starlette: a close
+            # sent before accept never completes the upgrade. The writer
+            # task never starts, so there's no WS frame to flush.
+            self._reject(403)
+            return
         self._app_state = WebSocketState.DISCONNECTED
         if self._ws is not None:
             try:
@@ -330,18 +374,9 @@ class WebSocket:
             # ``WebSocket(scope, receive=..., send=...)`` (no Rust ws)
             # the caller expects ``close()`` to dispatch a
             # ``websocket.close`` ASGI message to the bridge ``send``.
-            # Used by WS middleware that wraps the app with a Starlette-
-            # style ``(scope, receive, send)`` signature.
-            try:
-                r = self._send({
-                    "type": "websocket.close",
-                    "code": code,
-                    "reason": reason or "",
-                })
-                if hasattr(r, "__await__"):
-                    await r
-            except Exception:  # noqa: BLE001
-                pass
+            # Used by the in-process WS door and by WS middleware that wraps
+            # the app with a Starlette-style ``(scope, receive, send)`` sig.
+            await self._asgi_send_close(code, reason or "")
 
     # ── Send ──────────────────────────────────────────────────────
 
@@ -374,8 +409,11 @@ class WebSocket:
             raise RuntimeError(
                 'Cannot call "send_text" before "accept" or after a close.'
             )
-        self._ws.send_text(data)
-        return _IMMEDIATE_NONE
+        if self._ws is not None:
+            self._ws.send_text(data)
+            return _IMMEDIATE_NONE
+        # ASGI door: return the send coroutine for the caller to await.
+        return self._send({"type": "websocket.send", "text": data})
 
     def send_bytes(self, data):
         if self._app_state != WebSocketState.CONNECTED:
@@ -384,8 +422,10 @@ class WebSocket:
             )
         if not isinstance(data, bytes):
             data = bytes(data)
-        self._ws.send_bytes(data)
-        return _IMMEDIATE_NONE
+        if self._ws is not None:
+            self._ws.send_bytes(data)
+            return _IMMEDIATE_NONE
+        return self._send({"type": "websocket.send", "bytes": data})
 
     def send_json(self, data, mode: str = "text"):
         if mode not in _VALID_SEND_JSON_MODES:
@@ -395,11 +435,17 @@ class WebSocket:
                 'Cannot call "send_json" before "accept" or after a close.'
             )
         text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+        if self._ws is not None:
+            if mode == "text":
+                self._ws.send_text(text)
+            else:
+                self._ws.send_bytes(text.encode("utf-8"))
+            return _IMMEDIATE_NONE
         if mode == "text":
-            self._ws.send_text(text)
-        else:
-            self._ws.send_bytes(text.encode("utf-8"))
-        return _IMMEDIATE_NONE
+            return self._send({"type": "websocket.send", "text": text})
+        return self._send(
+            {"type": "websocket.send", "bytes": text.encode("utf-8")}
+        )
 
     # ── Receive ───────────────────────────────────────────────────
 
@@ -415,6 +461,12 @@ class WebSocket:
             raise RuntimeError(
                 'Cannot call "receive" once a disconnect has been received.'
             )
+        if self._ws is None:
+            # ASGI door: pull the next message straight off the channel.
+            msg = await self._receive()
+            if msg.get("type") == "websocket.disconnect":
+                self._app_state = WebSocketState.DISCONNECTED
+            return msg
         try:
             msg = await self._ws.receive_async()
         except RuntimeError as e:
@@ -424,6 +476,24 @@ class WebSocket:
             self._app_state = WebSocketState.DISCONNECTED
         return msg
 
+    async def _asgi_receive_text(self):
+        msg = await self._receive()
+        if msg.get("type") == "websocket.disconnect":
+            self._app_state = WebSocketState.DISCONNECTED
+            raise WebSocketDisconnect(
+                code=msg.get("code", 1000), reason=msg.get("reason", "") or ""
+            )
+        return msg.get("text", "")
+
+    async def _asgi_receive_bytes(self):
+        msg = await self._receive()
+        if msg.get("type") == "websocket.disconnect":
+            self._app_state = WebSocketState.DISCONNECTED
+            raise WebSocketDisconnect(
+                code=msg.get("code", 1000), reason=msg.get("reason", "") or ""
+            )
+        return msg.get("bytes", b"")
+
     def receive_text(self):
         """Returns the Rust TextAwaitable directly — zero Python wrapping.
 
@@ -432,12 +502,16 @@ class WebSocket:
         """
         if self._app_state == WebSocketState.DISCONNECTED:
             raise WebSocketDisconnect(code=1000, reason="already disconnected")
+        if self._ws is None:
+            return self._asgi_receive_text()
         return self._ws.receive_text_async()
 
     def receive_bytes(self):
         """Returns the Rust BytesAwaitable directly."""
         if self._app_state == WebSocketState.DISCONNECTED:
             raise WebSocketDisconnect(code=1000, reason="already disconnected")
+        if self._ws is None:
+            return self._asgi_receive_bytes()
         return self._ws.receive_bytes_async()
 
     async def receive_json(self, mode: str = "text") -> Any:

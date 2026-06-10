@@ -12,6 +12,15 @@ from typing import Any
 
 def _build() -> dict[str, types.ModuleType]:
     # Lazy imports to avoid circular issues
+    #
+    # Import the REAL ``fastapi.sse`` FIRST — while ``sys.modules["fastapi"]`` is
+    # still the real package — and keep it registered. fastapi_turbo.responses
+    # (next import) does ``from fastapi.sse import EventSourceResponse``; without
+    # this eager import, a cold start that swaps the fake ``fastapi`` module in
+    # before responses.py loads dies with ModuleNotFoundError (the fake parent has
+    # no __path__ to resolve the submodule). The cache entry survives the swap.
+    import fastapi.sse as _real_sse  # noqa: F401
+
     import fastapi_turbo
     import fastapi_turbo.responses as _responses
     import fastapi_turbo.requests as _requests
@@ -154,15 +163,13 @@ def _build() -> dict[str, types.ModuleType]:
         fastapi_routing._default_generate_unique_id = _routing._default_generate_unique_id  # type: ignore[attr-defined]
     except AttributeError:
         pass
-    # APIWebSocketRoute stub — fastapi-turbo registers WS routes directly
-    # via @app.websocket() rather than a dedicated class, but third-party
-    # code uses this class name for isinstance checks.
-    class APIWebSocketRoute:
-        def __init__(self, path: str, endpoint, *, name: str | None = None):
-            self.path = path
-            self.endpoint = endpoint
-            self.name = name or endpoint.__name__
-    fastapi_routing.APIWebSocketRoute = APIWebSocketRoute  # type: ignore[attr-defined]
+    # APIWebSocketRoute — fastapi-turbo registers WS routes as
+    # ``_ws_support.WSRoute`` holders (turbo's WebSocket is a standalone
+    # class real APIWebSocketRoute can't introspect). Bind the SAME class
+    # here so third-party ``isinstance(scope["route"], APIWebSocketRoute)``
+    # checks match the synthetic route the WS wrapper injects.
+    from fastapi_turbo._ws_support import WSRoute as _WSRoute
+    fastapi_routing.APIWebSocketRoute = _WSRoute  # type: ignore[attr-defined]
     # request_response — stac-fastapi, fastapi-pagination use this.
     # Upstream is a SYNC function returning an ASGI callable (the
     # callable itself is async). The returned callable builds a
@@ -385,8 +392,11 @@ def _build() -> dict[str, types.ModuleType]:
     modules["fastapi.security.open_id_connect_url"] = fastapi_security_open_id
 
     fastapi_security_base = _mod("fastapi.security.base")
-    class SecurityBase: pass
-    fastapi_security_base.SecurityBase = SecurityBase  # type: ignore[attr-defined]
+    # Real ``SecurityBase`` (the clone schemes now subclass it — security.py), so
+    # ``isinstance(scheme, SecurityBase)`` and real ``get_dependant`` security
+    # detection work. ``_security._SecurityBase`` is the real class captured
+    # pre-shim.
+    fastapi_security_base.SecurityBase = _security._SecurityBase  # type: ignore[attr-defined]
     modules["fastapi.security.base"] = fastapi_security_base
 
     fastapi_security_utils = _mod("fastapi.security.utils")
@@ -531,12 +541,16 @@ def _build() -> dict[str, types.ModuleType]:
     modules["fastapi.logger"] = fastapi_logger
 
     # ── fastapi.openapi.* ──────────────────────────────────────────
-    import fastapi_turbo._openapi as _oa
+    # The clone _openapi.py generator is deleted; app.openapi() generates via REAL
+    # get_openapi internally. For user code doing
+    # ``from fastapi.openapi.utils import get_openapi; get_openapi(routes=app.routes,...)``
+    # expose a wrapper that converts the CLONE route objects to real APIRoutes first
+    # (raw real get_openapi can't process clone routes).
     fastapi_openapi = _mod("fastapi.openapi")
     modules["fastapi.openapi"] = fastapi_openapi
 
     fastapi_openapi_utils = _mod("fastapi.openapi.utils")
-    fastapi_openapi_utils.get_openapi = _oa.generate_openapi_schema  # type: ignore[attr-defined]
+    fastapi_openapi_utils.get_openapi = _applications._shim_get_openapi  # type: ignore[attr-defined]
     modules["fastapi.openapi.utils"] = fastapi_openapi_utils
 
     # ── fastapi.openapi.constants ──────────────────────────────────
@@ -860,6 +874,20 @@ def _build() -> dict[str, types.ModuleType]:
     # ── fastapi.types ──────────────────────────────────────────────
     import typing as _typing
     fastapi_types = _mod("fastapi.types")
+    # Copy real fastapi.types wholesale. Real FastAPI internals (e.g.
+    # _should_embed_body_fields -> is_union_of_base_models) do lazy
+    # `from fastapi.types import UnionType` at runtime, which resolves to THIS shim
+    # module — an incomplete shim breaks real-route building (the pivot adapter)
+    # for body/Form/File routes. _build() runs before the sys.modules swap, so this
+    # import resolves to the REAL module.
+    try:
+        import importlib as _il
+        _real_types = _il.import_module("fastapi.types")
+        for _n in dir(_real_types):
+            if not _n.startswith("__"):
+                setattr(fastapi_types, _n, getattr(_real_types, _n))
+    except Exception:
+        pass
     fastapi_types.DecoratedCallable = _typing.TypeVar("DecoratedCallable", bound=_typing.Callable)  # type: ignore[attr-defined]
     fastapi_types.IncEx = _typing.Union[_typing.Set[int], _typing.Set[str], _typing.Dict[int, _typing.Any], _typing.Dict[str, _typing.Any], None]  # type: ignore[attr-defined]
     modules["fastapi.types"] = fastapi_types

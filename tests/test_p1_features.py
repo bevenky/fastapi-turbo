@@ -352,7 +352,8 @@ class TestMultipleBodyParams:
     def test_multiple_body_params_introspection(self):
         """Multiple Pydantic body params are combined into one model."""
         from pydantic import BaseModel
-        from fastapi_turbo._introspect import introspect_endpoint
+        from fastapi_turbo._introspect_from_real_fastapi import extract_params_from_route
+        from fastapi_turbo.applications import _real_fastapi
 
         class Item(BaseModel):
             name: str
@@ -363,17 +364,20 @@ class TestMultipleBodyParams:
         def handler(item: Item, user: User):
             pass
 
-        params = introspect_endpoint(handler, "/test")
-        # Should have a single combined body param
-        body_params = [p for p in params if p["kind"] == "body"]
+        real = _real_fastapi.routing.APIRoute("/test", handler, methods=["POST"])
+        params = extract_params_from_route(real, app=None)
+        # Should have a single combined body param feeding two per-field getters
+        body_params = [p for p in params if p.kind == "body"]
         assert len(body_params) == 1
-        assert body_params[0]["name"] == "_combined_body"
-        assert body_params[0]["_body_param_names"] == ["item", "user"]
+        assert body_params[0].name == "_combined_body"
+        getters = sorted(p.name for p in params if p.kind == "dependency")
+        assert getters == ["item", "user"]
 
     def test_single_body_no_combine(self):
         """Single Pydantic body param is NOT combined."""
         from pydantic import BaseModel
-        from fastapi_turbo._introspect import introspect_endpoint
+        from fastapi_turbo._introspect_from_real_fastapi import extract_params_from_route
+        from fastapi_turbo.applications import _real_fastapi
 
         class Item(BaseModel):
             name: str
@@ -381,15 +385,17 @@ class TestMultipleBodyParams:
         def handler(item: Item):
             pass
 
-        params = introspect_endpoint(handler, "/test")
-        body_params = [p for p in params if p["kind"] == "body"]
+        real = _real_fastapi.routing.APIRoute("/test", handler, methods=["POST"])
+        params = extract_params_from_route(real, app=None)
+        body_params = [p for p in params if p.kind == "body"]
         assert len(body_params) == 1
-        assert body_params[0]["name"] == "item"
+        assert body_params[0].name == "item"
 
     def test_combined_model_validates(self):
         """The combined model accepts correct data."""
         from pydantic import BaseModel
-        from fastapi_turbo._introspect import introspect_endpoint
+        from fastapi_turbo._introspect_from_real_fastapi import extract_params_from_route
+        from fastapi_turbo.applications import _real_fastapi
 
         class Item(BaseModel):
             name: str
@@ -400,13 +406,11 @@ class TestMultipleBodyParams:
         def handler(item: Item, user: User):
             pass
 
-        params = introspect_endpoint(handler, "/test")
-        body_param = [p for p in params if p["kind"] == "body"][0]
-        CombinedModel = body_param["model_class"]
-
-        instance = CombinedModel(
-            item={"name": "widget"},
-            user={"username": "alice"},
+        real = _real_fastapi.routing.APIRoute("/test", handler, methods=["POST"])
+        params = extract_params_from_route(real, app=None)
+        body_param = [p for p in params if p.kind == "body"][0]
+        instance = body_param.model_class.__pydantic_validator__.validate_json(
+            '{"item": {"name": "widget"}, "user": {"username": "alice"}}'
         )
         assert instance.item.name == "widget"
         assert instance.user.username == "alice"
@@ -464,7 +468,8 @@ class TestBodyEmbed:
     def test_embed_single_body_introspection(self):
         """Single body param with embed=True is combined."""
         from pydantic import BaseModel
-        from fastapi_turbo._introspect import introspect_endpoint
+        from fastapi_turbo._introspect_from_real_fastapi import extract_params_from_route
+        from fastapi_turbo.applications import _real_fastapi
         from fastapi.param_functions import Body
 
         class Item(BaseModel):
@@ -473,10 +478,11 @@ class TestBodyEmbed:
         def handler(item: Item = Body(embed=True)):
             pass
 
-        params = introspect_endpoint(handler, "/test")
-        body_params = [p for p in params if p["kind"] == "body"]
+        real = _real_fastapi.routing.APIRoute("/test", handler, methods=["POST"])
+        params = extract_params_from_route(real, app=None)
+        body_params = [p for p in params if p.kind == "body"]
         assert len(body_params) == 1
-        assert body_params[0]["name"] == "_combined_body"
+        assert body_params[0].name == "_combined_body"
 
     def test_embed_server(self, server_app):
         """Body(embed=True) works end-to-end: expects {"item": {...}}."""

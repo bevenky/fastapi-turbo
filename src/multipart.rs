@@ -52,6 +52,14 @@ pub fn parse_multipart_sync(
 
     let mut result: HashMap<String, Vec<ParsedField>> = HashMap::new();
 
+    // Starlette's multipart defaults: at most 1000 non-file fields and 1000
+    // files per request (a DoS guard). Exceeding either is a 400, NOT a
+    // validation 422 — match the Python dispatcher / upstream Starlette.
+    const MAX_FIELDS: usize = 1000;
+    const MAX_FILES: usize = 1000;
+    let mut fields_seen: usize = 0;
+    let mut files_seen: usize = 0;
+
     // Find first boundary occurrence
     let mut pos = find_bytes(body, db, 0).ok_or_else(|| "boundary not found".to_string())?;
 
@@ -100,6 +108,19 @@ pub fn parse_multipart_sync(
                     content_type = Some(hval.clone());
                 }
                 headers.push((hname, hval));
+            }
+        }
+
+        // Enforce the field/file count caps before reading the data.
+        if filename.is_some() {
+            files_seen += 1;
+            if files_seen > MAX_FILES {
+                return Err("Too many files. Maximum number of files is 1000.".to_string());
+            }
+        } else {
+            fields_seen += 1;
+            if fields_seen > MAX_FIELDS {
+                return Err("Too many fields. Maximum number of fields is 1000.".to_string());
             }
         }
 

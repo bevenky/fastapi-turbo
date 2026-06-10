@@ -10,7 +10,7 @@ Status: **all upstream FastAPI tests pass** under the `import fastapi_turbo` sys
 |---|---|---|---|
 | Upstream FastAPI shim gate (sandboxed; py3.14, direct `pytest tests/`) | 3,125 passed, 2 skipped, 4 xfailed | 2026-05-01 | post-R51 (`45236fc`) |
 | Upstream FastAPI canonical script (`run_external_compat_gates.sh fastapi`, deselects upstream's own opt-outs) | 3,119 passed, 10 deselected | 2026-05-01 | post-R51 (`45236fc`) |
-| Own suite (`pytest tests/`, `FASTAPI_TURBO_SKIP_SUBPROCESS_DRIFT=1`) | 1,125 passed, 3 skipped | 2026-05-07 | post-R53 (issue #1 fix) |
+| Own suite (`pytest tests/`, `FASTAPI_TURBO_SKIP_SUBPROCESS_DRIFT=1`) | 1,127 passed, 3 skipped | 2026-06-03 | post clone-deletion (dispatchers + Response) |
 | Sentry SDK FastAPI + ASGI integration | 75 passed (was 33+89=122 on older sentry-sdk; 2.42.0 surface is smaller — track via canonical script run) | 2026-05-01 | post-R51 (`45236fc`) |
 
 Snapshot counts shift as new regression tests land. Replace numbers with what `scripts/run_external_compat_gates.sh all` and `pytest tests/` print on the current HEAD before claiming a regression — the audit report fields are dated on purpose so a doc-vs-code drift is auditable rather than ambiguous (R51 finding 4).
@@ -26,17 +26,17 @@ Snapshot counts shift as new regression tests land. Replace numbers with what `s
     parent run; they're reliable in isolation, run them via
     `pytest tests/stress/test_r3{3,6,7}_regressions.py` directly):
     1. *True sandbox + FORCE env var* — every bind raises AND
-       `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`: 965 pass, 162 skipped.
+       `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`: 945 pass, 206 skipped.
        The conftest collection hooks (suite-level + parity-level)
        both honour the FORCE env var (R33), so this scenario also
        covers a dev box where the auditor wants the bucket-#1
        numbers without having to actually deny bind at the kernel.
     2. *Forced-fail bind only* — monkey-patched `socket.socket.bind`
-       to raise `PermissionError`, no env var: 965 pass, 162 skipped
+       to raise `PermissionError`, no env var: 945 pass, 206 skipped
        (same as #1 — the suite-level probe hits the patched bind
        first, propagates `LOOPBACK_DENIED=True`, parity collection
        hook also detects it).
-    3. *Bind works, no env var* (normal dev box): 1106 pass, 0 skipped
+    3. *Bind works, no env var* (normal dev box): 1151 pass, 1 skipped
        — full coverage. This is the "happy path" that CI / release
        runners hit. Drift detector at `tests/stress/test_r37_regressions.py`
        allows ±2 vs the doc claim.
@@ -72,7 +72,7 @@ Snapshot counts shift as new regression tests land. Replace numbers with what `s
 | `response_model=` (filtering, aliases, `model_validate(obj)`) | Full | |
 | `status_code=` / `tags=` / `summary=` / `description=` / `response_description=` | Full | |
 | `app.mount("/sub", sub_app)` for FastAPI / StaticFiles / ASGI | Full | |
-| `app.host("subdomain", sub_app)` | Full | Dispatched in-process by the ASGI entry: ``_asgi_dispatch_in_process`` checks the registered hosts BEFORE route match and recurses into the matching sub-app's ``__call__`` (R28). Works under raw ``httpx.ASGITransport(app=app)`` / serverless / sandbox runs without binding a loopback socket. Sub-app keeps its own route table, lifespan, and middleware chain. |
+| `app.host("subdomain", sub_app)` | Full | Dispatched in-process by a host-matching HTTP middleware that checks the registered hosts BEFORE route match and recurses into the matching sub-app's ``__call__`` (R28). Works under raw ``httpx.ASGITransport(app=app)`` / serverless / sandbox runs without binding a loopback socket. Sub-app keeps its own route table, lifespan, and middleware chain. |
 | `redirect_slashes` | Full | |
 | HEAD auto-handling from GET | Full | 405 + `Allow: <declared>` — matches upstream FastAPI byte-for-byte. |
 | OPTIONS auto-generation for CORS | Full | True preflights (`Origin` + `Access-Control-Request-Method`) are handled by `CORSMiddleware`; bare OPTIONS on undeclared method returns 405 + `Allow: <declared>` — matches upstream. |

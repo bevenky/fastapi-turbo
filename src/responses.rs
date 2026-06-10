@@ -6,6 +6,25 @@ use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyNone, PyString};
 use std::path::Path;
 use std::sync::OnceLock;
 
+/// Extract a `(name, value)` header pair from a Python tuple, accepting BOTH the
+/// clone `Response`'s `(str, str)` raw_headers AND real Starlette's `(bytes, bytes)`.
+/// Real Starlette stores `raw_headers: list[tuple[bytes, bytes]]`; without the bytes
+/// arm a plain `extract::<(String, String)>()` SILENTLY returns Err and the header
+/// (e.g. a Set-Cookie) vanishes with no error. Required before re-pointing the door
+/// to real Starlette responses.
+pub(crate) fn extract_header_pair(item: &Bound<'_, PyAny>) -> Option<(String, String)> {
+    if let Ok((k, v)) = item.extract::<(String, String)>() {
+        return Some((k, v));
+    }
+    if let Ok((k, v)) = item.extract::<(Vec<u8>, Vec<u8>)>() {
+        return Some((
+            String::from_utf8_lossy(&k).into_owned(),
+            String::from_utf8_lossy(&v).into_owned(),
+        ));
+    }
+    None
+}
+
 // ── Cached Python-side references — looked up once, reused forever ──────
 //
 // These OnceLocks store GIL-free pointers we can reacquire cheaply. Each
@@ -139,11 +158,35 @@ pub fn py_to_response_with_request(
     range_header: Option<&str>,
     if_range_header: Option<&str>,
 ) -> Response {
+    // Route-level default status (``status_code=201``); 200 for normal routes.
+    // Only the non-Response handler results below use it — a returned Response /
+    // StreamingResponse / FileResponse keeps its own status.
+    let default_status = crate::router::route_default_status();
+    // No-body statuses (1xx/204/304) on a route-level ``status_code``: a non-Response
+    // value return (dict/list/tuple/None) must produce an EMPTY body (no JSON, no
+    // content-length) — matches FastAPI/Starlette. (A returned Response with a
+    // no-body status is handled in response_object_to_response.)
+    // Only strip on the ROUTE default when there's no injected Response shell — a
+    // handler/dep with ``response: Response`` may override the status to a body one
+    // (``status_code=204`` route, handler sets 400 + returns a dict). Shell routes
+    // are stripped on the FINAL status in apply_injected_response instead.
+    let no_body_status = (default_status.as_u16() < 200
+        || default_status == StatusCode::NO_CONTENT
+        || default_status == StatusCode::NOT_MODIFIED)
+        && !crate::router::has_injected_response();
+    if no_body_status
+        && (obj.is_instance_of::<PyDict>()
+            || obj.is_instance_of::<PyList>()
+            || obj.is_instance_of::<pyo3::types::PyTuple>()
+            || obj.is_instance_of::<PyNone>())
+    {
+        return default_status.into_response();
+    }
     // dict or list -> JSON (MOST COMMON — check first, skip attr lookups)
     if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() {
         let bytes = dict_to_json_bytes(py, obj);
         return (
-            StatusCode::OK,
+            default_status,
             [("content-type", "application/json")],
             bytes::Bytes::from(bytes),
         )
@@ -154,13 +197,23 @@ pub fn py_to_response_with_request(
     if obj.is_instance_of::<pyo3::types::PyTuple>() {
         let mut buf = String::new();
         write_any_json(py, obj, &mut buf);
-        return (StatusCode::OK, [("content-type", "application/json")], buf).into_response();
+        return (default_status, [("content-type", "application/json")], buf).into_response();
+    }
+    // Sets / frozensets: serialize as a JSON array (FA's jsonable_encoder does the
+    // same). A handler returning a ``set`` (e.g. a ``set``/``frozenset`` Form or
+    // body param echoed back) must not serialize as the Python set repr.
+    if obj.is_instance_of::<pyo3::types::PySet>()
+        || obj.is_instance_of::<pyo3::types::PyFrozenSet>()
+    {
+        let mut buf = String::new();
+        write_any_json(py, obj, &mut buf);
+        return (default_status, [("content-type", "application/json")], buf).into_response();
     }
 
-    // None -> 200 with "null" body (matches FastAPI: json-serializes None to null)
+    // None -> default status with "null" body (FastAPI json-serializes None to null)
     if obj.is_instance_of::<PyNone>() {
         return (
-            StatusCode::OK,
+            default_status,
             [("content-type", "application/json")],
             "null",
         )
@@ -290,14 +343,14 @@ pub fn py_to_response_with_request(
     if obj.is_instance_of::<PyBool>() {
         let value = pyobj_to_serde(py, obj);
         let body = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
-        return (StatusCode::OK, [("content-type", "application/json")], body).into_response();
+        return (default_status, [("content-type", "application/json")], body).into_response();
     }
 
     // int / float -> JSON number (matches FastAPI: all scalars are JSON-serialized)
     if obj.is_instance_of::<PyInt>() || obj.is_instance_of::<PyFloat>() {
         let value = pyobj_to_serde(py, obj);
         let body = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
-        return (StatusCode::OK, [("content-type", "application/json")], body).into_response();
+        return (default_status, [("content-type", "application/json")], body).into_response();
     }
 
     // str -> JSON-wrapped string (matches FastAPI: strings are JSON-serialized).
@@ -307,7 +360,7 @@ pub fn py_to_response_with_request(
     // escapes non-ASCII to \uXXXX when needed.
     if let Ok(s) = obj.extract::<String>() {
         let json = serde_json::to_string(&s).unwrap_or_else(|_| "\"\"".to_string());
-        return (StatusCode::OK, [("content-type", "application/json")], json).into_response();
+        return (default_status, [("content-type", "application/json")], json).into_response();
     }
 
     // Plain Python class with ``__dict__`` (FA dependency classes like
@@ -318,13 +371,13 @@ pub fn py_to_response_with_request(
         if let Ok(dict) = d.cast::<PyDict>() {
             let mut buf = String::with_capacity(64);
             write_dict_json(py, dict, &mut buf);
-            return (StatusCode::OK, [("content-type", "application/json")], buf).into_response();
+            return (default_status, [("content-type", "application/json")], buf).into_response();
         }
     }
 
     // Fallback: str() it
     let repr = obj.str().map(|s| s.to_string()).unwrap_or_default();
-    (StatusCode::OK, [("content-type", "text/plain")], repr).into_response()
+    (default_status, [("content-type", "text/plain")], repr).into_response()
 }
 
 /// Convert a Python Response-like object (has status_code, headers, body).
@@ -350,7 +403,7 @@ fn response_object_to_response(
     if let Ok(raw_attr) = obj.getattr("raw_headers") {
         if let Ok(list) = raw_attr.cast::<PyList>() {
             for item in list.iter() {
-                if let Ok(tup) = item.extract::<(String, String)>() {
+                if let Some(tup) = extract_header_pair(&item) {
                     raw_header_keys.insert(tup.0.to_ascii_lowercase());
                 }
             }
@@ -378,7 +431,7 @@ fn response_object_to_response(
         } else if let Ok(items_list) = hdr_obj.call_method0("items") {
             if let Ok(list) = items_list.cast::<pyo3::types::PyList>() {
                 for item in list.iter() {
-                    if let Ok((key, val)) = item.extract::<(String, String)>() {
+                    if let Some((key, val)) = extract_header_pair(&item) {
                         if raw_header_keys.contains(&key.to_ascii_lowercase()) {
                             continue;
                         }
@@ -398,7 +451,7 @@ fn response_object_to_response(
         if let Ok(list) = raw_attr.cast::<PyList>() {
             if !list.is_empty() {
                 for item in list.iter() {
-                    if let Ok(tup) = item.extract::<(String, String)>() {
+                    if let Some(tup) = extract_header_pair(&item) {
                         if let (Ok(hname), Ok(hval)) =
                             (HeaderName::try_from(tup.0), HeaderValue::from_str(&tup.1))
                         {
@@ -434,6 +487,18 @@ fn response_object_to_response(
         bytes::Bytes::new()
     };
 
+    // No-body statuses (1xx, 204, 304) must carry NO body and NO content-length —
+    // a JSONResponse(None) still renders b"null", which hyper would turn into
+    // content-length:4. Match Starlette: drop the body (and content-length below).
+    let is_no_body = status.as_u16() < 200
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED;
+    let body_bytes = if is_no_body {
+        bytes::Bytes::new()
+    } else {
+        body_bytes
+    };
+
     let mut resp = axum::response::Response::builder()
         .status(status)
         .body(axum::body::Body::from(body_bytes))
@@ -444,6 +509,9 @@ fn response_object_to_response(
     // the entries we just accumulated via raw_headers.
     for (k, v) in headers.iter() {
         hmap.append(k, v.clone());
+    }
+    if is_no_body {
+        hmap.remove(axum::http::header::CONTENT_LENGTH);
     }
 
     // Drain `Response(..., background=BackgroundTask(...))` or
@@ -543,7 +611,36 @@ pub fn pyerr_to_response(py: Python<'_>, err: &PyErr) -> Response {
         }
     }
 
-    // Unhandled exception → print traceback to stderr and return plain-text 500.
+    // worker_timeout: a ``TimeoutError`` (the async worker-loop submit timeout
+    // backing ``FastAPI(worker_timeout=…)``) is an EXPECTED timeout, not an
+    // unhandled server error. The Python dispatcher maps it to a 504 via
+    // ``except asyncio.TimeoutError`` (applications.py) — text/plain
+    // "Gateway Timeout". Mirror that and DO NOT capture it: capturing would
+    // make the in-process door re-raise the timeout out of ``__call__``
+    // instead of returning a non-200 response.
+    if err.is_instance_of::<pyo3::exceptions::PyTimeoutError>(py) {
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            [("content-type", "text/plain; charset=utf-8")],
+            "Gateway Timeout",
+        )
+            .into_response();
+    }
+
+    // Unhandled exception → capture onto ``app._captured_server_exceptions``
+    // so the in-process oneshot door can re-raise it out of ``__call__``
+    // (matching the Python dispatcher's ``_asgi_emit_exception`` which
+    // ALWAYS re-raises a non-HTTP unhandled exception after sending the
+    // 500). Without this the door silently masks a real handler failure
+    // as a successful 500, breaking ``httpx.ASGITransport(raise_app_
+    // exceptions=True)`` / ``TestClient(raise_server_exceptions=True)``.
+    // Same mechanism the streaming path already uses (streaming.rs).
+    if let Some(app_obj) = crate::router::current_app(py) {
+        if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+            let _ = lst.call_method1(py, "append", (err.value(py),));
+        }
+    }
+    // Print traceback to stderr and return plain-text 500.
     err.print(py);
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -677,6 +774,20 @@ fn write_any_json(py: Python<'_>, obj: &Bound<'_, PyAny>, buf: &mut String) {
         use std::fmt::Write;
         let _ = write!(buf, "{i}");
         return;
+    }
+    // Big integer (> i64::MAX or < i64::MIN): emit the EXACT digits. A Python
+    // int's str() is always a valid JSON number literal, so splice it verbatim
+    // instead of falling through to the lossy f64 path below — matches Python
+    // json.dumps, which never rounds an int. Cold path only (in-range ints take
+    // the i64 fast write above). PyBool + Decimal are handled earlier, so this
+    // only fires for true large ints.
+    if obj.is_instance_of::<PyInt>() {
+        if let Ok(s) = obj.str() {
+            if let Ok(st) = s.to_str() {
+                buf.push_str(st);
+                return;
+            }
+        }
     }
     if let Ok(f) = obj.extract::<f64>() {
         use std::fmt::Write;
@@ -947,7 +1058,7 @@ fn extract_response_headers(obj: &Bound<'_, PyAny>) -> Vec<(String, String)> {
         } else if let Ok(items_list) = hdr.call_method0("items") {
             if let Ok(list) = items_list.cast::<PyList>() {
                 for item in list.iter() {
-                    if let Ok((ks, vs)) = item.extract::<(String, String)>() {
+                    if let Some((ks, vs)) = extract_header_pair(&item) {
                         out.push((ks, vs));
                     }
                 }
@@ -957,7 +1068,7 @@ fn extract_response_headers(obj: &Bound<'_, PyAny>) -> Vec<(String, String)> {
     if let Ok(raw) = obj.getattr("raw_headers") {
         if let Ok(list) = raw.cast::<PyList>() {
             for item in list.iter() {
-                if let Ok((k, v)) = item.extract::<(String, String)>() {
+                if let Some((k, v)) = extract_header_pair(&item) {
                     out.push((k, v));
                 }
             }

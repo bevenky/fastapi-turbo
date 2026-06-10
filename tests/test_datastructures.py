@@ -28,9 +28,10 @@ def test_url_from_scope():
         "scheme": "http",
         "server": ("localhost", 8000),
         "path": "/api/items",
-        "query_string": "page=2",
+        "query_string": b"page=2",
+        "headers": [],
     }
-    u = URL(scope)
+    u = URL(scope=scope)  # real Starlette URL takes scope as a keyword
     assert u.scheme == "http"
     assert u.hostname == "localhost"
     assert u.path == "/api/items"
@@ -52,7 +53,7 @@ def test_headers_case_insensitive():
 def test_headers_from_tuples():
     from starlette.datastructures import Headers
 
-    h = Headers([(b"content-type", b"text/html"), (b"x-custom", b"val")])
+    h = Headers(raw=[(b"content-type", b"text/html"), (b"x-custom", b"val")])
     assert h["content-type"] == "text/html"
     assert h["x-custom"] == "val"
 
@@ -71,7 +72,7 @@ def test_query_params():
 def test_address():
     from starlette.datastructures import Address
 
-    a = Address(("127.0.0.1", 8080))
+    a = Address("127.0.0.1", 8080)  # real Starlette Address(host, port) NamedTuple
     assert a.host == "127.0.0.1"
     assert a.port == 8080
 
@@ -93,16 +94,18 @@ def test_state():
 
 
 def test_request_basic():
-    from starlette.requests import Request
+    # The door builds requests via _door_make_request (real Starlette Request,
+    # real scope shapes: list[(bytes,bytes)] headers, bytes query_string).
+    from fastapi_turbo.requests import _door_make_request
 
-    scope = {
+    req = _door_make_request({
+        "type": "http",
         "method": "POST",
         "path": "/items",
-        "query_string": "page=1",
-        "headers": {"content-type": "application/json"},
+        "query_string": b"page=1",
+        "headers": [(b"content-type", b"application/json")],
         "path_params": {"item_id": "42"},
-    }
-    req = Request(scope)
+    })
     assert req.method == "POST"
     assert req.headers["content-type"] == "application/json"
     assert req.query_params["page"] == "1"
@@ -110,47 +113,41 @@ def test_request_basic():
 
 
 def test_request_cookies():
-    from starlette.requests import Request
+    from fastapi_turbo.requests import _door_make_request
 
-    scope = {
-        "headers": {"cookie": "session=abc123; theme=dark"},
-    }
-    req = Request(scope)
+    req = _door_make_request({"headers": [(b"cookie", b"session=abc123; theme=dark")]})
     assert req.cookies["session"] == "abc123"
     assert req.cookies["theme"] == "dark"
 
 
 def test_request_body():
-    from starlette.requests import Request
+    from fastapi_turbo.requests import _door_make_request
 
-    scope = {"_body": b'{"key": "value"}'}
-    req = Request(scope)
+    req = _door_make_request({"_body": b'{"key": "value"}'})
     body = asyncio.run(req.body())
     assert body == b'{"key": "value"}'
 
 
 def test_request_json():
-    from starlette.requests import Request
+    from fastapi_turbo.requests import _door_make_request
 
-    scope = {"_body": b'{"key": "value"}'}
-    req = Request(scope)
+    req = _door_make_request({"_body": b'{"key": "value"}'})
     data = asyncio.run(req.json())
     assert data == {"key": "value"}
 
 
 def test_request_state():
-    from starlette.requests import Request
+    from fastapi_turbo.requests import _door_make_request
 
-    req = Request()
+    req = _door_make_request({})
     req.state.user = "alice"
     assert req.state.user == "alice"
 
 
 def test_request_client():
-    from starlette.requests import Request
+    from fastapi_turbo.requests import _door_make_request
 
-    scope = {"client": ("192.168.1.1", 54321)}
-    req = Request(scope)
+    req = _door_make_request({"client": ("192.168.1.1", 54321)})
     assert req.client.host == "192.168.1.1"
     assert req.client.port == 54321
 
@@ -285,7 +282,8 @@ def test_background_tasks():
     bt.add_task(sync_task, "sync")
     bt.add_task(async_task, "async")
 
-    asyncio.run(bt._run())
+    # real Starlette BackgroundTasks runs via __call__ (clone had _run)
+    asyncio.run(bt())
     assert results == ["sync", "async"]
 
 

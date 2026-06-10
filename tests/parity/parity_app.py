@@ -13,7 +13,7 @@ from typing import Annotated, Optional, Union
 from fastapi import (
     FastAPI, APIRouter, Depends, Query, Path, Header, Cookie, Body, Form,
     File, UploadFile, HTTPException, Request, Response, Security,
-    BackgroundTasks, status,
+    BackgroundTasks, status, WebSocket, WebSocketDisconnect,
 )
 from fastapi.responses import (
     JSONResponse, HTMLResponse, PlainTextResponse, RedirectResponse,
@@ -190,11 +190,152 @@ app = FastAPI()
 app.include_router(dep_router)
 app.include_router(include_dep_router, dependencies=[Depends(side_effect_dep)])
 
+# ── StaticFiles mount (parity gate for the L3 ServeDir lever) ─────
+# A small mount so the byte-for-byte gate covers static-file serving
+# (content-type by extension, body bytes). Uses ONLY stock imports.
+try:  # noqa: E402 — stock FastAPI import; fall back to Starlette under the shim
+    from fastapi.staticfiles import StaticFiles
+except ImportError:  # pragma: no cover
+    from starlette.staticfiles import StaticFiles
+
+_PARITY_STATIC_DIR = tempfile.mkdtemp(prefix="parity_static_")
+with open(os.path.join(_PARITY_STATIC_DIR, "data.txt"), "w") as _f:
+    _f.write("static data here")
+with open(os.path.join(_PARITY_STATIC_DIR, "style.css"), "w") as _f:
+    _f.write("body { color: red; }")
+with open(os.path.join(_PARITY_STATIC_DIR, "app.js"), "w") as _f:
+    _f.write("console.log('hello');")
+# Extensions where mime_guess (tower-http ServeDir) DIVERGES from Python
+# mimetypes — included to prove the L3 fix matches Starlette across the board,
+# not just for .js.
+for _name, _data in [
+    ("mod.mjs", "export const x = 1;"),
+    ("doc.xml", "<root/>"),
+    ("conf.yaml", "a: 1"),
+    ("icon.svg", "<svg/>"),
+    ("readme.md", "# hi"),
+    ("data.json", '{"k": 1}'),
+    ("blob.unknownext", "raw bytes"),
+]:
+    with open(os.path.join(_PARITY_STATIC_DIR, _name), "w") as _f:
+        _f.write(_data)
+app.mount("/static", StaticFiles(directory=_PARITY_STATIC_DIR), name="static")
+
+
 # ── Health check ─────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ── Middleware-ordering parity (PMW) — corpus expansion (P1) ──────
+# FastAPI/Starlette run middleware in REVERSE registration order
+# (last-registered = outermost). Each middleware appends its name to an
+# X-MW-Trace response header on the way OUT, so the final header value
+# reveals the nesting order. The parity gate diffs that header between the
+# Rust engine and real FastAPI — if turbo nests middleware differently,
+# the trace differs. Safety net for the dispatcher collapse (middleware is
+# applied independently on the Rust and Python in-process paths).
+#
+# These run on EVERY response; existing parity tests assert on status +
+# json/text body only (not headers), so they're unaffected.
+
+@app.middleware("http")
+async def _mw_inner(request, call_next):
+    # Registered FIRST → innermost → appends FIRST (closest to handler).
+    response = await call_next(request)
+    trace = response.headers.get("X-MW-Trace", "")
+    response.headers["X-MW-Trace"] = (trace + ",inner").lstrip(",")
+    return response
+
+
+@app.middleware("http")
+async def _mw_outer(request, call_next):
+    # Registered SECOND → outermost → appends LAST.
+    response = await call_next(request)
+    trace = response.headers.get("X-MW-Trace", "")
+    response.headers["X-MW-Trace"] = (trace + ",outer").lstrip(",")
+    return response
+
+
+@app.get("/pmw-trace")
+def pmw_trace():
+    return {"ok": True}
+
+
+# ── WebSocket parity (PWS) — corpus expansion (P1), folded into the gate ──
+# WS runs on a dedicated per-connection OS thread + local event loop in turbo
+# (src/websocket.rs), NOT the shared async loop. These prove the observable
+# client-side behaviour matches FastAPI through the SAME dual-server gate as
+# HTTP — incl. that WS coexists with the @app.middleware("http") above (http
+# middleware must NOT wrap the websocket scope). Safety net for the dispatcher
+# collapse (WS has its own in-process dispatch twin).
+
+@app.websocket("/pws/echo")
+async def pws_echo(ws: WebSocket) -> None:
+    await ws.accept()
+    try:
+        while True:
+            msg = await ws.receive_text()
+            await ws.send_text(msg)
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/pws/json")
+async def pws_json(ws: WebSocket) -> None:
+    await ws.accept()
+    data = await ws.receive_json()
+    await ws.send_json({"echo": data})
+    await ws.close()
+
+
+@app.websocket("/pws/scope/{who}")
+async def pws_scope(ws: WebSocket, who: str) -> None:
+    await ws.accept()
+    await ws.send_json(
+        {
+            "who": who,
+            "q": ws.query_params.get("q", ""),
+            "hdr": ws.headers.get("x-test", ""),
+        }
+    )
+    await ws.close()
+
+
+@app.websocket("/pws/close-code")
+async def pws_close_code(ws: WebSocket) -> None:
+    await ws.accept()
+    await ws.send_text("first-and-only")
+    await ws.close(code=4002, reason="bye-now")
+
+
+def _pws_auth(token: str = Query(default="")) -> str:
+    # Normative Starlette reject path: raising WebSocketException BEFORE
+    # accept rejects the connection with a custom close code (matches the
+    # proven run_websocket_parity.py auth_dep pattern). NOTE: the
+    # ``await ws.close(code=...)`` before accept pattern showed an FA=4401 /
+    # turbo=None divergence — tracked as a WATCH item, not exercised here.
+    from fastapi import WebSocketException
+    if not token:
+        raise WebSocketException(code=4401, reason="missing token")
+    return token
+
+
+@app.websocket("/pws/dep")
+async def pws_dep(ws: WebSocket, token: str = Depends(_pws_auth)) -> None:
+    await ws.accept()
+    await ws.send_text(f"authed:{token}")
+    await ws.close()
+
+
+@app.websocket("/pws/close-before-accept")
+async def pws_close_before_accept(ws: WebSocket) -> None:
+    # Reject by closing BEFORE accept. Starlette refuses the handshake at the
+    # HTTP layer (client sees HTTP 403); turbo completes the upgrade then sends
+    # a WS close (client sees close code 4401). KNOWN divergence — see P155.
+    await ws.close(code=4401, reason="nope")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -327,6 +468,61 @@ async def p024(file: UploadFile):
 async def p025(name: str = Form(), file: UploadFile = File()):
     content = await file.read()
     return {"name": name, "filename": file.filename, "size": len(content)}
+
+# ── Multipart byte-parity endpoints (P132-P137) — corpus expansion (P1) ──
+# These echo back EVERYTHING the multipart parser produces so the parity
+# gate can diff the Rust (multer) parser against python-multipart/Starlette
+# byte-for-byte: filename, content-type, exact bytes (latin-1 round-trip),
+# size, multiple files, and form fields interleaved with files. This is the
+# safety net for the dispatcher collapse (multipart is parsed independently
+# on the Rust path and the Python in-process path).
+
+@app.post("/pmp-echo-file")
+async def pmp_echo_file(file: UploadFile = File()):
+    content = await file.read()
+    return {
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "size": len(content),
+        "content": content.decode("latin-1"),
+    }
+
+
+@app.post("/pmp-multi-files")
+async def pmp_multi_files(files: list[UploadFile] = File()):
+    out = []
+    for f in files:
+        c = await f.read()
+        out.append({
+            "filename": f.filename,
+            "content_type": f.content_type,
+            "content": c.decode("latin-1"),
+        })
+    return {"count": len(files), "files": out}
+
+
+@app.post("/pmp-form-and-files")
+async def pmp_form_and_files(
+    title: str = Form(),
+    tags: list[str] = Form(),
+    file: UploadFile = File(),
+):
+    c = await file.read()
+    return {
+        "title": title,
+        "tags": tags,
+        "filename": file.filename,
+        "content": c.decode("latin-1"),
+    }
+
+
+@app.post("/pmp-binary")
+async def pmp_binary(file: UploadFile = File()):
+    c = await file.read()
+    # Echo the raw bytes back as a latin-1 string so the test can compare
+    # exact byte content (incl. NULs / high bytes) without JSON escaping loss.
+    return {"size": len(c), "sha_like": sum(c) % 65521, "content": c.decode("latin-1")}
+
 
 # P026: response_model (filters extra fields)
 @app.get("/p026-response-model", response_model=ItemOut)

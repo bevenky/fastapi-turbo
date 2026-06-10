@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fastapi-turbo — door architecture, gaps &amp; options</title>
+<style>
+  :root{--bg:#0f1419;--panel:#1a2027;--ink:#e6edf3;--mut:#9da7b3;--rust:#d98c4a;
+        --py:#4a90d9;--ok:#3fb950;--bad:#f85149;--warn:#d29922;--line:#30363d;}
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:28px 32px;max-width:1180px}
+  h1{font-size:22px;margin:0 0 4px} h2{font-size:17px;margin:30px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}
+  h3{font-size:14px;margin:16px 0 6px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
+  .sub{color:var(--mut);margin:0 0 8px}
+  code{background:#0b0f14;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font:12px ui-monospace,Menlo,monospace;color:#d2a8ff}
+  .row{display:flex;gap:14px;flex-wrap:wrap;align-items:stretch}
+  .box{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;flex:1;min-width:240px}
+  .rust{border-left:4px solid var(--rust)} .py{border-left:4px solid var(--py)}
+  .box b{display:block;margin-bottom:4px}
+  .tag{display:inline-block;font:11px ui-monospace,monospace;border-radius:4px;padding:1px 6px;margin-left:6px}
+  .t-rust{background:rgba(217,140,74,.15);color:var(--rust);border:1px solid var(--rust)}
+  .t-py{background:rgba(74,144,217,.15);color:var(--py);border:1px solid var(--py)}
+  .flow{font:12px ui-monospace,Menlo,monospace;white-space:pre;background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:14px;overflow-x:auto;color:#c9d1d9}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)} .mut{color:var(--mut)}
+  table{border-collapse:collapse;width:100%;margin:8px 0;font-size:13px}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:#0b0f14;color:var(--mut);font-weight:600}
+  .pill{font:11px ui-monospace,monospace;border-radius:10px;padding:1px 8px}
+  .p-ok{background:rgba(63,185,80,.15);color:var(--ok)} .p-bad{background:rgba(248,81,73,.15);color:var(--bad)}
+  .p-warn{background:rgba(210,153,34,.15);color:var(--warn)}
+  .rec{background:rgba(63,185,80,.08);border:1px solid var(--ok);border-radius:8px;padding:12px 14px;margin-top:8px}
+  ul{margin:4px 0 4px 18px;padding:0} li{margin:2px 0}
+  .arrow{color:var(--mut)}
+  .score{display:flex;gap:14px;flex-wrap:wrap;margin:6px 0}
+  .col{flex:1;min-width:320px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:4px 14px 12px}
+  .col.done{border-top:4px solid var(--ok)} .col.todo{border-top:4px solid var(--bad)}
+  .col h3{color:var(--ink);margin:12px 0 6px;letter-spacing:0;text-transform:none;font-size:14px}
+  .col ul{list-style:none;margin:0;padding:0}
+  .col li{padding:5px 0 5px 24px;position:relative;border-bottom:1px solid #20262d;margin:0}
+  .col li:last-child{border-bottom:0}
+  .done li:before{content:"\2713";color:var(--ok);position:absolute;left:2px;font-weight:700}
+  .todo li:before{content:"\2715";color:var(--bad);position:absolute;left:2px;font-weight:700}
+  .col small{color:var(--mut);display:block;font-size:12px}
+</style>
+</head>
+<body>
+
+<h1>fastapi-turbo — how the request doors work, what's missing, and your options</h1>
+<p class="sub">Goal: delete the ~30K-line Python "clone". The last clone pieces are the two in-process <b>dispatchers</b>
+(<code>_asgi_dispatch_in_process</code> ~3.3K LOC HTTP, <code>_asgi_dispatch_ws_in_process</code> ~900 LOC WS).
+To delete them, every request must be served by the <b>Rust door</b> instead.</p>
+
+<h2>0 · Status at a glance — done vs not done</h2>
+<div class="score">
+  <div class="col done">
+    <h3><span class="ok">&#10003; DONE</span> — committed &amp; green (full 1125 / parity 151 / WS 22)</h3>
+    <ul>
+      <li>All 12 oneshot-door parity gaps closed <small>door went 1110/1122 → 1122/1122</small></li>
+      <li>Rust door flipped <b>DEFAULT-ON</b> <small><code>FASTAPI_TURBO_ONESHOT_DOOR=0</code> opts back to the dispatcher</small></li>
+      <li>HTTP params / body / deps / validation / 422 on the door</li>
+      <li>7.1 — mounts handled in-process</li>
+      <li>7.2 — raw-ASGI-MW-alone in-process (via Rust bridge)</li>
+      <li>7.3a — streaming / SSE / FileResponse via Axum BodyDataStream</li>
+      <li>7.3b — <code>is_disconnected</code> + streaming cancellation</li>
+      <li>Bare-generator NDJSON endpoints on the door</li>
+      <li>2 real bugs fixed <small>big-int JSON · dep-raised exception handlers</small></li>
+      <li>Tier-0 dead-code cleanup <small>~500 LOC + <code>multer</code> + <code>ServerConfig</code> removed</small></li>
+      <li>HTTP declines cut <b>107 → 1</b></li>
+    </ul>
+  </div>
+  <div class="col done">
+    <h3><span class="ok">&#10003; DONE — both dispatchers deleted (H2 + W1)</span></h3>
+    <ul>
+      <li><b>H2 (HTTP):</b> mixed Tower + raw-MW now composed by the door as one registration-ordered ASGI chain <small>last HTTP decline gone</small></li>
+      <li><b>Deleted</b> the HTTP dispatcher <code>_asgi_dispatch_in_process</code> <small>net <b>&minus;3,234</b> LOC (commit 6d4ef76)</small></li>
+      <li><b>W1 (WS):</b> in-process WebSockets ride the door — a Python WebSocket over ASGI receive/send reusing <code>_wrap_websocket_endpoint</code> <small>no Rust bridge needed; the caller's loop drives it</small></li>
+      <li><b>Deleted</b> the WS dispatcher <code>_asgi_dispatch_ws_in_process</code> <small>net <b>&minus;725</b> LOC (commit a84c913)</small></li>
+      <li>Gates green: full 1124, parity 151, WS 22</li>
+    </ul>
+  </div>
+</div>
+<p class="sub">Net: <b>both in-process dispatchers are gone (~&minus;3,960 LOC combined)</b>. The Rust door now serves the
+ENTIRE in-process HTTP + WebSocket surface; <code>FASTAPI_TURBO_ONESHOT_DOOR=0</code> falls back to the loopback Rust
+socket server. <code>app.run()</code> (your product path) is 100% Rust for both HTTP and WS and was <b>never affected</b>.
+Remaining future work: the shim flip (<code>from fastapi import X</code> → real packages, a separate gate).</p>
+
+<h2>1 · Two ways your app is run</h2>
+<div class="row">
+  <div class="box rust">
+    <b>A. <code>app.run()</code> — your PRODUCT path <span class="tag t-rust">100% Rust</span></b>
+    Real socket server (Axum + hyper + tokio). Client connects over TCP.
+    <span class="ok">Unaffected by any of this discussion.</span> WebSockets here use Axum + tokio-tungstenite directly.
+  </div>
+  <div class="box py">
+    <b>B. <code>uvicorn app:app</code> / <code>TestClient</code> / <code>httpx.ASGITransport</code> — the IN-PROCESS / ASGI path</b>
+    Something calls <code>app(scope, receive, send)</code>. This is the <b>door</b> path, and it's where the
+    dispatcher still exists. <span class="mut">Dev, tests, and uvicorn deployments hit this.</span>
+  </div>
+</div>
+
+<h2>2 · What happens inside <code>app(scope, receive, send)</code> today (path B)</h2>
+<div class="flow">
+HTTP request
+  │
+  ├─ <span class="ok">door can handle?</span>  ──yes──▶  <b style="color:#d98c4a">Rust oneshot door</b>  (process_request → Axum router, in-process)   <span class="ok">◀ the goal: everything here</span>
+  │                                   • params, body, deps, validation, streaming, is_disconnected,
+  │                                     mounts, raw-MW-alone, bare-generators, exceptions  → ALL work now
+  │
+  └─ <span class="bad">declines (1 case)</span> ─────▶  <b style="color:#4a90d9">Python dispatcher</b> (_asgi_dispatch_in_process, ~3.3K LOC)  <span class="bad">◀ want to DELETE</span>
+                                       └─ if it can't ──▶ loopback proxy (httpx → the app.run Rust server, over localhost)
+
+WebSocket request
+  │
+  └─ <span class="bad">always</span> ─────────────────▶  <b style="color:#4a90d9">Python WS dispatcher</b> (_asgi_dispatch_ws_in_process, ~900 LOC)  <span class="bad">◀ want to DELETE</span>
+                                       └─ fallback ──▶ loopback WS proxy (websockets client → app.run Rust server)
+</div>
+<p class="sub">Progress this session cut the HTTP declines from <b>107 → 1</b>. The only two things still NOT on the Rust door:
+<b>(HTTP)</b> one middleware-ordering edge case, and <b>(WS)</b> all in-process WebSockets.</p>
+
+<h2>3 · The HTTP middleware-ordering problem (the 1 remaining HTTP decline)</h2>
+<p class="sub">Middleware runs in two different places, so their order is fixed — opposite to what Starlette guarantees
+when the kinds are mixed:</p>
+<div class="flow">
+Starlette rule: LAST add_middleware(...) = OUTERMOST.
+
+  app.add_middleware(HTTPSRedirect)     # Tower kind
+  app.add_middleware(MyCustomASGI)      # raw ASGI kind, added later  → must be OUTERMOST
+
+What the door does:
+  ┌─ Tower MW  (CORS / GZip / HTTPSRedirect)   = Rust router LAYERS      ── always OUTER ──┐
+  │     ┌─ raw ASGI MW (Session / Sentry / custom) = Python handler-WRAPPER  ── always INNER ──┐ │
+  │     │        handler                                                                        │ │
+  └─────┴────────────────────────────────────────────────────────────────────────────────────┘ ┘
+
+  HTTPSRedirect (OUTER) returns 307 BEFORE the handler  →  the raw MW (INNER) never runs
+  →  it can't decorate the redirect.   <span class="bad">test_mixed_tower_and_raw_asgi_middleware_order fails IF routed to the door.</span>
+
+  Affects: the dev/in-process path, only when a raw ASGI MW is registered AFTER a Tower MW
+           that short-circuits. Rare. NOT failing today (the dispatcher still handles it).
+</div>
+
+<h2>4 · Full gap inventory — what's missing on the Rust door</h2>
+<table>
+<tr><th>Area</th><th>On the Rust door?</th><th>Notes</th></tr>
+<tr><td>HTTP params / body / deps / validation / 422</td><td><span class="pill p-ok">works</span></td><td>incl. the 12 gap fixes + 2 bug fixes this session</td></tr>
+<tr><td>HTTP streaming / SSE / FileResponse / is_disconnected</td><td><span class="pill p-ok">works</span></td><td>7.3a Axum BodyDataStream + 7.3b disconnect Event + cancellation</td></tr>
+<tr><td>HTTP mounts, raw-MW-alone, bare-generator NDJSON, exceptions</td><td><span class="pill p-ok">works</span></td><td>7.1 / 7.2 / bare-gen</td></tr>
+<tr><td><b>HTTP mixed Tower + raw MW ordering</b></td><td><span class="pill p-ok">works (H2)</span></td><td>door composes the registration-ordered ASGI chain (see §0)</td></tr>
+<tr><td><b>WebSocket — ALL in-process</b></td><td><span class="pill p-ok">works (W1)</span></td><td>Python WebSocket over ASGI receive/send reusing <code>_wrap_websocket_endpoint</code> (see §0)</td></tr>
+<tr><td>WebSocket via <code>app.run()</code> (sockets)</td><td><span class="pill p-ok">works</span></td><td>real Axum + tungstenite — unaffected</td></tr>
+</table>
+
+<h2>5 · Your options (HISTORICAL — both dispatchers are now deleted)</h2>
+<p class="sub" style="color:var(--ok)">RESOLVED: we shipped <b>H2</b> (door composes mixed Tower+raw MW itself) and a leaner <b>W1</b> (in-process WS over ASGI reusing the shared wrapper — no Rust cross-loop pumps). Both dispatchers deleted; see §0. The options below are kept as the decision record.</p>
+
+<h3>HTTP dispatcher (~3.3K LOC) — blocked only by the mixed-MW ordering</h3>
+<table>
+<tr><th>Option</th><th>What</th><th>Effort</th><th>Result</th></tr>
+<tr><td><b>H1 · xfail</b></td><td>Drop the mixed-MW decline, mark the 1 ordering test <code>xfail</code> (documented), delete the HTTP dispatcher.</td><td><span class="pill p-ok">~10 lines</span></td><td>HTTP dispatcher gone; 1 documented, reversible parity gap (rare combo, dev path only).</td></tr>
+<tr><td><b>H2 · full MW unify</b></td><td>Rebuild the door's whole MW stack (Tower + @middleware + BaseHTTP + raw) into one registration-ordered Python chain (real Starlette MW).</td><td><span class="pill p-bad">~400+ LOC, high risk</span></td><td>HTTP dispatcher gone; zero gap. Re-validates the entire MW surface.</td></tr>
+<tr><td><b>H3 · keep as fallback</b></td><td>Keep declining mixed-MW to the dispatcher. Door handles everything else.</td><td><span class="pill p-ok">0</span></td><td>Zero gap, zero risk — but the ~3.3K dispatcher STAYS (clone not deleted).</td></tr>
+</table>
+
+<h3>WebSocket dispatcher (~900 LOC) — blocked by all in-process WS</h3>
+<table>
+<tr><th>Option</th><th>What</th><th>Effort</th><th>Result</th></tr>
+<tr><td><b>W1 · in-process Rust WS door</b></td><td>Reuse the Rust <code>PyWebSocket</code>, feed its channels from ASGI receive/send (needs an ASGI-mode path around its Axum-upgrade handshake + cross-loop pumps).</td><td><span class="pill p-bad">large</span></td><td>WS dispatcher gone; socket-free in-process WS.</td></tr>
+<tr><td><b>W2 · harden the loopback WS proxy</b></td><td>Make the existing 28-line proxy faithful (forward accept/reject, close codes, subprotocols, dep errors; fix the deadlock), route in-process WS through it.</td><td><span class="pill p-warn">moderate</span></td><td>WS dispatcher gone; in-process WS goes over a localhost socket to the app.run Rust engine (real Axum + tungstenite).</td></tr>
+<tr><td><b>W3 · keep WS dispatcher</b></td><td>Leave it; the door stays HTTP-only.</td><td><span class="pill p-ok">0</span></td><td>Works today; the ~900-LOC WS clone STAYS.</td></tr>
+</table>
+
+<h2>6 · Recommendation</h2>
+<div class="rec">
+<b>H1 + W2</b> — the minimal-code path that still <b>deletes both dispatchers</b> (~4.2K LOC of clone gone):
+<ul>
+  <li><b>HTTP:</b> <code>xfail</code> the single mixed-MW ordering test → delete the 3.3K-line HTTP dispatcher. One documented, reversible gap on the dev path for a rare middleware combo. The full MW unify (H2) stays a tracked follow-up to close it later.</li>
+  <li><b>WS:</b> harden the loopback proxy (W2) → delete the 900-line WS dispatcher. In-process WS rides the <i>real</i> Axum + tungstenite engine over localhost — reuses the framework (your directive), far less code than a from-scratch Rust WS door (W1), and your <code>app.run()</code> WS is untouched and direct.</li>
+</ul>
+<b>Why not the big builds:</b> H2 (MW unify) and W1 (Rust WS door) are each multi-hour, high-risk, and only matter for the dev/in-process path — your product path (<code>app.run()</code>) already uses the full Rust engine for both HTTP and WS. The pros (zero gap / socket-free) are small next to the cost.
+<br><br>
+<b>If you want ZERO gaps and don't mind the work:</b> H2 + W1. <b>If you want zero risk now and accept keeping the clone:</b> H3 + W3 (do nothing — the door already handles ~99%).
+</div>
+
+<p class="sub" style="margin-top:18px">Everything is committed &amp; green (full 1125 / parity 151 / WS 22). Nothing below is started yet — your call drives it.</p>
+</body>
+</html>

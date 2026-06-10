@@ -23,7 +23,7 @@ const STATIC_CACHE_MAX_BYTES: u64 = 1024 * 1024;
 #[derive(Clone)]
 struct CachedFile {
     bytes: bytes::Bytes,
-    content_type: &'static str,
+    content_type: String,
     mtime: SystemTime,
     /// Monotonic instant of the last mtime validation. We revalidate at most
     /// once per `STATIC_TTL`; within that window, serve from cache without
@@ -42,27 +42,41 @@ fn static_cache() -> &'static Mutex<HashMap<String, CachedFile>> {
     STATIC_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn mime_for(path: &str) -> &'static str {
+/// Extension → Content-Type map, populated once at startup from Python's
+/// ``mimetypes`` module (Starlette's source of truth). A hardcoded Rust
+/// table — or ``mime_guess`` — cannot match Starlette across Python
+/// versions / OS mime files (e.g. ``.js`` is ``text/javascript`` on 3.12+
+/// but ``application/javascript`` on 3.10/3.11; ``.yaml`` / ``.xml`` /
+/// ``.otf`` also differ). The map values already include the charset
+/// suffix per Starlette's rule (``; charset=utf-8`` iff ``text/*``).
+/// Keys are lowercase extensions WITHOUT the dot (e.g. "js").
+static STATIC_MIME_MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+/// Starlette's fallback when ``mimetypes.guess_type`` returns None:
+/// ``media_type = "text/plain"`` then ``; charset=utf-8`` (it's ``text/*``).
+const STATIC_MIME_FALLBACK: &str = "text/plain; charset=utf-8";
+
+/// Install the Python-derived extension→Content-Type map. Idempotent
+/// (first call wins; later ``run_server`` calls in a test session reuse
+/// the process-global ``mimetypes`` registry, which doesn't change).
+fn set_static_mime_map(pairs: Vec<(String, String)>) {
+    let _ = STATIC_MIME_MAP.set(pairs.into_iter().collect());
+}
+
+fn mime_for(path: &str) -> String {
     let p = path.to_ascii_lowercase();
-    let ext = p.rsplit('.').next().unwrap_or("");
-    match ext {
-        "html" | "htm" => "text/html; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "js" | "mjs" => "application/javascript; charset=utf-8",
-        "json" => "application/json",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "ico" => "image/x-icon",
-        "wasm" => "application/wasm",
-        "txt" => "text/plain; charset=utf-8",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        _ => "application/octet-stream",
+    // Only treat a trailing ".ext" as an extension — guard against paths
+    // with no dot (rsplit would yield the whole filename otherwise).
+    let ext = match p.rsplit_once('.') {
+        Some((_, e)) => e,
+        None => return STATIC_MIME_FALLBACK.to_string(),
+    };
+    if let Some(map) = STATIC_MIME_MAP.get() {
+        if let Some(ct) = map.get(ext) {
+            return ct.clone();
+        }
     }
+    STATIC_MIME_FALLBACK.to_string()
 }
 
 /// Set of static-mount prefixes ("/static", etc.) — populated at server
@@ -201,7 +215,7 @@ where
                                     full_str,
                                     CachedFile {
                                         bytes: bytes.clone(),
-                                        content_type: ct,
+                                        content_type: ct.clone(),
                                         mtime,
                                         validated_at: std::time::Instant::now(),
                                     },
@@ -389,7 +403,7 @@ const REDOC_HTML: &str = r#"
 ///
 /// This function blocks until the server shuts down (Ctrl-C).
 #[pyfunction]
-#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![], root_path=None, redirect_slashes=true, max_request_size=None, not_found_handler=None, app=None, validation_handler=None, swagger_ui_oauth2_redirect_url=None, swagger_ui_html=None, redoc_html=None))]
+#[pyo3(signature = (routes, host, port, middlewares=vec![], openapi_json=None, docs_url=None, redoc_url=None, openapi_url=None, static_mounts=vec![], root_path=None, redirect_slashes=true, max_request_size=None, not_found_handler=None, app=None, validation_handler=None, swagger_ui_oauth2_redirect_url=None, swagger_ui_html=None, redoc_html=None, static_content_types=vec![]))]
 pub fn run_server(
     py: Python<'_>,
     routes: Vec<RouteInfo>,
@@ -410,7 +424,14 @@ pub fn run_server(
     swagger_ui_oauth2_redirect_url: Option<String>,
     swagger_ui_html: Option<String>,
     redoc_html: Option<String>,
+    static_content_types: Vec<(String, String)>,
 ) -> PyResult<()> {
+    // Install the Python-derived extension→Content-Type map (Starlette's
+    // ``mimetypes``-based source of truth) before any static request is
+    // served. Empty when the app declares no static mounts.
+    if !static_content_types.is_empty() {
+        set_static_mime_map(static_content_types);
+    }
     // Stash the user's 404 handler so the Rust Router fallback can dispatch
     // through Python when nothing else matched. Set once per process.
     // Always overwrite (RwLock, not OnceLock) so successive app.run()
@@ -420,6 +441,11 @@ pub fn run_server(
     if let Ok(mut slot) = crate::router::NOT_FOUND_HANDLER.write() {
         *slot = not_found_handler;
     }
+    // Clone the app for the runtime's worker threads BEFORE it's moved into the
+    // global slot — each worker thread of THIS server binds itself to this app so
+    // the door's 500-capture targets the right ``_captured_server_exceptions`` when
+    // multiple apps run their own loopback servers in one process.
+    let app_for_threads: Option<Py<PyAny>> = app.as_ref().map(|a| a.clone_ref(py));
     if let Ok(mut slot) = crate::router::APP_INSTANCE.write() {
         *slot = app;
     }
@@ -430,261 +456,84 @@ pub fn run_server(
     let mw_configs = parse_middleware_configs(py, &middlewares)?;
 
     // Release the GIL for the entire duration of the blocking server run.
-    py.detach(|| {
-        let rt = Runtime::new().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Failed to create tokio runtime: {e}"
-            ))
-        })?;
-
-        // Build per-server declared-paths Arcs for the redirect_slashes
-        // and non_preflight_options middlewares. Each server owns its
-        // own view — sharing a global static across concurrent test apps
-        // caused later-starting servers to overwrite an earlier server's
-        // set (→ 404s on the earlier app's routes).
-        let declared_paths_arc: std::sync::Arc<std::collections::HashSet<String>> = {
-            let set: std::collections::HashSet<String> =
-                routes.iter().map(|r| r.path.clone()).collect();
-            std::sync::Arc::new(set)
-        };
-        let declared_options_paths_arc: std::sync::Arc<std::collections::HashSet<String>> = {
-            let opts: std::collections::HashSet<String> = routes
-                .iter()
-                .filter(|r| r.methods.iter().any(|m| m.eq_ignore_ascii_case("OPTIONS")))
-                .map(|r| r.path.clone())
-                .collect();
-            std::sync::Arc::new(opts)
-        };
-        // Per-path declared-method map AND a registration-ordered
-        // ``Vec<(template, methods)>`` for the OPTIONS middleware.
-        // First-match-wins parity with upstream FastAPI requires
-        // walking templates in REGISTRATION order; the HashMap's
-        // iteration order is non-deterministic. Earlier code used
-        // "most specific" tiebreak (fewest ``{}`` segments) which
-        // matched matchit's behaviour but diverged from Starlette
-        // for overlapping literal/param routes (R27).
-        let allow_methods_by_path_arc: std::sync::Arc<
-            std::collections::HashMap<String, Vec<String>>,
-        > = {
-            let mut map: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            for r in &routes {
-                let entry = map.entry(r.path.clone()).or_default();
-                for m in &r.methods {
-                    let up = m.to_ascii_uppercase();
-                    if !entry.iter().any(|x| x == &up) {
-                        entry.push(up);
-                    }
-                }
-            }
-            std::sync::Arc::new(map)
-        };
-        let allow_methods_in_order_arc: std::sync::Arc<Vec<(String, Vec<String>)>> = {
-            let mut order: Vec<(String, Vec<String>)> = Vec::with_capacity(routes.len());
-            for r in &routes {
-                let methods: Vec<String> = r
-                    .methods
-                    .iter()
-                    .map(|m| m.to_ascii_uppercase())
-                    .collect();
-                if let Some(existing) =
-                    order.iter_mut().find(|(p, _)| p == &r.path)
-                {
-                    for m in methods {
-                        if !existing.1.iter().any(|x| x == &m) {
-                            existing.1.push(m);
-                        }
-                    }
-                } else {
-                    order.push((r.path.clone(), methods));
-                }
-            }
-            std::sync::Arc::new(order)
-        };
-        // Also populate the legacy globals for any single-app code paths
-        // (best-effort; authoritative is the per-server Arc).
-        if let Ok(mut slot) = DECLARED_PATHS.write() {
-            *slot = Some((*declared_paths_arc).clone());
-        }
-        if let Ok(mut slot) = DECLARED_OPTIONS_PATHS.write() {
-            *slot = Some((*declared_options_paths_arc).clone());
-        }
-
-        rt.block_on(async move {
-            let (mut router, ws_router) = build_router(routes);
-
-            // Pure Rust baseline endpoints — zero Python
-            router = router.route("/_ping", get(|| async {
-                (
-                    axum::http::StatusCode::OK,
-                    [("content-type", "application/json")],
-                    r#"{"ping":"pong"}"#,
-                )
-            }));
-
-            // Pure Rust WebSocket echo — measures Axum WS baseline (no Python)
-            router = router.route("/_ws-echo", axum::routing::any(
-                |ws: axum::extract::ws::WebSocketUpgrade| async {
-                    ws.on_upgrade(crate::websocket::handle_ws_echo_rust)
-                }
-            ));
-
-            // Add OpenAPI / documentation routes if enabled. An empty
-            // ``openapi_url`` means "disable OpenAPI + docs entirely" —
-            // FA behavior tested by ``test_conditional_openapi``.
-            // Docs UI is set up as long as ``openapi_url`` is set;
-            // JSON endpoint is auto-registered only when
-            // ``openapi_json`` is also provided (else Python handles it).
-            if openapi_url.is_some() {
-                let oa_url = openapi_url.as_deref().unwrap_or("/openapi.json");
-                if oa_url.is_empty() {
-                    // Skip openapi + docs routes; ``/openapi.json`` / ``/docs``
-                    // simply return 404.
-                } else {
-
-                if let Some(ref schema_json) = openapi_json {
-                    let json_clone = schema_json.clone();
-                    router = router.route(
-                        oa_url,
-                        get(move || async move {
-                            (
-                                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                                json_clone.clone(),
-                            )
-                        }),
-                    );
-                }
-
-                // Swagger UI — prefer Python-rendered HTML
-                // (``get_swagger_ui_html``) when supplied by the
-                // application; fall back to the embedded default
-                // template. Python rendering honours FA kwargs like
-                // ``swagger_ui_parameters`` and ``swagger_ui_init_oauth``.
-                if let Some(ref docs_path) = docs_url {
-                    let swagger_final = if let Some(s) = swagger_ui_html.clone() {
-                        s
-                    } else if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
-                        SWAGGER_UI_HTML
-                            .replace("__OPENAPI_URL__", oa_url)
-                            .replace("__OAUTH2_REDIRECT_URL__", oauth_redirect)
-                    } else {
-                        SWAGGER_UI_HTML
-                            .replace("__OPENAPI_URL__", oa_url)
-                            .lines()
-                            .filter(|l| !l.contains("oauth2RedirectUrl"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    };
-                    router = router.route(
-                        docs_path,
-                        get(move || async move {
-                            axum::response::Html(swagger_final.clone())
-                        }),
-                    );
-                    if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
-                        router = router.route(
-                            oauth_redirect,
-                            get(|| async {
-                                axum::response::Html(SWAGGER_OAUTH2_REDIRECT_HTML)
-                            }),
-                        );
-                    }
-                }
-
-                // ReDoc — similarly prefer Python-rendered HTML.
-                if let Some(ref redoc_path) = redoc_url {
-                    let redoc_final = redoc_html.clone().unwrap_or_else(|| {
-                        REDOC_HTML.replace("__OPENAPI_URL__", oa_url)
-                    });
-                    router = router.route(
-                        redoc_path,
-                        get(move || async move {
-                            axum::response::Html(redoc_final.clone())
-                        }),
-                    );
-                }
-                } // end: oa_url non-empty
-            }
-
-            // Register prefixes so the redirect_slashes middleware can
-            // short-circuit for static file requests.
-            let prefix_list: Vec<String> = static_mounts
-                .iter()
-                .map(|(p, _)| p.trim_end_matches('/').to_string())
-                .collect();
-            let _ = STATIC_PREFIXES.set(prefix_list.clone());
-
-            // FastAPI/Starlette semantics: root_path is metadata only — it is
-            // advertised in OpenAPI `servers` and used by `url_for`, but the
-            // routing layer always matches paths as-written. The ASGI server or
-            // reverse proxy is responsible for stripping the prefix before the
-            // request reaches us. vLLM relies on this behaviour.
-            let _ = &root_path;
-
-            // Apply app-level middleware (CORS, GZip, etc.) to the MAIN
-            // (HTTP) router. WebSocket routes are merged in AFTER middleware
-            // so they bypass the CORS/compression stack — tower-http's
-            // CorsLayer mutates the 101 Switching Protocols upgrade response
-            // and breaks the WS handshake when applied to WS routes.
-            let main_with_mw = apply_middlewares(router, &mw_configs);
-            // Merge WS routes in at the top level (no CORS). Then attach the
-            // FastAPI-style 404 fallback so it only fires when neither the
-            // HTTP nor WS branches matched.
-            let main_with_mw = crate::router::with_not_found_fallback(
-                ws_router.merge(main_with_mw)
-            );
-            let mut app = axum::Router::new();
-            for (prefix, directory) in &static_mounts {
-                let svc = CachedServeDir::new(prefix, std::path::PathBuf::from(directory));
-                app = app.nest_service(prefix, svc);
-            }
-            let mut app = app.fallback_service(main_with_mw);
-
-            // redirect_slashes: trailing-slash redirect middleware.
-            // Matches Starlette's `redirect_slashes=True` default.
-            if redirect_slashes {
-                let paths_arc = declared_paths_arc.clone();
-                app = app.layer(axum::middleware::from_fn(
-                    move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-                        let paths = paths_arc.clone();
-                        async move { slashes_redirect_middleware_with_paths(req, next, paths).await }
-                    },
-                ));
-            }
-
-            // Non-preflight OPTIONS: FastAPI/Starlette's CORS intercepts
-            // only actual cross-origin preflights (request has both
-            // `Origin` AND `Access-Control-Request-Method`). tower-http's
-            // CorsLayer is more lenient and returns 200 for any OPTIONS.
-            // We add a pre-middleware that lets OPTIONS *without* those
-            // headers fall through to method routing (→ 405 as expected).
-            let opts_paths_arc = declared_options_paths_arc.clone();
-            let allow_by_path_arc = allow_methods_by_path_arc.clone();
-            let allow_in_order_arc = allow_methods_in_order_arc.clone();
-            app = app.layer(axum::middleware::from_fn(
-                move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-                    let paths = opts_paths_arc.clone();
-                    let allow = allow_by_path_arc.clone();
-                    let order = allow_in_order_arc.clone();
-                    async move {
-                        non_preflight_options_middleware_with_paths(
-                            req, next, paths, allow, order,
-                        ).await
-                    }
-                },
-            ));
-
-            // max_request_size: 413 Payload Too Large on oversized bodies.
-            if let Some(limit) = max_request_size {
-                app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(limit));
-            }
-
-            let addr = format!("{host}:{port}");
-            let listener = TcpListener::bind(&addr).await.map_err(|e| {
-                pyo3::exceptions::PyOSError::new_err(format!(
-                    "Failed to bind to {addr}: {e}"
+    py.detach(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            // Bind every worker thread to THIS server's app (once at thread start —
+            // no per-request cost) so error capture finds the right app.
+            .on_thread_start(move || {
+                let bound = app_for_threads
+                    .as_ref()
+                    .map(|a| Python::attach(|py| a.clone_ref(py)));
+                crate::router::set_current_app(bound);
+            })
+            .build()
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to create tokio runtime: {e}"
                 ))
             })?;
+
+        // Assemble the complete Axum application router: user routes +
+        // the pure-Rust baseline endpoints + OpenAPI/docs + static mounts
+        // + the full Tower layer stack (CORS / compression /
+        // redirect_slashes / non-preflight-OPTIONS / body-limit). Pure,
+        // synchronous, and socket-free — so the SAME router is both served
+        // here over a TcpListener (the ``app.run()`` door) and can be
+        // driven in-process per request via ``tower::Service::oneshot``
+        // (the ASGI door). One engine, one router, two doors.
+        let _ = &root_path; // metadata only; never consulted by Rust routing
+        let app = assemble_app_router(
+            routes,
+            &mw_configs,
+            openapi_json,
+            docs_url,
+            redoc_url,
+            openapi_url,
+            &static_mounts,
+            redirect_slashes,
+            max_request_size,
+            swagger_ui_oauth2_redirect_url,
+            swagger_ui_html,
+            redoc_html,
+        );
+
+        rt.block_on(async move {
+
+            let addr = format!("{host}:{port}");
+            // Build the listener with SO_REUSEPORT so multiple worker
+            // PROCESSES can share one port (the kernel load-balances accepts)
+            // — the standard way Python servers scale past the single-process
+            // GIL ceiling across cores (à la `gunicorn -w N`). Plain
+            // `TcpListener::bind` for non-IP hosts (preserves DNS resolution).
+            let listener = match addr.parse::<std::net::SocketAddr>() {
+                Ok(sock_addr) => {
+                    let socket = if sock_addr.is_ipv4() {
+                        tokio::net::TcpSocket::new_v4()
+                    } else {
+                        tokio::net::TcpSocket::new_v6()
+                    }
+                    .map_err(|e| {
+                        pyo3::exceptions::PyOSError::new_err(format!("socket(): {e}"))
+                    })?;
+                    let _ = socket.set_reuseaddr(true);
+                    #[cfg(unix)]
+                    let _ = socket.set_reuseport(true);
+                    socket.bind(sock_addr).map_err(|e| {
+                        pyo3::exceptions::PyOSError::new_err(format!(
+                            "Failed to bind to {addr}: {e}"
+                        ))
+                    })?;
+                    socket.listen(1024).map_err(|e| {
+                        pyo3::exceptions::PyOSError::new_err(format!("listen(): {e}"))
+                    })?
+                }
+                Err(_) => TcpListener::bind(&addr).await.map_err(|e| {
+                    pyo3::exceptions::PyOSError::new_err(format!(
+                        "Failed to bind to {addr}: {e}"
+                    ))
+                })?,
+            };
 
             // Publish the bound address so request scopes can populate
             // `scope["server"] = (host, port)` / `.scheme` — FastAPI fills
@@ -707,6 +556,792 @@ pub fn run_server(
                 })?;
 
             Ok(())
+        })
+    })
+}
+
+/// Assemble the complete Axum application router used by BOTH request doors.
+///
+/// Pure and synchronous: it builds the per-server declared-path/method Arcs,
+/// the user routes, the pure-Rust baseline endpoints, the OpenAPI/docs routes,
+/// the static-file mounts, and the full Tower layer stack
+/// (CORS / compression / redirect_slashes / non-preflight-OPTIONS / body-limit),
+/// then returns the finished `axum::Router`. It binds no socket, so the returned
+/// router can be either served via `axum::serve` (the `app.run()` door) or driven
+/// in-process per request via `tower::Service::oneshot` (the ASGI door) — keeping
+/// the two doors byte-identical: one engine, one router.
+#[allow(clippy::too_many_arguments)]
+fn assemble_app_router(
+    routes: Vec<RouteInfo>,
+    mw_configs: &[MiddlewareConfig],
+    openapi_json: Option<String>,
+    docs_url: Option<String>,
+    redoc_url: Option<String>,
+    openapi_url: Option<String>,
+    static_mounts: &[(String, String)],
+    redirect_slashes: bool,
+    max_request_size: Option<usize>,
+    swagger_ui_oauth2_redirect_url: Option<String>,
+    swagger_ui_html: Option<String>,
+    redoc_html: Option<String>,
+) -> axum::Router {
+    // Build per-server declared-paths Arcs for the redirect_slashes
+    // and non_preflight_options middlewares. Each server owns its
+    // own view — sharing a global static across concurrent test apps
+    // caused later-starting servers to overwrite an earlier server's
+    // set (→ 404s on the earlier app's routes).
+    let declared_paths_arc: std::sync::Arc<std::collections::HashSet<String>> = {
+        let set: std::collections::HashSet<String> =
+            routes.iter().map(|r| r.path.clone()).collect();
+        std::sync::Arc::new(set)
+    };
+    let declared_options_paths_arc: std::sync::Arc<std::collections::HashSet<String>> = {
+        let opts: std::collections::HashSet<String> = routes
+            .iter()
+            .filter(|r| r.methods.iter().any(|m| m.eq_ignore_ascii_case("OPTIONS")))
+            .map(|r| r.path.clone())
+            .collect();
+        std::sync::Arc::new(opts)
+    };
+    // Per-path declared-method map AND a registration-ordered
+    // ``Vec<(template, methods)>`` for the OPTIONS middleware.
+    // First-match-wins parity with upstream FastAPI requires
+    // walking templates in REGISTRATION order; the HashMap's
+    // iteration order is non-deterministic. Earlier code used
+    // "most specific" tiebreak (fewest ``{}`` segments) which
+    // matched matchit's behaviour but diverged from Starlette
+    // for overlapping literal/param routes (R27).
+    let allow_methods_by_path_arc: std::sync::Arc<
+        std::collections::HashMap<String, Vec<String>>,
+    > = {
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in &routes {
+            let entry = map.entry(r.path.clone()).or_default();
+            for m in &r.methods {
+                let up = m.to_ascii_uppercase();
+                if !entry.iter().any(|x| x == &up) {
+                    entry.push(up);
+                }
+            }
+        }
+        std::sync::Arc::new(map)
+    };
+    let allow_methods_in_order_arc: std::sync::Arc<Vec<(String, Vec<String>)>> = {
+        let mut order: Vec<(String, Vec<String>)> = Vec::with_capacity(routes.len());
+        for r in &routes {
+            let methods: Vec<String> = r
+                .methods
+                .iter()
+                .map(|m| m.to_ascii_uppercase())
+                .collect();
+            if let Some(existing) =
+                order.iter_mut().find(|(p, _)| p == &r.path)
+            {
+                for m in methods {
+                    if !existing.1.iter().any(|x| x == &m) {
+                        existing.1.push(m);
+                    }
+                }
+            } else {
+                order.push((r.path.clone(), methods));
+            }
+        }
+        std::sync::Arc::new(order)
+    };
+    // Also populate the legacy globals for any single-app code paths
+    // (best-effort; authoritative is the per-server Arc).
+    if let Ok(mut slot) = DECLARED_PATHS.write() {
+        *slot = Some((*declared_paths_arc).clone());
+    }
+    if let Ok(mut slot) = DECLARED_OPTIONS_PATHS.write() {
+        *slot = Some((*declared_options_paths_arc).clone());
+    }
+
+    let (mut router, ws_router) = build_router(routes);
+
+    // Pure Rust baseline endpoints — zero Python
+    router = router.route("/_ping", get(|| async {
+        (
+            axum::http::StatusCode::OK,
+            [("content-type", "application/json")],
+            r#"{"ping":"pong"}"#,
+        )
+    }));
+
+    // Add OpenAPI / documentation routes if enabled. An empty
+    // ``openapi_url`` means "disable OpenAPI + docs entirely" —
+    // FA behavior tested by ``test_conditional_openapi``.
+    // Docs UI is set up as long as ``openapi_url`` is set;
+    // JSON endpoint is auto-registered only when
+    // ``openapi_json`` is also provided (else Python handles it).
+    if openapi_url.is_some() {
+        let oa_url = openapi_url.as_deref().unwrap_or("/openapi.json");
+        if oa_url.is_empty() {
+            // Skip openapi + docs routes; ``/openapi.json`` / ``/docs``
+            // simply return 404.
+        } else {
+
+        if let Some(ref schema_json) = openapi_json {
+            let json_clone = schema_json.clone();
+            router = router.route(
+                oa_url,
+                get(move || async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        json_clone.clone(),
+                    )
+                }),
+            );
+        }
+
+        // Swagger UI — prefer Python-rendered HTML
+        // (``get_swagger_ui_html``) when supplied by the
+        // application; fall back to the embedded default
+        // template. Python rendering honours FA kwargs like
+        // ``swagger_ui_parameters`` and ``swagger_ui_init_oauth``.
+        if let Some(ref docs_path) = docs_url {
+            let swagger_final = if let Some(s) = swagger_ui_html.clone() {
+                s
+            } else if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
+                SWAGGER_UI_HTML
+                    .replace("__OPENAPI_URL__", oa_url)
+                    .replace("__OAUTH2_REDIRECT_URL__", oauth_redirect)
+            } else {
+                SWAGGER_UI_HTML
+                    .replace("__OPENAPI_URL__", oa_url)
+                    .lines()
+                    .filter(|l| !l.contains("oauth2RedirectUrl"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            router = router.route(
+                docs_path,
+                get(move || async move {
+                    axum::response::Html(swagger_final.clone())
+                }),
+            );
+            if let Some(ref oauth_redirect) = swagger_ui_oauth2_redirect_url {
+                router = router.route(
+                    oauth_redirect,
+                    get(|| async {
+                        axum::response::Html(SWAGGER_OAUTH2_REDIRECT_HTML)
+                    }),
+                );
+            }
+        }
+
+        // ReDoc — similarly prefer Python-rendered HTML.
+        if let Some(ref redoc_path) = redoc_url {
+            let redoc_final = redoc_html.clone().unwrap_or_else(|| {
+                REDOC_HTML.replace("__OPENAPI_URL__", oa_url)
+            });
+            router = router.route(
+                redoc_path,
+                get(move || async move {
+                    axum::response::Html(redoc_final.clone())
+                }),
+            );
+        }
+        } // end: oa_url non-empty
+    }
+
+    // Register prefixes so the redirect_slashes middleware can
+    // short-circuit for static file requests.
+    let prefix_list: Vec<String> = static_mounts
+        .iter()
+        .map(|(p, _)| p.trim_end_matches('/').to_string())
+        .collect();
+    let _ = STATIC_PREFIXES.set(prefix_list.clone());
+
+    // Apply app-level middleware (CORS, GZip, etc.) to the MAIN
+    // (HTTP) router. WebSocket routes are merged in AFTER middleware
+    // so they bypass the CORS/compression stack — tower-http's
+    // CorsLayer mutates the 101 Switching Protocols upgrade response
+    // and breaks the WS handshake when applied to WS routes.
+    let main_with_mw = apply_middlewares(router, mw_configs);
+    // Merge WS routes in at the top level (no CORS). Then attach the
+    // FastAPI-style 404 fallback so it only fires when neither the
+    // HTTP nor WS branches matched.
+    let main_with_mw = crate::router::with_not_found_fallback(
+        ws_router.merge(main_with_mw)
+    );
+    let mut app = axum::Router::new();
+    for (prefix, directory) in static_mounts {
+        let svc = CachedServeDir::new(prefix, std::path::PathBuf::from(directory));
+        app = app.nest_service(prefix, svc);
+    }
+    let mut app = app.fallback_service(main_with_mw);
+
+    // redirect_slashes: trailing-slash redirect middleware.
+    // Matches Starlette's `redirect_slashes=True` default.
+    if redirect_slashes {
+        let paths_arc = declared_paths_arc.clone();
+        app = app.layer(axum::middleware::from_fn(
+            move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                let paths = paths_arc.clone();
+                async move { slashes_redirect_middleware_with_paths(req, next, paths).await }
+            },
+        ));
+    }
+
+    // Non-preflight OPTIONS: FastAPI/Starlette's CORS intercepts
+    // only actual cross-origin preflights (request has both
+    // `Origin` AND `Access-Control-Request-Method`). tower-http's
+    // CorsLayer is more lenient and returns 200 for any OPTIONS.
+    // We add a pre-middleware that lets OPTIONS *without* those
+    // headers fall through to method routing (→ 405 as expected).
+    let opts_paths_arc = declared_options_paths_arc.clone();
+    let allow_by_path_arc = allow_methods_by_path_arc.clone();
+    let allow_in_order_arc = allow_methods_in_order_arc.clone();
+    app = app.layer(axum::middleware::from_fn(
+        move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+            let paths = opts_paths_arc.clone();
+            let allow = allow_by_path_arc.clone();
+            let order = allow_in_order_arc.clone();
+            async move {
+                non_preflight_options_middleware_with_paths(
+                    req, next, paths, allow, order,
+                ).await
+            }
+        },
+    ));
+
+    // max_request_size: 413 Payload Too Large on oversized bodies.
+    if let Some(limit) = max_request_size {
+        app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(limit));
+    }
+
+    app
+}
+
+// ── The in-process ASGI door (the second door into the one engine) ──────
+//
+// `run_server` serves the assembled router over a TcpListener. The ASGI
+// door instead drives the SAME assembled router in-process, per request,
+// via `tower::Service::oneshot` — no socket, no double-hop. uvicorn /
+// serverless / TestClient(in_process) feed requests here.
+
+/// Process-global multi-threaded tokio runtime that drives the in-process
+/// ASGI door. Multi-threaded on purpose: the dispatch core's sync-handler
+/// arms call `tokio::task::block_in_place`, which is only legal on a
+/// multi-thread runtime. Created once, lazily, on first ASGI request.
+static ONESHOT_RT: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+
+fn oneshot_runtime() -> &'static Runtime {
+    ONESHOT_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build the in-process ASGI tokio runtime")
+    })
+}
+
+/// Per-app assembled routers, keyed by Python `id(app)`. A `Router` clone is
+/// cheap (Arc-backed), so each request clones the stored router and consumes
+/// the clone via `oneshot`. Keyed per app so that an `app.run()` server for
+/// app A and an in-process door for app B coexist without cross-routing.
+static APP_ROUTERS: std::sync::RwLock<
+    Option<std::collections::HashMap<u64, axum::Router>>,
+> = std::sync::RwLock::new(None);
+
+/// Build and store the assembled router for an app so the in-process ASGI
+/// door can drive it. Mirrors `run_server`'s setup (handler globals, MIME
+/// map, server addr, middleware parse, router assembly) but binds NO socket
+/// and does NOT serve — it stashes the finished router in `APP_ROUTERS`.
+#[pyfunction]
+#[pyo3(signature = (
+    app_id, routes, host, port, middlewares, openapi_json, docs_url, redoc_url,
+    openapi_url, static_mounts, root_path, redirect_slashes, max_request_size,
+    not_found_handler, app, validation_handler, swagger_ui_oauth2_redirect_url,
+    swagger_ui_html, redoc_html, static_content_types,
+))]
+pub fn register_app_router(
+    py: Python<'_>,
+    app_id: u64,
+    routes: Vec<RouteInfo>,
+    host: String,
+    port: u16,
+    middlewares: Vec<Py<PyAny>>,
+    openapi_json: Option<String>,
+    docs_url: Option<String>,
+    redoc_url: Option<String>,
+    openapi_url: Option<String>,
+    static_mounts: Vec<(String, String)>,
+    root_path: Option<String>,
+    redirect_slashes: bool,
+    max_request_size: Option<usize>,
+    not_found_handler: Option<Py<PyAny>>,
+    app: Option<Py<PyAny>>,
+    validation_handler: Option<Py<PyAny>>,
+    swagger_ui_oauth2_redirect_url: Option<String>,
+    swagger_ui_html: Option<String>,
+    redoc_html: Option<String>,
+    static_content_types: Vec<(String, String)>,
+) -> PyResult<()> {
+    if !static_content_types.is_empty() {
+        set_static_mime_map(static_content_types);
+    }
+    if let Ok(mut slot) = crate::router::NOT_FOUND_HANDLER.write() {
+        *slot = not_found_handler;
+    }
+    if let Ok(mut slot) = crate::router::APP_INSTANCE.write() {
+        *slot = app;
+    }
+    if let Ok(mut slot) = crate::router::VALIDATION_HANDLER.write() {
+        *slot = validation_handler;
+    }
+    let _ = crate::router::set_server_addr(host, port);
+    let mw_configs = parse_middleware_configs(py, &middlewares)?;
+    let _ = &root_path; // metadata only; not consulted by Rust routing
+    let router = assemble_app_router(
+        routes,
+        &mw_configs,
+        openapi_json,
+        docs_url,
+        redoc_url,
+        openapi_url,
+        &static_mounts,
+        redirect_slashes,
+        max_request_size,
+        swagger_ui_oauth2_redirect_url,
+        swagger_ui_html,
+        redoc_html,
+    );
+    let mut guard = APP_ROUTERS
+        .write()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("APP_ROUTERS lock poisoned"))?;
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(app_id, router);
+    Ok(())
+}
+
+/// Drive one HTTP request through a registered app's router in-process and
+/// return `(status, headers, body)` with the body fully buffered. The GIL is
+/// released while the runtime drives the dispatch; the Python handler
+/// re-acquires it inside the engine, exactly as under `app.run()`. The runtime
+/// door uses `process_request_streaming` (chunked body); this buffered variant
+/// is retained as a parity oracle for tests.
+#[pyfunction]
+#[pyo3(signature = (
+    app_id, method, path, query_string, headers, body, client_host, client_port,
+))]
+pub fn process_request(
+    py: Python<'_>,
+    app_id: u64,
+    method: String,
+    path: String,
+    query_string: String,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    body: Vec<u8>,
+    client_host: String,
+    client_port: u16,
+) -> PyResult<(u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
+    // Clone the per-app router (cheap, Arc-backed).
+    let router = {
+        let guard = APP_ROUTERS
+            .read()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("APP_ROUTERS lock poisoned"))?;
+        match guard.as_ref().and_then(|m| m.get(&app_id)) {
+            Some(r) => r.clone(),
+            None => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "process_request: app not registered (call register_app_router first)",
+                ))
+            }
+        }
+    };
+
+    // Rebuild the http::Request from the ASGI scope parts.
+    let uri = if query_string.is_empty() {
+        path
+    } else {
+        format!("{path}?{query_string}")
+    };
+    let mut builder = axum::http::Request::builder().method(method.as_str()).uri(uri);
+    for (k, v) in &headers {
+        builder = builder.header(k.as_slice(), v.as_slice());
+    }
+    let mut request = builder
+        .body(axum::body::Body::from(body))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("bad request: {e}")))?;
+    // ConnectInfo so `scope["client"]` can be populated. ASGI hosts that pass
+    // a non-IP client (e.g. TestClient's "testclient") simply get no
+    // ConnectInfo — request.client threading is refined in a later step.
+    if let Ok(addr) = format!("{client_host}:{client_port}").parse::<std::net::SocketAddr>() {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+    }
+
+    // Drive the router off-socket on the shared runtime with the GIL RELEASED.
+    // The oneshot future is SPAWNED onto a worker thread (not the block_on
+    // thread) so the dispatch core's `block_in_place` is always legal.
+    let result: Result<(u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>), String> = py.detach(|| {
+        oneshot_runtime().block_on(async move {
+            let join = tokio::spawn(async move {
+                use tower::ServiceExt;
+                // Router<()> is an Infallible Service, so oneshot cannot Err.
+                let response = router
+                    .oneshot(request)
+                    .await
+                    .expect("axum Router service is Infallible");
+                let status = response.status().as_u16();
+                let resp_headers: Vec<(Vec<u8>, Vec<u8>)> = response
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str().as_bytes().to_vec(), v.as_bytes().to_vec()))
+                    .collect();
+                // Bounded buffer. The oneshot door buffers the whole response
+                // (the streaming chunk-pump is a later step), so cap it to
+                // avoid unbounded memory on streaming / infinite-SSE bodies —
+                // those must route through the Python fallback until the pump
+                // lands. Fail fast with a clear, catchable error instead of
+                // OOM-ing the worker.
+                const MAX_INPROCESS_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+                let bytes =
+                    axum::body::to_bytes(response.into_body(), MAX_INPROCESS_RESPONSE_BYTES)
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "oneshot door cannot buffer this response \
+                                 (streaming/oversized > 32MiB, not yet supported): {e}"
+                            )
+                        })?;
+                Ok::<_, String>((status, resp_headers, bytes.to_vec()))
+            });
+            join.await.map_err(|e| format!("dispatch task error: {e}"))?
+        })
+    });
+    result.map_err(pyo3::exceptions::PyRuntimeError::new_err)
+}
+
+/// Look up the per-app assembled Axum router (cheap, Arc-backed clone).
+fn get_app_router(app_id: u64) -> Result<axum::Router, String> {
+    let guard = APP_ROUTERS
+        .read()
+        .map_err(|_| "APP_ROUTERS lock poisoned".to_string())?;
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&app_id))
+        .cloned()
+        .ok_or_else(|| {
+            "process_request: app not registered (call register_app_router first)".to_string()
+        })
+}
+
+/// Rebuild the ``http::Request`` from ASGI scope parts (shared by the buffered
+/// and streaming in-process entry points).
+fn build_inproc_request(
+    method: &str,
+    path: String,
+    query_string: String,
+    headers: &[(Vec<u8>, Vec<u8>)],
+    body: Vec<u8>,
+    client_host: &str,
+    client_port: u16,
+) -> Result<axum::http::Request<axum::body::Body>, String> {
+    let uri = if query_string.is_empty() {
+        path
+    } else {
+        format!("{path}?{query_string}")
+    };
+    let mut builder = axum::http::Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        builder = builder.header(k.as_slice(), v.as_slice());
+    }
+    let mut request = builder
+        .body(axum::body::Body::from(body))
+        .map_err(|e| format!("bad request: {e}"))?;
+    if let Ok(addr) = format!("{client_host}:{client_port}").parse::<std::net::SocketAddr>() {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+    }
+    Ok(request)
+}
+
+/// Streaming counterpart to [`process_request`]: drives the request through the
+/// assembled Axum router but DOES NOT buffer the body. Returns the status +
+/// headers immediately and an iterator (`PyResponseStream`) that yields the body
+/// chunks lazily — Axum's `BodyDataStream` does the framing, so the in-process
+/// door can pump a `StreamingResponse` (SSE / large / infinite) to ASGI `send`
+/// without the 32 MiB buffer cap. We add no streaming machinery of our own here;
+/// this is the GIL-releasing bridge over the same Axum `Body` `streaming.rs`
+/// already produces.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (app_id, method, path, query_string, headers, body, client_host, client_port, disconnect_flag=None))]
+pub fn process_request_streaming(
+    py: Python<'_>,
+    app_id: u64,
+    method: String,
+    path: String,
+    query_string: String,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    body: Vec<u8>,
+    client_host: String,
+    client_port: u16,
+    disconnect_flag: Option<Py<PyAny>>,
+) -> PyResult<(u16, Vec<(Vec<u8>, Vec<u8>)>, PyResponseStream)> {
+    let router = get_app_router(app_id).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    let mut request = build_inproc_request(
+        &method,
+        path,
+        query_string,
+        &headers,
+        body,
+        &client_host,
+        client_port,
+    )
+    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    // Carry the disconnect flag (a Python threading.Event) on the request so
+    // handle_request can stash it in the Request scope for is_disconnected().
+    if let Some(flag) = disconnect_flag {
+        request
+            .extensions_mut()
+            .insert(crate::router::DisconnectFlag(std::sync::Arc::new(flag)));
+    }
+
+    let result: Result<(u16, Vec<(Vec<u8>, Vec<u8>)>, axum::body::Body), String> = py.detach(|| {
+        oneshot_runtime().block_on(async move {
+            let join = tokio::spawn(async move {
+                use tower::ServiceExt;
+                let response = router
+                    .oneshot(request)
+                    .await
+                    .expect("axum Router service is Infallible");
+                let status = response.status().as_u16();
+                let resp_headers: Vec<(Vec<u8>, Vec<u8>)> = response
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str().as_bytes().to_vec(), v.as_bytes().to_vec()))
+                    .collect();
+                (status, resp_headers, response.into_body())
+            });
+            join.await.map_err(|e| format!("dispatch task error: {e}"))
+        })
+    });
+    let (status, resp_headers, axum_body) =
+        result.map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    Ok((
+        status,
+        resp_headers,
+        PyResponseStream {
+            stream: Mutex::new(Some(axum_body.into_data_stream())),
+        },
+    ))
+}
+
+/// Lazy body-chunk iterator over an Axum response `Body`. The door calls
+/// `next_chunk()` (in an executor thread) to pull one frame at a time and
+/// forward it to ASGI `send`. Axum's `BodyDataStream` owns the framing.
+#[pyclass]
+pub struct PyResponseStream {
+    // Mutex makes the (Send-but-not-Sync) BodyDataStream satisfy pyclass's
+    // Send+Sync bound; only ever locked from one executor thread at a time.
+    stream: Mutex<Option<axum::body::BodyDataStream>>,
+}
+
+#[pymethods]
+impl PyResponseStream {
+    /// Block for the next body chunk on the shared oneshot runtime (GIL
+    /// released). Returns `None` at end-of-stream.
+    fn next_chunk<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyBytes>>> {
+        use tokio_stream::StreamExt;
+        let next = py.detach(|| {
+            let mut guard = self.stream.lock().unwrap();
+            let stream = guard.as_mut()?;
+            oneshot_runtime().block_on(async { stream.next().await })
+        });
+        match next {
+            Some(Ok(b)) => Ok(Some(pyo3::types::PyBytes::new(py, &b))),
+            Some(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "oneshot door stream error: {e}"
+            ))),
+            None => {
+                *self.stream.lock().unwrap() = None;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Drop the underlying body stream (and its channel receiver) so the
+    /// streaming task in `streaming.rs` observes the receiver-drop and runs the
+    /// generator's GeneratorExit cleanup. Called by the door when the client
+    /// disconnects mid-stream (cancels an otherwise-infinite generator).
+    fn close(&self) {
+        *self.stream.lock().unwrap() = None;
+    }
+}
+
+/// Self-test for the in-process oneshot mechanism: build a trivial pure-Rust
+/// router, drive one request through it via `oneshot` on the shared runtime,
+/// and return `(status, body)`. Proves the runtime + Service::oneshot + body
+/// collection work in the built extension, independent of any Python handler.
+#[pyfunction]
+pub fn _oneshot_selftest(py: Python<'_>) -> PyResult<(u16, Vec<u8>)> {
+    py.detach(|| {
+        oneshot_runtime().block_on(async {
+            use tower::ServiceExt;
+            let app = axum::Router::new().route(
+                "/_oneshot",
+                get(|| async { axum::response::Json(serde_json::json!({"oneshot": "ok"})) }),
+            );
+            let request = axum::http::Request::builder()
+                .uri("/_oneshot")
+                .body(axum::body::Body::empty())
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+            let response = app
+                .oneshot(request)
+                .await
+                .expect("axum Router service is Infallible");
+            let status = response.status().as_u16();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+            Ok((status, bytes.to_vec()))
+        })
+    })
+}
+
+// ── Multi-worker mode: the fd-passing acceptor + worker PyO3 entries ──────
+//
+// `app.run(workers=N)` runs ONE acceptor (this process) + N forked worker
+// processes. The acceptor distributes connections; each worker runs the full
+// assembled router (all transports) on its fd-passed connections. See
+// `crate::cluster`.
+
+/// Run the fd-passing ACCEPTOR in this process: bind the TCP port + the worker
+/// registration unix socket and distribute accepted connections to the
+/// least-loaded worker. Blocks until Ctrl-C, then drains within `grace_secs`.
+#[pyfunction]
+#[pyo3(signature = (host, port, worker_sock_path, grace_secs = 10.0))]
+pub fn run_acceptor(
+    py: Python<'_>,
+    host: String,
+    port: u16,
+    worker_sock_path: String,
+    grace_secs: f64,
+) -> PyResult<()> {
+    py.detach(|| {
+        let rt = Runtime::new().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime: {e}"))
+        })?;
+        rt.block_on(async move {
+            let addr = format!("{host}:{port}");
+            let tcp = TcpListener::bind(&addr).await.map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!("Failed to bind to {addr}: {e}"))
+            })?;
+            let _ = crate::router::set_server_addr(host.clone(), port);
+            let _ = std::fs::remove_file(&worker_sock_path);
+            let unix = tokio::net::UnixListener::bind(&worker_sock_path).map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!(
+                    "Failed to bind worker socket {worker_sock_path}: {e}"
+                ))
+            })?;
+            println!("fastapi-turbo acceptor on http://{addr} (workers via {worker_sock_path})");
+            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            crate::cluster::run_acceptor(
+                tcp,
+                unix,
+                ready,
+                std::time::Duration::from_secs_f64(grace_secs),
+                async {
+                    let _ = tokio::signal::ctrl_c().await;
+                },
+            )
+            .await
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("acceptor: {e}")))
+        })
+    })
+}
+
+/// Run one WORKER in this (forked child) process: build the assembled router
+/// from the same args as `run_server`, connect to the acceptor's unix socket,
+/// and serve each fd-passed connection (all transports) with that router.
+#[pyfunction]
+#[pyo3(signature = (
+    acceptor_sock_path, routes, host, port, middlewares, openapi_json, docs_url,
+    redoc_url, openapi_url, static_mounts, root_path, redirect_slashes,
+    max_request_size, not_found_handler, app, validation_handler,
+    swagger_ui_oauth2_redirect_url, swagger_ui_html, redoc_html, static_content_types,
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker(
+    py: Python<'_>,
+    acceptor_sock_path: String,
+    routes: Vec<RouteInfo>,
+    host: String,
+    port: u16,
+    middlewares: Vec<Py<PyAny>>,
+    openapi_json: Option<String>,
+    docs_url: Option<String>,
+    redoc_url: Option<String>,
+    openapi_url: Option<String>,
+    static_mounts: Vec<(String, String)>,
+    root_path: Option<String>,
+    redirect_slashes: bool,
+    max_request_size: Option<usize>,
+    not_found_handler: Option<Py<PyAny>>,
+    app: Option<Py<PyAny>>,
+    validation_handler: Option<Py<PyAny>>,
+    swagger_ui_oauth2_redirect_url: Option<String>,
+    swagger_ui_html: Option<String>,
+    redoc_html: Option<String>,
+    static_content_types: Vec<(String, String)>,
+) -> PyResult<()> {
+    // Per-worker process globals (mirror run_server — each worker is independent).
+    if !static_content_types.is_empty() {
+        set_static_mime_map(static_content_types);
+    }
+    if let Ok(mut slot) = crate::router::NOT_FOUND_HANDLER.write() {
+        *slot = not_found_handler;
+    }
+    if let Ok(mut slot) = crate::router::APP_INSTANCE.write() {
+        *slot = app;
+    }
+    if let Ok(mut slot) = crate::router::VALIDATION_HANDLER.write() {
+        *slot = validation_handler;
+    }
+    let _ = crate::router::set_server_addr(host, port);
+    let mw_configs = parse_middleware_configs(py, &middlewares)?;
+    let _ = &root_path; // metadata only
+
+    py.detach(|| {
+        let rt = Runtime::new().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime: {e}"))
+        })?;
+        let router = assemble_app_router(
+            routes,
+            &mw_configs,
+            openapi_json,
+            docs_url,
+            redoc_url,
+            openapi_url,
+            &static_mounts,
+            redirect_slashes,
+            max_request_size,
+            swagger_ui_oauth2_redirect_url,
+            swagger_ui_html,
+            redoc_html,
+        );
+        rt.block_on(async move {
+            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            crate::cluster::run_worker(
+                std::path::Path::new(&acceptor_sock_path),
+                router,
+                ready,
+                async {
+                    let _ = tokio::signal::ctrl_c().await;
+                },
+            )
+            .await
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("worker: {e}")))
         })
     })
 }
@@ -1074,11 +1709,6 @@ async fn shutdown_signal_for_port(port: u16) {
         _ = term.recv() => {}
         _ = notify.notified() => {}
     }
-}
-
-#[allow(dead_code)]
-async fn shutdown_signal() {
-    shutdown_signal_for_port(0).await;
 }
 
 // ── Middleware configuration ─────────────────────────────────────────

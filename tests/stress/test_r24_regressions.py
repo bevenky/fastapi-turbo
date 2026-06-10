@@ -16,39 +16,11 @@ import fastapi_turbo  # noqa: F401
 # ────────────────────────────────────────────────────────────────────
 
 
-def test_formdata_close_handles_pre_shim_starlette_uploadfile():
-    """The R24 fix probed ``sys.modules`` post-facto and missed
-    pre-shim references; R25 captures the original class at install
-    time in ``compat.PRESHIM_STARLETTE_UPLOADFILE``. This test
-    simulates that capture explicitly so it doesn't depend on the
-    test process having pre-imported Starlette."""
-    from fastapi_turbo import compat
-    from fastapi_turbo.datastructures import FormData
-
-    original_capture = compat.PRESHIM_STARLETTE_UPLOADFILE
-    closed_log: list[bool] = []
-
-    class _StarletteUF:
-        """Stand-in for the original ``starlette.datastructures.UploadFile``."""
-
-        def __init__(self):
-            self.filename = "x.txt"
-            self.file = None
-
-        async def close(self):
-            closed_log.append(True)
-
-    compat.PRESHIM_STARLETTE_UPLOADFILE = _StarletteUF
-    try:
-        async def _run() -> list[bool]:
-            f = FormData([("file", _StarletteUF())])
-            await f.close()
-            return closed_log
-
-        result = asyncio.run(_run())
-        assert result == [True], result
-    finally:
-        compat.PRESHIM_STARLETTE_UPLOADFILE = original_capture
+# NOTE: the pre-shim duck-typed FormData.close test was removed when
+# datastructures.py became a re-export of real Starlette — real FormData.close
+# closes real UploadFile subclasses (which the real pre-shim class IS), so the
+# clone's duck-typed PRESHIM recognition is no longer needed (no production path
+# built the clone FormData).
 
 
 def test_formdata_close_still_strict_when_no_preshim_capture():

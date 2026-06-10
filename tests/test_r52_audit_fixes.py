@@ -16,7 +16,6 @@ import inspect
 import fastapi_turbo  # noqa: F401  # install shim
 from fastapi import FastAPI, APIRouter
 from fastapi.testclient import TestClient
-from fastapi_turbo.http import Headers, Response
 from starlette.responses import PlainTextResponse, JSONResponse
 from starlette.routing import Route
 
@@ -87,36 +86,6 @@ def test_starlette_passthrough_coexists_with_decorator_routes():
     with TestClient(app, in_process=True) as c:
         assert c.get("/st").text == "starlette"
         assert c.get("/decor").json() == {"ok": True}
-
-
-# ────────────────────────────────────────────────────────────────────
-# Finding 2 — Set-Cookie duplicate preservation
-# ────────────────────────────────────────────────────────────────────
-
-
-def test_headers_multi_items_defined_once_and_preserves_duplicates():
-    """The class previously defined ``multi_items`` twice; the second
-    definition collapsed duplicates. After R52 only one definition
-    remains, returning ``_raw_list``-backed values."""
-    h = Headers([("set-cookie", "a=1"), ("set-cookie", "b=2")])
-    items = h.multi_items()
-    set_cookie_vals = [v for k, v in items if k.lower() == "set-cookie"]
-    assert set_cookie_vals == ["a=1", "b=2"], items
-
-
-def test_response_cookies_preserves_multiple_set_cookie_headers():
-    h = Headers(
-        [
-            ("set-cookie", "session=abc"),
-            ("set-cookie", "tracking=xyz"),
-            ("content-type", "text/plain"),
-        ]
-    )
-    r = Response(status_code=200, headers=h, content=b"")
-    cookies = dict(r.cookies)
-    assert cookies == {"session": "abc", "tracking": "xyz"}, cookies
-
-
 # ────────────────────────────────────────────────────────────────────
 # Finding 6 — inspect.signature parity
 # ────────────────────────────────────────────────────────────────────

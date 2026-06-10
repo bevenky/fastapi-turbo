@@ -82,8 +82,6 @@ python/fastapi_turbo/
 ├── _introspect.py      # Function signature analysis
 ├── _resolution.py      # Dependency graph topological sort
 ├── _openapi.py         # OpenAPI 3.1 schema generation
-├── _async_bridge.py    # Event loop scheduling helper
-├── _ws_pipe_bridge.py  # (legacy) Pipe-based WS bridge
 ├── param_functions.py  # Query, Path, Header, Cookie, Body, Form, File
 ├── dependencies.py     # Depends class
 ├── security.py         # OAuth2, HTTPBearer, APIKey schemes

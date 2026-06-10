@@ -441,3 +441,71 @@ def test_httpsredirect_middleware(server_app):
     r = httpx.get(f"{url}/hello", headers={"x-forwarded-proto": "https"})
     assert r.status_code == 200
     assert r.json() == {"message": "hello"}
+
+
+# ── Stage C: name-based middleware matcher (post-flip readiness) ────
+#
+# After the shim flip, ``app.add_middleware(...)`` receives the REAL
+# Starlette middleware class, which lacks the clone's
+# ``_fastapi_turbo_middleware_type`` marker. ``_tower_type_for`` must
+# resolve it by class name (and across the MRO for subclasses) so the
+# Rust Tower layers still get selected. Pre-flip, the clone marker wins.
+
+
+def test_tower_type_for_resolves_real_classes_by_name():
+    from fastapi_turbo.applications import _tower_type_for
+
+    cases = {
+        "CORSMiddleware": "cors",
+        "GZipMiddleware": "gzip",
+        "HTTPSRedirectMiddleware": "httpsredirect",
+        "TrustedHostMiddleware": "trustedhost",
+        "SessionMiddleware": "python_http_session",
+        "AuthenticationMiddleware": "python_http_auth",
+        "BaseHTTPMiddleware": "base_http",
+    }
+    for name, expected in cases.items():
+        cls = type(name, (), {})  # marker-less, real-shaped
+        assert not hasattr(cls, "_fastapi_turbo_middleware_type")
+        assert _tower_type_for(cls) == expected, (name, _tower_type_for(cls))
+
+    # MRO walk: a user subclass of a real middleware resolves too.
+    base = type("CORSMiddleware", (), {})
+    sub = type("MyCORS", (base,), {})
+    assert _tower_type_for(sub) == "cors"
+
+    # String shorthand passes through; unknown classes return None.
+    assert _tower_type_for("cors") == "cors"
+    assert _tower_type_for(type("RandomMiddleware", (), {})) is None
+
+
+def test_tower_type_for_marker_wins_for_clone_classes():
+    """Pre-flip the clone class carries the marker — it must win so
+    behaviour is byte-identical to before the matcher refactor."""
+    from fastapi_turbo.applications import _tower_type_for
+    from fastapi_turbo.middleware.cors import CORSMiddleware
+
+    assert CORSMiddleware._fastapi_turbo_middleware_type == "cors"
+    assert _tower_type_for(CORSMiddleware) == "cors"
+
+
+def test_build_middleware_config_maps_real_classes_post_flip():
+    """A real-shaped (marker-less) class on the middleware stack produces
+    the same Rust Tower config the clone marker would."""
+    from fastapi_turbo import FastAPI
+
+    app = FastAPI()
+    app._middleware_stack = [
+        (type("CORSMiddleware", (), {}), {"allow_origins": ["*"]}),
+        (type("GZipMiddleware", (), {}), {"minimum_size": 500}),
+        (type("TrustedHostMiddleware", (), {}), {"allowed_hosts": ["example.com"]}),
+        (type("HTTPSRedirectMiddleware", (), {}), {}),
+        (type("RandomMiddleware", (), {}), {}),  # unknown → skipped
+    ]
+    config = app._build_middleware_config()
+    assert {"type": "cors", "allow_origins": ["*"]} in config
+    assert {"type": "gzip", "minimum_size": 500} in config
+    assert {"type": "trustedhost", "allowed_hosts": ["example.com"]} in config
+    assert {"type": "httpsredirect"} in config
+    assert all(c["type"] != "random" for c in config)
+    assert len(config) == 4

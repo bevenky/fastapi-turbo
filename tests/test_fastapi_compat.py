@@ -14,6 +14,17 @@ import pytest
 # ── Response.set_cookie: positional-or-keyword (Starlette-compatible) ──
 
 
+def _set_cookies(resp):
+    """Decoded Set-Cookie values from a (real Starlette) Response — its
+    ``raw_headers`` are ``(bytes, bytes)`` and also carry content-length."""
+    out = []
+    for k, v in resp.raw_headers:
+        kk = k.decode("latin-1") if isinstance(k, bytes) else str(k)
+        if kk.lower() == "set-cookie":
+            out.append(v.decode("latin-1") if isinstance(v, bytes) else str(v))
+    return out
+
+
 class TestStarletteCookieSignature:
     def test_positional_max_age(self):
         """Starlette users can call set_cookie positionally."""
@@ -22,7 +33,7 @@ class TestStarletteCookieSignature:
         r = Response()
         # Old Starlette call style: positional args
         r.set_cookie("sessionid", "abc123", 3600)
-        value = r.raw_headers[0][1]
+        value = _set_cookies(r)[0]
         assert "sessionid=abc123" in value
         assert "Max-Age=3600" in value
 
@@ -32,7 +43,7 @@ class TestStarletteCookieSignature:
 
         r = Response()
         r.set_cookie("k", "v", 3600, None, "/api", "example.com", True, True, "strict")
-        value = r.raw_headers[0][1]
+        value = _set_cookies(r)[0]
         assert "k=v" in value
         assert "Max-Age=3600" in value
         assert "Path=/api" in value
@@ -46,7 +57,7 @@ class TestStarletteCookieSignature:
 
         r = Response()
         r.delete_cookie("k", "/", "example.com", True)
-        value = r.raw_headers[0][1]
+        value = _set_cookies(r)[0]
         assert "Path=/" in value
         assert "Domain=example.com" in value
         assert "Secure" in value
@@ -57,7 +68,7 @@ class TestStarletteCookieSignature:
 
         r = Response()
         r.set_cookie("k", "v", partitioned=True)
-        value = r.raw_headers[0][1]
+        value = _set_cookies(r)[0]
         assert "Partitioned" in value
 
 
