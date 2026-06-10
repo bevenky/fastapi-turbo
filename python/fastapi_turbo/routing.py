@@ -223,8 +223,14 @@ class APIRoute(_real_fastapi.routing.APIRoute):
                 # time — upstream FastAPI 500s on this pattern. The clone
                 # dropped such annotations (``get_type_hints`` raised
                 # ``NameError`` → no response_model), so keep that.
+                # ``secure_cloned_response_field`` must be cleared too:
+                # real's ``get_route_handler`` reads it (not
+                # ``response_field``), so a route reused directly for
+                # delegation would otherwise resurrect the mock-validator
+                # 500 this branch exists to avoid.
                 self.response_model = None
                 self.response_field = None
+                self.secure_cloned_response_field = None
 
 
 class APIRouter(_real_fastapi.routing.APIRouter):
