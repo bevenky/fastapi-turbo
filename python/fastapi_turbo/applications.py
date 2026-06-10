@@ -4601,6 +4601,50 @@ class FastAPI(_real_fastapi.FastAPI):
             except OSError:
                 pass
 
+    def _route_obj_reusable(self, rd: dict, route) -> bool:
+        """P10.4 collection inversion: True when the decoration-built REAL
+        route can BE the adapter/delegation source directly — i.e. the
+        collection walker added nothing on top of what the route object's
+        own ctor already baked into its ``dependant``/response fields.
+
+        The per-route rebuild in ``_adapter_route_info`` /
+        ``_delegated_route_info`` exists precisely for the divergent
+        cases, which must KEEP rebuilding:
+
+        - include_router()/router/mount prefixes: ``rd["path"]`` carries
+          the full prefixed path; ``route.path`` does not (a ``{param}``
+          inside an added prefix would be classified as a QUERY param by
+          the decoration-time dependant);
+        - app/include/router-level dependencies: they live ONLY in
+          ``rd["_combined_dependencies"]`` and reach a dependant solely
+          via the rebuild's ``dependencies=`` ctor arg. The live route's
+          dependant holds route-level deps only — and the same route
+          object can be included into multiple apps with different
+          cascades, so it must NOT be mutated in place;
+        - cascaded ``default_response_class`` (router/include/app-level)
+          — the route's own attr is a ``DefaultPlaceholder`` when unset;
+        - rd's ``-> None``/NoneType ``response_model`` normalization
+          (a rebuild-input fix; caught by the ``is`` check below).
+        """
+        try:
+            if rd["path"] != route.path:
+                return False
+            merged = rd.get("_combined_dependencies") or []
+            own = list(getattr(route, "dependencies", None) or [])
+            if len(merged) != len(own) or any(
+                a is not b for a, b in zip(merged, own)
+            ):
+                return False
+            if rd.get("response_class") is not _unset_to_none(
+                getattr(route, "response_class", None)
+            ):
+                return False
+            if rd.get("response_model") is not getattr(route, "response_model", None):
+                return False
+        except (KeyError, TypeError, AttributeError):
+            return False
+        return True
+
     def _adapter_route_info(self, rd: dict, for_door_mix: bool = False):
         """Stage D: drive a route's door params off REAL FastAPI introspection
         instead of the clone's ``_introspect``.
@@ -4685,35 +4729,48 @@ class FastAPI(_real_fastapi.FastAPI):
         except Exception:
             return None
         try:
-            _http_methods = [
-                m
-                for m in rd["methods"]
-                if m in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
-            ]
-            real = _RealRoute(
-                rd["path"],
-                endpoint,
-                methods=_http_methods or rd["methods"],
-                dependencies=rd.get("_combined_dependencies") or None,
-                # A generator return is AsyncIterable[Item] / Iterable[Item] which
-                # real get_dependant can't field — build with response_model=None;
-                # item validation happens in _build_stream_handler instead.
-                response_model=None if _is_gen else rd.get("response_model"),
-                status_code=(
-                    rd["status_code"] if rd.get("status_code") not in (None, 200) else None
-                ),
-                response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
-                    _real_fastapi.responses.JSONResponse
-                ),
-                response_model_include=getattr(route, "response_model_include", None),
-                response_model_exclude=getattr(route, "response_model_exclude", None),
-                response_model_by_alias=getattr(route, "response_model_by_alias", True),
-                response_model_exclude_unset=getattr(route, "response_model_exclude_unset", False),
-                response_model_exclude_defaults=getattr(
-                    route, "response_model_exclude_defaults", False
-                ),
-                response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
-            )
+            if self._route_obj_reusable(rd, route):
+                # P10.4 inversion: the decoration-built real-APIRoute subclass
+                # already carries the exact dependant/response fields the
+                # rebuild below would reproduce — use it as the source of
+                # truth (skips a per-route real-APIRoute construction on
+                # every _build_server_args / door re-registration).
+                real = route
+            else:
+                _http_methods = [
+                    m
+                    for m in rd["methods"]
+                    if m
+                    in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+                ]
+                real = _RealRoute(
+                    rd["path"],
+                    endpoint,
+                    methods=_http_methods or rd["methods"],
+                    dependencies=rd.get("_combined_dependencies") or None,
+                    # A generator return is AsyncIterable[Item] / Iterable[Item] which
+                    # real get_dependant can't field — build with response_model=None;
+                    # item validation happens in _build_stream_handler instead.
+                    response_model=None if _is_gen else rd.get("response_model"),
+                    status_code=(
+                        rd["status_code"] if rd.get("status_code") not in (None, 200) else None
+                    ),
+                    response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
+                        _real_fastapi.responses.JSONResponse
+                    ),
+                    response_model_include=getattr(route, "response_model_include", None),
+                    response_model_exclude=getattr(route, "response_model_exclude", None),
+                    response_model_by_alias=getattr(route, "response_model_by_alias", True),
+                    response_model_exclude_unset=getattr(
+                        route, "response_model_exclude_unset", False
+                    ),
+                    response_model_exclude_defaults=getattr(
+                        route, "response_model_exclude_defaults", False
+                    ),
+                    response_model_exclude_none=getattr(
+                        route, "response_model_exclude_none", False
+                    ),
+                )
             # SecurityScopes: the adapter accumulates the ``Security(...,
             # scopes=[...])`` chain into each dependant's ``oauth_scopes`` and the
             # door builds ``SecurityScopes(scopes=...)`` from it (with scope-aware
@@ -4846,33 +4903,49 @@ class FastAPI(_real_fastapi.FastAPI):
         try:
             from fastapi_turbo._fastapi_turbo_core import ParamInfo
 
-            _RealRoute = _real_fastapi.routing.APIRoute
-            _http_methods = [
-                m
-                for m in rd["methods"]
-                if m in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
-            ]
-            real = _RealRoute(
-                rd["path"],
-                endpoint,
-                methods=_http_methods or rd["methods"],
-                dependencies=rd.get("_combined_dependencies") or None,
-                response_model=rd.get("response_model"),
-                status_code=(
-                    rd["status_code"] if rd.get("status_code") not in (None, 200) else None
-                ),
-                response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
-                    _real_fastapi.responses.JSONResponse
-                ),
-                response_model_include=getattr(route, "response_model_include", None),
-                response_model_exclude=getattr(route, "response_model_exclude", None),
-                response_model_by_alias=getattr(route, "response_model_by_alias", True),
-                response_model_exclude_unset=getattr(route, "response_model_exclude_unset", False),
-                response_model_exclude_defaults=getattr(
-                    route, "response_model_exclude_defaults", False
-                ),
-                response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
-            )
+            if self._route_obj_reusable(rd, route) and getattr(
+                route, "dependency_overrides_provider", None
+            ) in (None, self):
+                # P10.4 inversion: reuse the decoration-built real-APIRoute
+                # subclass directly (its dependant/response fields match what
+                # the rebuild below would reproduce). The provider guard keeps
+                # a router shared across DIFFERENT apps on the rebuild path —
+                # we stamp ``dependency_overrides_provider = self`` below, and
+                # that must never be flipped between apps on a live route.
+                real = route
+            else:
+                _RealRoute = _real_fastapi.routing.APIRoute
+                _http_methods = [
+                    m
+                    for m in rd["methods"]
+                    if m
+                    in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+                ]
+                real = _RealRoute(
+                    rd["path"],
+                    endpoint,
+                    methods=_http_methods or rd["methods"],
+                    dependencies=rd.get("_combined_dependencies") or None,
+                    response_model=rd.get("response_model"),
+                    status_code=(
+                        rd["status_code"] if rd.get("status_code") not in (None, 200) else None
+                    ),
+                    response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
+                        _real_fastapi.responses.JSONResponse
+                    ),
+                    response_model_include=getattr(route, "response_model_include", None),
+                    response_model_exclude=getattr(route, "response_model_exclude", None),
+                    response_model_by_alias=getattr(route, "response_model_by_alias", True),
+                    response_model_exclude_unset=getattr(
+                        route, "response_model_exclude_unset", False
+                    ),
+                    response_model_exclude_defaults=getattr(
+                        route, "response_model_exclude_defaults", False
+                    ),
+                    response_model_exclude_none=getattr(
+                        route, "response_model_exclude_none", False
+                    ),
+                )
             # Async-generator yield-dependencies: their teardown ordering relative
             # to an outer @app.middleware can't be replicated at the handler level
             # (the door applies middleware outside the delegated handler, and a
