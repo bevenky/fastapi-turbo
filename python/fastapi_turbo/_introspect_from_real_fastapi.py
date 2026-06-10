@@ -305,6 +305,76 @@ def _emit_request_param_model(
     return result_key
 
 
+def _make_form_param_model_builder(bf: Any):
+    """Synthetic dependency for a single FORM parameter-model
+    (``f: Annotated[Model, Form()]``): validate it EXACTLY like real FastAPI by
+    awaiting the request form and calling its own ``request_body_to_args`` — which
+    reproduces alias/validation_alias precedence, repeated-value lists,
+    ``model_config`` extra (forbid/allow/ignore), and the ``("body", field)``-prefixed
+    422. Async (form parsing awaits); raises ``HTTPException(422)`` on errors."""
+    from fastapi_turbo.applications import _real_fastapi
+
+    request_body_to_args = _real_fastapi.dependencies.utils.request_body_to_args
+
+    async def _build(request):
+        form = await request.form()
+        # Single form param-model → not embedded (request_body_to_args extracts the
+        # model's fields from the FormData and validates the whole thing).
+        values, errors = await request_body_to_args([bf], form, embed_body_fields=False)
+        if errors:
+            from fastapi import HTTPException
+            from fastapi.encoders import jsonable_encoder
+
+            raise HTTPException(status_code=422, detail=jsonable_encoder(errors))
+        return values[bf.name]
+
+    _build.__name__ = f"_fm_{getattr(bf, 'name', 'model')}"
+    return _build
+
+
+def _emit_form_param_model(
+    bf: Any, out: list[ParamInfo], result_key: str, *, is_handler_param: bool
+) -> str:
+    """Emit a single FORM parameter-model as an ASYNC builder dependency fed the
+    injected ``Request`` (it awaits ``request.form()``). The ``inject_request`` also
+    makes the door read the request body so the form is available."""
+    req_src = f"_fmreq_{bf.name}"
+    out.append(
+        ParamInfo(
+            name=req_src,
+            kind="inject_request",
+            type_hint="any",
+            required=False,
+            default_value=None,
+            has_default=False,
+            model_class=None,
+            alias=None,
+            is_handler_param=False,
+            scalar_validator=None,
+        )
+    )
+    out.append(
+        ParamInfo(
+            name=result_key,
+            kind="dependency",
+            type_hint="any",
+            required=True,
+            default_value=None,
+            has_default=False,
+            model_class=None,
+            alias=None,
+            dep_callable=_make_form_param_model_builder(bf),
+            dep_callable_id=None,
+            is_async_dep=True,
+            is_generator_dep=False,
+            dep_input_names=[("request", req_src)],
+            is_handler_param=is_handler_param,
+            scalar_validator=None,
+        )
+    )
+    return result_key
+
+
 def _make_getter(attr: str):
     """Synthetic dependency: pull one field off a validated combined-body model."""
 
@@ -506,6 +576,17 @@ def _emit_body(route: Any, dep: Any, out: list[ParamInfo]) -> None:
         return
     fi_names = {type(bf.field_info).__name__ for bf in body_fields}
     if fi_names <= {"Form", "File"}:
+        # A single Form parameter-model → validate via real FastAPI's own
+        # request_body_to_args (exact alias/extra/list parity, like query/header/
+        # cookie). The field-by-field _expand_param_model couldn't reproduce
+        # model_config extra or the raw-dict 422 ``input``.
+        if (
+            len(body_fields) == 1
+            and fi_names == {"Form"}
+            and _is_basemodel(_unwrap_optional(body_fields[0].field_info.annotation))
+        ):
+            _emit_form_param_model(body_fields[0], out, body_fields[0].name, is_handler_param=True)
+            return
         for bf in body_fields:
             kind = "file" if type(bf.field_info).__name__ == "File" else "form"
             ann = _unwrap_optional(bf.field_info.annotation)
