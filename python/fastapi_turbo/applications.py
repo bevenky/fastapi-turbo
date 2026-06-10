@@ -49,6 +49,7 @@ from fastapi_turbo.routing import (
     _looks_like_starlette_mount,
     _looks_like_starlette_websocket_route,
     _mark_starlette_compat_route,
+    _unset_to_none,
 )
 from fastapi_turbo._ws_support import _adapt_websocket_endpoint_class
 
@@ -1699,7 +1700,7 @@ def _shim_get_openapi(*, title, version, routes=None, webhooks=None, **kw):
             methods = getattr(route, "methods", None)
             if ep is None or path is None or not methods:
                 continue  # Mount / WebSocket / non-API routes
-            rc = getattr(route, "response_class", None)
+            rc = _unset_to_none(getattr(route, "response_class", None))
             try:
                 rc_ok = isinstance(rc, type) and issubclass(rc, _real_starlette_response)
             except TypeError:
@@ -2366,7 +2367,8 @@ class FastAPI(_real_fastapi.FastAPI):
                     clone._is_included_shadow = True
                     if (
                         eff_default is not None
-                        and getattr(clone, "response_class", None) is None
+                        and _unset_to_none(getattr(clone, "response_class", None))
+                        is None
                         and getattr(
                             clone,
                             "_fastapi_turbo_effective_response_class",
@@ -3850,7 +3852,10 @@ class FastAPI(_real_fastapi.FastAPI):
         try:
             return fn(route)
         except TypeError:
-            return fn(route, (route.methods or ["GET"])[0].lower())
+            # ``methods`` is normally a list (the turbo APIRoute re-stamps
+            # it), but guard with ``next(iter(...))`` in case a raw real
+            # APIRoute (set-typed methods) reaches this cascade.
+            return fn(route, next(iter(route.methods or ["GET"])).lower())
 
     def _collect_routes_from_router(
         self,
@@ -4033,7 +4038,9 @@ class FastAPI(_real_fastapi.FastAPI):
                         **getattr(route, "responses", {}),
                     },
                     "response_model": None,
-                    "response_class": getattr(route, "response_class", None),
+                    "response_class": _unset_to_none(
+                        getattr(route, "response_class", None)
+                    ),
                     "deprecated": (
                         bool(getattr(route, "deprecated", False))
                         or bool(getattr(router, "deprecated", False))
@@ -4140,7 +4147,9 @@ class FastAPI(_real_fastapi.FastAPI):
                         **getattr(route, "responses", {}),
                     },
                     "response_model": getattr(route, "response_model", None),
-                    "response_class": getattr(route, "response_class", None),
+                    "response_class": _unset_to_none(
+                        getattr(route, "response_class", None)
+                    ),
                     "deprecated": (
                         route.deprecated
                         or bool(getattr(router, "deprecated", False))
@@ -4188,7 +4197,7 @@ class FastAPI(_real_fastapi.FastAPI):
             # "no body for 204/304" assertion.
             if response_model is type(None):
                 response_model = None
-            response_class = getattr(route, "response_class", None)
+            response_class = _unset_to_none(getattr(route, "response_class", None))
             # Cascade default_response_class: route → router → include-level → app
             if response_class is None:
                 response_class = getattr(router, "default_response_class", None)
@@ -4201,8 +4210,10 @@ class FastAPI(_real_fastapi.FastAPI):
             # route → router → app. Carried on the rd (NOT stamped on the raw
             # endpoint, which may be shared across apps); build_router copies it
             # onto whichever handler (adapter / delegated) serves the route.
-            _route_strict = getattr(route, "strict_content_type", None)
-            _router_strict = getattr(router, "strict_content_type", None)
+            _route_strict = _unset_to_none(getattr(route, "strict_content_type", None))
+            _router_strict = _unset_to_none(
+                getattr(router, "strict_content_type", None)
+            )
             if _route_strict is not None:
                 _strict_effective = _route_strict
             elif _router_strict is not None:
@@ -4737,7 +4748,9 @@ class FastAPI(_real_fastapi.FastAPI):
             # else let real APIRoute use its default so the media type is canonical.
             # rd["response_class"] is the RESOLVED class (route → router → app
             # default_response_class); the route object alone may carry None.
-            rc = rd.get("response_class") or getattr(route, "response_class", None)
+            rc = rd.get("response_class") or _unset_to_none(
+                getattr(route, "response_class", None)
+            )
             try:
                 rc_ok = isinstance(rc, type) and issubclass(
                     rc, _real_starlette_response

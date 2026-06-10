@@ -9,6 +9,13 @@ import typing
 from typing import Any, Callable, Sequence
 from urllib.parse import quote
 
+# REAL pip FastAPI. This module is imported during ``fastapi_turbo``
+# package init (via ``applications.py``, which captures ``import
+# fastapi`` pre-shim at its line 18) — always BEFORE the compat shim
+# shadows ``sys.modules["fastapi"]`` — so this resolves to the real
+# package. ``APIRoute`` below is a THIN SUBCLASS of the real one.
+import fastapi as _real_fastapi
+
 
 def _is_union_origin(origin: Any) -> bool:
     return origin is typing.Union or origin is types.UnionType
@@ -75,8 +82,82 @@ model validation) from ``response_model`` being omitted (auto-derive from
 the return annotation). FA does the same — ``default=Default(None)``."""
 
 
-class APIRoute:
-    """Metadata for a single registered route."""
+def _unset_to_none(value: Any) -> Any:
+    """Map real FastAPI's "kwarg not explicitly set" marker to ``None``.
+
+    Real ``APIRoute.__init__`` stores a ``DefaultPlaceholder`` for unset
+    ``response_class`` / ``strict_content_type``; the door's collection
+    layer keys its cascades (route → router → include → app) off plain
+    ``None``."""
+    if isinstance(value, _real_fastapi.datastructures.DefaultPlaceholder):
+        return None
+    return value
+
+
+def _derive_return_annotation(endpoint: Callable) -> Any:
+    """Clone-style return-annotation lookup (``get_type_hints`` so
+    stringified annotations resolve)."""
+    try:
+        hints = typing.get_type_hints(endpoint, include_extras=False)
+        ra = hints.get("return")
+        if ra is None:
+            ra = inspect.signature(endpoint).return_annotation
+            if ra is inspect.Signature.empty:
+                ra = None
+        return ra
+    except (TypeError, ValueError, NameError):
+        return None
+
+
+def _is_streaming_annotation(ann: Any) -> bool:
+    import collections.abc as _abc
+    return typing.get_origin(ann) in (
+        _abc.AsyncIterable, _abc.AsyncIterator, _abc.AsyncGenerator,
+        _abc.Iterable, _abc.Iterator, _abc.Generator,
+    )
+
+
+# Kwargs forwarded verbatim to real ``APIRoute.__init__``. Everything
+# else that lands in ``**kwargs`` is swallowed (the clone tolerated
+# unknown kwargs; real raises TypeError).
+_REAL_APIROUTE_PASSTHROUGH = frozenset({
+    "status_code", "tags", "dependencies", "summary", "description",
+    "response_description", "responses", "deprecated", "include_in_schema",
+    "response_model_include", "response_model_exclude",
+    "response_model_by_alias", "response_model_exclude_unset",
+    "response_model_exclude_defaults", "response_model_exclude_none",
+    "dependency_overrides_provider",
+})
+
+
+class APIRoute(_real_fastapi.routing.APIRoute):
+    """Thin subclass of REAL FastAPI's ``APIRoute``.
+
+    Real ``__init__`` does the heavy lifting — signature introspection
+    (``dependant``), ``response_field``, path compilation, the whole
+    decoration-time validation battery, and ``self.app`` (real FastAPI's
+    request pipeline, so user ``route_class`` subclasses overriding
+    ``get_route_handler`` wrap real FastAPI's handler natively via
+    ``super().get_route_handler()``). This subclass only papers over the
+    door's read-contract differences:
+
+    - turbo-extra kwargs (``security`` / ``servers`` / ``external_docs``)
+      are stored as plain attrs; unknown kwargs are swallowed like the
+      clone did;
+    - ``methods`` is re-stamped as an ordered UPPER **list** (real stores
+      a set; the collection layer indexes ``methods[0]`` and the Rust
+      door extracts a ``Vec<String>``);
+    - ``generate_unique_id_function`` is stored RAW (``None`` when unset
+      — real's ``DefaultPlaceholder`` would otherwise be unwrapped by the
+      app-level cascade and rewrite every operationId) and
+      ``operation_id`` is computed eagerly, incl. the legacy
+      ``(route, method)`` two-arg fallback;
+    - streaming return annotations (``AsyncIterable[T]`` etc.) stay on
+      ``response_model`` — real 0.136 moves them to ``stream_item_type``,
+      but the door's SSE/NDJSON OpenAPI emitters (``_oa_stream_info``)
+      and ``_build_stream_handler`` read the raw annotation;
+    - ``openapi_extra`` / ``callbacks`` default to ``{}`` / ``[]``.
+    """
 
     def __init__(
         self,
@@ -85,151 +166,63 @@ class APIRoute:
         *,
         methods: list[str] | None = None,
         response_model: Any = _UNSET,
-        response_model_include: set | None = None,
-        response_model_exclude: set | None = None,
-        response_model_exclude_unset: bool = False,
-        response_model_exclude_defaults: bool = False,
-        response_model_exclude_none: bool = False,
-        response_model_by_alias: bool = True,
-        status_code: int | None = None,
-        tags: list[str] | None = None,
-        summary: str | None = None,
-        description: str | None = None,
-        response_description: str = "Successful Response",
-        responses: dict | None = None,
         name: str | None = None,
-        deprecated: bool | None = None,
         operation_id: str | None = None,
         generate_unique_id_function: Callable | None = None,
-        dependencies: Sequence | None = None,
         response_class: Any = None,
-        include_in_schema: bool = True,
         openapi_extra: dict | None = None,
-        security: list | None = None,
         callbacks: list | None = None,
+        strict_content_type: bool | None = None,
+        security: list | None = None,
         servers: list[dict[str, Any]] | None = None,
         external_docs: dict[str, Any] | None = None,
         **kwargs: Any,
     ):
-        self.path = path
-        self.endpoint = endpoint
-        self.methods = [m.upper() for m in (methods or ["GET"])]
-        # FastAPI auto-derives `response_model` from the handler's return
-        # annotation when the caller didn't set one explicitly. Mirror that
-        # so OpenAPI for endpoints like `def root() -> dict[str, str]` gets
-        # the full `{type: object, additionalProperties: ...}` schema. Use
-        # `typing.get_type_hints` so string annotations (`from __future__
-        # import annotations`) are resolved to real types.
-        if response_model is _UNSET:
-            # User didn't pass ``response_model`` — auto-derive from the
-            # return annotation.
-            import inspect as _inspect
-            import typing as _typing
-            derived = None
-            try:
-                hints = _typing.get_type_hints(endpoint, include_extras=False)
-                _ra = hints.get("return")
-                if _ra is None:
-                    _ra = _inspect.signature(endpoint).return_annotation
-                    if _ra is _inspect.Signature.empty:
-                        _ra = None
-                derived = _ra
-            except (TypeError, ValueError, NameError):
-                pass
-            # FA parity: ``-> Response`` (or subclass) is a RESPONSE-
-            # CLASS hint, not a Pydantic response_model. Drop it so the
-            # route bypasses response_model filtering. Streaming return
-            # types (``AsyncIterable[T]`` etc.) are KEPT because the SSE
-            # / JSONL OpenAPI emitters use them to register the item
-            # model under components.schemas.
-            try:
-                from fastapi_turbo.responses import Response as _RespCls
-                if isinstance(derived, type) and issubclass(derived, _RespCls):
-                    derived = None
-            except ImportError:
-                pass
-            response_model = derived
-            # FA parity: validate the DERIVED response_model too —
-            # ``def f() -> Response | None`` (Union of Response + None)
-            # should error at decoration because ``Response`` isn't a
-            # valid Pydantic field type. Pure ``Response`` was already
-            # dropped above.
-            if response_model is not None:
-                try:
-                    APIRouter._assert_response_models_are_valid(
-                        {"response_model": response_model},
-                    )
-                except Exception as _e:
-                    from fastapi_turbo.exceptions import FastAPIError as _FAErr
-                    if isinstance(_e, _FAErr):
-                        raise _FAErr(
-                            str(_e) + " If you don't need to use the "
-                            "response field, you can set the parameter "
-                            "response_model=None to skip response model generation."
-                        ) from None
-                    raise
-        elif response_model is None:
-            # Explicit ``response_model=None`` — FA treats this as "skip
-            # response-model filtering entirely, even if the handler has
-            # a return annotation". Keep it as None.
-            pass
-        self.response_model = response_model
-        self.response_model_include = response_model_include
-        self.response_model_exclude = response_model_exclude
-        self.response_model_exclude_unset = response_model_exclude_unset
-        self.response_model_exclude_defaults = response_model_exclude_defaults
-        self.response_model_exclude_none = response_model_exclude_none
-        self.response_model_by_alias = response_model_by_alias
-        self.status_code = status_code
-        self.tags = tags or []
-        self.summary = summary
-        # FA: when description= isn't set, falls back to the endpoint's
-        # docstring (``inspect.cleandoc(endpoint.__doc__)``). Matches
-        # FA's ``get_openapi`` which also truncates at the first ``\f``
-        # (formfeed) — text after ``\f`` is considered private
-        # (``:param`` / internal notes).
-        if description is None:
-            _raw_doc = getattr(endpoint, "__doc__", None)
-            if _raw_doc:
-                import inspect as _ins
-                description = _ins.cleandoc(_raw_doc)
-        if isinstance(description, str) and "\f" in description:
-            description = description.split("\f", 1)[0].rstrip("\n")
-        self.description = description
-        self.response_description = response_description
-        self.responses = responses or {}
-        # Endpoints can be ``functools.partial`` wrappers or callable
-        # class instances that don't carry ``__name__``. Fall back to
-        # the wrapped function's name, then the class name, then
-        # "endpoint" — matches FastAPI's ``get_name`` helper.
-        if name:
-            self.name = name
-        else:
+        super_kwargs = {
+            k: kwargs.pop(k) for k in list(kwargs) if k in _REAL_APIROUTE_PASSTHROUGH
+        }
+        if kwargs:
+            import logging
+            logging.getLogger("fastapi_turbo.routing").debug(
+                "APIRoute(%r): ignoring unknown kwargs %r", path, sorted(kwargs)
+            )
+        if response_model is not _UNSET:
+            # Explicit value (incl. explicit ``None`` = "skip response-
+            # model filtering"). When omitted, real's ``Default(None)``
+            # derivation reproduces the clone's: return annotation,
+            # ``-> Response`` drop, docstring description, decoration-time
+            # "Invalid args for response field" error.
+            super_kwargs["response_model"] = response_model
+        if response_class is not None:
+            super_kwargs["response_class"] = response_class
+        if strict_content_type is not None:
+            super_kwargs["strict_content_type"] = strict_content_type
+        if not name:
+            # Clone-style naming: dig ``functools.partial``'s wrapped
+            # function (real ``get_name`` would say "partial"), then the
+            # class name for callable instances.
             ep = endpoint
             inner = getattr(ep, "func", None)
             if inner is not None:
                 ep = inner
-            self.name = (
-                getattr(ep, "__name__", None)
-                or type(endpoint).__name__
-            )
-        self.deprecated = bool(deprecated) if deprecated is not None else False
-        self.dependencies = list(dependencies or [])
-        self.response_class = response_class
-        self.include_in_schema = include_in_schema
-        self.openapi_extra = openapi_extra or {}
-        self.security = security  # None = auto-derive; [] = disable; non-empty = override
-        self.callbacks = callbacks or []
-        # Per-operation servers / externalDocs (OpenAPI 3.1)
-        self.servers = servers  # None = inherit from app
-        self.external_docs = external_docs
+            name = getattr(ep, "__name__", None) or type(endpoint).__name__
+        # ``generate_unique_id_function`` is deliberately NOT forwarded:
+        # real's __init__ would call it with one arg to compute
+        # ``unique_id`` and a legacy ``(route, method)`` fn would raise.
+        super().__init__(
+            path,
+            endpoint,
+            methods=list(methods or ["GET"]),
+            name=name,
+            operation_id=operation_id,
+            callbacks=callbacks,
+            openapi_extra=openapi_extra,
+            **super_kwargs,
+        )
 
-        # Generate operation_id using the provided function or explicit
-        # value. FA's signature is ``generate_unique_id_function(route)``
-        # — single argument, returns a string.
-        if operation_id is not None:
-            self.operation_id = operation_id
-        elif generate_unique_id_function is not None:
+        # ── Door read-contract re-stamps ─────────────────────────────
+        self.methods = [m.upper() for m in (methods or ["GET"])]
+        if operation_id is None and generate_unique_id_function is not None:
             try:
                 self.operation_id = generate_unique_id_function(self)
             except TypeError:
@@ -237,42 +230,27 @@ class APIRoute:
                 self.operation_id = generate_unique_id_function(
                     self, self.methods[0] if self.methods else "get"
                 )
-        else:
-            self.operation_id = None
         self.generate_unique_id_function = generate_unique_id_function
-
-    def get_route_handler(self) -> Callable:
-        """Return the callable FA dispatches requests through.
-
-        Default implementation returns a placeholder — fastapi-turbo's Rust
-        dispatch pipeline invokes ``self.endpoint`` directly, so the
-        default handler is unused. The hook exists so subclasses can
-        override it with a wrapper that transforms the incoming
-        ``Request`` (e.g. ``GzipRequest`` that decompresses the body).
-
-        When a subclass overrides this method, the application layer
-        detects the override and routes the request through the
-        subclass's wrapper instead of the direct endpoint call. See
-        ``_build_custom_route_handler_adapter`` in ``applications.py``.
-        """
-        return self._default_route_handler()
-
-    def _default_route_handler(self) -> Callable:
-        """Build the default ``async (request) -> Response`` callable.
-
-        Mirrors FA's ``get_request_handler`` — runs body extraction,
-        dependency resolution, endpoint invocation and response
-        serialization given a ``Request``. fastapi-turbo builds this lazily
-        from ``applications.py`` so the callable can reuse the
-        already-compiled pipeline.
-        """
-        build = getattr(self, "_fastapi_turbo_build_default_handler", None)
-        if build is None:
-            raise RuntimeError(
-                "Default route handler unavailable: the application has "
-                "not finished registering routes yet."
-            )
-        return build()
+        self.openapi_extra = openapi_extra or {}
+        self.callbacks = callbacks or []
+        self.security = security  # None = auto-derive; [] = disable; non-empty = override
+        self.servers = servers  # None = inherit from app
+        self.external_docs = external_docs
+        if response_model is _UNSET:
+            if self.response_model is None:
+                derived = _derive_return_annotation(endpoint)
+                if derived is not None and _is_streaming_annotation(derived):
+                    self.response_model = derived
+            elif _derive_return_annotation(endpoint) is None:
+                # Clone-parity leniency: real's derivation keeps
+                # UNRESOLVABLE forward refs (PEP 563 string annotations
+                # referencing function-local classes) as lenient
+                # ``ForwardRef``s whose mock validator explodes at request
+                # time — upstream FastAPI 500s on this pattern. The clone
+                # dropped such annotations (``get_type_hints`` raised
+                # ``NameError`` → no response_model), so keep that.
+                self.response_model = None
+                self.response_field = None
 
 
 class APIRouter:
@@ -1115,7 +1093,7 @@ class APIRouter:
                 clone._is_included_shadow = True
                 if (
                     eff_default is not None
-                    and getattr(clone, "response_class", None) is None
+                    and _unset_to_none(getattr(clone, "response_class", None)) is None
                     and getattr(clone, "_fastapi_turbo_effective_response_class", None)
                     is None
                 ):

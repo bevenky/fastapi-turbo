@@ -520,101 +520,63 @@ def _looks_like_body(annotation) -> bool:
 
 
 
-def _build_real_default_route_handler(route, app):
-    """``async (request) -> Response`` via REAL FastAPI's pipeline for this
-    route — what ``super().get_route_handler()`` hands a custom route class.
-    Builds a plain real ``fastapi.routing.APIRoute`` from the route's metadata
-    (mirroring ``_delegated_route_info``) and wraps its handler with the three
-    AsyncExitStack scopes real FA's handler reads off ``request.scope``."""
-    from contextlib import AsyncExitStack as _AES
-
-    from fastapi_turbo.applications import _real_fastapi
-
-    methods = [
-        m
-        for m in (getattr(route, "methods", None) or ["GET"])
-        if m in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
-    ] or ["GET"]
-    real = _real_fastapi.routing.APIRoute(
-        getattr(route, "path", "/"),
-        route.endpoint,
-        methods=methods,
-        dependencies=getattr(route, "dependencies", None) or None,
-        response_model=getattr(route, "response_model", None),
-        status_code=(
-            route.status_code
-            if getattr(route, "status_code", None) not in (None, 200)
-            else None
-        ),
-        response_class=getattr(route, "response_class", None)
-        or _real_fastapi.datastructures.Default(_real_fastapi.responses.JSONResponse),
-        response_model_include=getattr(route, "response_model_include", None),
-        response_model_exclude=getattr(route, "response_model_exclude", None),
-        response_model_by_alias=getattr(route, "response_model_by_alias", True),
-        response_model_exclude_unset=getattr(route, "response_model_exclude_unset", False),
-        response_model_exclude_defaults=getattr(
-            route, "response_model_exclude_defaults", False
-        ),
-        response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
-    )
-    real.dependency_overrides_provider = app
-    inner = real.get_route_handler()
-
-    async def default_handler(request):
-        async with _AES() as _file_stack, _AES() as _inner_stack, _AES() as _function_stack:
-            request.scope["fastapi_middleware_astack"] = _file_stack
-            request.scope["fastapi_inner_astack"] = _inner_stack
-            request.scope["fastapi_function_astack"] = _function_stack
-            response = await inner(request)
-            # Run background tasks before yield-dep teardown (FA order), then
-            # clear so the door doesn't double-run them.
-            _bg = getattr(response, "background", None)
-            if _bg is not None:
-                _bgr = _bg()
-                if inspect.isawaitable(_bgr):
-                    await _bgr
-                response.background = None
-            return response
-
-    return default_handler
-
-
 def _build_custom_route_handler_endpoint(route, app):
     """Return the endpoint that fastapi-turbo registers with Rust when a
     route's APIRoute subclass overrides ``get_route_handler``. The
     endpoint takes a single ``Request`` kwarg (Rust injects it via
     ``inject_request``) and delegates to the user's wrapper.
 
-    On first call, builds ``original_route_handler`` via
-    ``_build_default_route_handler`` and caches it on the route so
-    subsequent requests reuse it. The user's ``get_route_handler``
-    returns their coroutine, which closes over ``original_route_handler``
-    and wraps the request before calling it.
+    The turbo ``APIRoute`` IS a real ``fastapi.routing.APIRoute``
+    subclass, so the user's ``super().get_route_handler()`` returns real
+    FastAPI's full pipeline handler: byte-exact body parsing, validation,
+    dependency resolution, response_model serialization. Real's handler
+    requires the AsyncExitStack scope keys (it raises if
+    ``fastapi_middleware_astack`` is missing — normally installed by
+    AsyncExitStackMiddleware, which the door bypasses), so this adapter
+    sets them up per request and runs background tasks before yield-dep
+    teardown (then clears them so the door doesn't double-run).
     """
+    from contextlib import AsyncExitStack as _AES
+
     from fastapi_turbo.responses import JSONResponse as _JR, Response as _Resp
     from fastapi_turbo.exceptions import (
         RequestValidationError as _RVE,
         HTTPException as _HE,
     )
 
-    # Expose the builder so ``APIRoute._default_route_handler`` can
-    # resolve it. ``get_route_handler``'s ``super().get_route_handler()``
-    # call routes through this — it returns REAL FastAPI's route handler (a
-    # plain real APIRoute built from this route's metadata), so a user's
-    # wrapper (GzipRoute/TimedRoute) wraps real FA's full pipeline: byte-exact
-    # body parsing, validation, response_model serialization. The clone
-    # mini-pipeline (_build_default_route_handler) is no longer on this path.
-    def _build_default() -> Callable:
-        return _build_real_default_route_handler(route, app)
-
-    route._fastapi_turbo_build_default_handler = _build_default  # type: ignore[attr-defined]
+    # Real's get_route_handler() resolves ``app.dependency_overrides``
+    # through this provider (a real FastAPI subclass) — point it at the
+    # app so overrides registered at any time are honored.
+    try:
+        route.dependency_overrides_provider = app
+    except (AttributeError, TypeError):
+        pass
 
     _app_ref = app
 
     async def custom_route_endpoint(request):
         try:
+            # Rebuilt per request: the user's ``get_route_handler`` is
+            # the documented FA extension hook, and rebuilding lets a
+            # request observe override/provider changes (TestClient).
             custom_handler = route.get_route_handler()
-            response = await custom_handler(request)
+            async with (
+                _AES() as _file_stack,
+                _AES() as _inner_stack,
+                _AES() as _function_stack,
+            ):
+                request.scope["fastapi_middleware_astack"] = _file_stack
+                request.scope["fastapi_inner_astack"] = _inner_stack
+                request.scope["fastapi_function_astack"] = _function_stack
+                response = await custom_handler(request)
+                # Run background tasks before yield-dep teardown (FA
+                # order), then clear so the door doesn't double-run them.
+                _bg = getattr(response, "background", None)
+                if _bg is not None:
+                    _bgr = _bg()
+                    if inspect.isawaitable(_bgr):
+                        await _bgr
+                    response.background = None
         except _HE as exc:
             # Route through the app's registered HTTPException handler
             # (TestClient path) so custom ``detail`` dicts surface.
