@@ -224,3 +224,155 @@ def _make_fa_body_validator(annotation, combined_body_fields=None):
         return _FABodyValidator(annotation, combined_body_fields=combined_body_fields)
     except Exception:  # noqa: BLE001
         return None
+
+
+# ── Async-handler driving glue (relocated from _resolution.py) ──────────────
+# Door glue, NOT introspection: the door drives an ``async def`` handler/dep from
+# sync code (block_in_place → with_gil). Kept here so _resolution.py (clone
+# introspection) can be deleted while this survives.
+
+
+def _has_await_in_source(func) -> bool:
+    """Best-effort static check: does this function's source text contain any
+    ``await`` expressions? Returns True on any detection failure so greenlet-bridge
+    libs (SQLAlchemy async, redis.asyncio) fall through to the safe path."""
+    try:
+        import ast
+        import inspect as _inspect
+        import textwrap
+
+        src = _inspect.getsource(func)
+        tree = ast.parse(textwrap.dedent(src))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return True
+
+
+# asyncio primitives that REQUIRE a running loop bound to the *calling* thread.
+_LOOP_AFFINITY_NAMES = frozenset(
+    {
+        "get_running_loop",
+        "get_event_loop",
+        "current_task",
+        "all_tasks",
+        "create_task",
+        "ensure_future",
+        "run_coroutine_threadsafe",
+        "call_soon",
+        "call_soon_threadsafe",
+        "call_later",
+        "call_at",
+    }
+)
+
+
+def _uses_running_loop(func) -> bool:
+    """Best-effort static check: does this function reference an asyncio primitive
+    that needs a running event loop on the calling thread? Returns False on any
+    detection failure (the ``await`` scan already errs safe by returning True)."""
+    try:
+        import ast
+        import inspect as _inspect
+        import textwrap
+
+        src = _inspect.getsource(func)
+        tree = ast.parse(textwrap.dedent(src))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in _LOOP_AFFINITY_NAMES:
+                return True
+            if isinstance(node, ast.Name) and node.id in _LOOP_AFFINITY_NAMES:
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
+    """Wrap an async function so it can be called from sync code (the door's
+    block_in_place path). No-await fast path drives it with one ``send(None)`` on
+    the calling thread; otherwise it routes to the shared worker loop. See git
+    history (_resolution.py) for the three execution paths in detail."""
+    func_id = id(async_func)
+    _orig_name = getattr(async_func, "__name__", None)
+    _orig_qual = getattr(async_func, "__qualname__", None)
+
+    def _stamp(w):
+        w._fastapi_turbo_wrapped_id = func_id
+        w._fastapi_turbo_original_endpoint = async_func
+        if _orig_name:
+            w.__name__ = _orig_name
+        if _orig_qual:
+            w.__qualname__ = _orig_qual
+        return w
+
+    if not _has_await_in_source(async_func) and not _uses_running_loop(async_func):
+
+        def _noawait_caller(**kwargs):
+            coro = async_func(**kwargs)
+            try:
+                coro.send(None)
+            except StopIteration as e:
+                return e.value
+            except BaseException:
+                try:
+                    coro.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            try:
+                coro.close()
+            except Exception:  # noqa: BLE001
+                pass
+            from fastapi_turbo._async_worker import submit
+
+            return submit(async_func(**kwargs), app=app)
+
+        return _stamp(_noawait_caller)
+
+    if for_handler:
+
+        def _submit_caller(**kwargs):
+            from fastapi_turbo._async_worker import submit
+
+            return submit(async_func(**kwargs), app=app)
+
+        return _stamp(_submit_caller)
+
+    needs_loop = [False]
+
+    def _submit_partial(coro):
+        import asyncio as _asyncio
+
+        from fastapi_turbo._async_worker import get_loop
+
+        loop = get_loop()
+        fut = _asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result(timeout=30)
+
+    def _sync_caller(**kwargs):
+        if needs_loop[0]:
+            from fastapi_turbo._async_worker import submit
+
+            return submit(async_func(**kwargs), app=app)
+
+        coro = async_func(**kwargs)
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+        except BaseException:
+            needs_loop[0] = True
+            try:
+                coro.close()
+            except Exception:  # noqa: BLE001
+                pass
+            from fastapi_turbo._async_worker import submit
+
+            return submit(async_func(**kwargs), app=app)
+        needs_loop[0] = True
+        return _submit_partial(coro)
+
+    return _stamp(_sync_caller)

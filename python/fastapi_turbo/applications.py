@@ -42,7 +42,8 @@ from fastapi_turbo._sentry_compat import (  # noqa: F401 — re-exported below
 
 
 from fastapi_turbo._introspect import introspect_endpoint
-from fastapi_turbo._resolution import build_resolution_plan, _make_sync_wrapper
+from fastapi_turbo._resolution import build_resolution_plan
+from fastapi_turbo._door_support import _make_sync_wrapper
 from fastapi_turbo.datastructures import State
 from fastapi_turbo.routing import (
     APIRouter,
@@ -5645,7 +5646,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 else:
                     # Fallback: async wrapper for non-compilable deps
                     if is_async and not inspect.isasyncgenfunction(endpoint):
-                        from fastapi_turbo._resolution import _make_sync_wrapper
+                        from fastapi_turbo._door_support import _make_sync_wrapper
                         endpoint = _make_sync_wrapper(endpoint, for_handler=True, app=self)
                         is_async = False
             elif (
@@ -5691,7 +5692,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 and os.environ.get("FASTAPI_TURBO_WORKER_TIMEOUT") is None
             )
             if needs_app_plumb:
-                from fastapi_turbo._resolution import _make_sync_wrapper
+                from fastapi_turbo._door_support import _make_sync_wrapper
                 endpoint = _make_sync_wrapper(endpoint, for_handler=True, app=self)
                 is_async = False
 
@@ -5799,7 +5800,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 and inspect.iscoroutinefunction(endpoint)
                 and not inspect.isasyncgenfunction(endpoint)
             ):
-                from fastapi_turbo._resolution import (
+                from fastapi_turbo._door_support import (
                     _has_await_in_source as _has_await,
                     _make_sync_wrapper as _msw,
                 )
@@ -7593,7 +7594,7 @@ class FastAPI(_real_fastapi.FastAPI):
         # instruction), then wrap in the ``@app.middleware("http")`` chain so those
         # middlewares (which the clone applies by wrapping the handler) still run.
         if _inspect.iscoroutinefunction(handler):
-            from fastapi_turbo._resolution import _make_sync_wrapper
+            from fastapi_turbo._door_support import _make_sync_wrapper
 
             handler = _make_sync_wrapper(handler, for_handler=True, app=self)
         # Dispatch handler-raised exceptions to the app's custom exception handlers
@@ -7775,7 +7776,7 @@ class FastAPI(_real_fastapi.FastAPI):
         # (the door drives sync handlers), then exception handlers (innermost, so
         # real FastAPI's RequestValidationError/HTTPException dispatch to the app's
         # handlers), then the @app.middleware("http") chain.
-        from fastapi_turbo._resolution import _make_sync_wrapper
+        from fastapi_turbo._door_support import _make_sync_wrapper
 
         handler = _make_sync_wrapper(handler, for_handler=True, app=self)
         handler = _wrap_with_exception_handlers(handler, self)
