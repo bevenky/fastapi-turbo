@@ -8418,12 +8418,18 @@ class FastAPI(_real_fastapi.FastAPI):
         ``app.mount`` / plugin registration) so the door re-registers instead of
         serving a stale router (or 1000-closing a freshly-added WS route)."""
         router = getattr(self, "router", None)
+        # dependency_overrides are a testing feature set at RUNTIME (after the door
+        # registered). Include the current override key-set so the door re-registers
+        # when it changes — override-active routes then decline to the clone path
+        # (which resolves overrides per request, incl. different-signature ones).
+        _ov = getattr(self, "dependency_overrides", None)
         return (
             len(getattr(router, "routes", None) or ()),
             len(getattr(self, "_http_middlewares", None) or ()),
             len(getattr(self, "_middleware_stack", None) or ()),
             len(getattr(self, "_raw_asgi_middlewares", None) or ()),
             len(getattr(self, "_mounts", None) or ()),
+            frozenset(id(k) for k in _ov) if _ov else None,
         )
 
     def _ensure_oneshot_registered(self, scope: dict) -> None:

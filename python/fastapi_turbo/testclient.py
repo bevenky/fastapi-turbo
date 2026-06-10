@@ -936,6 +936,16 @@ class TestClient:
         Starlette-style transport — this mirrors how Starlette's own
         TestClient wraps arbitrary ASGI apps.
         """
+        # dependency_overrides are a RUNTIME testing feature: the in-process door
+        # re-registers when they change (its fingerprint tracks them) so the clone
+        # path resolves overrides per request, incl. different-signature ones. The
+        # real loopback server's router is fixed at startup and can't, so route
+        # override-active requests through the in-process door (same Rust engine).
+        # Checked every request (not just first) since overrides are set after the
+        # client/server start; once switched we stay in-process (idempotent).
+        if not self._in_process and getattr(self.app, "dependency_overrides", None):
+            self._switch_to_in_process()
+            return
         if self._started:
             return
         # in_process=True (or env var) → same ASGI-transport path we
