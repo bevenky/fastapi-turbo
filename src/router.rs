@@ -822,11 +822,12 @@ fn resolve_body_validator(py: Python<'_>, param: &ParamInfo) -> Option<Py<PyAny>
             return Some(v.unbind());
         }
     }
-    // Non-model typed body: validate only STRUCTURAL containers (``list[Model]`` /
-    // ``tuple[...]`` → type_hint "list_*") via the TypeAdapter. dict / plain scalar
-    // bodies stay on the lenient body_json path so a missing Content-Type under
+    // Non-model typed body: validate STRUCTURAL containers — ``list[Model]`` /
+    // ``tuple[...]`` (type_hint "list_*") and TYPED ``dict[K, V]`` (type_hint
+    // "dict") — via the TypeAdapter. A BARE ``dict`` / plain scalar body stays on
+    // the lenient body_json path so a missing Content-Type under
     // ``strict_content_type=False`` is still accepted (test_strict_content_type_*).
-    if param.type_hint.starts_with("list") {
+    if param.type_hint.starts_with("list") || param.type_hint == "dict" {
         return param.scalar_validator.as_ref().map(|v| v.clone_ref(py));
     }
     None
@@ -3559,7 +3560,19 @@ fn extract_single_param(
                     // Validate raw bytes directly (FA shapes). On error,
                     // remap to FA's combined/with-body 422 (alias-aware loc,
                     // top-level ``input=None``) instead of a raw 500.
-                    let py_bytes = pyo3::types::PyBytes::new(py, body_bytes);
+                    // A COMBINED body (embed/multiple) whose JSON is NOT an object
+                    // (e.g. ``[]``): real FA extracts each field → all missing. Feed
+                    // ``{}`` so the validator emits per-field missing (loc=["body",
+                    // field], input=None) instead of a top-level model_attributes_type.
+                    let combined_non_object = is_combined
+                        && serde_json::from_slice::<serde_json::Value>(body_bytes)
+                            .map(|v| !v.is_object())
+                            .unwrap_or(false);
+                    let py_bytes = if combined_non_object {
+                        pyo3::types::PyBytes::new(py, b"{}")
+                    } else {
+                        pyo3::types::PyBytes::new(py, body_bytes)
+                    };
                     let result = validator.call_method1(py, "validate_json", (py_bytes,));
                     match result {
                         Ok(v) => {
@@ -3571,6 +3584,9 @@ fn extract_single_param(
                                 return Err(crate::responses::pyerr_to_response(py, &e));
                             }
                             if is_combined {
+                                if combined_non_object {
+                                    return Err(pydantic_error_response_combined(py, &e, "body"));
+                                }
                                 return Err(pydantic_error_response_combined_with_body(
                                     py, &e, "body", body_bytes,
                                 ));

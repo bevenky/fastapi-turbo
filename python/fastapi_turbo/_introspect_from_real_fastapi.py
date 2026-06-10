@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import inspect
 import typing
+from collections.abc import Mapping as _abc_Mapping
 from typing import Any
 
 from fastapi_turbo._fastapi_turbo_core import ParamInfo
@@ -171,10 +172,20 @@ def _param_from_field(
     else:
         resolved_name = mf.name
         alias = explicit_alias
+    if is_body_model:
+        type_hint = "model"
+    else:
+        type_hint = _get_type_name(ann)
+        # A TYPED dict body (``dict[int, float]``) needs structural validation (the
+        # door validates "dict" via the field TypeAdapter); a BARE ``dict`` stays
+        # "str" → the lenient body_json path (keeps strict_content_type lax handling).
+        if kind == "body" and typing.get_origin(body_ann) in (dict, _abc_Mapping):
+            if typing.get_args(body_ann):
+                type_hint = "dict"
     return ParamInfo(
         name=resolved_name,
         kind=kind,
-        type_hint=("model" if is_body_model else _get_type_name(ann)),
+        type_hint=type_hint,
         required=required,
         default_value=_default_of(fi),
         has_default=not required,
