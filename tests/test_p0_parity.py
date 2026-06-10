@@ -61,9 +61,9 @@ class TestResponseModelByAlias:
         def get_user():
             return {"userId": 5}
 
-        routes = app._collect_all_routes()
-        result = routes[0]["endpoint"]()
-        # Now output uses python field names
+        from fastapi_turbo.testclient import TestClient
+        result = TestClient(app, in_process=True).get("/u").json()
+        # Output uses python field names
         assert "user_id" in result
         assert "userId" not in result
 
@@ -82,8 +82,8 @@ class TestResponseModelByAlias:
         def get_m():
             return {"name": "Alice"}
 
-        routes = app._collect_all_routes()
-        result = routes[0]["endpoint"]()
+        from fastapi_turbo.testclient import TestClient
+        result = TestClient(app, in_process=True).get("/m").json()
         assert "displayName" in result
 
 
@@ -101,11 +101,12 @@ class TestDefaultResponseClass:
         def h():
             return "<b>hi</b>"
 
-        routes = app._collect_all_routes()
-        result = routes[0]["endpoint"]()
-        # Result should be wrapped in HTMLResponse
-        assert hasattr(result, "status_code")
-        assert result.media_type == "text/html"
+        from fastapi_turbo.testclient import TestClient
+        resp = TestClient(app, in_process=True).get("/")
+        # Served as HTML via the app-level default_response_class
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert resp.text == "<b>hi</b>"
 
     def test_route_overrides_app(self):
         from fastapi import FastAPI
@@ -117,9 +118,10 @@ class TestDefaultResponseClass:
         def p():
             return "plain"
 
-        routes = app._collect_all_routes()
-        result = routes[0]["endpoint"]()
-        assert result.media_type == "text/plain"
+        from fastapi_turbo.testclient import TestClient
+        resp = TestClient(app, in_process=True).get("/p")
+        assert resp.headers["content-type"].startswith("text/plain")
+        assert resp.text == "plain"
 
     def test_router_level_default(self):
         from fastapi import APIRouter, FastAPI
@@ -133,9 +135,9 @@ class TestDefaultResponseClass:
             return "<p>router</p>"
 
         app.include_router(router)
-        routes = app._collect_all_routes()
-        result = routes[0]["endpoint"]()
-        assert result.media_type == "text/html"
+        from fastapi_turbo.testclient import TestClient
+        resp = TestClient(app, in_process=True).get("/r")
+        assert resp.headers["content-type"].startswith("text/html")
 
 
 # ── FastAPI(responses=) ──────────────────────────────────────────────
@@ -190,8 +192,8 @@ class TestDebugMode:
         app = FastAPI(debug=True)
         assert app.debug is True
 
-    def test_debug_prints_traceback(self, capsys):
-        """In debug mode, handler exceptions print a traceback to stderr."""
+    def test_debug_prints_traceback(self, capfd):
+        """Handler exceptions surface a traceback on stderr (engine-printed)."""
         from fastapi import FastAPI
 
         app = FastAPI(debug=True)
@@ -200,12 +202,13 @@ class TestDebugMode:
         def boom():
             raise ValueError("something broke")
 
-        routes = app._collect_all_routes()
-        try:
-            routes[0]["endpoint"]()
-        except ValueError:
-            pass
-        captured = capsys.readouterr()
+        from fastapi_turbo.testclient import TestClient
+
+        resp = TestClient(
+            app, in_process=True, raise_server_exceptions=False
+        ).get("/boom")
+        assert resp.status_code == 500
+        captured = capfd.readouterr()
         # Traceback should include the error type and message
         assert "ValueError" in captured.err
         assert "something broke" in captured.err

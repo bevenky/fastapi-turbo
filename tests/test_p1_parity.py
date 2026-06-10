@@ -331,8 +331,8 @@ class TestPydanticV2Decorators:
         def get_user():
             return {"first_name": "Alice", "last_name": "Smith"}
 
-        routes = app._collect_all_routes()
-        result = routes[0]["endpoint"]()
+        from fastapi_turbo.testclient import TestClient
+        result = TestClient(app, in_process=True).get("/u").json()
         assert result.get("full_name") == "Alice Smith"
 
     def test_field_serializer(self):
@@ -353,8 +353,8 @@ class TestPydanticV2Decorators:
         def get_m():
             return {"tags": ["a", "b", "c"]}
 
-        routes = app._collect_all_routes()
-        result = routes[0]["endpoint"]()
+        from fastapi_turbo.testclient import TestClient
+        result = TestClient(app, in_process=True).get("/m").json()
         assert result == {"tags": "a,b,c"}
 
     def test_model_validator(self):

@@ -112,14 +112,11 @@ class TestResponseClass:
         def get_html():
             return "<h1>hi</h1>"
 
-        # Collect route metadata
-        routes = app._collect_all_routes()
-        assert routes[0]["endpoint"] is not get_html  # wrapped
-
-        # Invoke the compiled endpoint
-        result = routes[0]["endpoint"]()
-        assert hasattr(result, "status_code")
-        assert result.media_type == "text/html"
+        from fastapi_turbo.testclient import TestClient
+        resp = TestClient(app, in_process=True).get("/html")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert resp.text == "<h1>hi</h1>"
 
     def test_response_class_ignores_existing_response(self):
         from fastapi import FastAPI
@@ -475,10 +472,10 @@ class TestExceptionHandler:
         def fail():
             raise HTTPException(status_code=400, detail="bad")
 
-        routes = app._collect_all_routes()
-        result = routes[0]["endpoint"]()
-        assert hasattr(result, "status_code")
-        assert result.status_code == 418
+        from fastapi_turbo.testclient import TestClient
+        resp = TestClient(app, in_process=True).get("/fail")
+        assert resp.status_code == 418
+        assert resp.json() == {"caught": "bad"}
 
     def test_mro_lookup(self):
         from fastapi import FastAPI
@@ -542,10 +539,9 @@ class TestHTTPMiddleware:
             call_log.append("handler")
             return {"x": 1}
 
-        routes = app._collect_all_routes()
-        # Sync-driven chain (fast path) — endpoint stays sync
-        assert routes[0]["is_async"] is False
-        result = routes[0]["endpoint"]()
+        from fastapi_turbo.testclient import TestClient
+        resp = TestClient(app, in_process=True).get("/hello")
+        assert resp.json() == {"x": 1}
         assert call_log == ["before", "handler", "after"]
 
     def test_middleware_chain_order(self):
@@ -573,8 +569,8 @@ class TestHTTPMiddleware:
             call_log.append("handler")
             return {}
 
-        routes = app._collect_all_routes()
-        routes[0]["endpoint"]()
+        from fastapi_turbo.testclient import TestClient
+        TestClient(app, in_process=True).get("/")
         # FA convention: LAST-decorated middleware is OUTERMOST.
         # @mw2 is outer → runs first on request, last on response.
         assert call_log == ["mw2_in", "mw1_in", "handler", "mw1_out", "mw2_out"]
