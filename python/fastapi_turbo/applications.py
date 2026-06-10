@@ -46,11 +46,11 @@ from fastapi_turbo.datastructures import State
 from fastapi_turbo.routing import (
     APIRouter,
     APIRoute,
-    _adapt_websocket_endpoint_class,
     _looks_like_starlette_mount,
     _looks_like_starlette_websocket_route,
     _mark_starlette_compat_route,
 )
+from fastapi_turbo._ws_support import _adapt_websocket_endpoint_class
 
 
 class URLPath(str):
