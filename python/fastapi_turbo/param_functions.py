@@ -24,15 +24,6 @@ from starlette.datastructures import UploadFile as _RealUploadFile
 from pydantic.fields import FieldInfo
 
 
-# Keys that we handle ourselves and must NOT be forwarded to FieldInfo.__init__
-# (FieldInfo silently accepts them but discards the values).
-_CUSTOM_KEYS = frozenset({
-    "example",       # singular example (FieldInfo only has 'examples')
-    "regex",         # legacy alias for 'pattern'
-    "include_in_schema",  # not a FieldInfo kwarg
-})
-
-
 class _ParamMarker(FieldInfo):
     """Base for all parameter markers.
 

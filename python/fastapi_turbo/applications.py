@@ -71,15 +71,12 @@ class URLPath(str):
 # Route-handler helpers extracted to ``_route_helpers.py``.
 from fastapi_turbo._route_helpers import (  # noqa: F401 — re-exports
     _apply_response_model,
-    _apply_status_code,
     _build_custom_route_handler_endpoint,
     _close_one_upload,
     _close_upload_files,
     _has_overridden_get_route_handler,
     _is_async_callable,
-    _maybe_print_debug_traceback,
     _model_needs_full_dump,
-    _wrap_response_class,
 )
 
 
@@ -399,28 +396,6 @@ def _door_wrap_stream_teardown(app, stream_response, req_gens):
                 _teardown()
 
     stream_response.body_iterator = _wrapped()
-
-
-def _collect_dependencies_from_markers(dependencies):
-    """Convert a list of Depends markers into introspection-ready param dicts."""
-    from fastapi_turbo.dependencies import Depends as DependsClass
-
-    result = []
-    for i, dep in enumerate(dependencies):
-        if isinstance(dep, DependsClass):
-            dep_func = dep.dependency
-            result.append({
-                "name": f"_global_dep_{i}_{id(dep_func)}",
-                "kind": "dependency",
-                "type_hint": "any",
-                "required": False,
-                "default_value": None,
-                "model_class": None,
-                "alias": None,
-                "dep_callable": dep_func,
-                "use_cache": dep.use_cache,
-            })
-    return result
 
 
 def _parse_range_header(header_val: str, total_len: int):

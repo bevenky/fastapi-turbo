@@ -555,19 +555,3 @@ class WebSocket:
             return await self.receive_text()
         except (RuntimeError, WebSocketDisconnect):
             raise StopAsyncIteration
-
-
-def _extract_close_info_from_error(msg: str) -> tuple[int, str]:
-    """Parse the Rust-side RuntimeError to recover close code + reason.
-
-    The fast-path awaitables format close errors as 'WS_CLOSED:<code>:<reason>'
-    so we can preserve the peer's actual close code in WebSocketDisconnect.
-    """
-    if msg.startswith("WS_CLOSED:"):
-        rest = msg[len("WS_CLOSED:"):]
-        code_str, _, reason = rest.partition(":")
-        try:
-            return int(code_str), reason
-        except ValueError:
-            pass
-    return 1000, msg
