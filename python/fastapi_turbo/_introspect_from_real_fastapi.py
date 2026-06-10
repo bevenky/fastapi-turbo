@@ -227,6 +227,84 @@ def _make_model_builder(model_cls, loc_prefix: str):
     return _build
 
 
+def _make_request_param_model_builder(mf: Any, kind: str):
+    """Synthetic dependency for a query/header/cookie PARAMETER-MODEL
+    (``f: Annotated[Model, Query()/Header()/Cookie()]``): validate it EXACTLY like
+    real FastAPI by calling its own ``request_params_to_args`` on the live request
+    multidict. That single call reproduces alias / validation_alias precedence,
+    header underscore→dash, list (repeated-value) fields, ``model_config`` extra
+    (forbid/allow/ignore), and the loc-prefixed 422 — so all the alias/extra/
+    constraint variants match upstream byte-for-byte. Raises ``HTTPException(422)``
+    (which the door renders) on validation errors."""
+    # REAL FastAPI's helper — the compat shim replaces ``fastapi.dependencies.utils``
+    # with a stub, so reach it via the pre-shim ``_real_fastapi`` capture.
+    from fastapi_turbo.applications import _real_fastapi
+
+    request_params_to_args = _real_fastapi.dependencies.utils.request_params_to_args
+
+    def _build(request):
+        if kind == "query":
+            received = request.query_params
+        elif kind == "header":
+            received = request.headers
+        else:  # cookie
+            received = request.cookies
+        values, errors = request_params_to_args([mf], received)
+        if errors:
+            from fastapi import HTTPException
+            from fastapi.encoders import jsonable_encoder
+
+            raise HTTPException(status_code=422, detail=jsonable_encoder(errors))
+        return values[mf.name]
+
+    _build.__name__ = f"_pm_{getattr(mf, 'name', 'model')}"
+    return _build
+
+
+def _emit_request_param_model(
+    mf: Any, kind: str, out: list[ParamInfo], uid: str, result_key: str, *, is_handler_param: bool
+) -> str:
+    """Emit a query/header/cookie parameter-model as a synthetic builder dependency
+    fed the injected ``Request`` — it validates via real FastAPI's
+    ``request_params_to_args`` (see ``_make_request_param_model_builder``). Returns
+    ``result_key`` (holds the validated model instance)."""
+    req_src = f"_pmreq{uid}"
+    out.append(
+        ParamInfo(
+            name=req_src,
+            kind="inject_request",
+            type_hint="any",
+            required=False,
+            default_value=None,
+            has_default=False,
+            model_class=None,
+            alias=None,
+            is_handler_param=False,
+            scalar_validator=None,
+        )
+    )
+    out.append(
+        ParamInfo(
+            name=result_key,
+            kind="dependency",
+            type_hint="any",
+            required=True,
+            default_value=None,
+            has_default=False,
+            model_class=None,
+            alias=None,
+            dep_callable=_make_request_param_model_builder(mf, kind),
+            dep_callable_id=None,
+            is_async_dep=False,
+            is_generator_dep=False,
+            dep_input_names=[("request", req_src)],
+            is_handler_param=is_handler_param,
+            scalar_validator=None,
+        )
+    )
+    return result_key
+
+
 def _make_getter(attr: str):
     """Synthetic dependency: pull one field off a validated combined-body model."""
 
@@ -603,7 +681,15 @@ def _emit_dep(
     for kind in _SCALAR_BUCKETS:
         for mf in _bucket_fields(dep, kind):
             src_key = f"_dep{uid}__{mf.name}"
-            out.append(_param_from_field(mf, kind, name=src_key))
+            ann = _unwrap_optional(mf.field_info.annotation)
+            # A query/header/cookie parameter-model input to this dep → validate via
+            # real FastAPI's request_params_to_args (same as the handler path).
+            if kind in ("query", "header", "cookie") and _is_basemodel(ann):
+                _emit_request_param_model(
+                    mf, kind, out, f"{uid}_{mf.name}", src_key, is_handler_param=False
+                )
+            else:
+                out.append(_param_from_field(mf, kind, name=src_key))
             input_wiring.append((mf.name, src_key))
 
     # 2. sub-dependencies first (so they resolve before this dep), wired by the
@@ -659,9 +745,17 @@ def extract_params_from_route(route: Any, app: Any = None) -> list[ParamInfo]:
         for idx, mf in enumerate(_bucket_fields(dep, kind)):
             ann = _unwrap_optional(mf.field_info.annotation)
             if _is_basemodel(ann):
-                _expand_param_model(
-                    ann, kind, params, f"_{kind}{idx}_{mf.name}", mf.name, is_handler_param=True
-                )
+                # query/header/cookie parameter-model → validate via real FastAPI's
+                # request_params_to_args (exact alias/extra/list parity). Form keeps
+                # the field-by-field expansion (the builder can't await request.form()).
+                if kind in ("query", "header", "cookie"):
+                    _emit_request_param_model(
+                        mf, kind, params, f"_{kind}{idx}_{mf.name}", mf.name, is_handler_param=True
+                    )
+                else:
+                    _expand_param_model(
+                        ann, kind, params, f"_{kind}{idx}_{mf.name}", mf.name, is_handler_param=True
+                    )
             else:
                 params.append(_param_from_field(mf, kind))
 
