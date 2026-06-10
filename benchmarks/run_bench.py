@@ -179,13 +179,17 @@ def _start_fr(port: int) -> subprocess.Popen:
     """Boot fastapi-turbo serving the same `app`."""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(HERE) + os.pathsep + env.get("PYTHONPATH", "")
+    # workers=1 pins single-process serving. app.run() now defaults to
+    # multi-worker (os.cpu_count() with an fd-passing acceptor), which
+    # is the right production default but skews conn=1 latency runs and
+    # doesn't match the 1-worker uvicorn leg.
     code = f"""
 import fastapi_turbo.compat
 fastapi_turbo.compat.install()
 import sys
 sys.path.insert(0, {str(HERE)!r})
 from _bench_app import app
-app.run({HOST!r}, {port})
+app.run({HOST!r}, {port}, workers=1)
 """
     return subprocess.Popen(
         [sys.executable, "-c", code],
