@@ -24,18 +24,25 @@ from starlette.requests import ClientDisconnect, HTTPConnection, Request
 __all__ = ["Request", "HTTPConnection", "ClientDisconnect", "_door_make_request"]
 
 
-def _make_disconnect_receive(disconnect_event):
+def _make_disconnect_receive(disconnect_event, body=b""):
     """Build the ``receive()`` for a door-built Request.
 
-    ``body()``/``stream()``/``form()`` use the pre-set ``_body`` attr, so this
-    is driven ONLY by ``Request.is_disconnected()`` — which peeks one tick via
-    an immediately-cancelled ``anyio.CancelScope``. So: return
-    ``http.disconnect`` SYNCHRONOUSLY when the door's Event is set (the peek
-    sees it → disconnected), else await a checkpoint so the cancelled scope
-    aborts the peek and ``is_disconnected()`` returns False (matches the clone's
-    "False when no live receive" leniency; also covers the no-Event case)."""
+    The door's own Request pre-sets ``_body``, so ``body()``/``stream()``/
+    ``form()`` resolve without ``receive()``. But a user who RECONSTRUCTS a
+    Request off the same scope/receive (e.g. a custom APIRoute that does
+    ``MyRequest(request.scope, request.receive)`` and ``await super().body()``)
+    has no ``_body`` and reads the body through the normal ASGI ``receive()``
+    channel — so deliver the buffered body ONCE (one ``http.request`` message),
+    then fall back to the disconnect/idle behavior. The first-message delivery
+    also satisfies ``is_disconnected()``'s one-tick peek (non-disconnect → False),
+    matching the prior behavior."""
+    delivered = False
 
     async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
         if disconnect_event is not None and disconnect_event.is_set():
             return {"type": "http.disconnect"}
         await anyio.sleep_forever()
@@ -65,7 +72,12 @@ def _door_make_request(scope):
         # off a bare scope still sees it (zero-behavior-change insurance).
         seed = getattr(app, "_app_state", None) if app is not None else None
         scope["state"] = dict(seed) if seed else {}
-    req = Request(scope, _make_disconnect_receive(scope.get("_fastapi_turbo_disconnect")))
+    req = Request(
+        scope,
+        _make_disconnect_receive(
+            scope.get("_fastapi_turbo_disconnect"), scope.get("_body", b"")
+        ),
+    )
     # Pre-set the buffered body so body()/stream()/form() resolve synchronously
     # without a body-delivering receive().
     req._body = scope.get("_body", b"")

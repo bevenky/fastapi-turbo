@@ -96,6 +96,15 @@ thread_local! {
     static INJECTED_RESPONSE: std::cell::RefCell<Option<Py<PyAny>>> =
         const { std::cell::RefCell::new(None) };
 
+    /// Per-request SHARED injected ``BackgroundTasks``. FastAPI gives the handler
+    /// AND every dependency that takes ``background_tasks: BackgroundTasks`` the
+    /// SAME instance, so a dep can add tasks and they run after the response.
+    /// ``build_injected_object`` builds it lazily (first need wins, later ones
+    /// share); ``drain_background_tasks`` drains this one instance. Reset per
+    /// request (worker-thread invariant, like INJECTED_RESPONSE).
+    static INJECTED_BACKGROUND_TASKS: std::cell::RefCell<Option<Py<PyAny>>> =
+        const { std::cell::RefCell::new(None) };
+
     /// Per-request route-level default status code (``@app.get(status_code=201)``).
     /// Set by handle_request from RouteState; read by ``py_to_response`` to status
     /// non-Response handler results. Reset per request (worker-thread invariant).
@@ -132,6 +141,9 @@ impl Drop for DisconnectFlagGuard {
         });
         INJECTED_RESPONSE.with(|r| {
             *r.borrow_mut() = None;
+        });
+        INJECTED_BACKGROUND_TASKS.with(|b| {
+            *b.borrow_mut() = None;
         });
         ROUTE_DEFAULT_STATUS.with(|s| s.set(None));
     }
@@ -367,7 +379,16 @@ fn build_injected_object(
 
             Ok(request_cls(py)?.bind(py).call1((scope,))?.unbind())
         }
-        "inject_background_tasks" => {
+        "inject_background_tasks" => INJECTED_BACKGROUND_TASKS.with(|cell| {
+            // Return the per-request SHARED BackgroundTasks (FastAPI semantics) so
+            // the handler AND every dependency add to the SAME instance — which
+            // ``drain_background_tasks`` then runs after the response. (A dep's
+            // tasks were previously dropped: it got its own instance, in ``resolved``,
+            // never drained.)
+            let mut slot = cell.borrow_mut();
+            if let Some(existing) = slot.as_ref() {
+                return Ok(existing.clone_ref(py));
+            }
             let bg = bg_tasks_cls(py)?.bind(py).call0()?;
             // Stash the current app on the BackgroundTasks instance
             // so ``run_sync`` can pass ``app=`` when submitting async
@@ -378,8 +399,10 @@ fn build_injected_object(
                     let _ = bg.setattr("_app", app.bind(py));
                 }
             }
-            Ok(bg.unbind())
-        }
+            let bg = bg.unbind();
+            *slot = Some(bg.clone_ref(py));
+            Ok(bg)
+        }),
         "inject_response" => INJECTED_RESPONSE.with(|cell| {
             // Return the per-request SHARED Response (FastAPI semantics) so the
             // handler and every dependency mutate the same object.
@@ -495,8 +518,25 @@ fn inject_framework_objects(
 /// received gets DEFERRED — tasks run on a tokio blocking thread after
 /// the response is flushed, matching FastAPI/Starlette semantics.
 /// The handler doesn't wait for task completion.
-fn drain_background_tasks(_py: Python<'_>, kwargs: &Bound<'_, PyDict>, params: &[ParamInfo]) {
+fn drain_background_tasks(py: Python<'_>, kwargs: &Bound<'_, PyDict>, params: &[ParamInfo]) {
     let mut seen_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // Drain the per-request SHARED BackgroundTasks (handler + every dependency add
+    // to it) — a dep-injected instance lives in ``resolved``, not ``kwargs``, so the
+    // kwargs scan below would miss it. Dedup by ptr against the kwargs scan.
+    let shared = INJECTED_BACKGROUND_TASKS.with(|c| c.borrow().as_ref().map(|o| o.clone_ref(py)));
+    if let Some(bg) = shared {
+        let bg = bg.bind(py);
+        seen_ids.insert(bg.as_ptr() as usize);
+        let has_tasks = bg
+            .getattr("_tasks")
+            .ok()
+            .and_then(|t| t.len().ok())
+            .map(|n| n > 0)
+            .unwrap_or(false);
+        if has_tasks {
+            let _ = bg.call_method0("run_sync");
+        }
+    }
     for param in params {
         if param.kind == "inject_background_tasks" {
             if let Ok(Some(bg_obj)) = kwargs.get_item(&param.name) {
