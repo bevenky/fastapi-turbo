@@ -7645,8 +7645,12 @@ class FastAPI(_real_fastapi.FastAPI):
         protocols). Returns ``(params, handler, is_async)`` or ``None``."""
         import os
 
+        # DEFAULT-ON (opt out via FASTAPI_TURBO_DELEGATE=0): adapter declines drain
+        # to real FastAPI's own route handler, NOT the clone-compiled path. Override-
+        # active apps delegate even under the opt-out (correctness: the clone's
+        # override machinery mis-resolves complex different-signature overrides).
         if not getattr(self, "dependency_overrides", None):
-            if os.environ.get("FASTAPI_TURBO_DELEGATE") != "1":
+            if os.environ.get("FASTAPI_TURBO_DELEGATE") == "0":
                 return None
         if rd.get("is_websocket") or rd.get("_from_mount"):
             return None
