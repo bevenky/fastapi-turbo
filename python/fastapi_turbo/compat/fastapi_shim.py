@@ -154,15 +154,13 @@ def _build() -> dict[str, types.ModuleType]:
         fastapi_routing._default_generate_unique_id = _routing._default_generate_unique_id  # type: ignore[attr-defined]
     except AttributeError:
         pass
-    # APIWebSocketRoute stub — fastapi-turbo registers WS routes directly
-    # via @app.websocket() rather than a dedicated class, but third-party
-    # code uses this class name for isinstance checks.
-    class APIWebSocketRoute:
-        def __init__(self, path: str, endpoint, *, name: str | None = None):
-            self.path = path
-            self.endpoint = endpoint
-            self.name = name or endpoint.__name__
-    fastapi_routing.APIWebSocketRoute = APIWebSocketRoute  # type: ignore[attr-defined]
+    # APIWebSocketRoute — fastapi-turbo registers WS routes as
+    # ``_ws_support.WSRoute`` holders (turbo's WebSocket is a standalone
+    # class real APIWebSocketRoute can't introspect). Bind the SAME class
+    # here so third-party ``isinstance(scope["route"], APIWebSocketRoute)``
+    # checks match the synthetic route the WS wrapper injects.
+    from fastapi_turbo._ws_support import WSRoute as _WSRoute
+    fastapi_routing.APIWebSocketRoute = _WSRoute  # type: ignore[attr-defined]
     # request_response — stac-fastapi, fastapi-pagination use this.
     # Upstream is a SYNC function returning an ASGI callable (the
     # callable itself is async). The returned callable builds a

@@ -2324,115 +2324,29 @@ class FastAPI(_real_fastapi.FastAPI):
                 joined = pfx.rstrip("/") + "/" + child.lstrip("/")
                 return joined or "/"
 
-            # default_response_class cascade — see the equivalent
-            # block in routing.py for the inheritance rules. The
-            # walker threads ``parent_default`` so nested routers
-            # without their own default still pick up an ancestor's.
-            outer_default = (
-                default_response_class
-                if default_response_class is not None
-                else getattr(router, "default_response_class", None)
-            )
-
-            # Outer-most include kwarg deps + the included router's
-            # own deps — every route below this include sees these
-            # before its own/intermediate deps.
-            outer_extra_deps = (
-                list(dependencies or [])
-                + list(getattr(router, "dependencies", []) or [])
-            )
-
-            def _mirror(src_router, pfx: str, parent_default, parent_deps) -> None:
-                own_default = getattr(src_router, "default_response_class", None)
-                eff_default = (
-                    own_default if own_default is not None else parent_default
-                )
-                # ``parent_deps`` is the deps chain accumulated from
-                # the outermost include down to (but not including)
-                # this router's own deps. Routes on THIS router get
-                # ``parent_deps`` (already includes outer include
-                # kwargs + ancestor router deps + intermediate include
-                # kwargs from upstream callers). The current router's
-                # own ``.dependencies`` are appended for the routes
-                # registered directly on it.
-                eff_extra_deps = list(parent_deps)
-                eff_extra_deps.extend(
-                    getattr(src_router, "dependencies", []) or []
-                )
+            # The shadow mirror exists ONLY for ``app.router.routes``
+            # parity (callers iterating routes see sub-routes at their
+            # final paths); the door's flatten walks
+            # ``_included_routers`` + include_meta for the real
+            # cascades. The old response-class / deps / owner-router
+            # stamps on the clones were write-only — nothing read them.
+            def _mirror(src_router, pfx: str) -> None:
                 for r in getattr(src_router, "routes", []):
                     if getattr(r, "_is_included_shadow", False):
                         continue
                     clone = _copy.copy(r)
                     clone.path = _stack_path(pfx, getattr(r, "path", ""))
                     clone._is_included_shadow = True
-                    if (
-                        eff_default is not None
-                        and _unset_to_none(getattr(clone, "response_class", None))
-                        is None
-                        and getattr(
-                            clone,
-                            "_fastapi_turbo_effective_response_class",
-                            None,
-                        )
-                        is None
-                    ):
-                        clone._fastapi_turbo_effective_response_class = (
-                            eff_default
-                        )
-                    if eff_extra_deps:
-                        clone._fastapi_turbo_include_deps = list(eff_extra_deps)
-                    # Stamp the owning router so the in-process
-                    # dispatcher can resolve closest-wins precedence
-                    # for ``strict_content_type`` (and any other
-                    # router-level setting) at request time without
-                    # having to walk the include tree.
-                    clone._fastapi_turbo_owner_router = src_router
                     self.router.routes.append(clone)
                 for entry in getattr(src_router, "_included_routers", []):
                     child_router, child_prefix = entry[0], entry[1]
-                    child_meta = entry[3] if len(entry) >= 4 else {}
-                    child_include_default = (
-                        child_meta.get("default_response_class")
-                        if isinstance(child_meta, dict)
-                        else None
-                    )
-                    nested_default = (
-                        child_include_default
-                        if child_include_default is not None
-                        else eff_default
-                    )
-                    # Carry forward parent + this router's own deps +
-                    # this child include's kwarg deps. The child router's
-                    # OWN deps are added by the recursive call's
-                    # ``eff_extra_deps`` extension.
-                    child_include_deps = (
-                        list(child_meta.get("dependencies", []) or [])
-                        if isinstance(child_meta, dict)
-                        else []
-                    )
-                    nested_parent_deps = (
-                        list(eff_extra_deps) + child_include_deps
-                    )
                     nested = _stack_path(
                         _stack_path(pfx, child_prefix or ""),
                         getattr(child_router, "prefix", "") or "",
                     )
-                    _mirror(
-                        child_router,
-                        nested,
-                        nested_default,
-                        nested_parent_deps,
-                    )
+                    _mirror(child_router, nested)
 
-            # Outer-most call: ``parent_deps`` is the include kwargs
-            # only — the included router's OWN deps are added by
-            # ``_mirror`` for each of its routes.
-            _mirror(
-                router,
-                full_prefix,
-                outer_default,
-                list(dependencies or []),
-            )
+            _mirror(router, full_prefix)
         except Exception as _exc:  # noqa: BLE001
             _log.debug("silent catch in applications: %r", _exc)
 
@@ -3453,27 +3367,14 @@ class FastAPI(_real_fastapi.FastAPI):
         # Build a synthetic route object for ``ws.scope["route"]``. FA
         # exposes the matched ``APIWebSocketRoute`` here; third-party
         # code (e.g. route introspection in handlers) uses it to pull
-        # the path template.
-        try:
-            from fastapi_turbo.compat import fastapi_shim as _fa_shim
-            _APIWSRoute = getattr(
-                getattr(_fa_shim, "fastapi_routing", None) or object(),
-                "APIWebSocketRoute",
-                None,
-            )
-        except Exception as _exc:  # noqa: BLE001
-            _log.debug("silent catch in applications: %r", _exc)
-            _APIWSRoute = None
-        if _APIWSRoute is None:
-            class _APIWSRoute:  # type: ignore[no-redef]
-                def __init__(self, path, endpoint, name=None):
-                    self.path = path
-                    self.endpoint = endpoint
-                    self.name = name or getattr(endpoint, "__name__", "")
+        # the path template. ``WSRoute`` IS the class the shim binds as
+        # ``fastapi.routing.APIWebSocketRoute``, so isinstance checks
+        # see one consistent type.
+        from fastapi_turbo._ws_support import WSRoute as _APIWSRoute
         _synthetic_route = _APIWSRoute(
-            path=route_path,
-            endpoint=endpoint,
-            name=getattr(endpoint, "__name__", ""),
+            route_path,
+            endpoint,
+            name=getattr(endpoint, "__name__", "") or None,
         )
 
         async def _ws_entry(ws, **path_kwargs):

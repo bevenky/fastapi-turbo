@@ -20,6 +20,51 @@ from typing import Any, Callable
 _log = logging.getLogger("fastapi_turbo.applications")
 
 
+# ── Starlette-compat route classification ───────────────────────────
+# Pre-constructed Starlette ``Route`` / ``WebSocketRoute`` / ``Mount``
+# instances handed in via ``FastAPI(routes=[...])`` / ``APIRouter(
+# routes=[...])`` / ``add_route`` are tagged here so the collection
+# walker dispatches them with Starlette ASGI semantics.
+
+def _looks_like_starlette_mount(route) -> bool:
+    cls_name = type(route).__name__
+    return cls_name == "Mount" or (
+        hasattr(route, "routes")
+        and hasattr(route, "app")
+        and not hasattr(route, "endpoint")
+    )
+
+
+def _looks_like_starlette_websocket_route(route) -> bool:
+    return (
+        getattr(route, "_is_websocket", False)
+        or type(route).__name__ == "WebSocketRoute"
+    )
+
+
+def _mark_starlette_compat_route(route) -> None:
+    from fastapi_turbo._ws_support import _adapt_websocket_endpoint_class
+
+    if _looks_like_starlette_mount(route):
+        try:
+            route._fastapi_turbo_starlette_mount = True  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            pass
+        return
+    if _looks_like_starlette_websocket_route(route):
+        try:
+            route.endpoint = _adapt_websocket_endpoint_class(route.endpoint)
+            route._is_websocket = True  # type: ignore[attr-defined]
+            route._fastapi_turbo_starlette_websocket = True  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            pass
+        return
+    try:
+        route._fastapi_turbo_starlette_passthrough = True  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
+
+
 def _is_async_callable(func) -> bool:
     """Return True if ``func`` is async, including when wrapped via ``@wraps``.
 
