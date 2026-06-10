@@ -2843,15 +2843,52 @@ def _build_stream_handler(orig_endpoint, response_model, response_class, app):
                 gen = _orig(**kwargs)
                 sse_aiter = gen.__aiter__() if _is_a else iterate_in_threadpool(gen)
 
-                # NOTE: real FastAPI decouples iteration from a keepalive timer via
-                # an anyio task group, but the door streams an async-gen with a NEW
-                # task per __anext__, so a task group spanning the generator's yields
-                # raises "exit cancel scope in a different task". Plain producer
-                # (no idle keepalive ping) until the door does single-task streaming.
+                # Keepalive: real FastAPI decouples iteration from the ping timer
+                # with an anyio task group, but the door drives an async-gen with a
+                # NEW task per __anext__, so a task group spanning the generator's
+                # yields raises "exit cancel scope in a different task". Instead use
+                # an asyncio producer task feeding a Queue + per-item asyncio.wait_for
+                # — the timeout lives entirely within ONE __anext__ (no cross-task
+                # scope), and a missing item just re-waits (queue keeps it).
                 async def _stream():
-                    async for raw in sse_aiter:
-                        yield _serialize(raw)
-                        await _anyio.sleep(0)
+                    import asyncio as _asyncio
+
+                    _done = object()
+                    q: _asyncio.Queue = _asyncio.Queue()
+
+                    async def _producer():
+                        err = None
+                        try:
+                            async for raw in sse_aiter:
+                                await q.put((_serialize(raw), None))
+                        except BaseException as exc:  # noqa: BLE001
+                            err = exc
+                        await q.put((_done, err))
+
+                    # Ping interval is read where the tests monkeypatch it
+                    # (``fastapi.routing._PING_INTERVAL``), with the sse default.
+                    try:
+                        import fastapi.routing as _fr
+
+                        ping = getattr(_fr, "_PING_INTERVAL", _sse_mod._PING_INTERVAL)
+                    except Exception:  # noqa: BLE001
+                        ping = _sse_mod._PING_INTERVAL
+
+                    prod = _asyncio.ensure_future(_producer())
+                    try:
+                        while True:
+                            try:
+                                item, err = await _asyncio.wait_for(q.get(), ping)
+                            except (TimeoutError, _asyncio.TimeoutError):
+                                yield _sse_mod.KEEPALIVE_COMMENT
+                                continue
+                            if item is _done:
+                                if err is not None:
+                                    raise err
+                                break
+                            yield item
+                    finally:
+                        prod.cancel()
 
                 resp = _SR(_stream(), media_type="text/event-stream")
                 resp.headers["Cache-Control"] = "no-cache"
