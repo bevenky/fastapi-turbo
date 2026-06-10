@@ -11,10 +11,9 @@ import os
 from typing import Any, Callable, Sequence
 
 # Real pip FastAPI for the "accelerate real FastAPI" pivot. This module is imported
-# by fastapi_turbo/__init__.py BEFORE the compat shim installs (see __init__.py),
-# so `import fastapi` here resolves to the REAL package — captured before any
-# sys.modules shadowing. fastapi_turbo.FastAPI subclasses it; later pivot steps
-# delete the clone overrides so the real base's routing/openapi/deps show through.
+# by fastapi_turbo/__init__.py BEFORE ``compat.install()`` patches the accelerated
+# entry points onto the real package (see __init__.py), so the class statement
+# below subclasses the GENUINE ``fastapi.FastAPI``.
 import fastapi as _real_fastapi
 
 # NOTE on patched-name lookups: the patch-on-real compat installer
@@ -735,70 +734,37 @@ def _pack_asgi_headers(response) -> list[tuple[bytes, bytes]]:
     return norm_headers
 
 
-_REAL_STARLETTE_CLASS_CACHE: dict[tuple[str, str], object] = {}
-_REAL_STARLETTE_LOAD_LOCK = __import__("threading").RLock()
-
-
 def _load_real_starlette_class(submodule: str, classname: str):
-    """Bypass the fastapi_turbo shim to load the REAL Starlette class.
+    """Load the GENUINE Starlette class for the in-process dispatcher.
 
-    The shim hijacks ``sys.modules['starlette.*']`` so user code's
-    ``from starlette.middleware.cors import CORSMiddleware`` resolves
-    to our Tower-bound marker stub (which has no ``__call__``). For
-    the in-process dispatcher we need the real Starlette
-    implementation so CORS / GZip / HTTPSRedirect actually work for
-    TestClient / ASGITransport users.
+    Post shim-flip, ``starlette.*`` modules in ``sys.modules`` ARE the real
+    package — but the compat patcher rebinds a few attributes (the
+    Tower-marker middleware classes among them) to turbo stand-ins that are
+    inert as ASGI. When the in-process / TestClient path needs the real
+    implementation (so CORS / GZip / HTTPSRedirect actually run), consult
+    the patcher's saved original for that exact (module, attribute) first;
+    fall back to the live attribute when it was never patched.
 
-    Snapshots ``starlette.*`` from ``sys.modules``, evicts them,
-    forces a fresh import (which finds the real installed package on
-    disk), captures the class reference, then restores the shim
-    modules so subsequent user-land imports still see our shim.
-    Cached so the snapshot only happens once per (submodule, class).
-
-    Thread-safety: the snapshot/restore window is guarded by a
-    process-wide reentrant lock. ``add_middleware`` pre-loads each
-    Tower-bound class at registration so the dispatcher's hot path
-    is just a dict lookup — the slow path only runs during app
-    construction (single-threaded by convention) or if a user
-    side-channel adds middleware mid-request (uncommon)."""
-    cache_key = (submodule, classname)
-    cached = _REAL_STARLETTE_CLASS_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    import sys
+    This replaces the pre-flip snapshot/evict/re-import dance (which dodged
+    the fake sys.modules entries at the cost of a process-wide lock and
+    duplicate class identities from the fresh import)."""
     import importlib
 
-    with _REAL_STARLETTE_LOAD_LOCK:
-        # Re-check inside the lock to avoid duplicate loads when two
-        # callers race past the unsynchronised lookup above.
-        cached = _REAL_STARLETTE_CLASS_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
+    try:
+        mod = importlib.import_module(f"starlette.{submodule}")
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        from fastapi_turbo import compat as _compat
 
-        saved: dict[str, object] = {}
-        for m in list(sys.modules):
-            if m == "starlette" or m.startswith("starlette."):
-                saved[m] = sys.modules[m]
-                del sys.modules[m]
-
-        importlib.invalidate_caches()
-        try:
-            mod = importlib.import_module(f"starlette.{submodule}")
-            cls = getattr(mod, classname, None)
-        except Exception:  # noqa: BLE001
-            cls = None
-        finally:
-            # Drop anything imported during the un-shimmed window so the
-            # shim remains canonical in sys.modules. THEN restore.
-            for m in list(sys.modules):
-                if (m == "starlette" or m.startswith("starlette.")) and m not in saved:
-                    del sys.modules[m]
-            for m, original in saved.items():
-                sys.modules[m] = original
-
-        _REAL_STARLETTE_CLASS_CACHE[cache_key] = cls
-        return cls
+        for patched_mod, attr, original in _compat._PATCHES:
+            if patched_mod is mod and attr == classname:
+                # First record for this (module, attr) holds the genuine
+                # pre-patch value.
+                return None if original is _compat._MISSING else original
+    except Exception as _exc:  # noqa: BLE001
+        _log.debug("compat original lookup failed: %r", _exc)
+    return getattr(mod, classname, None)
 
 
 # Real Starlette/FastAPI middleware class names → fastapi-turbo

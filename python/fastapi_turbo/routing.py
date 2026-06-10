@@ -11,9 +11,10 @@ from urllib.parse import quote
 
 # REAL pip FastAPI. This module is imported during ``fastapi_turbo``
 # package init (via ``applications.py``, which captures ``import
-# fastapi`` pre-shim at its line 18) — always BEFORE the compat shim
-# shadows ``sys.modules["fastapi"]`` — so this resolves to the real
-# package. ``APIRoute`` below is a THIN SUBCLASS of the real one.
+# fastapi`` at its line 18) — always BEFORE ``compat.install()`` patches
+# the accelerated entry points onto the real package — so class
+# statements below bind the GENUINE base classes. ``APIRoute`` below is
+# a THIN SUBCLASS of the real one.
 import fastapi as _real_fastapi
 
 

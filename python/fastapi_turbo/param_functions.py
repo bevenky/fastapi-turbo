@@ -13,9 +13,9 @@ from __future__ import annotations
 
 from abc import ABCMeta
 
-# Real FastAPI's param classes. Imported during package init BEFORE the compat
-# shim installs, so this resolves to the REAL module; the bound reference stays
-# real after the shim rebinds ``sys.modules['fastapi']``. Each marker below
+# Real FastAPI's param classes. Imported during package init BEFORE
+# ``compat.install()`` patches attributes onto the real package, so this binds
+# the GENUINE classes (``fastapi.params`` is never patched). Each marker below
 # multiply-inherits from the matching ``_real_params.*`` so REAL FastAPI
 # introspection (the pivot adapter) recognizes it (correct ``in_`` / Body class),
 # while the clone's ``_introspect`` keeps reading our custom attrs (``_kind`` …).
