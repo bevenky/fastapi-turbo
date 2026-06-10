@@ -2703,6 +2703,16 @@ async fn handle_request(
                         try_user_dep_exception_handler(py, &e)
                             .unwrap_or_else(|| pyerr_to_response(py, &e))
                     } else {
+                        // A STREAMING body that reads a request-scope dep must keep
+                        // it open until end-of-stream — wrap body_iterator so the
+                        // deps tear down after the body (returns true → skip the
+                        // immediate teardown). Must run BEFORE py_to_response reads
+                        // the (now-wrapped) body_iterator.
+                        let deferred = maybe_defer_request_scope_to_stream(
+                            py,
+                            py_result.bind(py),
+                            &gen_deps,
+                        );
                         // Build the response while request-scope deps are still open
                         // (lazy ORM rows materialize) — matches FA's exit-stack order.
                         let mut resp = py_to_response_with_request(
@@ -2712,10 +2722,11 @@ async fn handle_request(
                             if_range_header.as_deref(),
                         );
                         apply_injected_response(py, &mut resp);
-                        // REQUEST-scope (default) yield-deps tear down AFTER the
-                        // response. (Streaming bodies that read a request-scope dep
-                        // are handled by deferring this to end-of-stream — D2.)
-                        teardown_request_scope_gens(py, &gen_deps, false);
+                        if !deferred {
+                            // REQUEST-scope (default) yield-deps tear down AFTER the
+                            // (buffered) response.
+                            teardown_request_scope_gens(py, &gen_deps, false);
+                        }
                         resp
                     }
                 }
@@ -2836,6 +2847,39 @@ fn teardown_request_scope_gens(py: Python<'_>, gen_deps: &[(Py<PyAny>, bool)], e
             }
         }
     }
+}
+
+/// For a STREAMING result with REQUEST-scope yield deps, defer their teardown to
+/// end-of-stream: wrap the ``StreamingResponse``'s ``body_iterator`` (Python helper)
+/// so the deps stay open while the body is read (FA ``request_stack`` order — the
+/// session a streaming body iterates must not be closed first). Returns true when
+/// it deferred, so the caller SKIPS the immediate request-scope teardown.
+fn maybe_defer_request_scope_to_stream(
+    py: Python<'_>,
+    result: &Bound<'_, PyAny>,
+    gen_deps: &[(Py<PyAny>, bool)],
+) -> bool {
+    // Only StreamingResponse-like results carry a body_iterator.
+    if !result.hasattr("body_iterator").unwrap_or(false) {
+        return false;
+    }
+    let req_gens = pyo3::types::PyList::empty(py);
+    for (gen, is_func) in gen_deps.iter() {
+        if !*is_func {
+            let _ = req_gens.append(gen.bind(py));
+        }
+    }
+    if req_gens.is_empty() {
+        return false;
+    }
+    let app_arg = match current_app(py) {
+        Some(a) => a.into_bound(py),
+        None => py.None().into_bound(py),
+    };
+    py.import("fastapi_turbo.applications")
+        .and_then(|m| m.getattr("_door_wrap_stream_teardown"))
+        .and_then(|f| f.call1((app_arg, result, &req_gens)))
+        .is_ok()
 }
 
 /// Door dep-resolution error path: route a dependency-raised exception through

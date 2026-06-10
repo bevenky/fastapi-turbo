@@ -1687,6 +1687,54 @@ from fastapi_turbo._middleware_wrap import (  # noqa: F401 — public-shape re-e
     _MiddlewareSuspendedError,
     _wrap_with_http_middlewares,
 )
+
+
+def _door_wrap_stream_teardown(app, stream_response, req_gens):
+    """Defer REQUEST-scope yield-dependency teardown to AFTER the streaming body is
+    fully sent (FastAPI ``request_stack`` order). The door owns the response, so it
+    wraps the ``StreamingResponse``'s ``body_iterator`` here; the teardown logic
+    itself stays in Python — drive each generator past its yield (LIFO), capturing
+    a post-yield raise onto the app since the response is already streaming."""
+    inner = stream_response.body_iterator
+
+    def _teardown():
+        for g in reversed(req_gens):
+            try:
+                g.send(None)
+            except StopIteration:
+                pass
+            except BaseException as exc:  # noqa: BLE001
+                if app is not None:
+                    try:
+                        app._captured_server_exceptions.append(exc)
+                    except Exception:  # noqa: BLE001
+                        pass
+            else:
+                try:
+                    g.close()
+                except BaseException:  # noqa: BLE001
+                    pass
+
+    if hasattr(inner, "__aiter__"):
+
+        async def _wrapped():
+            try:
+                async for chunk in inner:
+                    yield chunk
+            finally:
+                _teardown()
+
+    else:
+
+        def _wrapped():
+            try:
+                yield from inner
+            finally:
+                _teardown()
+
+    stream_response.body_iterator = _wrapped()
+
+
 def _collect_dependencies_from_markers(dependencies):
     """Convert a list of Depends markers into introspection-ready param dicts."""
     from fastapi_turbo.dependencies import Depends as DependsClass

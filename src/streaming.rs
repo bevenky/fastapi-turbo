@@ -294,6 +294,14 @@ fn iterate_async_generator(
                 if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
                     break;
                 }
+                // Capture onto the app so TestClient(raise_server_exceptions=True)
+                // surfaces a streaming-body failure (parity with the sync path) —
+                // e.g. a request-scope dep whose session errors mid-stream.
+                if let Some(app_obj) = crate::router::current_app(py) {
+                    if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+                        let _ = lst.call_method1(py, "append", (e.value(py),));
+                    }
+                }
                 eprintln!("fastapi-turbo: run_until_complete streaming error: {e}");
                 break;
             }

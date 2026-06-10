@@ -584,9 +584,13 @@ def _dep_cache_id(dep: Any, call: Any) -> int | None:
         scopes = dep.cache_key[1]  # () unless the dependant actually uses scopes
     except Exception:
         scopes = ()
-    if not scopes:
-        return id(call)
-    return (id(call) ^ (hash(tuple(scopes)) & _U64_MASK)) & _U64_MASK
+    # FA 0.136 cache_key = (call, scopes, scope): a function-scope dep is a DISTINCT
+    # cache entry from the same callable at request scope, so they're separate
+    # instances (e.g. one yield-dep used at both scopes must not be deduped).
+    scope = getattr(dep, "scope", None) or "request"
+    if not scopes and scope == "request":
+        return id(call)  # common case — zero blast radius
+    return (id(call) ^ (hash((tuple(scopes), scope)) & _U64_MASK)) & _U64_MASK
 
 
 def _emit_dep_special_params(dep: Any, out: list[ParamInfo], uid: str) -> list[tuple[str, str]]:
