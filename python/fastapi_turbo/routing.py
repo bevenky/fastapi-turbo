@@ -253,8 +253,23 @@ class APIRoute(_real_fastapi.routing.APIRoute):
                 self.response_field = None
 
 
-class APIRouter:
-    """Route collection that mirrors FastAPI's APIRouter."""
+class APIRouter(_real_fastapi.routing.APIRouter):
+    """Route collection that mirrors FastAPI's APIRouter.
+
+    A thin subclass of REAL FastAPI's ``APIRouter`` (so ``isinstance``
+    checks against real classes pass and the shim binding upgrades for
+    free). Registration stays turbo-DEFERRED: real's eager
+    include-flatten is NOT used — the door's collection walker reads
+    ``routes`` + ``_included_routers`` and flattens at startup, so every
+    registration method below overrides real's.
+
+    ``super().__init__()`` runs with DEFAULTS only: real asserts on
+    prefixes the clone tolerated (e.g. a trailing ``/``, which the
+    walker normalizes at join time) and wraps unset kwargs in
+    ``DefaultPlaceholder``s the cascade consumers don't expect. Every
+    turbo-visible field is re-stamped with clone semantics (raw ``None``
+    = "unset") right after.
+    """
 
     def __init__(
         self,
@@ -279,6 +294,7 @@ class APIRouter:
         routes: Sequence | None = None,
         **kwargs: Any,
     ):
+        super().__init__()
         self.routes: list = []
         self._included_routers: list[tuple[APIRouter, str, list[str], dict]] = []
         self.strict_content_type = strict_content_type

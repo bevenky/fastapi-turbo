@@ -7054,9 +7054,10 @@ class FastAPI(_real_fastapi.FastAPI):
                 sub_scope["path"] = sub_path
                 sub_scope["raw_path"] = sub_path.encode("latin-1")
                 sub_scope["root_path"] = scope.get("root_path", "") + prefix
-                if callable(mounted_app):
-                    await mounted_app(sub_scope, receive, send)
-                    return True
+                # APIRouter FIRST: it is now a real Starlette Router
+                # subclass (callable as ASGI), but turbo routers must be
+                # served through a wrapping app (deferred include + AES
+                # scopes), not raw Router.__call__.
                 from fastapi_turbo.routing import APIRouter as _APIRouter
                 if isinstance(mounted_app, _APIRouter):
                     sub_app = type(self)()
@@ -7065,6 +7066,9 @@ class FastAPI(_real_fastapi.FastAPI):
                     except Exception as _exc:  # noqa: BLE001
                         _log.debug("in-process APIRouter mount: %r", _exc)
                     await sub_app(sub_scope, receive, send)
+                    return True
+                if callable(mounted_app):
+                    await mounted_app(sub_scope, receive, send)
                     return True
         # Starlette Mount routes declared via FastAPI(routes=[Mount(...)])
         for route in getattr(self.router, "routes", []) or []:
@@ -7092,14 +7096,16 @@ class FastAPI(_real_fastapi.FastAPI):
             sub_scope["path"] = sub_path
             sub_scope["raw_path"] = sub_path.encode("latin-1")
             sub_scope["root_path"] = scope.get("root_path", "") + prefix
-            if callable(mounted_app):
-                await mounted_app(sub_scope, receive, send)
-                return True
+            # APIRouter FIRST (see the _mounts branch above): turbo
+            # routers are real Starlette Routers now, hence callable.
             from fastapi_turbo.routing import APIRouter as _APIRouter
             if isinstance(mounted_app, _APIRouter):
                 sub_app = type(self)(docs_url=None, redoc_url=None, openapi_url=None)
                 sub_app.include_router(mounted_app)
                 await sub_app(sub_scope, receive, send)
+                return True
+            if callable(mounted_app):
+                await mounted_app(sub_scope, receive, send)
                 return True
         return False
 
@@ -7396,7 +7402,11 @@ class FastAPI(_real_fastapi.FastAPI):
                     ws_path_local == _mp_strip
                     or ws_path_local.startswith(_mp_strip + "/")
                 ):
-                    if not callable(_ma):
+                    if not callable(_ma) or isinstance(_ma, APIRouter):
+                        # Mounted bare APIRouters are callable now (real
+                        # Starlette Router) but their WS routes are
+                        # WSRoute holders the raw Router can't dispatch —
+                        # fall through to the in-process WS door.
                         continue
                     sub_ws_scope = dict(scope)
                     sub_ws_path = ws_path_local[len(_mp_strip):] or "/"
@@ -7420,7 +7430,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 ):
                     continue
                 _ma = _mounted_route_asgi_app(type(self), _route)
-                if not callable(_ma):
+                if not callable(_ma) or isinstance(_ma, APIRouter):
                     continue
                 sub_ws_scope = dict(scope)
                 sub_ws_path = ws_path_local[len(_mp_strip):] or "/"
