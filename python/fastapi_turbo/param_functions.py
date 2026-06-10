@@ -233,6 +233,17 @@ class UploadFile(_RealUploadFile, metaclass=ABCMeta):
     def __subclasshook__(cls, other):
         if cls is not UploadFile:
             return NotImplemented
+        # REAL Starlette/FastAPI UploadFile (sub)classes count as instances of
+        # the turbo class. Post shim-flip the real form parsers keep their
+        # load-time binding and build REAL UploadFile objects, while
+        # ``starlette.datastructures.UploadFile`` (the name real
+        # ``FormData.close`` isinstance-checks through at call time) is
+        # patched to THIS class — without this branch those parsed uploads
+        # would silently stop matching (and stop being closed). hasattr on
+        # the real CLASS can't catch this: ``filename`` is a plain instance
+        # attribute there.
+        if isinstance(other, type) and issubclass(other, _RealUploadFile):
+            return True
         if all(hasattr(other, attr) for attr in ("filename", "content_type", "read")):
             return True
         return NotImplemented

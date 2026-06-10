@@ -17,7 +17,12 @@ from typing import Annotated, Optional
 
 from pydantic import BaseModel
 
-from fastapi_turbo.exceptions import HTTPException
+# REAL FastAPI's HTTPException (the Starlette subclass), imported pre-shim.
+# Real FA security schemes raise exactly this class — post shim-flip,
+# ``pytest.raises(fastapi.exceptions.HTTPException)`` and user
+# ``except fastapi.HTTPException`` must match scheme rejections. The engine's
+# catch sites use the Starlette BASE class, so these are still caught there.
+from fastapi.exceptions import HTTPException
 from fastapi_turbo.param_functions import Form as _Form
 from fastapi_turbo.requests import Request
 

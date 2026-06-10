@@ -17,6 +17,19 @@ from typing import Any, Callable, Sequence
 # delete the clone overrides so the real base's routing/openapi/deps show through.
 import fastapi as _real_fastapi
 
+# NOTE on patched-name lookups: the patch-on-real compat installer
+# setattr-patches ``fastapi.routing.APIRoute`` (and friends) to the turbo
+# subclasses on this SAME live module object, so a runtime lookup through
+# ``_real_fastapi.routing.APIRoute`` returns the turbo subclass once the
+# patcher has run. That is deliberately what the internal real-route
+# construction sites below use: real ``get_openapi`` (and real
+# ``include_router``) isinstance-check through the SAME live attribute, so
+# constructing with the live class keeps checker and instances consistent
+# both pre- and post-install. Only resolve through ``_real_fastapi`` paths
+# the installer never patches (``openapi.utils.get_openapi``,
+# ``datastructures.Default``, ``responses.JSONResponse``, ...) when the
+# genuine object is required.
+
 # Module logger for the silently-swallowed paths. ``except Exception:
 # pass`` used to be the default; where the swallow is genuinely
 # defensive (optional integrations, best-effort introspection) we now
@@ -1574,78 +1587,6 @@ def _build_stream_handler(orig_endpoint, response_model, response_class, app):
     return _json_lines_wrap
 
 
-def _shim_get_openapi(*, title, version, routes=None, webhooks=None, **kw):
-    """Shim for ``fastapi.openapi.utils.get_openapi`` — the clone ``_openapi.py``
-    generator is deleted, so user code doing
-    ``from fastapi.openapi.utils import get_openapi; get_openapi(routes=app.routes, ...)``
-    (e.g. a custom ``app.openapi``) must convert the CLONE route objects to real
-    ``APIRoute``s before calling REAL get_openapi. Builds from each route's own-level
-    attributes (mount/include prefixing is already baked into ``route.path``)."""
-    _RealRoute = _real_fastapi.routing.APIRoute
-    _http = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
-
-    def _convert(route_list):
-        out = []
-        for route in route_list or []:
-            ep = getattr(route, "endpoint", None)
-            path = getattr(route, "path", None)
-            methods = getattr(route, "methods", None)
-            if ep is None or path is None or not methods:
-                continue  # Mount / WebSocket / non-API routes
-            rc = _unset_to_none(getattr(route, "response_class", None))
-            try:
-                rc_ok = isinstance(rc, type) and issubclass(rc, _real_starlette_response)
-            except TypeError:
-                rc_ok = False
-            rm = getattr(route, "response_model", None)
-            needs_none, is_sse, is_json, inner = _oa_stream_info(rm, rc, ep)
-            if needs_none:
-                rm = None
-            oe = dict(getattr(route, "openapi_extra", None) or {})
-            if getattr(route, "servers", None):
-                oe["servers"] = route.servers
-            if getattr(route, "external_docs", None):
-                oe["externalDocs"] = route.external_docs
-            if getattr(route, "security", None) is not None:
-                oe["security"] = route.security
-            rkw = dict(
-                methods=[m for m in methods if m in _http] or list(methods),
-                response_model=rm,
-                status_code=getattr(route, "status_code", None),
-                tags=getattr(route, "tags", None) or None,
-                summary=getattr(route, "summary", None),
-                description=getattr(route, "description", None) or "",
-                response_description=getattr(
-                    route, "response_description", "Successful Response"
-                ),
-                responses=getattr(route, "responses", None) or None,
-                deprecated=getattr(route, "deprecated", None),
-                operation_id=getattr(route, "operation_id", None),
-                dependencies=getattr(route, "dependencies", None) or None,
-                include_in_schema=getattr(route, "include_in_schema", True),
-                name=getattr(route, "name", None),
-                openapi_extra=oe or None,
-            )
-            if rc_ok:
-                rkw["response_class"] = rc
-            try:
-                rr = _RealRoute(path, ep, **rkw)
-            except Exception:  # noqa: BLE001
-                continue
-            if is_sse or is_json:
-                _oa_apply_stream(rr, is_sse, is_json, inner)
-            out.append(rr)
-        return out
-
-    return _real_fastapi.openapi.utils.get_openapi(
-        title=title,
-        version=version,
-        routes=_convert(routes),
-        webhooks=_convert(webhooks) if webhooks else None,
-        **kw,
-    )
-
-
 class FastAPI(_real_fastapi.FastAPI):
     """Drop-in replacement for ``fastapi.FastAPI``, backed by Rust Axum.
 
@@ -2700,20 +2641,24 @@ class FastAPI(_real_fastapi.FastAPI):
         precedence over an ``include_router(..., generate_unique_id_function
         =...)`` override — matches FA's resolution order.
         """
-        fn = (
-            getattr(route, "generate_unique_id_function", None)
-            or getattr(router, "generate_unique_id_function", None)
-            or include_fn
-            or getattr(self, "generate_unique_id_function", None)
-        )
-        if fn is None:
-            return None
-        # FA parity: when users write ``generate_unique_id_function=
-        # Default(my_fn)``, the value is wrapped in a ``DefaultPlaceholder``.
-        # Unwrap here before invoking.
+        # FA parity: a ``DefaultPlaceholder`` (``Default(generate_unique_id)``,
+        # what real APIRouter/strawberry pass when the user did NOT set one)
+        # means UNSET — fall through to the next cascade level. If every
+        # level is unset, return None so real ``get_openapi`` applies its own
+        # default on the CONVERTED route (which carries the full include
+        # prefix in ``path``; the live route object here does not, so calling
+        # the default fn on it would drop the prefix from the operationId).
         from fastapi_turbo.datastructures import DefaultPlaceholder as _DP
-        if isinstance(fn, _DP):
-            fn = fn.value
+
+        def _set_or_none(v):
+            return None if v is None or isinstance(v, _DP) else v
+
+        fn = (
+            _set_or_none(getattr(route, "generate_unique_id_function", None))
+            or _set_or_none(getattr(router, "generate_unique_id_function", None))
+            or _set_or_none(include_fn)
+            or _set_or_none(getattr(self, "generate_unique_id_function", None))
+        )
         if fn is None or not callable(fn):
             return None
         # Skip internal routes (docs, openapi.json) — user's

@@ -76,7 +76,26 @@ def _adapt_websocket_endpoint_class(endpoint: Callable) -> Callable:
     async def _endpoint(websocket, _endpoint_cls=endpoint):
         from fastapi_turbo.exceptions import WebSocketDisconnect as _WSD
 
-        instance = _endpoint_cls()
+        try:
+            instance = _endpoint_cls()
+        except TypeError:
+            # REAL Starlette ``WebSocketEndpoint.__init__`` requires
+            # ``(scope, receive, send)`` (it asserts ``scope["type"] ==
+            # "websocket"``). The adapter below drives ``on_connect`` /
+            # ``on_receive`` / ``on_disconnect`` directly through the turbo
+            # WebSocket wrapper, so the stored receive/send are never used —
+            # hand it the wrapper's scope and inert callables.
+            _scope = getattr(websocket, "scope", None)
+            if not isinstance(_scope, dict) or _scope.get("type") != "websocket":
+                _scope = {"type": "websocket"}
+
+            async def _inert_receive():
+                return {"type": "websocket.disconnect", "code": 1000}
+
+            async def _inert_send(message):
+                return None
+
+            instance = _endpoint_cls(_scope, _inert_receive, _inert_send)
         close_code = 1000
         try:
             await _maybe_await_ws_result(instance.on_connect(websocket))
