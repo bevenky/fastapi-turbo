@@ -159,7 +159,10 @@ def _param_from_field(
     if kind in _SCALAR_BUCKETS and _is_basemodel(_unwrap_optional(ann)):
         raise Undelegable(f"{kind} parameter-model expansion → real FastAPI")
     required = fi.is_required()
-    is_body_model = kind == "body" and _is_basemodel(ann)
+    # Unwrap Optional[Model] (``item: Item | None``) so the body still validates
+    # through the model (defaults included) instead of being passed as a raw dict.
+    body_ann = _unwrap_optional(ann)
+    is_body_model = kind == "body" and _is_basemodel(body_ann)
     explicit_alias = _alias_of(fi)
     if name is not None:
         resolved_name = name
@@ -175,7 +178,7 @@ def _param_from_field(
         required=required,
         default_value=_default_of(fi),
         has_default=not required,
-        model_class=(ann if is_body_model else None),
+        model_class=(body_ann if is_body_model else None),
         alias=alias,
         scalar_validator=_field_validator(mf, is_body_model, kind),
         is_handler_param=is_handler_param,
