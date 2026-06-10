@@ -7637,13 +7637,17 @@ class FastAPI(_real_fastapi.FastAPI):
         returns a real Response the door renders.
 
         Gated behind ``FASTAPI_TURBO_DELEGATE=1`` (default off) while it's proven
-        end-to-end. WebSocket / mounted routes decline (different protocols);
-        ``dependency_overrides`` declines (runtime override resolution stays on the
-        clone path for now). Returns ``(params, handler, is_async)`` or ``None``."""
+        end-to-end — EXCEPT override-active apps, which ALWAYS delegate: real
+        FastAPI's ``solve_dependencies`` + ``dependency_overrides_provider`` (set
+        below) resolves ``app.dependency_overrides`` at REQUEST time, including
+        different-signature overrides, so overrides no longer need the
+        clone-compiled path. WebSocket / mounted routes decline (different
+        protocols). Returns ``(params, handler, is_async)`` or ``None``."""
         import os
 
-        if os.environ.get("FASTAPI_TURBO_DELEGATE") != "1":
-            return None
+        if not getattr(self, "dependency_overrides", None):
+            if os.environ.get("FASTAPI_TURBO_DELEGATE") != "1":
+                return None
         if rd.get("is_websocket") or rd.get("_from_mount"):
             return None
         route = rd.get("_route_obj")
