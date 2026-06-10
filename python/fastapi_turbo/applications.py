@@ -2801,6 +2801,64 @@ def _build_stream_handler(orig_endpoint, response_model, response_class, app):
     # INSTANCE (not a type) → fall through to the NDJSON auto-wrap.
     rc = response_class if isinstance(response_class, type) else None
     if rc is not None:
+        # EventSourceResponse is a MARKER — real FastAPI does the SSE encoding in
+        # the routing layer (here). Format each yielded item as an SSE event +
+        # keepalive pings + the SSE headers, returning a plain StreamingResponse the
+        # door streams. Mirrors fastapi/routing.py's is_sse_stream branch.
+        _is_sse = False
+        try:
+            from fastapi_turbo.responses import EventSourceResponse as _ESR
+
+            _is_sse = issubclass(rc, _ESR)
+        except Exception:  # noqa: BLE001
+            _is_sse = False
+        if _is_sse:
+
+            def _sse_wrap(_orig=orig_endpoint, _is_a=is_async_gen, **kwargs):
+                from fastapi_turbo.responses import StreamingResponse as _SR
+                from fastapi.encoders import jsonable_encoder as _je
+                import fastapi_turbo.sse as _sse_mod
+                import json as _json
+                import anyio as _anyio
+                from starlette.concurrency import iterate_in_threadpool
+
+                _SSEv = _sse_mod.ServerSentEvent
+                _fmt = _sse_mod.format_sse_event
+
+                def _serialize(item):
+                    if isinstance(item, _SSEv):
+                        if item.raw_data is not None:
+                            ds = item.raw_data
+                        elif item.data is not None:
+                            _mdj = getattr(item.data, "model_dump_json", None)
+                            ds = _mdj() if callable(_mdj) else _json.dumps(_je(item.data))
+                        else:
+                            ds = None
+                        return _fmt(
+                            data_str=ds, event=item.event, id=item.id,
+                            retry=item.retry, comment=item.comment,
+                        )
+                    return _fmt(data_str=_json.dumps(_je(item)))
+
+                gen = _orig(**kwargs)
+                sse_aiter = gen.__aiter__() if _is_a else iterate_in_threadpool(gen)
+
+                # NOTE: real FastAPI decouples iteration from a keepalive timer via
+                # an anyio task group, but the door streams an async-gen with a NEW
+                # task per __anext__, so a task group spanning the generator's yields
+                # raises "exit cancel scope in a different task". Plain producer
+                # (no idle keepalive ping) until the door does single-task streaming.
+                async def _stream():
+                    async for raw in sse_aiter:
+                        yield _serialize(raw)
+                        await _anyio.sleep(0)
+
+                resp = _SR(_stream(), media_type="text/event-stream")
+                resp.headers["Cache-Control"] = "no-cache"
+                resp.headers["X-Accel-Buffering"] = "no"
+                return resp
+
+            return _sse_wrap
 
         def _rc_wrap(_orig=orig_endpoint, _rc=rc, **kwargs):
             return _rc(_orig(**kwargs))
