@@ -879,6 +879,10 @@ def _emit_dep(
             dep_input_names=input_wiring,
             is_handler_param=is_handler_param,
             scalar_validator=None,
+            # FastAPI 0.136 ``Depends(..., scope="function")`` — function-scope yield
+            # deps tear down before the response (raise → response); default/request
+            # scope tears down after the body.
+            is_function_scope=(getattr(dep, "scope", None) == "function"),
         )
     )
     return result_key

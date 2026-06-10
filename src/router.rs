@@ -972,6 +972,12 @@ pub struct ParamInfo {
     pub is_async_dep: bool,
     #[pyo3(get, set)]
     pub is_generator_dep: bool,
+    /// ``Depends(..., scope="function")`` (FastAPI 0.136). A function-scope yield
+    /// dependency tears down BEFORE the response is sent (its post-yield raise
+    /// becomes the response); the default ("request") scope tears down AFTER the
+    /// response body. Only meaningful when ``is_generator_dep``.
+    #[pyo3(get, set)]
+    pub is_function_scope: bool,
     #[pyo3(get, set)]
     pub dep_input_names: Vec<(String, String)>,
     #[pyo3(get, set)]
@@ -1000,6 +1006,7 @@ impl Clone for ParamInfo {
             dep_callable_id: self.dep_callable_id,
             is_async_dep: self.is_async_dep,
             is_generator_dep: self.is_generator_dep,
+            is_function_scope: self.is_function_scope,
             dep_input_names: self.dep_input_names.clone(),
             is_handler_param: self.is_handler_param,
             oauth_scopes: self.oauth_scopes.clone(),
@@ -1010,7 +1017,7 @@ impl Clone for ParamInfo {
 #[pymethods]
 impl ParamInfo {
     #[new]
-    #[pyo3(signature = (name, kind, type_hint="str".to_string(), required=true, default_value=None, has_default=false, model_class=None, alias=None, dep_callable=None, dep_callable_id=None, is_async_dep=false, is_generator_dep=false, dep_input_names=vec![], is_handler_param=true, scalar_validator=None, oauth_scopes=vec![]))]
+    #[pyo3(signature = (name, kind, type_hint="str".to_string(), required=true, default_value=None, has_default=false, model_class=None, alias=None, dep_callable=None, dep_callable_id=None, is_async_dep=false, is_generator_dep=false, dep_input_names=vec![], is_handler_param=true, scalar_validator=None, oauth_scopes=vec![], is_function_scope=false))]
     fn new(
         name: String,
         kind: String,
@@ -1028,6 +1035,7 @@ impl ParamInfo {
         is_handler_param: bool,
         scalar_validator: Option<Py<PyAny>>,
         oauth_scopes: Vec<String>,
+        is_function_scope: bool,
     ) -> Self {
         ParamInfo {
             name,
@@ -1044,6 +1052,7 @@ impl ParamInfo {
             dep_callable_id,
             is_async_dep,
             is_generator_dep,
+            is_function_scope,
             dep_input_names,
             is_handler_param,
             oauth_scopes,
@@ -2415,7 +2424,9 @@ async fn handle_request(
             let mut resolved: HashMap<String, Py<PyAny>> = HashMap::new();
             let mut dep_cache: HashMap<u64, String> = HashMap::new();
             // Live ``yield`` dependency generators awaiting teardown.
-            let mut gen_deps: Vec<Py<PyAny>> = Vec::new();
+            // (generator, is_function_scope). Function-scope deps tear down before
+            // the response; request-scope (default) after the body.
+            let mut gen_deps: Vec<(Py<PyAny>, bool)> = Vec::new();
             // Accumulate missing/coercion errors from extra-dep INPUT params so
             // a route with several ``Depends`` each missing a required param
             // surfaces ALL of them in one 422 (FA parity), and skip any dep
@@ -2471,7 +2482,13 @@ async fn handle_request(
                         // Call the dep. A ``yield`` dep is entered (and stashed for
                         // teardown); async via send(None); plain sync directly.
                         let result = if param.is_generator_dep {
-                            enter_sync_generator_dep(py, dep_callable, &dep_kwargs, &mut gen_deps)
+                            enter_sync_generator_dep(
+                                py,
+                                dep_callable,
+                                &dep_kwargs,
+                                &mut gen_deps,
+                                param.is_function_scope,
+                            )
                         } else if param.is_async_dep {
                             // Try-sync first; a suspending coroutine routes to the
                             // shared worker loop (run_coroutine_threadsafe) so deps
@@ -2676,18 +2693,31 @@ async fn handle_request(
                 Ok(py_result) => {
                     // Run any BackgroundTasks the handler received (deferred).
                     drain_background_tasks(py, &kwargs, &state.params);
-                    // Build the response BEFORE yield-dep teardown so lazily
-                    // serialized objects (e.g. ORM rows) materialize while the
-                    // session is still open — matches FastAPI's exit-stack order.
-                    let mut resp = py_to_response_with_request(
-                        py,
-                        py_result.bind(py),
-                        range_header.as_deref(),
-                        if_range_header.as_deref(),
-                    );
-                    apply_injected_response(py, &mut resp);
-                    teardown_generator_deps(py, &gen_deps, false);
-                    resp
+                    // FA exit-stack order: FUNCTION-scope yield-deps (inner stack)
+                    // tear down BEFORE the response is built/sent — a post-yield
+                    // raise becomes the response.
+                    if let Err(e) = teardown_function_scope_gens(py, &gen_deps) {
+                        // Don't leak request-scope deps — close them, then render
+                        // the function-scope raise through the user handlers.
+                        teardown_request_scope_gens(py, &gen_deps, true);
+                        try_user_dep_exception_handler(py, &e)
+                            .unwrap_or_else(|| pyerr_to_response(py, &e))
+                    } else {
+                        // Build the response while request-scope deps are still open
+                        // (lazy ORM rows materialize) — matches FA's exit-stack order.
+                        let mut resp = py_to_response_with_request(
+                            py,
+                            py_result.bind(py),
+                            range_header.as_deref(),
+                            if_range_header.as_deref(),
+                        );
+                        apply_injected_response(py, &mut resp);
+                        // REQUEST-scope (default) yield-deps tear down AFTER the
+                        // response. (Streaming bodies that read a request-scope dep
+                        // are handled by deferring this to end-of-stream — D2.)
+                        teardown_request_scope_gens(py, &gen_deps, false);
+                        resp
+                    }
                 }
                 Err(ref py_err) => {
                     // FA exit-stack parity: throw the handler error into the
@@ -2719,12 +2749,13 @@ fn enter_sync_generator_dep(
     py: Python<'_>,
     dep_callable: &Py<PyAny>,
     dep_kwargs: &pyo3::Bound<'_, PyDict>,
-    gen_deps: &mut Vec<Py<PyAny>>,
+    gen_deps: &mut Vec<(Py<PyAny>, bool)>,
+    is_function_scope: bool,
 ) -> PyResult<Py<PyAny>> {
     let gen = dep_callable.call(py, (), Some(dep_kwargs))?;
     match gen.call_method1(py, "send", (py.None(),)) {
         Ok(v) => {
-            gen_deps.push(gen);
+            gen_deps.push((gen, is_function_scope));
             Ok(v)
         }
         // A generator that returns without yielding has no value and nothing to
@@ -2743,14 +2774,66 @@ fn enter_sync_generator_dep(
 /// ``db.close()``); on the error path we ``close()`` the generator (raising
 /// ``GeneratorExit`` so ``try/finally`` cleanup still runs). Teardown errors are
 /// swallowed — the response has already been produced.
-fn teardown_generator_deps(py: Python<'_>, gen_deps: &[Py<PyAny>], errored: bool) {
-    for gen in gen_deps.iter().rev() {
+fn teardown_generator_deps(py: Python<'_>, gen_deps: &[(Py<PyAny>, bool)], errored: bool) {
+    for (gen, _is_func) in gen_deps.iter().rev() {
         if errored {
             let _ = gen.call_method0(py, "close");
         } else if gen.call_method1(py, "send", (py.None(),)).is_ok() {
             // Yielded again (multi-yield dep) — close out the remainder.
             // (StopIteration / teardown error means it's already done.)
             let _ = gen.call_method0(py, "close");
+        }
+    }
+}
+
+/// Tear down FUNCTION-scope yield deps (FA ``function_stack``) on the success
+/// path — BEFORE the response is built/sent. Advances each past its yield (LIFO);
+/// a post-yield raise is RETURNED so the caller turns it into the response (FA's
+/// ``function_stack.__aexit__`` propagating before ``await response()``).
+fn teardown_function_scope_gens(py: Python<'_>, gen_deps: &[(Py<PyAny>, bool)]) -> PyResult<()> {
+    for (gen, is_func) in gen_deps.iter().rev() {
+        if !*is_func {
+            continue;
+        }
+        match gen.call_method1(py, "send", (py.None(),)) {
+            // Yielded again (multi-yield) — close out the remainder.
+            Ok(_) => {
+                let _ = gen.call_method0(py, "close");
+            }
+            // Normal completion.
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {}
+            // Raised after yield → becomes the response.
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Tear down REQUEST-scope (default) yield deps (FA ``request_stack``) — AFTER the
+/// response body. ``errored`` closes them (GeneratorExit); otherwise advances past
+/// the yield. A post-yield raise is CAPTURED onto the app (the response is already
+/// sent, so TestClient re-raises it) rather than swallowed.
+fn teardown_request_scope_gens(py: Python<'_>, gen_deps: &[(Py<PyAny>, bool)], errored: bool) {
+    for (gen, is_func) in gen_deps.iter().rev() {
+        if *is_func {
+            continue;
+        }
+        if errored {
+            let _ = gen.call_method0(py, "close");
+            continue;
+        }
+        match gen.call_method1(py, "send", (py.None(),)) {
+            Ok(_) => {
+                let _ = gen.call_method0(py, "close");
+            }
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {}
+            Err(e) => {
+                if let Some(app) = current_app(py) {
+                    if let Ok(lst) = app.getattr(py, "_captured_server_exceptions") {
+                        let _ = lst.call_method1(py, "append", (e.value(py),));
+                    }
+                }
+            }
         }
     }
 }
@@ -2796,11 +2879,11 @@ fn fastapi_error(py: Python<'_>, msg: &str) -> PyErr {
 /// exception) propagates it. Returns the error to surface to the client.
 fn teardown_generator_deps_error(
     py: Python<'_>,
-    gen_deps: &[Py<PyAny>],
+    gen_deps: &[(Py<PyAny>, bool)],
     original: PyErr,
 ) -> PyErr {
     let mut live: Option<PyErr> = Some(original);
-    for gen in gen_deps.iter().rev() {
+    for (gen, _is_func) in gen_deps.iter().rev() {
         match live.take() {
             Some(err) => {
                 let exc = err.value(py).clone();
