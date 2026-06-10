@@ -4430,10 +4430,8 @@ class FastAPI(_real_fastapi.FastAPI):
         # ``fastapi.openapi.docs`` helpers.
         if self.docs_url is not None and _openapi_url_val:
             try:
-                import fastapi_turbo.compat as _c
-                _c.install()
-                import sys as _sys
-                _docs_mod = _sys.modules.get("fastapi.openapi.docs")
+                import importlib as _importlib
+                _docs_mod = _importlib.import_module("fastapi.openapi.docs")
             except Exception:  # noqa: BLE001
                 _docs_mod = None
             if _docs_mod is not None and hasattr(_docs_mod, "get_swagger_ui_html"):
@@ -4465,10 +4463,8 @@ class FastAPI(_real_fastapi.FastAPI):
 
         if self.redoc_url is not None and _openapi_url_val:
             try:
-                import fastapi_turbo.compat as _c
-                _c.install()
-                import sys as _sys
-                _docs_mod = _sys.modules.get("fastapi.openapi.docs")
+                import importlib as _importlib
+                _docs_mod = _importlib.import_module("fastapi.openapi.docs")
             except Exception:  # noqa: BLE001
                 _docs_mod = None
             if _docs_mod is not None and hasattr(_docs_mod, "get_redoc_html"):
@@ -4509,10 +4505,8 @@ class FastAPI(_real_fastapi.FastAPI):
             and _openapi_url_val
         ):
             try:
-                import fastapi_turbo.compat as _c
-                _c.install()
-                import sys as _sys
-                _docs_mod = _sys.modules.get("fastapi.openapi.docs")
+                import importlib as _importlib
+                _docs_mod = _importlib.import_module("fastapi.openapi.docs")
             except Exception:  # noqa: BLE001
                 _docs_mod = None
             if _docs_mod is not None and hasattr(
@@ -5602,10 +5596,8 @@ class FastAPI(_real_fastapi.FastAPI):
         redoc_html_str: str | None = None
         if self.docs_url is not None and self.openapi_url is not None:
             try:
-                import fastapi_turbo.compat as _c
-                _c.install()
-                import sys
-                _docs_mod = sys.modules.get("fastapi.openapi.docs")
+                import importlib as _importlib
+                _docs_mod = _importlib.import_module("fastapi.openapi.docs")
                 if _docs_mod is not None:
                     resp = _docs_mod.get_swagger_ui_html(
                         openapi_url=self.openapi_url,
@@ -5620,10 +5612,8 @@ class FastAPI(_real_fastapi.FastAPI):
                 swagger_ui_html_str = None
         if self.redoc_url is not None and self.openapi_url is not None:
             try:
-                import fastapi_turbo.compat as _c
-                _c.install()
-                import sys
-                _docs_mod = sys.modules.get("fastapi.openapi.docs")
+                import importlib as _importlib
+                _docs_mod = _importlib.import_module("fastapi.openapi.docs")
                 if _docs_mod is not None:
                     resp = _docs_mod.get_redoc_html(
                         openapi_url=self.openapi_url,
