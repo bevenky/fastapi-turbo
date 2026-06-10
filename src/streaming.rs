@@ -311,7 +311,12 @@ fn iterate_async_generator(
 
 /// Convert a Python str or bytes value to `bytes::Bytes`.
 fn python_val_to_bytes(val: &Bound<'_, PyAny>) -> bytes::Bytes {
-    if let Ok(s) = val.extract::<String>() {
+    // bytes chunks first (most common for streaming) — single memcpy, and no
+    // String-extract exception overhead. `extract::<Vec<u8>>` on a bytes object
+    // iterates per-element (~15ns/byte); `as_bytes` is a straight slice copy.
+    if let Ok(b) = val.cast::<pyo3::types::PyBytes>() {
+        bytes::Bytes::copy_from_slice(b.as_bytes())
+    } else if let Ok(s) = val.extract::<String>() {
         bytes::Bytes::from(s)
     } else if let Ok(b) = val.extract::<Vec<u8>>() {
         bytes::Bytes::from(b)

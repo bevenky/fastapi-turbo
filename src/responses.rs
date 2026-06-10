@@ -114,7 +114,12 @@ static ORJSON_KWARGS: OnceLock<Py<PyAny>> = OnceLock::new();
 fn orjson_kwargs(py: Python<'_>) -> &'static Py<PyAny> {
     ORJSON_KWARGS.get_or_init(|| {
         let d = pyo3::types::PyDict::new(py);
-        d.set_item("default", json_default(py).bind(py))
+        // MUST be the interned "default" string: orjson matches keyword names by
+        // pointer identity against CPython's interned strings. A plain
+        // PyString::new("default") key makes orjson raise "unexpected keyword
+        // argument" and silently knocks every dict response onto the stdlib-json
+        // fallback path.
+        d.set_item(pyo3::intern!(py, "default"), json_default(py).bind(py))
             .expect("set default");
         d.unbind().into_any()
     })
@@ -127,6 +132,12 @@ fn dict_to_json_bytes(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Vec<u8> {
     if let Some(dumps) = orjson_dumps(py) {
         let kw = orjson_kwargs(py);
         if let Ok(bytes) = dumps.call(py, (obj,), Some(kw.bind(py).cast().unwrap())) {
+            // PyBytes fast path: single memcpy. (`extract::<Vec<u8>>` iterates the
+            // bytes object per-element via the sequence protocol — ~15ns/byte,
+            // i.e. ~10μs for a 660-byte response.)
+            if let Ok(b) = bytes.bind(py).cast::<pyo3::types::PyBytes>() {
+                return b.as_bytes().to_vec();
+            }
             if let Ok(b) = bytes.extract::<Vec<u8>>(py) {
                 return b;
             }
