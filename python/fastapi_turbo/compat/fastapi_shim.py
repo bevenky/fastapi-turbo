@@ -12,6 +12,15 @@ from typing import Any
 
 def _build() -> dict[str, types.ModuleType]:
     # Lazy imports to avoid circular issues
+    #
+    # Import the REAL ``fastapi.sse`` FIRST — while ``sys.modules["fastapi"]`` is
+    # still the real package — and keep it registered. fastapi_turbo.responses
+    # (next import) does ``from fastapi.sse import EventSourceResponse``; without
+    # this eager import, a cold start that swaps the fake ``fastapi`` module in
+    # before responses.py loads dies with ModuleNotFoundError (the fake parent has
+    # no __path__ to resolve the submodule). The cache entry survives the swap.
+    import fastapi.sse as _real_sse  # noqa: F401
+
     import fastapi_turbo
     import fastapi_turbo.responses as _responses
     import fastapi_turbo.requests as _requests
