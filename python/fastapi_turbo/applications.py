@@ -5789,6 +5789,11 @@ class FastAPI(_real_fastapi.FastAPI):
         # when it changes — override-active routes then decline to the clone path
         # (which resolves overrides per request, incl. different-signature ones).
         _ov = getattr(self, "dependency_overrides", None)
+        # The door caches a per-route ``wants_request_scope`` flag (skips the
+        # request-scope ctxvar set when no consumer exists). Its inputs are the
+        # exception-handler count and the Sentry-installed flag; include both so
+        # a handler registered AFTER the first request forces a RouteState
+        # rebuild instead of leaving the scope permanently un-populated.
         return (
             len(getattr(router, "routes", None) or ()),
             len(getattr(self, "_http_middlewares", None) or ()),
@@ -5796,6 +5801,8 @@ class FastAPI(_real_fastapi.FastAPI):
             len(getattr(self, "_raw_asgi_middlewares", None) or ()),
             len(getattr(self, "_mounts", None) or ()),
             frozenset(id(k) for k in _ov) if _ov else None,
+            bool(getattr(self, "exception_handlers", None)),
+            bool(getattr(self, "_fastapi_turbo_sentry_installed", False)),
         )
 
     def _ensure_oneshot_registered(self, scope: dict) -> None:

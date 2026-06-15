@@ -213,6 +213,14 @@ fn set_request_scope_ctxvar(
         return;
     }
 
+    // Zero-consumer fast path: when nothing reads the request-scope ctxvar for
+    // this app (no user exception handlers, no Sentry), skip the endpoint/route
+    // getattrs, the kwargs dict build, and the Python call entirely. This is the
+    // bench/common handler-only case and removes ~4-5μs from every request.
+    if !state.wants_request_scope {
+        return;
+    }
+
     // Pull the user endpoint and route path off the RouteState for
     // Sentry-style transaction refinement. The handler is a compiled
     // wrapper; the original endpoint lives on its
@@ -1252,6 +1260,14 @@ struct RouteState {
     has_file_params: bool,
     has_form_params: bool,
     has_http_middleware: bool,
+    /// True when SOME consumer of the request-scope ContextVar exists for this
+    /// app: a user ``@app.exception_handler`` entry OR an active Sentry client.
+    /// When false, ``set_request_scope_ctxvar`` skips the endpoint/route
+    /// getattrs, dict build, and the Python call entirely (the bench/common
+    /// handler-only apps take this skip). Computed once at startup; the door
+    /// rebuilds RouteState when ``app.exception_handlers`` changes (folded into
+    /// ``_door_fingerprint``), so a late-registered handler is not missed.
+    wants_request_scope: bool,
     /// True when the Python handler advertises
     /// ``_fastapi_turbo_defers_extraction_errors = True`` — the compile
     /// pipeline sets this on routes with `Depends(...)` so that
@@ -1451,6 +1467,30 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     }
                 }
             }
+            // Does ANY consumer of the request-scope ctxvar exist for this app?
+            // Consumers: a non-empty ``app.exception_handlers`` (user
+            // ``@app.exception_handler`` entries) OR an active Sentry client
+            // (``_fastapi_turbo_sentry_installed``). When neither holds, the
+            // per-request scope set serves nobody and is skipped.
+            let wants_request_scope = current_app(py)
+                .map(|app| {
+                    let eh_nonempty = app
+                        .getattr(py, "exception_handlers")
+                        .ok()
+                        .and_then(|eh| eh.bind(py).len().ok())
+                        .map(|n| n > 0)
+                        // If we can't read exception_handlers, keep the old
+                        // (populating) behaviour to stay safe.
+                        .unwrap_or(true);
+                    let sentry = app
+                        .getattr(py, "_fastapi_turbo_sentry_installed")
+                        .and_then(|v| v.extract::<bool>(py))
+                        .unwrap_or(false);
+                    eh_nonempty || sentry
+                })
+                // No bound app (shouldn't happen on the door path) → be safe.
+                .unwrap_or(true);
+
             Arc::new(RouteState {
                 handler: route.handler.clone_ref(py),
                 params,
@@ -1464,6 +1504,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                 has_inject_response: has_inj_resp,
                 has_file_params: has_file,
                 has_form_params: has_form,
+                wants_request_scope,
                 has_http_middleware: route
                     .handler
                     .getattr(py, "_has_http_middleware")
