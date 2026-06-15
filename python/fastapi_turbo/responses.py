@@ -41,7 +41,50 @@ __all__ = [
     "UJSONResponse",
     "EventSourceResponse",
     "_json_default",
+    "_drive_stream",
 ]
+
+
+async def _drive_stream(aiter, push):
+    """Single-driver for an async streaming body — the Rust door's hot path.
+
+    The naive Rust loop drove EACH ``__anext__`` through its own
+    ``run_until_complete`` on a thread-local event loop: one full asyncio
+    loop iteration per chunk (~37µs/chunk). This coroutine consumes the
+    WHOLE async iterator under a single ``run_until_complete``, amortizing
+    the loop machinery across every chunk (N run_until_complete → 1).
+
+    ``aiter`` is the StreamingResponse's ``body_iterator`` — which, for
+    request-scope yield-dep streams, is already the teardown-WRAPPED
+    async-gen (``_door_wrap_stream_teardown``), so ``async for`` over it
+    runs that wrapper's ``finally: _teardown()`` automatically. (Note:
+    Starlette threadpool-wraps SYNC stream content into an async-gen via
+    ``iterate_in_threadpool``, so this async driver handles sync content too.)
+
+    ``push`` is the Rust ``ChunkPush`` callback: ``push(item) -> bool``;
+    it converts the item to bytes and blocking-sends it through the mpsc
+    channel, returning ``False`` when the receiver was dropped (client
+    disconnect / door closed the body). On ``False`` we ``break`` and call
+    ``aclose()`` — which throws ``GeneratorExit`` into the gen so its
+    ``try/finally`` + ``except GeneratorExit`` fire (streaming-cancellation
+    parity). ``aclose()`` runs ONLY on the break (disconnect) path: when the
+    ``async for`` exhausts normally OR raises mid-stream, the gen is already
+    finished and its ``finally`` (teardown) has run — calling ``aclose()`` on
+    a threadpool-wrapped gen in that state can hang under the thread-local
+    loop, and is redundant. A mid-stream raise propagates out of ``async for``
+    → out of this coroutine → out of ``run_until_complete`` as a Rust
+    ``Err``, where the door captures it onto
+    ``app._captured_server_exceptions`` (TestClient parity).
+    """
+    disconnected = False
+    async for item in aiter:
+        if not push(item):
+            disconnected = True
+            break
+    if disconnected:
+        aclose = getattr(aiter, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
 def _json_default(obj):

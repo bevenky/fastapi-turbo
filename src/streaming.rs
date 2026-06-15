@@ -205,14 +205,64 @@ fn iterate_sync_generator(
     }
 }
 
-/// Iterate an async Python generator chunk-by-chunk on a thread-local event
-/// loop, pushing each chunk to the mpsc channel as soon as it's yielded.
-/// This is the hot path for LLM token streaming (vLLM / SGLang) — every
-/// token must reach the client immediately; buffering defeats the purpose.
+/// Per-chunk callback handed to the Python `_drive_stream` driver.
 ///
-/// Strategy: try the fast sync probe (send(None)) first. If the generator
-/// suspends on real I/O, switch to run_until_complete for ALL remaining
-/// chunks permanently. This avoids destroying the generator state.
+/// `__call__(item) -> bool` converts the yielded item to bytes and
+/// blocking-sends it through the mpsc channel, returning `True` to keep
+/// going and `False` when the receiver was dropped (client disconnect /
+/// door closed the body). The driver breaks on `False` and runs `aclose()`.
+///
+/// The instance never crosses a thread boundary at the Rust level: it's
+/// created inside the `spawn_blocking` closure under `Python::attach`,
+/// handed to Python as a positional arg, and only `__call__`-ed from that
+/// same blocking thread. `tx` is a cheap `.clone()` of the channel Sender
+/// (an Arc bump). `__call__` never raises — it returns a bool — so the
+/// driver's `async for` never sees a spurious error from the push.
+///
+/// `tx` is wrapped in `Option` so the driver function can explicitly drop it
+/// (`take_tx`) after `run_until_complete` returns: when the driver coroutine
+/// raises mid-stream, CPython may keep the coroutine frame (and thus this
+/// callback) alive in a reference CYCLE that only the cyclic GC collects.
+/// That would leave a `Sender` clone alive, holding the channel open so the
+/// HTTP body never terminates and the client hangs on read. Explicitly
+/// taking the sender breaks that dependency on GC timing.
+#[pyclass]
+struct ChunkPush {
+    tx: Option<mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>,
+}
+
+#[pymethods]
+impl ChunkPush {
+    fn __call__(&self, py: Python<'_>, item: &Bound<'_, PyAny>) -> bool {
+        let Some(tx) = self.tx.as_ref() else {
+            return false;
+        };
+        let chunk = python_val_to_bytes(item);
+        // Release the GIL across the (possibly backpressure-blocking) send —
+        // holding it through ``blocking_send`` stalls every other Python
+        // thread; a slow consumer could pin the interpreter for seconds.
+        py.detach(|| tx.blocking_send(Ok(chunk)).is_ok())
+    }
+}
+
+/// Iterate an async Python generator on a thread-local event loop, pushing
+/// each chunk to the mpsc channel as soon as it's yielded. This is the hot
+/// path for LLM token streaming (vLLM / SGLang) — every token must reach
+/// the client immediately; buffering defeats the purpose.
+///
+/// Single-driver: instead of driving each `__anext__` through its own
+/// `run_until_complete` (one full asyncio loop iteration per chunk,
+/// ~37µs/chunk), we run the whole async iterator under ONE
+/// `run_until_complete` over the Python driver coroutine
+/// `fastapi_turbo.responses._drive_stream(aiter, push)`. The driver
+/// `async for`s the iterator and hands each item to the `ChunkPush`
+/// callback; the loop machinery is amortized across every chunk.
+///
+/// `aclose()` on disconnect, the request-scope teardown wrap (consumed via
+/// `async for`), and SSE's internal producer/`wait_for` all compose under
+/// the single outer `run_until_complete`. A mid-stream raise propagates out
+/// of the driver coroutine and surfaces here as a Rust `Err`, captured onto
+/// `app._captured_server_exceptions` for TestClient parity.
 fn iterate_async_generator(
     py: Python<'_>,
     iterator: &Py<PyAny>,
@@ -246,65 +296,56 @@ fn iterate_async_generator(
         }
     };
 
-    // Convert async-gen → async iterator once.
-    let aiter = match iterator.bind(py).call_method0("__aiter__") {
-        Ok(it) => it.unbind(),
+    // Build the per-chunk push callback over a cloned Sender, then the
+    // driver coroutine: ``_drive_stream(body_iterator, push)``. Passing
+    // ``body_iterator`` itself (not its ``__aiter__()``) means the driver's
+    // ``aclose()`` fires on the WRAPPED gen — preserving request-scope
+    // yield-dep teardown (``_door_wrap_stream_teardown``'s ``finally``).
+    let push = match Py::new(
+        py,
+        ChunkPush {
+            tx: Some(tx.clone()),
+        },
+    ) {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("fastapi-turbo: __aiter__ failed: {e}");
+            eprintln!("fastapi-turbo: ChunkPush alloc failed: {e}");
             return;
         }
     };
 
-    // Drive each __anext__ through run_until_complete on the thread-local
-    // event loop. This is correct for ALL async generators — both those that
-    // do real async I/O (asyncio.sleep, DB queries) and those that complete
-    // synchronously. The overhead of run_until_complete for sync generators
-    // is ~5μs per chunk — negligible compared to the network I/O cost of
-    // streaming. The pre-drain above already captured the first chunk via
-    // the fast send(None) path to minimize TTFB.
-    loop {
-        let coro = match aiter.call_method0(py, "__anext__") {
-            Ok(c) => c,
-            Err(e) => {
-                if !e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
-                    eprintln!("fastapi-turbo: __anext__ spawn error: {e}");
-                }
-                break;
-            }
-        };
+    let runner_coro = match (|| -> PyResult<Py<PyAny>> {
+        let responses = py.import("fastapi_turbo.responses")?;
+        let drive = responses.getattr("_drive_stream")?;
+        Ok(drive.call1((iterator.bind(py), push.clone_ref(py)))?.unbind())
+    })() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("fastapi-turbo: building stream driver failed: {e}");
+            return;
+        }
+    };
 
-        match loop_obj.call_method1(py, "run_until_complete", (coro.bind(py),)) {
-            Ok(val) => {
-                let chunk = python_val_to_bytes(val.bind(py));
-                // Release the GIL while the downstream channel might
-                // block on backpressure — see sync path for rationale.
-                let send_err = py.detach(|| tx.blocking_send(Ok(chunk)).is_err());
-                if send_err {
-                    // Receiver dropped — drive the async generator's GeneratorExit
-                    // cleanup (``aclose``) so try/finally + ``except
-                    // GeneratorExit`` fire (streaming-cancellation parity).
-                    if let Ok(aclose_coro) = aiter.call_method0(py, "aclose") {
-                        let _ = loop_obj
-                            .call_method1(py, "run_until_complete", (aclose_coro.bind(py),));
-                    }
-                    break;
+    // ONE run_until_complete drives the whole stream. The first chunk is
+    // pushed the instant the driver's ``async for`` yields it (TTFB is equal
+    // or better than the per-chunk loop). On a non-StopAsyncIteration error
+    // (mid-stream raise), capture it onto the app for TestClient parity.
+    let result = loop_obj.call_method1(py, "run_until_complete", (runner_coro.bind(py),));
+
+    // Explicitly drop the callback's Sender clone now (before any GC-cycle
+    // retention of the coroutine frame can keep it alive). Together with the
+    // closure's own `tx` going out of scope at function return, this closes
+    // the channel so the HTTP body terminates and the client doesn't hang.
+    push.borrow_mut(py).tx.take();
+
+    if let Err(e) = result {
+        if !e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
+            if let Some(app_obj) = crate::router::current_app(py) {
+                if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+                    let _ = lst.call_method1(py, "append", (e.value(py),));
                 }
             }
-            Err(e) => {
-                if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
-                    break;
-                }
-                // Capture onto the app so TestClient(raise_server_exceptions=True)
-                // surfaces a streaming-body failure (parity with the sync path) —
-                // e.g. a request-scope dep whose session errors mid-stream.
-                if let Some(app_obj) = crate::router::current_app(py) {
-                    if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-                        let _ = lst.call_method1(py, "append", (e.value(py),));
-                    }
-                }
-                eprintln!("fastapi-turbo: run_until_complete streaming error: {e}");
-                break;
-            }
+            eprintln!("fastapi-turbo: run_until_complete streaming error: {e}");
         }
     }
 }
