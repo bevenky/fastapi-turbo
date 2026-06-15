@@ -1259,6 +1259,13 @@ struct RouteState {
     has_inject_response: bool,
     has_file_params: bool,
     has_form_params: bool,
+    /// True when SOME code path reads the ``query_multi`` repeated-key multimap:
+    /// a list-typed query param, a param-model route (reads the full raw_query),
+    /// or a dependency (its list-query inputs go through ``extract_single_param``
+    /// which reads ``query_multi``). When false, the second full query-string
+    /// parse + per-key Vec allocs are skipped — the common case for body-only,
+    /// scalar-query, and no-query routes.
+    needs_query_multi: bool,
     has_http_middleware: bool,
     /// True when SOME consumer of the request-scope ContextVar exists for this
     /// app: a user ``@app.exception_handler`` entry OR an active Sentry client.
@@ -1435,6 +1442,16 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
             .iter()
             .any(|p| p.kind == "inject_background_tasks");
         let has_inj_resp = route.params.iter().any(|p| p.kind == "inject_response");
+        // ``query_multi`` (the repeated-key multimap) is only read by: list-typed
+        // query params (3093/3794), param-model routes that emit ``raw_query``
+        // (3663, ``pm_`` params), and dependencies whose list-query inputs go
+        // through ``extract_single_param`` (3794). Anything else — body-only,
+        // scalar query, no query — never touches it, so skip the second parse.
+        let needs_query_multi = has_dep
+            || route.params.iter().any(|p| {
+                p.name.starts_with("pm_")
+                    || (p.kind == "query" && p.type_hint.starts_with("list_"))
+            });
 
         let state = Python::attach(|py| {
             // Pre-cache pydantic validators at startup (saves ~0.3μs getattr per POST request)
@@ -1504,6 +1521,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                 has_inject_response: has_inj_resp,
                 has_file_params: has_file,
                 has_form_params: has_form,
+                needs_query_multi,
                 wants_request_scope,
                 has_http_middleware: route
                     .handler
@@ -1925,12 +1943,18 @@ async fn handle_request(
 ) -> Response {
     // Parse raw query string into a multimap so repeated `?tag=a&tag=b`
     // keys are preserved (used when a handler param is annotated as a list).
-    let query_multi: HashMap<String, Vec<String>> = {
+    // axum's ``Query<HashMap<_,_>>`` extractor already parsed the query once;
+    // this multimap is a SECOND parse, only needed for list-typed query params,
+    // param-model raw_query, and dep list-query inputs. Skip it otherwise — the
+    // empty map readers (`.get(...).unwrap_or_default()`) behave identically.
+    let query_multi: HashMap<String, Vec<String>> = if state.needs_query_multi {
         let mut m: HashMap<String, Vec<String>> = HashMap::new();
         for (k, v) in url::form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes()) {
             m.entry(k.into_owned()).or_default().push(v.into_owned());
         }
         m
+    } else {
+        HashMap::new()
     };
     // In-process disconnect flag (streaming door) — read off the request's Axum
     // extension BEFORE the body is consumed; stashed in the thread-local below
@@ -1976,13 +2000,43 @@ async fn handle_request(
             (None, FormKind::None)
         };
 
-    // Always capture the full header map. Needed for:
+    // Capture the full header map only when something reads it:
     // - Header/Cookie params
     // - Request injection (vLLM/SGLang read request.headers)
     // - BaseHTTPMiddleware dispatch (Qwen auth reads authorization header)
-    // The clone is ~2-3μs for typical request headers.
-    let headers: Option<HeaderMap> = if true {
+    // - File/form params (read content-type / boundary off the clone)
+    // - Body params (the body arm reads content-type off `headers`)
+    // The clone is ~0.6-1μs for typical request headers; routes with none of
+    // these (e.g. /hello, /path/{id}) skip it entirely.
+    let needs_headers = state.has_header_params
+        || state.has_inject_request
+        || state.has_http_middleware
+        || state.has_file_params
+        || state.has_form_params
+        // Body routes no longer force the clone — the body arm reads
+        // Content-Type from the ``content_type`` carrier captured below.
+        // A dependency input may read a Header/Cookie (or inject Request) that
+        // isn't visible in the top-level ``route.params`` — keep the clone for
+        // any dep route. (Conservative; the bench ``/with-deps`` dep reads a
+        // header, so this is load-bearing.)
+        || state.has_dep_params;
+    let headers: Option<HeaderMap> = if needs_headers {
         Some(request.headers().clone())
+    } else {
+        None
+    };
+
+    // Capture Content-Type as an owned String for the body arm. Cheap (one
+    // header get + to_string) and lets a body-only route skip the full header
+    // clone above: ``needs_headers`` drops ``has_body_params`` when the route
+    // has no other header-reading param, so ``headers`` is ``None`` but the
+    // body arm still sees the MIME via this carrier.
+    let content_type: Option<String> = if state.has_body_params {
+        request
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
     } else {
         None
     };
@@ -2184,6 +2238,7 @@ async fn handle_request(
                     &query_params,
                     &query_multi,
                     &headers,
+                    content_type.as_deref(),
                     &body_json_opt,
                     &body_bytes,
                     &mut multipart_fields,
@@ -2311,6 +2366,7 @@ async fn handle_request(
                         &query_params,
                         &query_multi,
                         &headers,
+                        content_type.as_deref(),
                         &body_json_opt,
                         &body_bytes,
                         &mut multipart_fields,
@@ -2384,6 +2440,7 @@ async fn handle_request(
                         &query_params,
                         &query_multi,
                         &headers,
+                        content_type.as_deref(),
                         &body_json_opt,
                         &body_bytes,
                         &mut multipart_fields,
@@ -2658,6 +2715,7 @@ async fn handle_request(
                 &query_params,
                 &query_multi,
                 &headers,
+                content_type.as_deref(),
                 &body_json_opt,
                 &body_bytes,
                 &mut multipart_fields,
@@ -3021,6 +3079,11 @@ fn extract_params_to_pydict_full<'py>(
     query_params: &HashMap<String, String>,
     query_multi: &HashMap<String, Vec<String>>,
     headers: &Option<HeaderMap>,
+    // Content-Type captured cheaply before the body was consumed. Lets a
+    // body-only route (no header/cookie/inject/file/form/dep params) skip the
+    // full ``HeaderMap`` clone entirely while the body arm still sees the MIME.
+    // ``None`` ⇒ fall back to reading ``headers`` (the non-body-fast-path case).
+    content_type: Option<&str>,
     body_json: &Option<&serde_json::Value>,
     body_bytes: &[u8],
     multipart_fields: &mut Option<HashMap<String, Vec<ParsedField>>>,
@@ -3191,10 +3254,12 @@ fn extract_params_to_pydict_full<'py>(
                     // Lax mode: missing Content-Type is OK, but a
                     // declared non-JSON ``Content-Type`` still errors
                     // (FA parity — ``test_lax_post_with_text_plain_is_still_rejected``).
-                    let ct_header = headers
-                        .as_ref()
-                        .and_then(|h| h.get("content-type"))
-                        .and_then(|v| v.to_str().ok());
+                    let ct_header = content_type.or_else(|| {
+                        headers
+                            .as_ref()
+                            .and_then(|h| h.get("content-type"))
+                            .and_then(|v| v.to_str().ok())
+                    });
                     let ct_is_json = match ct_header {
                         Some(s) => {
                             let lower = s.to_ascii_lowercase();
