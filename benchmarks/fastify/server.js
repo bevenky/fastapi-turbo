@@ -4,6 +4,18 @@
 //
 // Run:  PORT=8004 node server.js     (npm i fastify here first)
 const fastify = require("fastify")({ logger: false });
+const { Readable } = require("node:stream");
+
+// ── streaming contract ──────────────────────────────────────────────
+// Exactly 10 chunks. Each chunk is a fixed 64-byte line:
+//   `chunk-${i}: ` (9 bytes for single-digit i) + 54 '=' pad + "\n"
+// Total body = 640 bytes. Content-Type: text/plain; charset=utf-8.
+// NO artificial per-chunk delay — measures framework streaming OVERHEAD.
+// MUST stay byte-identical across all 5 servers.
+const STREAM_CHUNKS = 10;
+function streamChunk(i) {
+  return Buffer.from(`chunk-${i}: ` + "=".repeat(54) + "\n");
+}
 
 // Static-string baseline, like fastapi-turbo's Rust /_ping.
 fastify.get("/_ping", (req, reply) => {
@@ -64,6 +76,17 @@ fastify.post(
     return { ok: true, sku, qty, tag_count: tags.length };
   }
 );
+
+// 10-chunk stream via an async generator → Readable. No delay.
+fastify.get("/stream", (req, reply) => {
+  async function* gen() {
+    for (let i = 0; i < STREAM_CHUNKS; i++) {
+      yield streamChunk(i);
+    }
+  }
+  reply.type("text/plain; charset=utf-8");
+  return reply.send(Readable.from(gen()));
+});
 
 const port = Number(process.env.PORT || 8004);
 fastify.listen({ host: "127.0.0.1", port }).then(() => {

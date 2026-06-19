@@ -97,16 +97,56 @@ def list_items():
     return {"items": [{"id": i, "name": f"item-{i}"} for i in range(20)]}
 
 
-# ── streaming ──
-@app.get("/stream")
-async def stream():
-    from fastapi.responses import StreamingResponse
+# ── streaming ──────────────────────────────────────────────────────
+# Contract (shared across all 5 bench servers): exactly 10 chunks, each
+# a fixed 64-byte line "chunk-{i}: " + 54 '=' pad + "\\n" (640 bytes
+# total), Content-Type text/plain; charset=utf-8, NO artificial per-chunk
+# delay. Three turbo variants isolate the three streaming costs.
+from fastapi.responses import StreamingResponse
 
+_STREAM_N = 10
+_STREAM_CT = "text/plain; charset=utf-8"
+
+
+def _chunk(i: int) -> bytes:
+    return (f"chunk-{i}: " + "=" * 54 + "\\n").encode()
+
+
+@app.get("/stream-sync")
+def stream_sync():
+    def gen():
+        for i in range(_STREAM_N):
+            yield _chunk(i)
+
+    return StreamingResponse(gen(), media_type=_STREAM_CT)
+
+
+@app.get("/stream-async")
+async def stream_async():
     async def gen():
-        for i in range(10):
-            yield f"chunk-{i}\\n".encode()
+        for i in range(_STREAM_N):
+            yield _chunk(i)
 
-    return StreamingResponse(gen(), media_type="text/plain")
+    return StreamingResponse(gen(), media_type=_STREAM_CT)
+
+
+@app.get("/stream-await")
+async def stream_await():
+    async def gen():
+        for i in range(_STREAM_N):
+            await asyncio.sleep(0)
+            yield _chunk(i)
+
+    return StreamingResponse(gen(), media_type=_STREAM_CT)
+
+
+@app.get("/stream")
+def stream():
+    def gen():
+        for i in range(_STREAM_N):
+            yield _chunk(i)
+
+    return StreamingResponse(gen(), media_type=_STREAM_CT)
 '''
 
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -25,6 +26,20 @@ type Item struct {
 	SKU  string   `json:"sku" binding:"required"`
 	Qty  int      `json:"qty" binding:"required"`
 	Tags []string `json:"tags"`
+}
+
+// ── streaming contract ──────────────────────────────────────────────
+// Exactly 10 chunks. Each chunk is a fixed 64-byte line:
+//
+//	"chunk-{i}: " (9 bytes for single-digit i) + 54 '=' pad + "\n"
+//
+// Total body = 640 bytes. Content-Type: text/plain; charset=utf-8.
+// NO artificial per-chunk delay — measures framework streaming OVERHEAD.
+// MUST stay byte-identical across all 5 servers.
+const streamChunks = 10
+
+func streamChunk(i int) []byte {
+	return []byte(fmt.Sprintf("chunk-%d: ", i) + strings.Repeat("=", 54) + "\n")
 }
 
 func main() {
@@ -88,6 +103,17 @@ func main() {
 			"qty":       item.Qty,
 			"tag_count": len(item.Tags),
 		})
+	})
+
+	// 10-chunk stream, manual writer loop + flush per chunk. No delay.
+	r.GET("/stream", func(c *gin.Context) {
+		c.Header("Content-Type", "text/plain; charset=utf-8")
+		c.Status(http.StatusOK)
+		w := c.Writer
+		for i := 0; i < streamChunks; i++ {
+			_, _ = w.Write(streamChunk(i))
+			w.Flush()
+		}
 	})
 
 	port := os.Getenv("PORT")
