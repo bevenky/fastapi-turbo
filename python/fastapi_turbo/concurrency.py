@@ -65,20 +65,50 @@ async def run_until_first_complete(
     ]
 
 
-async def iterate_in_threadpool(iterator):
-    """Wrap a sync iterator to yield from a thread pool."""
+class _StopThreadpoolIteration(Exception):
+    pass
 
-    class _StopIteration(Exception):
-        pass
 
-    def _next(it):
+def _threadpool_next(it):
+    try:
+        return next(it)
+    except StopIteration:
+        raise _StopThreadpoolIteration()
+
+
+class iterate_in_threadpool:
+    """Wrap a sync iterable as an async iterator that steps it in a threadpool.
+
+    Returned by Starlette's ``StreamingResponse.__init__`` for sync ``content``
+    (the shim patches both ``starlette.concurrency`` and ``fastapi.concurrency``
+    to point here). Behaves exactly like the original async-generator version —
+    ``__aiter__``/``__anext__`` step the underlying sync iterator one item at a
+    time off the event loop — so real Starlette's ``async for chunk in
+    self.body_iterator`` is satisfied.
+
+    Additionally it exposes the ORIGINAL sync iterator via
+    ``_fastapi_turbo_sync_source``. The Rust streaming door checks for that
+    attribute on ``body_iterator`` and, when present, drives the source sync
+    iterator directly via the GIL (Rust ``__next__`` loop on a blocking
+    thread) — skipping the per-chunk threadpool round-trip entirely. A bare
+    async generator could not hold this attribute, which is why this is a
+    small class rather than a generator function.
+    """
+
+    __slots__ = ("_fastapi_turbo_sync_source", "_iter")
+
+    def __init__(self, iterable):
+        # Preserve the original object so the door can drive it directly. Real
+        # Starlette only ever passes a sync iterable here; iter() is idempotent
+        # on an iterator and materializes one for plain iterables (lists, etc.).
+        self._fastapi_turbo_sync_source = iterable
+        self._iter = iter(iterable)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
         try:
-            return next(it)
-        except StopIteration:
-            raise _StopIteration()
-
-    while True:
-        try:
-            yield await run_in_threadpool(_next, iterator)
-        except _StopIteration:
-            break
+            return await run_in_threadpool(_threadpool_next, self._iter)
+        except _StopThreadpoolIteration:
+            raise StopAsyncIteration

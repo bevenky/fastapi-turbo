@@ -60,13 +60,26 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
     }
 
     // Grab the body_iterator as a Py<PyAny> to pass across threads.
-    let iter_bound = obj
+    let mut iter_bound = obj
         .getattr(pyo3::intern!(py, "body_iterator"))
         .expect("StreamingResponse missing body_iterator");
 
+    // Sync-generator fast path: Starlette wraps sync stream content via
+    // ``iterate_in_threadpool`` (shim-patched to turbo's), whose wrapper
+    // exposes the ORIGINAL sync iterator as ``_fastapi_turbo_sync_source``.
+    // When present, drive that source directly via the Rust ``__next__`` loop
+    // on a blocking thread — no event loop, no per-chunk threadpool hop.
+    // Otherwise the wrapper's ``__anext__`` is an async iterator → the slow
+    // (threadpool-per-chunk) async path. Detecting the source here lets the
+    // first-chunk pre-drain and ``iterate_sync_generator`` run unchanged.
+    if let Ok(src) = iter_bound.getattr(pyo3::intern!(py, "_fastapi_turbo_sync_source")) {
+        iter_bound = src;
+    }
+
     // Detect async vs sync here rather than inside the streaming task — we
     // already hold the GIL, and the task can then skip two hasattr probes
-    // on its critical first-chunk path.
+    // on its critical first-chunk path. A swapped-in sync source has no
+    // ``__anext__`` → sync path; the threadpool wrapper does → async path.
     let is_async = iter_bound
         .hasattr(pyo3::intern!(py, "__anext__"))
         .unwrap_or(false);

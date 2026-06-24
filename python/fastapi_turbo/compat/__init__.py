@@ -311,6 +311,14 @@ def install() -> None:
     _patch(st_conc, "run_in_threadpool", _tc.run_in_threadpool)
     _patch(st_conc, "iterate_in_threadpool", _tc.iterate_in_threadpool)
     _patch(st_conc, "run_until_first_complete", _tc.run_until_first_complete)
+    # ``starlette.responses`` did ``from .concurrency import iterate_in_threadpool``
+    # at import time, binding the name into its OWN namespace — patching
+    # ``starlette.concurrency`` above does NOT reach ``StreamingResponse``.
+    # Patch the response module's bound name directly so sync-content streams
+    # get turbo's wrapper (which exposes ``_fastapi_turbo_sync_source`` for the
+    # Rust door's direct-drive fast path).
+    st_responses = importlib.import_module("starlette.responses")
+    _patch(st_responses, "iterate_in_threadpool", _tc.iterate_in_threadpool)
 
     # Docs JSON helper: same bytes, no ``json.dumps`` (see docstring above —
     # the engine pre-renders docs HTML at boot, inside test mock windows).
