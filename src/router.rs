@@ -2056,12 +2056,29 @@ async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Capture method/path/query for Request injection AND for middleware
-    // that inspects request.url.path (e.g., Qwen's BasicAuthMiddleware).
-    // Always captured — the 3 string copies cost <1μs.
-    let scope_method = Some(request.method().as_str().to_string());
-    let scope_path = Some(request.uri().path().to_string());
-    let scope_query = Some(request.uri().query().unwrap_or("").to_string());
+    // Capture method/path/query ONLY when a consumer exists: the request-scope
+    // ctxvar (exception handlers / Sentry), an http-middleware chain that inspects
+    // request.url.path, or Request injection. For a plain route (the common case)
+    // all three consumers are absent, so we skip 3 heap allocs + memcpys per
+    // request. Every consumer already tolerates None (ctxvar early-returns;
+    // metadata/inject run only under their flags), so None is safe here.
+    let wants_scope_strings =
+        state.wants_request_scope || state.has_http_middleware || state.has_inject_request;
+    let scope_method = if wants_scope_strings {
+        Some(request.method().as_str().to_string())
+    } else {
+        None
+    };
+    let scope_path = if wants_scope_strings {
+        Some(request.uri().path().to_string())
+    } else {
+        None
+    };
+    let scope_query = if wants_scope_strings {
+        Some(request.uri().query().unwrap_or("").to_string())
+    } else {
+        None
+    };
 
     // Extract client address from ConnectInfo (set by into_make_service_with_connect_info).
     let client_addr: Option<SocketAddr> = request
