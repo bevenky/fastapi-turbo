@@ -84,6 +84,25 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
         .hasattr(pyo3::intern!(py, "__anext__"))
         .unwrap_or(false);
 
+    // For async streams, decide up front whether the gen NEVER awaits a
+    // loop-needing primitive (``_stream_is_noawait`` — bytecode ``GET_AWAITABLE``
+    // absence on the real user gen). When true, the streaming task drives each
+    // ``__anext__`` with a bare ``send(None)`` reaching ``StopIteration`` —
+    // pushing the chunk INLINE, skipping the per-stream ``run_until_complete``
+    // event-loop tax. A gen that DOES await falls to the existing single
+    // ``run_until_complete`` driver (``_drive_stream``) — unchanged behavior.
+    // Resolved here under the GIL we already hold, off the streaming task's
+    // critical path. The probe MUST be conservative: a bare ``send(None)`` on a
+    // loop-needing gen raises ``RuntimeError`` and CORRUPTS it, so we only fast-
+    // path gens proven await-free.
+    let noawait = is_async
+        && py
+            .import("fastapi_turbo.responses")
+            .and_then(|m| m.getattr("_stream_is_noawait"))
+            .and_then(|f| f.call1((obj,)))
+            .and_then(|r| r.extract::<bool>())
+            .unwrap_or(false);
+
     // Pre-drain the first chunk synchronously so hyper can coalesce the
     // response headers and the first data frame into a single TCP write.
     // For async generators we skip this optimization entirely: probing
@@ -116,7 +135,11 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
     tokio::task::spawn_blocking(move || {
         Python::attach(|py| {
             if is_async {
-                iterate_async_generator(py, &iterator, &tx);
+                if noawait {
+                    iterate_async_generator_inline(py, &iterator, &tx);
+                } else {
+                    iterate_async_generator(py, &iterator, &tx);
+                }
             } else {
                 let iter_obj = iterator.bind(py);
                 iterate_sync_generator(py, iter_obj, &tx);
@@ -276,20 +299,17 @@ impl ChunkPush {
 /// the single outer `run_until_complete`. A mid-stream raise propagates out
 /// of the driver coroutine and surfaces here as a Rust `Err`, captured onto
 /// `app._captured_server_exceptions` for TestClient parity.
-fn iterate_async_generator(
-    py: Python<'_>,
-    iterator: &Py<PyAny>,
-    tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
-) {
-    // Get or create a thread-local event loop. We're inside `spawn_blocking`
-    // so each stream owns its loop for the duration of the response — no
-    // cross-thread scheduling for __anext__.
+/// Get or create the per-thread streaming event loop. We're inside
+/// `spawn_blocking` so each stream owns its loop for the duration of the
+/// response — no cross-thread scheduling for `__anext__`. The no-await inline
+/// driver and the `_drive_stream`/`_resume_anext` paths all share this SAME
+/// loop so SSE's `ensure_future` producer task survives across chunks.
+fn stream_loop(py: Python<'_>) -> PyResult<Py<PyAny>> {
     use std::cell::RefCell;
     thread_local! {
         static STREAM_LOOP: RefCell<Option<Py<PyAny>>> = const { RefCell::new(None) };
     }
-
-    let loop_obj = match STREAM_LOOP.with(|cell| -> PyResult<Py<PyAny>> {
+    STREAM_LOOP.with(|cell| -> PyResult<Py<PyAny>> {
         let mut opt = cell.borrow_mut();
         if opt.is_none() {
             let asyncio = py.import("asyncio")?;
@@ -301,7 +321,15 @@ fn iterate_async_generator(
             *opt = Some(new_loop.unbind());
         }
         Ok(opt.as_ref().unwrap().clone_ref(py))
-    }) {
+    })
+}
+
+fn iterate_async_generator(
+    py: Python<'_>,
+    iterator: &Py<PyAny>,
+    tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+) {
+    let loop_obj = match stream_loop(py) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("fastapi-turbo: streaming loop init failed: {e}");
@@ -361,6 +389,176 @@ fn iterate_async_generator(
             eprintln!("fastapi-turbo: run_until_complete streaming error: {e}");
         }
     }
+}
+
+/// Drive a PROVEN no-await async generator INLINE, skipping the per-stream
+/// `run_until_complete` event-loop tax. The caller (`create_streaming_response`)
+/// only routes here when `_stream_is_noawait` returned true — i.e. the real user
+/// gen contains no `await` (bytecode `GET_AWAITABLE` absent), so every
+/// `aiter.__anext__()` reaches `StopIteration(chunk)` on a single bare
+/// `coro.send(None)` with NO running loop.
+///
+/// Correctness boundary (verified): a bare `send(None)` on a gen that awaits a
+/// loop-needing primitive RAISES `RuntimeError("no running event loop")` and
+/// CORRUPTS the gen (the partly-advanced `__anext__` can't be resumed, and the
+/// gen then reports `StopAsyncIteration`, silently truncating the body). That is
+/// why we NEVER probe-then-drive an unknown gen here — the no-await verdict is
+/// decided statically up front. As a defense-in-depth fallback, if `send(None)`
+/// unexpectedly SUSPENDS (returns a value) instead of stopping, we resume that
+/// SAME already-started coro via `_resume_anext` on the shared `stream_loop`
+/// (the only correct resume — `await started` continues from the suspension
+/// point, never re-sending from the front). A `RuntimeError` on the bare send is
+/// the destructive case: the chunk is unrecoverable, so we capture + stop.
+///
+/// `__aiter__()` on an async-gen returns self, so the teardown wrapper's
+/// `finally` runs on normal exhaustion, and `aclose()` on disconnect throws
+/// `GeneratorExit` into the WRAPPED gen (request-scope yield-dep teardown
+/// parity). Mid-stream raises propagate out of `send`/`run_until_complete` and
+/// are captured onto `app._captured_server_exceptions` (TestClient parity).
+fn iterate_async_generator_inline(
+    py: Python<'_>,
+    iterator: &Py<PyAny>,
+    tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+) {
+    let aiter = match iterator.bind(py).call_method0(pyo3::intern!(py, "__aiter__")) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("fastapi-turbo: inline stream __aiter__ failed: {e}");
+            return;
+        }
+    };
+
+    // Lazily created only if a chunk unexpectedly suspends (the await-free
+    // verdict should mean this never fires, but the fallback must be correct).
+    let mut loop_obj: Option<Py<PyAny>> = None;
+    let mut resume_helper: Option<Py<PyAny>> = None;
+
+    loop {
+        let coro = match aiter.call_method0(pyo3::intern!(py, "__anext__")) {
+            Ok(c) => c,
+            Err(e) => {
+                capture_or_eprint_stream_err(py, &e);
+                break;
+            }
+        };
+
+        // Bare send(None): for a no-await gen this reaches StopIteration(chunk).
+        let send_result = coro.call_method1(pyo3::intern!(py, "send"), (py.None(),));
+
+        let chunk: bytes::Bytes = match send_result {
+            // The gen SUSPENDED (returned a value) — the proven-no-await path
+            // shouldn't reach here, but resume the SAME started coro correctly.
+            Ok(_yielded) => {
+                match resume_suspended_anext(
+                    py,
+                    &coro,
+                    &mut loop_obj,
+                    &mut resume_helper,
+                ) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break, // StopAsyncIteration — done
+                    Err(e) => {
+                        capture_or_eprint_stream_err(py, &e);
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                    // Normal per-chunk completion: chunk is the StopIteration value.
+                    match e.value(py).getattr(pyo3::intern!(py, "value")) {
+                        Ok(v) if !v.is_none() => python_val_to_bytes(&v),
+                        // StopIteration() with no value → treat as empty chunk skip.
+                        _ => continue,
+                    }
+                } else if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
+                    break; // gen exhausted
+                } else if e.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py) {
+                    // Destructive case: a loop-needing await raised on bare send.
+                    // The coro is unrecoverable; capture and stop so we never
+                    // ship a corrupt/truncated body silently.
+                    capture_or_eprint_stream_err(py, &e);
+                    break;
+                } else {
+                    // Mid-stream raise (ValueError, etc.) — capture for parity.
+                    capture_or_eprint_stream_err(py, &e);
+                    break;
+                }
+            }
+        };
+
+        // Push inline. Release the GIL across the (possibly backpressure-
+        // blocking) send so a slow consumer can't pin the interpreter.
+        let alive = py.detach(|| tx.blocking_send(Ok(chunk)).is_ok());
+        if !alive {
+            // Receiver dropped (client disconnect / door closed the body) —
+            // aclose() throws GeneratorExit into the WRAPPED gen so its
+            // try/finally + teardown fire (streaming-cancellation parity).
+            close_aiter(py, &aiter, &mut loop_obj);
+            break;
+        }
+    }
+}
+
+/// Resume an already-started `__anext__` coro that unexpectedly suspended,
+/// driving it to its next item on the shared stream loop via `_resume_anext`.
+/// Returns `Ok(Some(chunk))`, `Ok(None)` on StopAsyncIteration, or `Err` on a
+/// mid-stream raise.
+fn resume_suspended_anext(
+    py: Python<'_>,
+    coro: &Bound<'_, PyAny>,
+    loop_obj: &mut Option<Py<PyAny>>,
+    resume_helper: &mut Option<Py<PyAny>>,
+) -> PyResult<Option<bytes::Bytes>> {
+    if loop_obj.is_none() {
+        *loop_obj = Some(stream_loop(py)?);
+    }
+    if resume_helper.is_none() {
+        let responses = py.import("fastapi_turbo.responses")?;
+        *resume_helper = Some(responses.getattr("_resume_anext")?.unbind());
+    }
+    let l = loop_obj.as_ref().unwrap().bind(py);
+    let helper = resume_helper.as_ref().unwrap().bind(py);
+    let resume_coro = helper.call1((coro,))?;
+    match l.call_method1("run_until_complete", (resume_coro,)) {
+        Ok(v) => Ok(Some(python_val_to_bytes(&v))),
+        Err(e) => {
+            if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Run `aiter.aclose()` on the shared stream loop (disconnect cleanup). aclose
+/// returns a coroutine, so it needs the loop even for a no-await gen.
+fn close_aiter(py: Python<'_>, aiter: &Bound<'_, PyAny>, loop_obj: &mut Option<Py<PyAny>>) {
+    let aclose_coro = match aiter.call_method0(pyo3::intern!(py, "aclose")) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if loop_obj.is_none() {
+        match stream_loop(py) {
+            Ok(l) => *loop_obj = Some(l),
+            Err(_) => return,
+        }
+    }
+    let l = loop_obj.as_ref().unwrap().bind(py);
+    let _ = l.call_method1("run_until_complete", (aclose_coro,));
+}
+
+/// Capture a streaming exception onto `app._captured_server_exceptions` (so
+/// TestClient `raise_server_exceptions=True` surfaces it), mirroring the
+/// single-driver path. StopAsyncIteration is never passed here.
+fn capture_or_eprint_stream_err(py: Python<'_>, e: &PyErr) {
+    if let Some(app_obj) = crate::router::current_app(py) {
+        if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+            let _ = lst.call_method1(py, "append", (e.value(py),));
+        }
+    }
+    eprintln!("fastapi-turbo: inline streaming error: {e}");
 }
 
 /// Convert a Python str or bytes value to `bytes::Bytes`.

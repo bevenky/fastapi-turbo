@@ -42,6 +42,8 @@ __all__ = [
     "EventSourceResponse",
     "_json_default",
     "_drive_stream",
+    "_resume_anext",
+    "_stream_is_noawait",
 ]
 
 
@@ -85,6 +87,91 @@ async def _drive_stream(aiter, push):
         aclose = getattr(aiter, "aclose", None)
         if aclose is not None:
             await aclose()
+
+
+async def _resume_anext(started):
+    """Resume an already-started ``__anext__()`` coroutine from its suspension.
+
+    The Rust no-await fast path (``streaming.rs::iterate_async_generator``)
+    drives each ``aiter.__anext__()`` with a single bare ``coro.send(None)``
+    on the streaming thread WITHOUT an event loop. When that step reaches
+    ``StopIteration(chunk)`` the chunk is pushed inline (no loop). When the
+    step instead SUSPENDS (the gen really awaited something — ``asyncio.sleep``,
+    a memory-stream ``receive``, SSE's ``wait_for``), ``send(None)`` returns a
+    value and the Rust side hands the *already-started* coro here, running this
+    coroutine on the shared ``STREAM_LOOP`` via ``run_until_complete``.
+
+    ``await started`` correctly resumes the coro from exactly where it
+    suspended — it does NOT re-send ``None`` from the front (which would trip
+    "async generator already running"). It returns the gen's next item (or
+    propagates ``StopAsyncIteration`` / a mid-stream raise), so the whole
+    stream's loop-needing chunks all run on the SAME loop, keeping SSE's
+    ``ensure_future`` producer task alive across chunks.
+    """
+    return await started
+
+
+_NOAWAIT_STREAM_CACHE: dict[int, bool] = {}
+
+
+def _gen_is_noawait(gen) -> bool:
+    """Bytecode check: does this async generator's OWN body never ``await``?
+
+    An ``await`` expression compiles to the ``GET_AWAITABLE`` opcode; its
+    absence in the gen's code object proves the body never awaits, so every
+    ``__anext__`` reaches ``StopIteration`` on a bare ``send(None)`` (verified)
+    — never the destructive ``RuntimeError('no running event loop')`` that a
+    loop-needing ``await`` raises on a bare send (which corrupts the gen: the
+    partly-advanced ``__anext__`` can't be resumed and the gen then reports
+    ``StopAsyncIteration``, silently truncating the stream).
+
+    NOTE: this looks ONLY at the gen's own code, not at anything it iterates.
+    Wrapper gens (e.g. ``async for x in inner: yield x``) have no
+    ``GET_AWAITABLE`` of their own yet are await-ing iff ``inner`` awaits, so a
+    wrapper must NOT be analyzed directly — its verdict is stamped from the
+    wrapped ``inner`` (see ``_door_wrap_stream_teardown``). Cached by
+    code-object id."""
+    import dis
+
+    code = getattr(gen, "ag_code", None)
+    if code is None:
+        return False
+    key = id(code)
+    cached = _NOAWAIT_STREAM_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        has_await = any(
+            ins.opname == "GET_AWAITABLE" for ins in dis.get_instructions(code)
+        )
+        verdict = not has_await
+    except Exception:  # noqa: BLE001
+        verdict = False
+    _NOAWAIT_STREAM_CACHE[key] = verdict
+    return verdict
+
+
+def _stream_is_noawait(response) -> bool:
+    """Decide whether the Rust streaming door may drive a response's async
+    ``body_iterator`` inline with bare ``send(None)`` (no event loop) instead
+    of the per-chunk ``run_until_complete`` path. Returns True ONLY for async
+    generators proven not to await a loop-needing primitive — see
+    ``_gen_is_noawait``.
+
+    Called from ``streaming.rs`` with the StreamingResponse object. Order:
+      1. An explicit ``_fastapi_turbo_stream_noawait`` flag (a bool) on the
+         response wins — set by ``_door_wrap_stream_teardown`` from the WRAPPED
+         user gen, so a teardown wrapper inherits the real gen's verdict
+         instead of being (mis)analyzed as no-await just because its own body
+         only does ``async for`` (a wrapper has no ``GET_AWAITABLE`` of its
+         own yet awaits iff ``inner`` does).
+      2. Otherwise analyze the body_iterator's own bytecode (the raw
+         ``StreamingResponse(user_gen())`` case, where ``body_iterator`` IS the
+         user gen)."""
+    flag = getattr(response, "_fastapi_turbo_stream_noawait", None)
+    if flag is not None:
+        return bool(flag)
+    return _gen_is_noawait(getattr(response, "body_iterator", None))
 
 
 def _json_default(obj):

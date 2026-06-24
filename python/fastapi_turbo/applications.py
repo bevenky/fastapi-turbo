@@ -289,6 +289,21 @@ def _door_wrap_stream_teardown(app, stream_response, req_gens):
     a post-yield raise onto the app since the response is already streaming."""
     inner = stream_response.body_iterator
 
+    # Propagate the no-await verdict of the REAL user gen (``inner``) onto the
+    # response BEFORE wrapping. The async ``_wrapped`` below only does
+    # ``async for ... : yield`` (no ``GET_AWAITABLE`` of its own), so bytecode
+    # analysis of the wrapper would wrongly green-light the Rust inline-drive
+    # fast path even when ``inner`` awaits. Stamping the wrapped gen's verdict
+    # here keeps that decision keyed on the real body. (Only meaningful for
+    # async ``inner``; sync ``inner`` doesn't reach the async fast path.)
+    if hasattr(inner, "__aiter__"):
+        try:
+            from fastapi_turbo.responses import _gen_is_noawait as _gina
+
+            stream_response._fastapi_turbo_stream_noawait = _gina(inner)
+        except Exception:  # noqa: BLE001
+            stream_response._fastapi_turbo_stream_noawait = False
+
     def _teardown():
         for g in reversed(req_gens):
             try:
