@@ -114,7 +114,7 @@ class _FABodyValidator:
     polymorphically alongside Pydantic's own SchemaValidator.
     """
 
-    __slots__ = ("_validator", "_is_model", "_combined_body_fields")
+    __slots__ = ("_validator", "_is_model", "_combined_body_fields", "_native")
 
     def __init__(self, annotation, combined_body_fields=None):
         from pydantic import TypeAdapter
@@ -133,6 +133,19 @@ class _FABodyValidator:
             ta = TypeAdapter(annotation)
         self._validator = ta.validator
         self._is_model = is_model
+        # Fused happy-path validator: a real BaseModel exposes
+        # ``__pydantic_validator__`` whose ``validate_json(bytes)`` does a
+        # single jiter parse + validate pass (no json.loads + validate_python
+        # two-pass). For a JSON object body this is byte-identical to the
+        # wrapped ``validate_python(json.loads(body), from_attributes=True)``
+        # path (``from_attributes`` only affects non-dict inputs). Left None
+        # for ``_TypeAdapterProxy``/dataclass/scalar annotations that lack it,
+        # and never used when this is a combined-body wrapper (the cold path
+        # owns the per-field ``missing`` shaping for non-dict bodies).
+        if combined_body_fields:
+            self._native = None
+        else:
+            self._native = getattr(annotation, "__pydantic_validator__", None)
         # When set, this is a ``_combined_body`` wrapper — a list of
         # field names that produce per-field ``missing`` errors when
         # the raw body isn't a dict (FA parity — ``PUT`` with body
@@ -159,6 +172,22 @@ class _FABodyValidator:
 
     def validate_json(self, body):
         import json as _json
+
+        # Happy-path fast lane: a real BaseModel's fused jiter validator
+        # parses + validates in one pass. On ANY exception fall through to
+        # the existing two-pass path below, which preserves FA-exact error
+        # shapes (json_invalid loc=byte_pos, model_attributes_type for
+        # non-object bodies, combined-body per-field missing).
+        if self._native is not None:
+            try:
+                if isinstance(body, (bytes, bytearray)):
+                    return self._native.validate_json(body)
+                if isinstance(body, memoryview):
+                    return self._native.validate_json(bytes(body))
+                if isinstance(body, str):
+                    return self._native.validate_json(body)
+            except Exception:  # noqa: BLE001
+                pass
 
         if isinstance(body, (bytes, bytearray, memoryview)):
             raw = bytes(body)
