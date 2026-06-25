@@ -118,9 +118,10 @@ class APIRoute(_real_fastapi.routing.APIRoute):
     - turbo-extra kwargs (``security`` / ``servers`` / ``external_docs``)
       are stored as plain attrs; unknown kwargs are swallowed like the
       clone did;
-    - ``methods`` is re-stamped as an ordered UPPER **list** (real stores
-      a set; the collection layer indexes ``methods[0]`` and the Rust
-      door extracts a ``Vec<String>``);
+    - ``methods`` is left as real FastAPI's UPPER **set** (parity:
+      ``RouteContext`` / ``iter_route_contexts`` and user code read
+      ``route.methods`` expecting a set); the collection layer passes
+      ``sorted(route.methods)`` to the Rust door's ``Vec<String>``;
     - ``generate_unique_id_function`` is stored RAW (``None`` when unset
       — real's ``DefaultPlaceholder`` would otherwise be unwrapped by the
       app-level cascade and rewrite every operationId) and
@@ -195,14 +196,17 @@ class APIRoute(_real_fastapi.routing.APIRoute):
         )
 
         # ── Door read-contract re-stamps ─────────────────────────────
-        self.methods = [m.upper() for m in (methods or ["GET"])]
+        # ``self.methods`` is left as real FastAPI's UPPER set (set by
+        # super().__init__) for parity — RouteContext/iter_route_contexts
+        # and user code expect a set. The collection layer converts to a
+        # sorted list for the Rust door.
         if operation_id is None and generate_unique_id_function is not None:
             try:
                 self.operation_id = generate_unique_id_function(self)
             except TypeError:
                 # Fall back to legacy ``(route, method)`` callers.
                 self.operation_id = generate_unique_id_function(
-                    self, self.methods[0] if self.methods else "get"
+                    self, next(iter(self.methods)) if self.methods else "get"
                 )
         self.generate_unique_id_function = generate_unique_id_function
         self.openapi_extra = openapi_extra or {}

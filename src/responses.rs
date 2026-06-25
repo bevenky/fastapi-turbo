@@ -1705,7 +1705,7 @@ pub fn file_response_with_range(
                 };
                 const CHUNK: usize = 64 * 1024;
                 let mut buf = vec![0u8; CHUNK];
-                for ((start, end), pre) in ranges_owned.into_iter().zip(preambles.into_iter()) {
+                for ((start, end), pre) in ranges_owned.into_iter().zip(preambles) {
                     if tx.send(Ok(pre)).await.is_err() {
                         return;
                     }

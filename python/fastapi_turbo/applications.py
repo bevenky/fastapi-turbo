@@ -2927,7 +2927,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 }]
                 collected.append({
                     "path": full_path,
-                    "methods": route.methods,
+                    "methods": sorted(route.methods),
                     "endpoint": custom_ep,
                     "is_async": True,
                     "handler_name": route.name,
@@ -3028,7 +3028,7 @@ class FastAPI(_real_fastapi.FastAPI):
             collected.append(
                 {
                     "path": full_path,
-                    "methods": route.methods,
+                    "methods": sorted(route.methods),
                     "endpoint": endpoint,
                     "_endpoint_door": _endpoint_door,
                     "is_async": is_async,
