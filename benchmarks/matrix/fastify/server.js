@@ -4,6 +4,16 @@
 // so JSON.stringify preserves insertion order (no key reordering).
 //
 // Run:  PORT=8005 node server.js
+// Multi-core: CLUSTER=N forks N workers sharing the port (round-robin). The
+// primary only manages workers — it does NOT create pools or listen. With
+// CLUSTER unset/<=1 this is a single process (original behavior).
+const cluster = require("node:cluster");
+const CLUSTERN = Number(process.env.CLUSTER || 0);
+if (CLUSTERN > 1 && cluster.isPrimary) {
+  for (let i = 0; i < CLUSTERN; i++) cluster.fork();
+  return; // primary doesn't load fastify/pg/redis
+}
+
 const fastify = require("fastify")({ logger: false });
 const { Readable } = require("node:stream");
 const { Pool } = require("pg");
