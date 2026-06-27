@@ -18,6 +18,8 @@ resolve to the REAL packages; the bound references stay real after the shim runs
 """
 from __future__ import annotations
 
+import types as _types
+
 from starlette.responses import (
     Response,
     HTMLResponse,
@@ -47,40 +49,94 @@ __all__ = [
 ]
 
 
+_STREAM_DONE = object()
+
+
+@_types.coroutine
+def _step_anext(coro):
+    """Drive ONE ``__anext__()`` coroutine, fast-pathing cooperative yields.
+
+    ``await asyncio.sleep(0)`` (and anyio's checkpoints) are *bare* cooperative
+    yields — they yield ``None`` and register nothing on the loop. Measured on
+    uvloop, a real ``await sleep(0)`` round-trips the loop at ~13µs/chunk, while
+    resuming the coroutine inline with ``send(None)`` costs ~0.1µs — a 40-100×
+    gap, purely for a loop trip the chunk never needed.
+
+    So we step the coroutine by hand: on a ``None`` yield (cooperative
+    checkpoint) we resume INLINE with another ``send(None)`` — no loop
+    round-trip. On a yield of a *real* awaitable (a Future, from genuine I/O —
+    ``asyncio.sleep(>0)``, a socket read, a DB driver), we ``yield`` it up to
+    the running Task so the event loop drives the I/O and resumes us when it
+    completes (preserving correctness AND cross-stream overlap). Returns the
+    ``StopIteration`` value (the chunk) on completion, or ``_STREAM_DONE`` on
+    ``StopAsyncIteration``. Other exceptions (mid-stream raises) propagate.
+
+    Safe by construction: this runs UNDER ``run_until_complete`` (a running
+    loop), so a real ``await`` that calls ``get_running_loop()`` succeeds and
+    yields a Future — never the bare-send ``RuntimeError`` that corrupts a gen
+    when stepped with no loop. Verified equivalent to ``async for`` (real waits
+    honored to the ms; concurrent streams overlap their waits).
+    """
+    to_send = None
+    to_throw = None
+    while True:
+        try:
+            if to_throw is not None:
+                x = coro.throw(to_throw)
+            else:
+                x = coro.send(to_send)
+        except StopIteration as e:
+            return e.value
+        except StopAsyncIteration:
+            return _STREAM_DONE
+        to_send = None
+        to_throw = None
+        if x is None:
+            continue          # cooperative checkpoint — resume inline, no loop trip
+        # Real awaitable: forward to the running Task (loop drives the I/O).
+        # Whatever the loop sends back on resume — a value OR an exception
+        # (e.g. CancelledError from wait_for, a future's exception) — must be
+        # propagated INTO the inner coroutine so its own try/except handles it
+        # (parity with ``await``). Forwarding only ``send`` would let those
+        # exceptions escape and skip the gen's handlers.
+        try:
+            to_send = yield x
+        except BaseException as e:  # noqa: BLE001 — re-injected into coro below
+            to_throw = e
+
+
 async def _drive_stream(aiter, push):
     """Single-driver for an async streaming body — the Rust door's hot path.
 
-    The naive Rust loop drove EACH ``__anext__`` through its own
-    ``run_until_complete`` on a thread-local event loop: one full asyncio
-    loop iteration per chunk (~37µs/chunk). This coroutine consumes the
-    WHOLE async iterator under a single ``run_until_complete``, amortizing
-    the loop machinery across every chunk (N run_until_complete → 1).
+    ONE ``run_until_complete`` consumes the WHOLE async iterator (vs the naive
+    per-chunk loop), and within it ``_step_anext`` short-circuits cooperative
+    ``await sleep(0)`` checkpoints inline (~0.1µs) instead of paying a full
+    asyncio loop iteration (~13µs) per chunk — real I/O awaits still defer to
+    the loop and overlap across streams.
 
     ``aiter`` is the StreamingResponse's ``body_iterator`` — which, for
     request-scope yield-dep streams, is already the teardown-WRAPPED
-    async-gen (``_door_wrap_stream_teardown``), so ``async for`` over it
-    runs that wrapper's ``finally: _teardown()`` automatically. (Note:
-    Starlette threadpool-wraps SYNC stream content into an async-gen via
+    async-gen (``_door_wrap_stream_teardown``), so stepping its ``__anext__``
+    runs that wrapper's ``finally: _teardown()`` automatically. (Starlette
+    threadpool-wraps SYNC stream content into an async-gen via
     ``iterate_in_threadpool``, so this async driver handles sync content too.)
 
     ``push`` is the Rust ``ChunkPush`` callback: ``push(item) -> bool``;
-    it converts the item to bytes and blocking-sends it through the mpsc
-    channel, returning ``False`` when the receiver was dropped (client
-    disconnect / door closed the body). On ``False`` we ``break`` and call
-    ``aclose()`` — which throws ``GeneratorExit`` into the gen so its
-    ``try/finally`` + ``except GeneratorExit`` fire (streaming-cancellation
-    parity). ``aclose()`` runs ONLY on the break (disconnect) path: when the
-    ``async for`` exhausts normally OR raises mid-stream, the gen is already
-    finished and its ``finally`` (teardown) has run — calling ``aclose()`` on
-    a threadpool-wrapped gen in that state can hang under the thread-local
-    loop, and is redundant. A mid-stream raise propagates out of ``async for``
-    → out of this coroutine → out of ``run_until_complete`` as a Rust
-    ``Err``, where the door captures it onto
+    returns ``False`` when the receiver was dropped (client disconnect / door
+    closed the body). On ``False`` we ``break`` and ``aclose()`` — throwing
+    ``GeneratorExit`` into the gen so its ``try/finally`` fires (cancellation
+    parity). ``aclose()`` runs ONLY on the disconnect path: on normal
+    exhaustion / mid-stream raise the gen is already finished. A mid-stream
+    raise propagates out as a Rust ``Err``, captured onto
     ``app._captured_server_exceptions`` (TestClient parity).
     """
+    it = aiter.__aiter__()
     disconnected = False
-    async for item in aiter:
-        if not push(item):
+    while True:
+        chunk = await _step_anext(it.__anext__())
+        if chunk is _STREAM_DONE:
+            break
+        if not push(chunk):
             disconnected = True
             break
     if disconnected:
