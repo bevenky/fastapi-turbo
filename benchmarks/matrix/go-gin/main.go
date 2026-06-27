@@ -33,6 +33,47 @@ var (
 	rdb    *redis.Client
 )
 
+// ── cross-framework matrix SQL (exact statements) ───────────────────
+const (
+	selOnePG  = "SELECT id, sku, name, qty FROM items WHERE id = 5"
+	selListPG = "SELECT id, sku, name, qty FROM items ORDER BY id LIMIT 10"
+	insPG     = "INSERT INTO bench_writes (val) VALUES ('x')"
+	updPG     = "UPDATE bench_writes SET val = 'y' WHERE id = 5"
+	delPG     = "DELETE FROM bench_writes WHERE id = 999999999"
+
+	rKey  = "bench:item"
+	rWKey = "bench:wkey"
+	rVal  = "bench-value"
+)
+
+// pgWrite runs one write statement inside an explicit transaction and
+// commits or rolls back per the commit flag (so commit=false is repeatable).
+func pgWrite(ctx context.Context, sql string, commit bool) error {
+	tx, err := pgPool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, sql); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
+	if commit {
+		return tx.Commit(ctx)
+	}
+	return tx.Rollback(ctx)
+}
+
+// commitFlag parses ?commit=true|false, defaulting to true.
+func commitFlag(c *gin.Context) bool {
+	if q := c.Query("commit"); q != "" {
+		v, err := strconv.ParseBool(q)
+		if err == nil {
+			return v
+		}
+	}
+	return true
+}
+
 // ── request bodies ──────────────────────────────────────────────────
 type ItemBody struct {
 	SKU  string   `json:"sku"`
@@ -101,6 +142,18 @@ type PgItem struct {
 
 type PgItemsResp struct {
 	Items []PgItem `json:"items"`
+}
+
+// ── write-op response (ordered: "ok" then "committed") ──────────────
+type WroteResp struct {
+	OK        bool `json:"ok"`
+	Committed bool `json:"committed"`
+}
+
+// ── redis pipeline/multi response (ordered: "ok" then "n") ──────────
+type RedisPipeResp struct {
+	OK bool `json:"ok"`
+	N  int  `json:"n"`
 }
 
 // ── large JSON payload (~28791 bytes), built once ───────────────────
@@ -336,6 +389,135 @@ func main() {
 	}
 	r.GET("/pg/items/sync", pgItems)
 	r.GET("/pg/items/async", pgItems)
+
+	// ── cross-framework PG matrix: select_one ───────────────────────
+	pgSelectOne := func(c *gin.Context) {
+		var it PgItem
+		row := pgPool.QueryRow(c.Request.Context(), selOnePG)
+		if err := row.Scan(&it.ID, &it.SKU, &it.Name, &it.Qty); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, it)
+	}
+	r.GET("/pg/select_one/sync", pgSelectOne)
+	r.GET("/pg/select_one/async", pgSelectOne)
+
+	// ── cross-framework PG matrix: select_list ──────────────────────
+	pgSelectList := func(c *gin.Context) {
+		rows, err := pgPool.Query(c.Request.Context(), selListPG)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+			return
+		}
+		defer rows.Close()
+		items := make([]PgItem, 0, 10)
+		for rows.Next() {
+			var it PgItem
+			if err := rows.Scan(&it.ID, &it.SKU, &it.Name, &it.Qty); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+				return
+			}
+			items = append(items, it)
+		}
+		if err := rows.Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, PgItemsResp{Items: items})
+	}
+	r.GET("/pg/select_list/sync", pgSelectList)
+	r.GET("/pg/select_list/async", pgSelectList)
+
+	// ── cross-framework PG matrix: insert / update / delete ─────────
+	pgWriteHandler := func(sql string) gin.HandlerFunc {
+		return func(c *gin.Context) {
+			commit := commitFlag(c)
+			if err := pgWrite(c.Request.Context(), sql, commit); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, WroteResp{OK: true, Committed: commit})
+		}
+	}
+	pgInsert := pgWriteHandler(insPG)
+	r.POST("/pg/insert/sync", pgInsert)
+	r.POST("/pg/insert/async", pgInsert)
+	pgUpdate := pgWriteHandler(updPG)
+	r.POST("/pg/update/sync", pgUpdate)
+	r.POST("/pg/update/async", pgUpdate)
+	pgDelete := pgWriteHandler(delPG)
+	r.POST("/pg/delete/sync", pgDelete)
+	r.POST("/pg/delete/async", pgDelete)
+
+	// ── cross-framework Redis matrix (mode/op paths) ────────────────
+	mRedisGet := func(c *gin.Context) {
+		val, err := rdb.Get(c.Request.Context(), rKey).Result()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+			return
+		}
+		c.Data(http.StatusOK, "application/json", []byte(val))
+	}
+	r.GET("/redis/sync/get", mRedisGet)
+	r.GET("/redis/async/get", mRedisGet)
+
+	mRedisSet := func(c *gin.Context) {
+		if err := rdb.Set(c.Request.Context(), rWKey, rVal, 0).Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, OKResp{OK: true})
+	}
+	r.POST("/redis/sync/set", mRedisSet)
+	r.POST("/redis/async/set", mRedisSet)
+
+	mRedisSetDurable := func(c *gin.Context) {
+		ctx := c.Request.Context()
+		if err := rdb.Set(ctx, rWKey, rVal, 0).Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+			return
+		}
+		// force a local AOF fsync (0 replicas); ignore error if AOF is off.
+		_ = rdb.Do(ctx, "WAITAOF", 1, 0, 100).Err()
+		c.JSON(http.StatusOK, OKResp{OK: true})
+	}
+	r.POST("/redis/sync/set_durable", mRedisSetDurable)
+	r.POST("/redis/async/set_durable", mRedisSetDurable)
+
+	mRedisPipeline := func(c *gin.Context) {
+		ctx := c.Request.Context()
+		_, err := rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+			for i := 0; i < 10; i++ {
+				pipe.Set(ctx, fmt.Sprintf("%s:%d", rWKey, i), rVal, 0)
+			}
+			return nil
+		})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, RedisPipeResp{OK: true, N: 10})
+	}
+	r.POST("/redis/sync/pipeline", mRedisPipeline)
+	r.POST("/redis/async/pipeline", mRedisPipeline)
+
+	mRedisMulti := func(c *gin.Context) {
+		ctx := c.Request.Context()
+		_, err := rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			for i := 0; i < 10; i++ {
+				pipe.Set(ctx, fmt.Sprintf("%s:%d", rWKey, i), rVal, 0)
+			}
+			return nil
+		})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, RedisPipeResp{OK: true, N: 10})
+	}
+	r.POST("/redis/sync/multi", mRedisMulti)
+	r.POST("/redis/async/multi", mRedisMulti)
 
 	port := os.Getenv("PORT")
 	if port == "" {

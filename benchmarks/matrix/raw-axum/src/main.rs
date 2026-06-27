@@ -154,6 +154,29 @@ fn default_limit() -> i64 {
     10
 }
 
+// ── cross-framework DB matrix (app_db.py) models ─────────────────────
+#[derive(Deserialize)]
+struct CommitQuery {
+    #[serde(default = "default_commit")]
+    commit: bool,
+}
+
+fn default_commit() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+struct WroteResp {
+    ok: bool,
+    committed: bool,
+}
+
+#[derive(Serialize)]
+struct PipeResp {
+    ok: bool,
+    n: i64,
+}
+
 // ── plain JSON: simple ────────────────────────────────────────────────
 async fn hello() -> impl IntoResponse {
     Json(Hello { message: "hello" })
@@ -347,6 +370,178 @@ async fn pg_items(
     }
 }
 
+// ── cross-framework Postgres matrix (app_db.py /pg/{op}/{sync|async}) ──
+// These servers have ONE native driver and no sync/async split, so the
+// /…/sync and /…/async routes share the same handler code.
+async fn pg_select_one(State(state): State<Arc<AppState>>) -> Response {
+    let client = match state.pg.get().await {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    // items.id is int4 -> bind WHERE id=$1 as i32.
+    let id: i32 = 5;
+    let row = client
+        .query_opt("SELECT id, sku, name, qty FROM items WHERE id = $1", &[&id])
+        .await;
+    match row {
+        Ok(Some(r)) => Json(PgItem {
+            id: r.get(0),
+            sku: r.get(1),
+            name: r.get(2),
+            qty: r.get(3),
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn pg_select_list(State(state): State<Arc<AppState>>) -> Response {
+    let client = match state.pg.get().await {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let limit: i64 = 10;
+    let rows = client
+        .query(
+            "SELECT id, sku, name, qty FROM items ORDER BY id LIMIT $1",
+            &[&limit],
+        )
+        .await;
+    match rows {
+        Ok(rows) => {
+            let items = rows
+                .iter()
+                .map(|r| PgItem {
+                    id: r.get(0),
+                    sku: r.get(1),
+                    name: r.get(2),
+                    qty: r.get(3),
+                })
+                .collect();
+            Json(PgItemList { items }).into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// Run a single write inside an explicit transaction; commit or roll back per
+// the ?commit= flag so commit=false leaves the DB unchanged (repeatable).
+async fn pg_write(state: &Arc<AppState>, sql: &str, params: &[&(dyn tokio_postgres::types::ToSql + Sync)], commit: bool) -> Response {
+    let mut client = match state.pg.get().await {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let txn = match client.transaction().await {
+        Ok(t) => t,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if txn.execute(sql, params).await.is_err() {
+        let _ = txn.rollback().await;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let res = if commit { txn.commit().await } else { txn.rollback().await };
+    match res {
+        Ok(_) => Json(WroteResp { ok: true, committed: commit }).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn pg_insert(State(state): State<Arc<AppState>>, Query(q): Query<CommitQuery>) -> Response {
+    pg_write(&state, "INSERT INTO bench_writes (val) VALUES ($1)", &[&"x"], q.commit).await
+}
+
+async fn pg_update(State(state): State<Arc<AppState>>, Query(q): Query<CommitQuery>) -> Response {
+    pg_write(&state, "UPDATE bench_writes SET val = $1 WHERE id = 5", &[&"y"], q.commit).await
+}
+
+async fn pg_delete(State(state): State<Arc<AppState>>, Query(q): Query<CommitQuery>) -> Response {
+    let del_id: i32 = 999_999_999;
+    pg_write(&state, "DELETE FROM bench_writes WHERE id = $1", &[&del_id], q.commit).await
+}
+
+// ── cross-framework Redis matrix (app_db.py /redis/{sync|async}/{op}) ──
+const RKEY: &str = "bench:item";
+const RWKEY: &str = "bench:wkey";
+const RVAL: &str = "bench-value";
+
+async fn redis_get_x(State(state): State<Arc<AppState>>) -> Response {
+    let mut conn = match state.redis.get().await {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let val: Option<String> = conn.get(RKEY).await.ok().flatten();
+    match val {
+        Some(v) => ([(header::CONTENT_TYPE, "application/json")], v).into_response(),
+        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn redis_set_x(State(state): State<Arc<AppState>>) -> Response {
+    let mut conn = match state.redis.get().await {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let r: redis::RedisResult<()> = conn.set(RWKEY, RVAL).await;
+    match r {
+        Ok(_) => Json(OkResp { ok: true }).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn redis_set_durable(State(state): State<Arc<AppState>>) -> Response {
+    let mut conn = match state.redis.get().await {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let r: redis::RedisResult<()> = conn.set(RWKEY, RVAL).await;
+    if r.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    // durability: force an AOF fsync via WAITAOF (local fsync, 0 replicas).
+    // Ignore the error if AOF is off.
+    let _: redis::RedisResult<redis::Value> = redis::cmd("WAITAOF")
+        .arg(1)
+        .arg(0)
+        .arg(100)
+        .query_async(&mut conn)
+        .await;
+    Json(OkResp { ok: true }).into_response()
+}
+
+async fn redis_pipeline(State(state): State<Arc<AppState>>) -> Response {
+    let mut conn = match state.redis.get().await {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mut pipe = redis::pipe(); // NON-transactional
+    for i in 0..10 {
+        pipe.set(format!("{RWKEY}:{i}"), RVAL).ignore();
+    }
+    let r: redis::RedisResult<()> = pipe.query_async(&mut conn).await;
+    match r {
+        Ok(_) => Json(PipeResp { ok: true, n: 10 }).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn redis_multi(State(state): State<Arc<AppState>>) -> Response {
+    let mut conn = match state.redis.get().await {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mut pipe = redis::pipe();
+    pipe.atomic(); // MULTI/EXEC
+    for i in 0..10 {
+        pipe.set(format!("{RWKEY}:{i}"), RVAL).ignore();
+    }
+    let r: redis::RedisResult<()> = pipe.query_async(&mut conn).await;
+    match r {
+        Ok(_) => Json(PipeResp { ok: true, n: 10 }).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 // ── baseline ──────────────────────────────────────────────────────────
 async fn ping() -> impl IntoResponse {
     (
@@ -433,6 +628,28 @@ async fn main() {
         .route("/pg/item/{item_id}/async", get(pg_item))
         .route("/pg/items/sync", get(pg_items))
         .route("/pg/items/async", get(pg_items))
+        // cross-framework Postgres matrix (app_db.py) — sync == async handler
+        .route("/pg/select_one/sync", get(pg_select_one))
+        .route("/pg/select_one/async", get(pg_select_one))
+        .route("/pg/select_list/sync", get(pg_select_list))
+        .route("/pg/select_list/async", get(pg_select_list))
+        .route("/pg/insert/sync", post(pg_insert))
+        .route("/pg/insert/async", post(pg_insert))
+        .route("/pg/update/sync", post(pg_update))
+        .route("/pg/update/async", post(pg_update))
+        .route("/pg/delete/sync", post(pg_delete))
+        .route("/pg/delete/async", post(pg_delete))
+        // cross-framework Redis matrix (app_db.py) — sync == async handler
+        .route("/redis/sync/get", get(redis_get_x))
+        .route("/redis/async/get", get(redis_get_x))
+        .route("/redis/sync/set", post(redis_set_x))
+        .route("/redis/async/set", post(redis_set_x))
+        .route("/redis/sync/set_durable", post(redis_set_durable))
+        .route("/redis/async/set_durable", post(redis_set_durable))
+        .route("/redis/sync/pipeline", post(redis_pipeline))
+        .route("/redis/async/pipeline", post(redis_pipeline))
+        .route("/redis/sync/multi", post(redis_multi))
+        .route("/redis/async/multi", post(redis_multi))
         // baseline
         .route("/_ping", get(ping))
         .with_state(state);

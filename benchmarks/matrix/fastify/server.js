@@ -185,6 +185,151 @@ async function pgItems(req) {
 fastify.get("/pg/items/sync", pgItems);
 fastify.get("/pg/items/async", pgItems);
 
+// ══════════════════════════════════════════════════════════════════════
+// app_db.py CROSS-FRAMEWORK contract: /pg/{op}/{sync|async} and
+// /redis/{sync|async}/{op}. Node has ONE native pg driver (node-postgres)
+// and ONE native redis driver (ioredis), and no sync/async language split,
+// so the .../sync and .../async paths share the SAME handler code and
+// return identical output. JSON built as ordered plain objects (no response
+// schema) so JSON.stringify preserves key insertion order.
+// ══════════════════════════════════════════════════════════════════════
+
+// ── Postgres (app_db.py contract) ────────────────────────────────────
+const SEL_ONE = "SELECT id, sku, name, qty FROM items WHERE id = $1";
+const SEL_LIST = "SELECT id, sku, name, qty FROM items ORDER BY id LIMIT $1";
+const INS = "INSERT INTO bench_writes (val) VALUES ($1)";
+const UPD = "UPDATE bench_writes SET val = $1 WHERE id = 5";
+const DEL = "DELETE FROM bench_writes WHERE id = $1";
+const DEL_ID = 999999999;
+
+function pgRow(r) {
+  return { id: r.id, sku: r.sku, name: r.name, qty: r.qty };
+}
+
+// commit flag from ?commit=true|false (string), default true
+function commitFlag(req) {
+  const c = req.query.commit;
+  return c === undefined ? true : c !== "false";
+}
+
+async function pgSelectOne() {
+  const client = await pg.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(SEL_ONE, [5]);
+    await client.query("COMMIT");
+    return pgRow(rows[0]);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+fastify.get("/pg/select_one/sync", pgSelectOne);
+fastify.get("/pg/select_one/async", pgSelectOne);
+
+async function pgSelectList() {
+  const client = await pg.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(SEL_LIST, [10]);
+    await client.query("COMMIT");
+    return { items: rows.map(pgRow) };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+fastify.get("/pg/select_list/sync", pgSelectList);
+fastify.get("/pg/select_list/async", pgSelectList);
+
+// writes: explicit per-request txn; honor commit (true→COMMIT, false→ROLLBACK)
+async function pgWrite(sql, params, commit) {
+  const client = await pg.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(sql, params);
+    await client.query(commit ? "COMMIT" : "ROLLBACK");
+    return { ok: true, committed: commit };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function pgInsert(req) {
+  return pgWrite(INS, ["x"], commitFlag(req));
+}
+fastify.post("/pg/insert/sync", pgInsert);
+fastify.post("/pg/insert/async", pgInsert);
+
+async function pgUpdate(req) {
+  return pgWrite(UPD, ["y"], commitFlag(req));
+}
+fastify.post("/pg/update/sync", pgUpdate);
+fastify.post("/pg/update/async", pgUpdate);
+
+async function pgDelete(req) {
+  return pgWrite(DEL, [DEL_ID], commitFlag(req));
+}
+fastify.post("/pg/delete/sync", pgDelete);
+fastify.post("/pg/delete/async", pgDelete);
+
+// ── Redis (app_db.py contract) ───────────────────────────────────────
+const RKEY = "bench:item";
+const RWKEY = "bench:wkey";
+const RVAL = "bench-value";
+
+async function redisGet(req, reply) {
+  const val = await redis.get(RKEY);
+  reply.type("application/json").send(val);
+}
+fastify.get("/redis/sync/get", redisGet);
+fastify.get("/redis/async/get", redisGet);
+
+async function redisSet() {
+  await redis.set(RWKEY, RVAL);
+  return { ok: true };
+}
+fastify.post("/redis/sync/set", redisSet);
+fastify.post("/redis/async/set", redisSet);
+
+async function redisSetDurable() {
+  await redis.set(RWKEY, RVAL);
+  try {
+    // durability: force an AOF fsync via WAITAOF (local fsync, 0 replicas).
+    await redis.call("WAITAOF", 1, 0, 100);
+  } catch (e) {
+    // AOF off / WAITAOF unsupported — ignore
+  }
+  return { ok: true };
+}
+fastify.post("/redis/sync/set_durable", redisSetDurable);
+fastify.post("/redis/async/set_durable", redisSetDurable);
+
+async function redisPipeline() {
+  const pipe = redis.pipeline(); // NON-transactional batch
+  for (let i = 0; i < 10; i++) pipe.set(`${RWKEY}:${i}`, RVAL);
+  await pipe.exec();
+  return { ok: true, n: 10 };
+}
+fastify.post("/redis/sync/pipeline", redisPipeline);
+fastify.post("/redis/async/pipeline", redisPipeline);
+
+async function redisMulti() {
+  const tx = redis.multi(); // MULTI/EXEC transaction
+  for (let i = 0; i < 10; i++) tx.set(`${RWKEY}:${i}`, RVAL);
+  await tx.exec();
+  return { ok: true, n: 10 };
+}
+fastify.post("/redis/sync/multi", redisMulti);
+fastify.post("/redis/async/multi", redisMulti);
+
 // ── boot ─────────────────────────────────────────────────────────────
 const port = Number(process.env.PORT || 8005);
 fastify
