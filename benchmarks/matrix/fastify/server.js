@@ -312,6 +312,19 @@ async function redisMulti() {
 fastify.post("/redis/sync/multi", redisMulti);
 fastify.post("/redis/async/multi", redisMulti);
 
+// ── WebSocket echo (contract: receive text -> echo SAME text back) ────
+// @fastify/websocket v11 (fastify v5): handler gets the raw `ws` socket.
+// Echo preserves the frame type (text stays text) and the exact payload.
+fastify.register(require("@fastify/websocket"));
+fastify.register(async function (fastify) {
+  fastify.get("/ws", { websocket: true }, (socket /* ws.WebSocket */) => {
+    socket.on("message", (data, isBinary) => {
+      socket.send(data, { binary: isBinary });
+    });
+    // close: ws answers the closing handshake automatically — nothing to do.
+  });
+});
+
 // ── boot ─────────────────────────────────────────────────────────────
 const port = Number(process.env.PORT || 8005);
 fastify

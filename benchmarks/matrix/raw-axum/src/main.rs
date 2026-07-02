@@ -17,7 +17,10 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -555,6 +558,31 @@ async fn redis_multi(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+// ── WebSocket echo (contract: receive text -> echo SAME text back) ────
+async fn ws_upgrade(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(ws_echo)
+}
+
+async fn ws_echo(mut socket: WebSocket) {
+    while let Some(Ok(msg)) = socket.recv().await {
+        match msg {
+            // echo text as text, binary as binary — payload verbatim
+            Message::Text(t) => {
+                if socket.send(Message::Text(t)).await.is_err() {
+                    return;
+                }
+            }
+            Message::Binary(b) => {
+                if socket.send(Message::Binary(b)).await.is_err() {
+                    return;
+                }
+            }
+            Message::Close(_) => return, // axum completes the close handshake
+            _ => {}                      // ping/pong handled automatically
+        }
+    }
+}
+
 // ── baseline ──────────────────────────────────────────────────────────
 async fn ping() -> impl IntoResponse {
     (
@@ -663,6 +691,8 @@ async fn main() {
         .route("/redis/async/pipeline", post(redis_pipeline))
         .route("/redis/sync/multi", post(redis_multi))
         .route("/redis/async/multi", post(redis_multi))
+        // WebSocket echo
+        .route("/ws", get(ws_upgrade))
         // baseline
         .route("/_ping", get(ping))
         .with_state(state);

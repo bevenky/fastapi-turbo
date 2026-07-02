@@ -9,7 +9,9 @@ structs/objects to match).
 
 Dimensions covered: GET/POST/PUT/PATCH/DELETE x sync/async x
 {simple JSON, large JSON, small/large XML} + streaming (sync/async/await) +
-Redis (get/set x sync/async) + Postgres (item-by-id/list x sync/async).
+Redis (get/set x sync/async) + Postgres (item-by-id/list x sync/async) +
+WebSocket echo at /ws (accept; loop receive text -> echo same text verbatim;
+close cleanly on disconnect — byte-identical across all 5 servers).
 
 Connection targets (shared by all 5 servers):
   Postgres: host=127.0.0.1 port=5432 dbname=fastapi_turbo_bench user=venky
@@ -27,7 +29,7 @@ import os
 if os.environ.get("BENCH_ENGINE") == "turbo":
     import fastapi_turbo  # noqa: F401
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -342,11 +344,27 @@ else:
                           for r in rows]}
 
 
+# ── WebSocket echo (contract: receive text -> echo SAME text verbatim) ─
+@app.websocket("/ws")
+async def ws_echo(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            msg = await ws.receive_text()
+            await ws.send_text(msg)
+    except WebSocketDisconnect:
+        pass
+
+
 if __name__ == "__main__":
     import sys
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     if os.environ.get("BENCH_ENGINE") == "turbo":
+        # FASTAPI_TURBO_WORKERS env (read inside app.run) overrides workers=1.
         app.run(host="127.0.0.1", port=port, workers=1)
     else:
         import uvicorn
-        uvicorn.run(app, host="127.0.0.1", port=port, workers=1, log_level="warning")
+        workers = int(os.environ.get("BENCH_WORKERS", "1"))
+        # uvicorn needs an import string (not an app object) for workers > 1.
+        uvicorn.run("app:app", host="127.0.0.1", port=port, workers=workers,
+                    log_level="warning")

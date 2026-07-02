@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -518,6 +519,29 @@ func main() {
 	}
 	r.POST("/redis/sync/multi", mRedisMulti)
 	r.POST("/redis/async/multi", mRedisMulti)
+
+	// ── WebSocket echo (contract: receive text -> echo SAME text back) ──
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  4096,
+		WriteBufferSize: 4096,
+		CheckOrigin:     func(r *http.Request) bool { return true },
+	}
+	r.GET("/ws", func(c *gin.Context) {
+		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			mt, msg, err := conn.ReadMessage()
+			if err != nil {
+				return // client closed (or error) — Close() completes the handshake
+			}
+			if err := conn.WriteMessage(mt, msg); err != nil {
+				return
+			}
+		}
+	})
 
 	port := os.Getenv("PORT")
 	if port == "" {
