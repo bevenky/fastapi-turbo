@@ -669,13 +669,6 @@ def _wrap_websocket_endpoint(
             return app_ref.dependency_overrides.get(dep_callable, dep_callable)
         return dep_callable
 
-    async def _call_maybe_async(fn, kwargs):
-        """Call ``fn``; await the result if it's a coroutine."""
-        r = fn(**kwargs)
-        if _inspect.iscoroutine(r):
-            return await r
-        return r
-
     async def _resolve_dep_async(dep, ws, generators, cache):
         """Recursively resolve a ``Depends(...)`` chain for the WS
         endpoint. Returns the resolved value. ``generators`` is a

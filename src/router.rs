@@ -1331,13 +1331,12 @@ struct RouteState {
     params: Vec<ParamInfo>,
     is_async: bool,
     has_body_params: bool,
-    #[allow(dead_code)] // Wired at compile time, consumed by a future fast path.
     has_header_params: bool,
     has_dep_params: bool,
     has_any_params: bool,
     has_inject_request: bool,
     has_inject_background_tasks: bool,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Wired at compile time, consumed by a future fast path.
     has_inject_response: bool,
     /// True when ANY ``inject_*`` param exists that ``inject_framework_objects``
     /// serves (request / background_tasks / response / security_scopes). When
