@@ -1019,6 +1019,11 @@ pub struct ParamInfo {
     /// scopes=...)`` from this. Empty for every other param kind.
     #[pyo3(get, set)]
     pub oauth_scopes: Vec<String>,
+    /// Async-dep classification cache (0 unknown / 1 sync-fast / 2 needs-worker)
+    /// for ``is_async_dep`` params — the per-dep counterpart of
+    /// ``RouteState.handler_async_class``. ``Arc`` so clones (RouteState builds
+    /// clone the params) share one converged classification per dep callable.
+    pub dep_async_class: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Clone for ParamInfo {
@@ -1045,6 +1050,7 @@ impl Clone for ParamInfo {
             dep_input_names: self.dep_input_names.clone(),
             is_handler_param: self.is_handler_param,
             oauth_scopes: self.oauth_scopes.clone(),
+            dep_async_class: self.dep_async_class.clone(),
         })
     }
 }
@@ -1096,6 +1102,9 @@ impl ParamInfo {
             dep_input_names,
             is_handler_param,
             oauth_scopes,
+            dep_async_class: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                crate::handler_bridge::ASYNC_CLASS_UNKNOWN,
+            )),
         }
     }
 }
@@ -1373,6 +1382,21 @@ struct RouteState {
     /// non-Response handler results, overridable by a handler/dep-set
     /// ``response.status_code``.
     status_code: Option<u16>,
+    /// Effective async-worker submit timeout, resolved ONCE at ``build_router``
+    /// via ``_async_worker._default_timeout(app)`` (env var →
+    /// ``app.worker_timeout`` → last-constructed fallback → None). The async
+    /// dispatch arms pass it straight into ``submit_fast`` — no per-request
+    /// ``APP_INSTANCE.read()`` + clone_ref, no kwargs dict, no env read under
+    /// the GIL. Staleness is handled by the door: ``_door_fingerprint`` /
+    /// re-registration rebuilds RouteState (and ``register_app_router`` /
+    /// ``run_server`` set ``APP_INSTANCE`` before building), so each app's
+    /// routes capture their OWN app's timeout — strictly better isolation than
+    /// the old last-registered-wins per-request read.
+    worker_timeout: Option<f64>,
+    /// Async-handler classification cache (0 unknown / 1 sync-fast /
+    /// 2 needs-worker) — per-route ``AtomicU8`` replacing the old process-global
+    /// ``Mutex<HashMap>`` that every async request contended on.
+    handler_async_class: std::sync::atomic::AtomicU8,
     // Note: body validation stays with Pydantic (Rust-backed) for 100% compatibility.
     // jsonschema crate can't handle custom validators, coercion, defaults, etc.
 }
@@ -1495,6 +1519,29 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
             )
         })
         .collect();
+
+    // Resolve the effective async-worker submit timeout ONCE for this build.
+    // All three build entry points (``run_server``, ``register_app_router``,
+    // the cluster worker) set ``APP_INSTANCE`` to the app being registered
+    // immediately before assembling the router, and the door re-registers
+    // (rebuilding every RouteState) when ``_door_fingerprint`` changes — so
+    // the value captured here is the OWNING app's timeout for the lifetime
+    // of these RouteStates.
+    let worker_timeout: Option<f64> = Python::attach(|py| {
+        let app = APP_INSTANCE
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|a| a.clone_ref(py)));
+        let resolver = py
+            .import("fastapi_turbo._async_worker")
+            .and_then(|m| m.getattr("_default_timeout"))
+            .ok()?;
+        let resolved = match app {
+            Some(a) => resolver.call1((a.bind(py),)).ok()?,
+            None => resolver.call1((py.None(),)).ok()?,
+        };
+        resolved.extract::<Option<f64>>().ok().flatten()
+    });
 
     for route in routes {
         let axum_path = convert_path(&route.path);
@@ -1648,6 +1695,10 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                     .unwrap_or(false),
                 route_obj: route.handler.getattr(py, "_fastapi_turbo_route_obj").ok(),
                 status_code: route.status_code,
+                worker_timeout,
+                handler_async_class: std::sync::atomic::AtomicU8::new(
+                    crate::handler_bridge::ASYNC_CLASS_UNKNOWN,
+                ),
             })
         });
 
@@ -2467,15 +2518,12 @@ async fn handle_request(
                             }
                         }
                     }
-                    let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
-                        .read()
-                        .ok()
-                        .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
-                    match crate::handler_bridge::call_async_on_local_loop_with_app(
+                    match crate::handler_bridge::call_async_on_local_loop_classified(
                         py,
                         &state.handler,
                         &kwargs,
-                        app_for_submit.as_ref(),
+                        &state.handler_async_class,
+                        state.worker_timeout,
                     ) {
                         Ok(r) => py_to_response_with_request(
                             py,
@@ -2537,15 +2585,12 @@ async fn handle_request(
                             }
                         }
                     }
-                    let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
-                        .read()
-                        .ok()
-                        .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
-                    match crate::handler_bridge::call_async_on_local_loop_with_app(
+                    match crate::handler_bridge::call_async_on_local_loop_classified(
                         py,
                         &state.handler,
                         &kwargs,
-                        app_for_submit.as_ref(),
+                        &state.handler_async_class,
+                        state.worker_timeout,
                     ) {
                         Ok(r) => {
                             // Gated: no BackgroundTasks param and no deps (a dep can share the
@@ -2620,15 +2665,12 @@ async fn handle_request(
                     // called (a bare .call returns the un-awaited coroutine). We're
                     // inside `if state.is_async`, so always drive on the local loop,
                     // exactly like the no-dep async branches above.
-                    let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
-                        .read()
-                        .ok()
-                        .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
-                    match crate::handler_bridge::call_async_on_local_loop_with_app(
+                    match crate::handler_bridge::call_async_on_local_loop_classified(
                         py,
                         &state.handler,
                         &kwargs,
-                        app_for_submit.as_ref(),
+                        &state.handler_async_class,
+                        state.worker_timeout,
                     ) {
                         Ok(r) => {
                             // Gated: no BackgroundTasks param and no deps (a dep can share the
@@ -2669,16 +2711,6 @@ async fn handle_request(
             let mut dep_extraction_errors: Vec<serde_json::Value> = Vec::new();
             let mut failed_sources: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            // App handle for routing a suspending async dep to the shared
-            // worker loop (the same loop lifespan + handlers run on) so
-            // loop-affinity / configured timeouts hold. Issue: async deps
-            // that actually ``await`` (asyncio.sleep, async DB I/O) used to
-            // raise "Coroutine suspended" via the try-sync-only path.
-            let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
-                .read()
-                .ok()
-                .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
-
             for param in &state.params {
                 match param.kind.as_str() {
                     "dependency" => {
@@ -2726,13 +2758,15 @@ async fn handle_request(
                             )
                         } else if param.is_async_dep {
                             // Try-sync first; a suspending coroutine routes to the
-                            // shared worker loop (run_coroutine_threadsafe) so deps
-                            // that genuinely ``await`` resolve instead of erroring.
-                            crate::handler_bridge::call_async_on_local_loop_with_app(
+                            // shared worker loop so deps that genuinely ``await``
+                            // resolve instead of erroring. The route-build-resolved
+                            // timeout keeps loop-affinity / configured timeouts.
+                            crate::handler_bridge::call_async_on_local_loop_classified(
                                 py,
                                 dep_callable,
                                 &dep_kwargs,
-                                app_for_submit.as_ref(),
+                                &param.dep_async_class,
+                                state.worker_timeout,
                             )
                         } else {
                             dep_callable.call(py, (), Some(&dep_kwargs))
@@ -2908,15 +2942,12 @@ async fn handle_request(
             // async handler is driven on the local loop (handles suspension) — the
             // 599 fallback below can't re-resolve deps, so we must not rely on it.
             let result = if state.is_async {
-                let app_for_submit: Option<Py<PyAny>> = APP_INSTANCE
-                    .read()
-                    .ok()
-                    .and_then(|g| g.as_ref().map(|p| p.clone_ref(py)));
-                crate::handler_bridge::call_async_on_local_loop_with_app(
+                crate::handler_bridge::call_async_on_local_loop_classified(
                     py,
                     &state.handler,
                     &kwargs,
-                    app_for_submit.as_ref(),
+                    &state.handler_async_class,
+                    state.worker_timeout,
                 )
             } else {
                 state.handler.call(py, (), Some(&kwargs))
@@ -2967,7 +2998,7 @@ async fn handle_request(
                 Err(ref py_err) => {
                     // FA exit-stack parity: throw the handler error into the
                     // yield-deps; a dep that swallows it surfaces FastAPIError.
-                    // (Async handlers always resolve via call_async_on_local_loop_with_app,
+                    // (Async handlers always resolve via call_async_on_local_loop_classified,
                     // which routes a suspending coroutine to the worker loop — it never
                     // surfaces a "needs event loop" error, so the old 599 fallback that
                     // used to live here was unreachable and has been removed.)

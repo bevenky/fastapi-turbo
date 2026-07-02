@@ -1,11 +1,16 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
 // ── Async worker: drives suspending Python coroutines on the shared worker loop ──
 
 /// Cached reference to the Python `_async_worker.submit` function.
 static ASYNC_SUBMIT: OnceLock<Py<PyAny>> = OnceLock::new();
+/// Cached reference to `_async_worker.submit_fast` — positional entry point
+/// (coro, timeout) used by the door's hot path. No kwargs dict, no per-request
+/// `_default_timeout` resolution (the timeout was resolved at route build).
+static ASYNC_SUBMIT_FAST: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Initialize the async worker (Python-managed thread with `run_forever()`).
 pub fn init_async_worker() {
@@ -18,6 +23,8 @@ pub fn init_async_worker() {
             .expect("_async_worker");
         worker.call_method0("init").expect("worker init");
         let submit = worker.getattr("submit").expect("submit").unbind();
+        let submit_fast = worker.getattr("submit_fast").expect("submit_fast").unbind();
+        let _ = ASYNC_SUBMIT_FAST.set(submit_fast);
         let _ = ASYNC_SUBMIT.set(submit);
     });
 }
@@ -50,6 +57,22 @@ fn submit_to_async_worker(
             submit.call(py, (coro.bind(py),), Some(&kwargs))
         }
     }
+}
+
+/// Hot-path submit: positional `(coro, timeout)` into `_async_worker.submit_fast`.
+/// The effective timeout was resolved ONCE at route build (env var →
+/// `app.worker_timeout` → last-constructed fallback) and lives on the
+/// RouteState — no per-request kwargs dict, no `_default_timeout` env read /
+/// getattr chain under the GIL.
+fn submit_to_async_worker_fast(
+    py: Python<'_>,
+    coro: Py<PyAny>,
+    timeout: Option<f64>,
+) -> PyResult<Py<PyAny>> {
+    let submit = ASYNC_SUBMIT_FAST
+        .get()
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Async worker not initialized"))?;
+    submit.call1(py, (coro.bind(py), timeout))
 }
 
 /// Run an async Python handler — tries FAST path first (same-thread), falls back to SLOW path (worker thread).
@@ -162,32 +185,24 @@ pub fn call_async_on_local_loop_positional_with_kwargs_and_app(
 }
 
 /// Handler classification — determined on the FIRST call, reused forever.
-/// "sync-fast": completes via StopIteration on send(None) — no I/O.
-/// "needs-worker": suspends on send(None) — real async I/O, route to worker.
-static HANDLER_CLASS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<usize, bool>>,
-> = std::sync::OnceLock::new();
+/// The slot is an `AtomicU8` living on the per-route state (RouteState for
+/// handlers, ParamInfo for async deps) — no process-global `Mutex<HashMap>`
+/// taken by every async request on every tokio thread. Stale values are
+/// self-correcting: a "sync-fast" that suspends is reclassified + resubmitted;
+/// a "needs-worker" that is actually fast still runs correctly on the worker.
+pub const ASYNC_CLASS_UNKNOWN: u8 = 0;
+pub const ASYNC_CLASS_SYNC_FAST: u8 = 1;
+pub const ASYNC_CLASS_NEEDS_WORKER: u8 = 2;
 
-fn handler_class_map() -> &'static std::sync::Mutex<std::collections::HashMap<usize, bool>> {
-    HANDLER_CLASS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-pub fn call_async_on_local_loop_with_app(
+pub fn call_async_on_local_loop_classified(
     py: Python<'_>,
     handler: &Py<PyAny>,
     kwargs: &Bound<'_, PyDict>,
-    app: Option<&Py<PyAny>>,
+    class_slot: &AtomicU8,
+    timeout: Option<f64>,
 ) -> PyResult<Py<PyAny>> {
-    let handler_id = handler.as_ptr() as usize;
-
-    // Check cached classification for this handler.
-    let classification = {
-        let map = handler_class_map().lock().unwrap();
-        map.get(&handler_id).copied()
-    };
-
-    match classification {
-        Some(true) => {
+    match class_slot.load(Ordering::Relaxed) {
+        ASYNC_CLASS_SYNC_FAST => {
             // === KNOWN SYNC-FAST: probe safely ===
             let coro = handler.call(py, (), Some(kwargs))?;
             match coro.call_method1(py, "send", (py.None(),)) {
@@ -200,28 +215,24 @@ pub fn call_async_on_local_loop_with_app(
                 }
                 _ => {
                     // Was fast, now isn't — reclassify as needs-worker.
-                    let mut map = handler_class_map().lock().unwrap();
-                    map.insert(handler_id, false);
+                    class_slot.store(ASYNC_CLASS_NEEDS_WORKER, Ordering::Relaxed);
                     let _ = coro.call_method0(py, "close");
                 }
             }
         }
-        Some(false) => {
+        ASYNC_CLASS_NEEDS_WORKER => {
             // === KNOWN NEEDS-WORKER: skip probe, go straight to worker ===
             init_async_worker();
             let coro = handler.call(py, (), Some(kwargs))?;
-            return submit_to_async_worker(py, coro, app);
+            return submit_to_async_worker_fast(py, coro, timeout);
         }
-        None => {
+        _ => {
             // === FIRST CALL: probe to classify ===
             let coro = handler.call(py, (), Some(kwargs))?;
             match coro.call_method1(py, "send", (py.None(),)) {
                 Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
                     // Sync-fast — mark and return.
-                    {
-                        let mut map = handler_class_map().lock().unwrap();
-                        map.insert(handler_id, true);
-                    }
+                    class_slot.store(ASYNC_CLASS_SYNC_FAST, Ordering::Relaxed);
                     let v = e.value(py);
                     return match v.getattr("value") {
                         Ok(val) => Ok(val.unbind()),
@@ -230,8 +241,7 @@ pub fn call_async_on_local_loop_with_app(
                 }
                 Err(e) if e.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py) => {
                     // No running event loop — mark as needs-worker.
-                    let mut map = handler_class_map().lock().unwrap();
-                    map.insert(handler_id, false);
+                    class_slot.store(ASYNC_CLASS_NEEDS_WORKER, Ordering::Relaxed);
                     let _ = coro.call_method0(py, "close");
                 }
                 Err(other) => return Err(other),
@@ -239,8 +249,7 @@ pub fn call_async_on_local_loop_with_app(
                     // Suspended — mark as needs-worker. On first call this
                     // is typically asyncpg.create_pool() — no connection
                     // acquired yet, safe to close.
-                    let mut map = handler_class_map().lock().unwrap();
-                    map.insert(handler_id, false);
+                    class_slot.store(ASYNC_CLASS_NEEDS_WORKER, Ordering::Relaxed);
                     let _ = coro.call_method0(py, "close");
                 }
             }
@@ -250,5 +259,5 @@ pub fn call_async_on_local_loop_with_app(
     // Fall through: route to async worker
     init_async_worker();
     let coro = handler.call(py, (), Some(kwargs))?;
-    submit_to_async_worker(py, coro, app)
+    submit_to_async_worker_fast(py, coro, timeout)
 }

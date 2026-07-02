@@ -14,8 +14,15 @@ Performance notes:
       cuts ~5 μs per submit vs allocating fresh
     * schedule via ``loop.call_soon_threadsafe`` directly — avoids
       the ``run_coroutine_threadsafe`` wrapper's extra layer
-    * stash result/exception in a list captured by closure — avoids
+    * stash result/exception in a plain list — avoids
       Future.set_result/Future.result machinery
+    * module-level ``_runner``/``_kickoff``/``_cancel_in_box`` helpers
+      take the box/event as arguments — no per-submit closure function
+      objects (3 MAKE_FUNCTION + cells saved per request)
+    * ``submit_fast(coro, timeout)`` — positional entry point for the
+      Rust door, which resolves the effective timeout ONCE at route
+      build; skips the per-request ``_default_timeout`` env/getattr
+      chain entirely
 
     Net: ~25 μs per submit vs ~40 μs for the stdlib
     ``run_coroutine_threadsafe`` path.
@@ -136,6 +143,97 @@ def _default_timeout(app=None) -> float | None:
     return None
 
 
+async def _runner(coro, box, ev):
+    """Drive ``coro`` on the worker loop; stash result/exception in ``box``.
+
+    Module-level (box/event passed as arguments) so submits don't pay a
+    per-call MAKE_FUNCTION + closure-cell allocation.
+    """
+    try:
+        box[0] = await coro
+    except BaseException as e:  # noqa: BLE001 — re-raised on the caller
+        box[1] = e
+    finally:
+        ev.set()
+
+
+def _kickoff(coro, box, ev, loop, context):
+    # Both ``_kickoff`` and the cancel scheduled from the caller run on
+    # the worker loop thread, so they're serialized by asyncio. If the
+    # caller already timed out (``box[3]`` is True), don't even start
+    # the coroutine — close it cleanly and signal completion so the
+    # event-pool slot gets released.
+    if box[3]:
+        try:
+            coro.close()
+        except Exception:  # noqa: BLE001
+            pass
+        ev.set()
+        return
+    runner = _runner(coro, box, ev)
+    task = (
+        loop.create_task(runner, context=context)
+        if context is not None
+        else asyncio.ensure_future(runner, loop=loop)
+    )
+    box[2] = task
+    # Between scheduling ``_kickoff`` and it actually running, the
+    # caller may have timed out and requested cancellation. Check
+    # the flag once more after task creation.
+    if box[3]:
+        task.cancel()
+
+
+def _cancel_in_box(box):
+    t = box[2]
+    if t is not None and not t.done():
+        t.cancel()
+
+
+def submit_fast(coro, timeout=None, context=None) -> object:
+    """Positional fast path: schedule ``coro`` on the worker's loop and
+    block until done.
+
+    Used by the Rust door, which resolves the effective timeout ONCE at
+    route build (env var → ``app.worker_timeout`` → last-constructed
+    fallback) and passes it positionally — no per-request
+    ``_default_timeout`` env read / getattr chain, no kwargs dict.
+
+    Semantics are identical to ``submit``: exceptions re-raise on the
+    caller's thread; an elapsed ``timeout`` cancels the task on the
+    worker loop (thread-safely) and raises ``TimeoutError``; the pooled
+    Event is dropped (not reused) on failure.
+    """
+    if _loop is None:
+        init()
+    ev = _acquire_event()
+    # box slots:
+    #   [0] = result
+    #   [1] = exception
+    #   [2] = task handle (set by ``_kickoff`` on the loop)
+    #   [3] = cancel_requested (set by caller before scheduling cancel)
+    box: list = [None, None, None, False]
+    loop = _loop
+    loop.call_soon_threadsafe(_kickoff, coro, box, ev, loop, context)
+    # Interruptible wait — honors signals, unlike a bare Condition.wait().
+    if not ev.wait(timeout=timeout):
+        # Request cancellation. Both the ``cancel_requested`` flag and
+        # the scheduled ``_cancel_in_box`` run on the same worker loop
+        # thread, so whichever of (``_kickoff``, cancel) runs first, the
+        # other sees the outcome — no race where the coroutine survives.
+        box[3] = True
+        loop.call_soon_threadsafe(_cancel_in_box, box)
+        raise TimeoutError(
+            f"fastapi-turbo worker-loop submit timed out after {timeout}s"
+        )
+    exc = box[1]
+    if exc is not None:
+        # Don't pool events that held a failure — conservative.
+        raise exc
+    _release_event(ev)
+    return box[0]
+
+
 def submit(
     coro,
     *,
@@ -171,73 +269,7 @@ def submit(
     """
     if timeout is _SENTINEL:  # type: ignore[comparison-overlap]
         timeout = _default_timeout(app)
-    if _loop is None:
-        init()
-    ev = _acquire_event()
-    # box slots:
-    #   [0] = result
-    #   [1] = exception
-    #   [2] = task handle (set by ``_kickoff`` on the loop)
-    #   [3] = cancel_requested (set by caller before scheduling cancel)
-    box: list = [None, None, None, False]
-    loop = _loop
-
-    async def _runner():
-        try:
-            box[0] = await coro
-        except BaseException as e:  # noqa: BLE001 — re-raised below
-            box[1] = e
-        finally:
-            ev.set()
-
-    def _kickoff():
-        # Both ``_kickoff`` and the cancel scheduled below run on the
-        # worker loop thread, so they're serialized by asyncio. If the
-        # caller already timed out (``box[3]`` is True), don't even
-        # start the coroutine — close it cleanly and signal completion
-        # so the event-pool slot gets released.
-        if box[3]:
-            try:
-                coro.close()
-            except Exception:  # noqa: BLE001
-                pass
-            ev.set()
-            return
-        task = (
-            loop.create_task(_runner(), context=context)
-            if context is not None
-            else asyncio.ensure_future(_runner(), loop=loop)
-        )
-        box[2] = task
-        # Between scheduling ``_kickoff`` and it actually running, the
-        # caller may have timed out and requested cancellation. Check
-        # the flag once more after task creation.
-        if box[3]:
-            task.cancel()
-
-    def _cancel_on_loop():
-        t = box[2]
-        if t is not None and not t.done():
-            t.cancel()
-
-    loop.call_soon_threadsafe(_kickoff)
-    # Interruptible wait — honors signals, unlike a bare Condition.wait().
-    if not ev.wait(timeout=timeout):
-        # Request cancellation. Both the ``cancel_requested`` flag and
-        # the scheduled ``_cancel_on_loop`` run on the same worker loop
-        # thread, so whichever of (``_kickoff``, cancel) runs first, the
-        # other sees the outcome — no race where the coroutine survives.
-        box[3] = True
-        loop.call_soon_threadsafe(_cancel_on_loop)
-        raise TimeoutError(
-            f"fastapi-turbo worker-loop submit timed out after {timeout}s"
-        )
-    exc = box[1]
-    if exc is not None:
-        # Don't pool events that held a failure — conservative.
-        raise exc
-    _release_event(ev)
-    return box[0]
+    return submit_fast(coro, timeout, context)
 
 
 def get_loop() -> asyncio.AbstractEventLoop:
