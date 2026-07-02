@@ -71,7 +71,7 @@ def ws_section():
         return ""
     ws = json.loads(p.read_text())
     data = ws.get("data", ws)
-    frameworks = [f for f in FW_ORDER if f in data] + [f for f in data if f not in FW_ORDER]
+    frameworks = [f for f in FW if f in data] + [f for f in data if f not in FW]
     metrics = [("p50_us", "RTT p50 (µs, lower better)", "low"),
                ("p99_us", "RTT p99 (µs, lower better)", "low"),
                ("msgs_per_s", "throughput (msgs/s, higher better)", "high")]
