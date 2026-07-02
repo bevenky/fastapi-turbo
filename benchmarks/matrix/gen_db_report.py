@@ -77,8 +77,15 @@ html = f"""<!doctype html><html><head><meta charset=utf-8><title>DB/Redis matrix
 </style></head><body><div class=wrap>
 <h1>Postgres + Redis deep matrix</h1>
 <p class=sub>{datetime.now().strftime('%Y-%m-%d %H:%M')} · {META['cores']} cores · all frameworks workers/cluster={META['db_workers']}
-(Postgres 100-conn budget) · oha c={META['conc']}, {META['dur']} · req/s, higher better. <span class=best>green</span>=best in row.
-turbo/FastAPI = multiprocess (one pool PER worker); Gin/Fastify/Axum = one shared pool. set_durable = AOF appendfsync=always.</p>
+(Postgres 100-conn budget) · oha c={META['conc']}, {META['dur']} · req/s, higher better. <span class=best>green</span>=best in row.</p>
+<p class=sub><b>Methodology (audited):</b> reads are 1 wire round trip in EVERY framework (psycopg3/psycopg2 autocommit reads,
+asyncpg no-op pool reset, pgx cached statements, axum prepare_cached, Fastify pool.query); writes use an explicit
+transaction everywhere (commit=true → COMMIT, false → ROLLBACK — isolates the WAL-fsync cost).
+Python engines run their measured-best async PG driver (turbo → psycopg3-async, uvicorn → asyncpg) and every
+backend-driver group benches in an ISOLATED boot (co-resident driver pools contaminated asyncpg up to 4x).
+turbo/FastAPI = multiprocess (one pool PER worker); Gin/Fastify/Axum = one shared pool.
+<b>set_durable</b> (SET + WAITAOF under appendfsync=always) measures Redis's fsync durability floor — high
+run-to-run variance (AOF file state); compare within a run only.</p>
 
 <h2>Cross-framework — Postgres reads (req/s)</h2>
 {table(FW, cross_reads)}

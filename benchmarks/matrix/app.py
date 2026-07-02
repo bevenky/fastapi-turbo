@@ -34,6 +34,12 @@ from pydantic import BaseModel
 app = FastAPI()
 
 PG_DSN = "host=127.0.0.1 port=5432 dbname=fastapi_turbo_bench user=venky"
+# Pool bounds per WORKER PROCESS. The runner must keep workers x PG_POOL_MAX
+# under Postgres max_connections (100): at workers=18 the old fixed 4..8 meant
+# a 144-connection growth storm -> "too many clients" -> pool checkouts stall
+# (measured: turbo pg-sync collapsed to 23 rps at w18 while fine at w1/w8).
+PG_POOL_MIN = int(os.environ.get("BENCH_PG_POOL_MIN", "2"))
+PG_POOL_MAX = int(os.environ.get("BENCH_PG_POOL_MAX", "4"))
 REDIS_URL = "redis://127.0.0.1:6379"
 
 
@@ -90,7 +96,7 @@ def _get_sync_pg():
         # autocommit: this app's PG endpoints are read-only SELECTs. Without it
         # psycopg3 wraps every read in BEGIN..COMMIT = 3 wire round trips where
         # Gin/pgx and node-postgres do 1 (audited) — an unfair 2-RTT handicap.
-        _sync_pg = ConnectionPool(PG_DSN, min_size=4, max_size=8, open=True,
+        _sync_pg = ConnectionPool(PG_DSN, min_size=PG_POOL_MIN, max_size=PG_POOL_MAX, open=True,
                                   kwargs={"autocommit": True})
     return _sync_pg
 
@@ -117,7 +123,7 @@ async def _get_async_pg():
 
         _async_pg = await asyncpg.create_pool(
             host="127.0.0.1", port=5432, database="fastapi_turbo_bench",
-            user="venky", min_size=4, max_size=8, reset=_no_reset,
+            user="venky", min_size=PG_POOL_MIN, max_size=PG_POOL_MAX, reset=_no_reset,
         )
     return _async_pg
 
@@ -126,7 +132,7 @@ async def _get_async_pg3():
     global _async_pg3
     if _async_pg3 is None:
         from psycopg_pool import AsyncConnectionPool
-        pool = AsyncConnectionPool(PG_DSN, min_size=4, max_size=8, open=False,
+        pool = AsyncConnectionPool(PG_DSN, min_size=PG_POOL_MIN, max_size=PG_POOL_MAX, open=False,
                                    kwargs={"autocommit": True})
         await pool.open()
         _async_pg3 = pool

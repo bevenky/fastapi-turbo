@@ -128,6 +128,11 @@ html = f"""<!doctype html><html><head><meta charset=utf-8>
 <b>Throughput</b> = ALL frameworks on all {TPMETA['cores']} cores
 (turbo/uvicorn workers={TPMETA['workers']}, Fastify cluster={TPMETA['workers']}, Gin/Axum native), oha c={TPMETA['conc']}.
 <span class=metric>NNc = cores used.</span> <span class=best>Green</span> = best in row.</p>
+<p class=sub><b>Fairness (audited):</b> PG reads are 1 wire round trip in every framework (psycopg3 autocommit / asyncpg
+no-op reset / pgx+axum cached statements); each Python engine runs its measured-best async PG driver
+(turbo → psycopg3-async, uvicorn → asyncpg); Python DB/redis endpoint groups bench in isolated boots
+(co-resident driver pools cross-contaminate); PG pool size × workers stays under Postgres max_connections.
+uvicorn has no /_ping (turbo's is built-in Rust; vanilla FastAPI has no static fast-path).</p>
 
 <h2>① Per-request latency — conn=1 p50 (µs, lower better)</h2>
 <p class=sub>How fast is a single request. Independent of core count — this is per-core efficiency.</p>

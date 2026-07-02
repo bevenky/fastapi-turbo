@@ -177,13 +177,19 @@ def run_fw(name, fw):
 def main():
     reg = registry()
     want = sys.argv[1:] or list(reg.keys())
+    p = os.path.join(HERE, "results_db.json")
+    # merge into existing results when re-running a subset of frameworks
     out = {}
+    if os.path.exists(p):
+        try:
+            out = json.load(open(p)).get("data", {})
+        except Exception:
+            out = {}
     print(f"cores={NCPU} db_workers={DBWORKERS} conc={CONC} dur={DUR}\n")
     for name in want:
         out[name] = run_fw(name, reg[name])
     # restore redis
     redis_cli("CONFIG", "SET", "appendonly", "no")
-    p = os.path.join(HERE, "results_db.json")
     with open(p, "w") as f:
         json.dump({"meta": {"cores": NCPU, "db_workers": DBWORKERS, "conc": CONC, "dur": DUR}, "data": out}, f, indent=2)
     print(f"\nwrote {p}")

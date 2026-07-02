@@ -215,11 +215,19 @@ def run_framework(name, fw):
 def main():
     reg = registry()
     want = sys.argv[1:] or list(reg.keys())
+    path = os.path.join(HERE, "results_throughput.json")
+    # merge into existing results when re-running a subset of frameworks
     out = {}
+    if os.path.exists(path):
+        try:
+            out = json.load(open(path)).get("data", {})
+        except Exception:
+            out = {}
     print(f"cores={NCPU} workers={WORKERS} conc={CONC} dur={DUR}\n")
     for name in want:
-        out[name] = run_framework(name, reg[name])
-    path = os.path.join(HERE, "results_throughput.json")
+        prev = out.get(name, {})
+        fresh = run_framework(name, reg[name])
+        out[name] = {**prev, **fresh}
     with open(path, "w") as f:
         json.dump({"meta": {"cores": NCPU, "workers": WORKERS, "conc": CONC, "dur": DUR}, "data": out}, f, indent=2)
     print(f"\nwrote {path}")
