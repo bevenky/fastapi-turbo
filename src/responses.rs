@@ -45,6 +45,7 @@ static FILE_RESPONSE_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
 static PLAIN_RESPONSE_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
 static HTML_RESPONSE_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
 static STREAMING_RESPONSE_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
+static BASE_RESPONSE_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
 
 fn init_response_classes(py: Python<'_>) {
     if JSON_RESPONSE_CLS.get().is_some() {
@@ -65,6 +66,12 @@ fn init_response_classes(py: Python<'_>) {
         }
         if let Ok(c) = m.getattr("StreamingResponse") {
             let _ = STREAMING_RESPONSE_CLS.set(c.unbind());
+        }
+        // Base starlette Response: body pre-rendered, never has path /
+        // body_iterator — exact-class hits skip those failed getattr probes
+        // (audited ~460ns/request on Response(content=...) endpoints).
+        if let Ok(c) = m.getattr("Response") {
+            let _ = BASE_RESPONSE_CLS.set(c.unbind());
         }
     }
 }
@@ -241,7 +248,8 @@ pub fn py_to_response_with_request(
     // rendered bytes; skip the path + body_iterator probes entirely.
     let is_plain_response = JSON_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py)))
         || PLAIN_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py)))
-        || HTML_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py)));
+        || HTML_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py)))
+        || BASE_RESPONSE_CLS.get().is_some_and(|c| ty.is(c.bind(py)));
     if is_plain_response {
         if let Ok(status_attr) = obj.getattr("status_code") {
             return response_object_to_response(py, obj, &status_attr);
@@ -406,36 +414,40 @@ fn response_object_to_response(
     let status_code = status_attr.extract::<u16>().unwrap_or(200);
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-    // Collect raw_headers keys first so we can skip them in the headers
-    // dict pass (duplicates must come from raw_headers only — the dict
-    // just carries the canonical latest value, which `MutableHeaders.
-    // append` already pushed into raw_headers too).
-    let mut raw_header_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Ok(raw_attr) = obj.getattr("raw_headers") {
-        if let Ok(list) = raw_attr.cast::<PyList>() {
-            for item in list.iter() {
-                if let Some(tup) = extract_header_pair(&item) {
-                    raw_header_keys.insert(tup.0.to_ascii_lowercase());
+    // Headers: real Starlette's `.headers` property is a MutableHeaders VIEW
+    // over the SAME `raw_headers` list, so when `raw_headers` exists (as a
+    // list — the Starlette invariant, set by `init_headers` in `__init__`),
+    // ONE pass over it carries every header including duplicates (multi
+    // Set-Cookie). The old code read raw_headers twice (HashSet key pass +
+    // append pass) AND materialized `.headers`.items() — audited ~1.4µs of
+    // per-request redundancy. The `.headers` pass survives only as the
+    // fallback for duck-typed response objects with no raw_headers list.
+    let mut headers = HeaderMap::new();
+    let raw_list = obj
+        .getattr("raw_headers")
+        .ok()
+        .and_then(|a| a.cast::<PyList>().cloned().ok());
+    if let Some(list) = raw_list {
+        // `append` preserves duplicates (multi Set-Cookie).
+        for item in list.iter() {
+            if let Some(tup) = extract_header_pair(&item) {
+                if let (Ok(hname), Ok(hval)) =
+                    (HeaderName::try_from(tup.0), HeaderValue::from_str(&tup.1))
+                {
+                    headers.append(hname, hval);
                 }
             }
         }
-    }
-
-    let mut headers = HeaderMap::new();
-    if let Ok(hdr_obj) = obj.getattr("headers") {
-        // Support both plain dict and MutableHeaders (which has .items())
+    } else if let Ok(hdr_obj) = obj.getattr("headers") {
+        // Fallback: plain dict or MutableHeaders-like (.items()) with no
+        // raw_headers backing — duck-typed/legacy response objects.
         if let Ok(dict) = hdr_obj.cast::<PyDict>() {
-            if !dict.is_empty() {
-                for (k, v) in dict.iter() {
-                    if let (Ok(key), Ok(val)) = (k.extract::<String>(), v.extract::<String>()) {
-                        if raw_header_keys.contains(&key.to_ascii_lowercase()) {
-                            continue;
-                        }
-                        if let (Ok(hname), Ok(hval)) =
-                            (HeaderName::try_from(key), HeaderValue::from_str(&val))
-                        {
-                            headers.insert(hname, hval);
-                        }
+            for (k, v) in dict.iter() {
+                if let (Ok(key), Ok(val)) = (k.extract::<String>(), v.extract::<String>()) {
+                    if let (Ok(hname), Ok(hval)) =
+                        (HeaderName::try_from(key), HeaderValue::from_str(&val))
+                    {
+                        headers.insert(hname, hval);
                     }
                 }
             }
@@ -443,30 +455,10 @@ fn response_object_to_response(
             if let Ok(list) = items_list.cast::<pyo3::types::PyList>() {
                 for item in list.iter() {
                     if let Some((key, val)) = extract_header_pair(&item) {
-                        if raw_header_keys.contains(&key.to_ascii_lowercase()) {
-                            continue;
-                        }
                         if let (Ok(hname), Ok(hval)) =
                             (HeaderName::try_from(key), HeaderValue::from_str(&val))
                         {
                             headers.insert(hname, hval);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // raw_headers list preserves duplicates (e.g., multiple Set-Cookie).
-    // Skip entirely if the list is empty (common case — no cookies set).
-    if let Ok(raw_attr) = obj.getattr("raw_headers") {
-        if let Ok(list) = raw_attr.cast::<PyList>() {
-            if !list.is_empty() {
-                for item in list.iter() {
-                    if let Some(tup) = extract_header_pair(&item) {
-                        if let (Ok(hname), Ok(hval)) =
-                            (HeaderName::try_from(tup.0), HeaderValue::from_str(&tup.1))
-                        {
-                            headers.append(hname, hval);
                         }
                     }
                 }
