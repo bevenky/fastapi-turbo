@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "lat_n": 5000,
+    "lat_warmup": 500,
+    "procs": 6,
+    "conns": 8,
+    "dur_s": 5.0,
+    "pipeline": 16,
+    "server_workers": 8,
+    "msg_bytes": 64,
+    "note": "pure-Python client (websockets+uvloop); tops out ~high-100k msgs/s \u2014 relative comparison only"
+  },
+  "data": {
+    "fastapi-turbo": {
+      "p50_us": 43.2,
+      "p99_us": 60.5,
+      "msgs_per_s": 186379
+    },
+    "FastAPI (uvicorn)": {
+      "p50_us": 70.6,
+      "p99_us": 174.0,
+      "msgs_per_s": 759595
+    },
+    "Gin (Go)": {
+      "p50_us": 29.8,
+      "p99_us": 65.7,
+      "msgs_per_s": 328484
+    },
+    "Fastify (Node)": {
+      "p50_us": 29.9,
+      "p99_us": 57.7,
+      "msgs_per_s": 328131
+    },
+    "raw-axum": {
+      "p50_us": 27.4,
+      "p99_us": 61.0,
+      "msgs_per_s": 894046
+    }
+  }
+}

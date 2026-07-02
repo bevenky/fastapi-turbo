@@ -64,6 +64,41 @@ def fnum(v):
     return f"{v:,.0f}" if isinstance(v, float) else f"{v:,}"
 
 
+def ws_section():
+    """WebSocket echo table from results_ws.json (skipped if absent)."""
+    p = HERE / "results_ws.json"
+    if not p.exists():
+        return ""
+    ws = json.loads(p.read_text())
+    data = ws.get("data", ws)
+    frameworks = [f for f in FW_ORDER if f in data] + [f for f in data if f not in FW_ORDER]
+    metrics = [("p50_us", "RTT p50 (µs, lower better)", "low"),
+               ("p99_us", "RTT p99 (µs, lower better)", "low"),
+               ("msgs_per_s", "throughput (msgs/s, higher better)", "high")]
+    h = ["<h2>③ WebSocket echo (/ws — 64-byte text round trips)</h2>",
+         '<p class=sub>Latency: 1 connection, sequential echo round trips. Throughput: multi-process client, '
+         'pipelined connections. Python bench client (websockets+uvloop) — may bottleneck at high message '
+         'rates; treat throughput as relative.</p>',
+         '<table><tr><th class=lab>metric</th>']
+    for fw in frameworks:
+        h.append(f'<th class="{"turbo" if fw == "fastapi-turbo" else ""}">{SHORT.get(fw, fw)}</th>')
+    h.append('</tr>')
+    for key, label, better in metrics:
+        vals = {fw: (data[fw] or {}).get(key) for fw in frameworks}
+        present = [v for v in vals.values() if v is not None]
+        best = (min if better == "low" else max)(present) if present else None
+        h.append(f'<tr><td class=lab>{label}</td>')
+        for fw in frameworks:
+            v = vals[fw]
+            cls = "turbo " if fw == "fastapi-turbo" else ""
+            if v is not None and v == best:
+                cls += "best"
+            h.append(f'<td class="{cls.strip()}">{fnum(v)}</td>')
+        h.append('</tr>')
+    h.append('</table>')
+    return "".join(h)
+
+
 def cell(fw, v, best, better):
     cls = "turbo " if fw == "fastapi-turbo" else ""
     if v is not None and best is not None and v == best:
@@ -141,6 +176,7 @@ uvicorn has no /_ping (turbo's is built-in Rust; vanilla FastAPI has no static f
 <h2>② Throughput — all {TPMETA['cores']} cores, c={TPMETA['conc']} (req/s, higher better)</h2>
 <p class=sub>Max requests/sec with every framework using all cores (the real deployment number). Small grey number = cores actually used.</p>
 {table("tp", tp, "", "high", extra=cores)}
+{ws_section()}
 </div></body></html>"""
 
 OUT.write_text(html)
