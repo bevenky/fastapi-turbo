@@ -12,29 +12,29 @@
   },
   "data": {
     "fastapi-turbo": {
-      "p50_us": 37.9,
-      "p99_us": 54.1,
-      "msgs_per_s": 243486
+      "p50_us": 39.7,
+      "p99_us": 57.5,
+      "msgs_per_s": 171063
     },
     "FastAPI (uvicorn)": {
-      "p50_us": 68.0,
-      "p99_us": 82.6,
-      "msgs_per_s": 723048
+      "p50_us": 66.6,
+      "p99_us": 82.9,
+      "msgs_per_s": 557218
     },
     "Gin (Go)": {
-      "p50_us": 29.0,
-      "p99_us": 39.0,
-      "msgs_per_s": 355307
+      "p50_us": 29.1,
+      "p99_us": 41.0,
+      "msgs_per_s": 293655
     },
     "Fastify (Node)": {
-      "p50_us": 28.2,
-      "p99_us": 42.0,
-      "msgs_per_s": 346385
+      "p50_us": 29.4,
+      "p99_us": 43.3,
+      "msgs_per_s": 264067
     },
     "raw-axum": {
-      "p50_us": 25.7,
-      "p99_us": 39.7,
-      "msgs_per_s": 758559
+      "p50_us": 25.5,
+      "p99_us": 49.5,
+      "msgs_per_s": 759873
     }
   }
 }
