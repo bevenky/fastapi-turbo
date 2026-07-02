@@ -130,22 +130,36 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
         let _ = tx.try_send(Ok(chunk));
     }
 
-    // Spawn a blocking task that iterates the Python generator and pushes
-    // the remaining chunks through the channel.
-    tokio::task::spawn_blocking(move || {
-        Python::attach(|py| {
-            if is_async {
-                if noawait {
-                    iterate_async_generator_inline(py, &iterator, &tx);
+    // Mechanism 2: an async gen with REAL awaits multiplexes as a TASK on the
+    // shared `_async_worker` loop — no per-stream thread, no per-stream event
+    // loop, no `run_until_complete` machinery (~122µs → the loop amortizes it
+    // across every in-flight stream). Falls back to the legacy dedicated-
+    // thread driver when the loop is unavailable (closed / no tokio runtime
+    // context) or when `FASTAPI_TURBO_STREAM_THREAD=1` forces it.
+    let worker_scheduled = is_async
+        && !noawait
+        && !stream_thread_forced()
+        && schedule_stream_on_worker_loop(py, &iterator, &tx);
+
+    // Legacy paths: spawn a blocking task that iterates the Python generator
+    // and pushes the remaining chunks through the channel. (Sync gens and
+    // proven-no-await async gens ALWAYS take this path — unchanged.)
+    if !worker_scheduled {
+        tokio::task::spawn_blocking(move || {
+            Python::attach(|py| {
+                if is_async {
+                    if noawait {
+                        iterate_async_generator_inline(py, &iterator, &tx);
+                    } else {
+                        iterate_async_generator(py, &iterator, &tx);
+                    }
                 } else {
-                    iterate_async_generator(py, &iterator, &tx);
+                    let iter_obj = iterator.bind(py);
+                    iterate_sync_generator(py, iter_obj, &tx);
                 }
-            } else {
-                let iter_obj = iterator.bind(py);
-                iterate_sync_generator(py, iter_obj, &tx);
-            }
+            });
         });
-    });
+    }
 
     let stream = ReceiverStream::new(rx);
     let body = Body::from_stream(stream);
@@ -279,12 +293,407 @@ impl ChunkPush {
         // thread; a slow consumer could pin the interpreter for seconds.
         py.detach(|| tx.blocking_send(Ok(chunk)).is_ok())
     }
+
+    /// Drop the Sender clone — called by `_drive_stream` on NORMAL completion.
+    /// On the legacy path this is a harmless early drop (the driving closure
+    /// still holds its own Sender until after exception capture); on the
+    /// worker-loop path the counterpart (`LoopChunkPush::close`) is what lets
+    /// the HTTP body EOF skip the done-callback hop.
+    fn close(&mut self) {
+        self.tx.take();
+    }
 }
 
-/// Iterate an async Python generator on a thread-local event loop, pushing
-/// each chunk to the mpsc channel as soon as it's yielded. This is the hot
-/// path for LLM token streaming (vLLM / SGLang) — every token must reach
-/// the client immediately; buffering defeats the purpose.
+// ═══ Mechanism 2: await-streams multiplex as tasks on the shared worker loop ═══
+//
+// The legacy driver burns a `spawn_blocking` thread + a thread-local event
+// loop + one `run_until_complete` per stream (~80µs of GIL-held loop
+// machinery per response). Instead, `_drive_stream(aiter, push)` is scheduled
+// as a plain TASK on the persistent `_async_worker` loop — the same loop that
+// runs needs-worker async handlers — via one `call_soon_threadsafe` enqueue
+// (a Rust `StreamJob` pyclass, mirroring router.rs's async-inline `InlineJob`).
+//
+// The one hard rule on the shared loop: NEVER block it. The legacy
+// `ChunkPush` does `py.detach + blocking_send`, which on a full body channel
+// would stall EVERY in-flight request in the process. `LoopChunkPush` uses
+// `try_send`; on `Full` it hands the driver an asyncio Future and spawns a
+// tokio waiter that awaits channel capacity (`Sender::reserve`), sends the
+// pending chunk itself (order preserved — the driver can't push again until
+// the future resolves), and resolves the future via `call_soon_threadsafe`
+// (True = keep going, False = receiver dropped while waiting).
+//
+// Everything else is preserved exactly: disconnect → `aclose()` throws
+// GeneratorExit into the WRAPPED gen (request-scope yield-dep teardown via
+// `_door_wrap_stream_teardown`); a mid-stream raise is captured onto
+// `app._captured_server_exceptions` BEFORE the body channel closes
+// (TestClient parity — the legacy closure's Sender clone gave the same
+// ordering); SSE's `ensure_future` keepalive producer lands on the SAME loop
+// as every `__anext__` naturally (it's all one task now). The no-await inline
+// path and sync-gen path are untouched.
+
+/// `FASTAPI_TURBO_STREAM_THREAD=1` forces the legacy per-stream
+/// dedicated-thread driver (kill switch, read once).
+fn stream_thread_forced() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("FASTAPI_TURBO_STREAM_THREAD")
+            .map(|v| matches!(v.trim(), "1" | "true" | "True" | "TRUE" | "yes" | "on"))
+            .unwrap_or(false)
+    })
+}
+
+/// Cached `fastapi_turbo.responses._resolve_stream_future` — the
+/// `call_soon_threadsafe` target that resolves a backpressure future
+/// (`done()`-guarded so a cancelled future never raises InvalidStateError).
+fn stream_future_resolver(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
+    static RESOLVER: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+    if let Some(r) = RESOLVER.get() {
+        return Ok(r);
+    }
+    let f = py
+        .import("fastapi_turbo.responses")?
+        .getattr("_resolve_stream_future")?
+        .unbind();
+    let _ = RESOLVER.set(f);
+    Ok(RESOLVER.get().expect("just set"))
+}
+
+/// Cached `fastapi_turbo.responses._drive_stream` (per-stream import+getattr
+/// would land on the request hot path).
+fn drive_stream_fn(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
+    static DRIVE: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+    if let Some(f) = DRIVE.get() {
+        return Ok(f);
+    }
+    let f = py
+        .import("fastapi_turbo.responses")?
+        .getattr("_drive_stream")?
+        .unbind();
+    let _ = DRIVE.set(f);
+    Ok(DRIVE.get().expect("just set"))
+}
+
+/// Cached `contextvars.Context` type (fresh empty context per stream enqueue).
+fn contextvars_context_type(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
+    static CTX: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+    if let Some(c) = CTX.get() {
+        return Ok(c);
+    }
+    let c = py.import("contextvars")?.getattr("Context")?.unbind();
+    let _ = CTX.set(c);
+    Ok(CTX.get().expect("just set"))
+}
+
+/// Cached `fastapi_turbo.responses._spawn_stream_task` — the loop-thread task
+/// spawner (eager-start on 3.12+, `create_task` fallback).
+fn stream_task_spawner(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
+    static SPAWN: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+    if let Some(f) = SPAWN.get() {
+        return Ok(f);
+    }
+    let f = py
+        .import("fastapi_turbo.responses")?
+        .getattr("_spawn_stream_task")?
+        .unbind();
+    let _ = SPAWN.set(f);
+    Ok(SPAWN.get().expect("just set"))
+}
+
+/// The canonical Python bool singleton as an owned `Py<PyAny>` — the driver
+/// discriminates the push result via `is True` / `is False`.
+fn py_bool(py: Python<'_>, v: bool) -> Py<PyAny> {
+    pyo3::types::PyBool::new(py, v).to_owned().into_any().unbind()
+}
+
+/// Capture a streaming exception onto the GIVEN app's
+/// `_captured_server_exceptions` (TestClient `raise_server_exceptions=True`
+/// parity). The app is resolved ONCE at stream-creation time on the request
+/// thread — the worker loop thread has no per-thread `CURRENT_APP` binding,
+/// so resolving there could hit the wrong app in multi-server processes.
+fn capture_stream_err_on_app(py: Python<'_>, app: Option<&Py<PyAny>>, e: &PyErr) {
+    if let Some(app_obj) = app {
+        if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+            let _ = lst.call_method1(py, "append", (e.value(py),));
+        }
+    }
+}
+
+/// Loop-native per-chunk push handed to `_drive_stream` — MUST NOT block the
+/// shared worker loop. `__call__(item)` returns:
+///   * `True`  — chunk sent (`try_send` succeeded);
+///   * `False` — receiver dropped (client disconnect / door closed the body);
+///   * an asyncio `Future` — channel full; a tokio waiter task delivers the
+///     pending chunk when capacity frees and resolves the future
+///     (True = delivered, False = receiver dropped while waiting).
+///
+/// `tx` is `Option` so `StreamCompleter` can explicitly drop the Sender when
+/// the driver task finishes: a raised driver frame can be GC-cycle-retained,
+/// and channel close must never depend on GC timing (the HTTP body would
+/// hang). `rt` is the request runtime's handle, captured at stream-creation
+/// time on the tokio side — the loop thread has no runtime context to spawn
+/// the backpressure waiter from.
+#[pyclass]
+struct LoopChunkPush {
+    tx: Option<mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>,
+    rt: tokio::runtime::Handle,
+}
+
+#[pymethods]
+impl LoopChunkPush {
+    fn __call__(&self, py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Ok(py_bool(py, false));
+        };
+        let chunk = python_val_to_bytes(item);
+        match tx.try_send(Ok(chunk)) {
+            Ok(()) => Ok(py_bool(py, true)),
+            Err(mpsc::error::TrySendError::Closed(_)) => Ok(py_bool(py, false)),
+            Err(mpsc::error::TrySendError::Full(pending)) => {
+                // Backpressure: hand the driver a Future to await. We are ON
+                // the loop thread (the driver task called us synchronously),
+                // so `create_future()` here is loop-safe.
+                let loop_obj = crate::handler_bridge::worker_loop().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err("async worker loop not initialized")
+                })?;
+                let call_soon = crate::handler_bridge::worker_call_soon()
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err(
+                            "async worker loop not initialized",
+                        )
+                    })?
+                    .clone_ref(py);
+                let fut = loop_obj.call_method0(py, "create_future")?;
+                let resolver = stream_future_resolver(py)?.clone_ref(py);
+                let fut_for_waiter = fut.clone_ref(py);
+                let tx_for_waiter = tx.clone();
+                self.rt.spawn(async move {
+                    // `reserve()` resolves when a slot frees; sending via the
+                    // permit (not the driver) preserves chunk order — the
+                    // driver is suspended on the future until we resolve it.
+                    let ok = match tx_for_waiter.reserve().await {
+                        Ok(permit) => {
+                            permit.send(pending);
+                            true
+                        }
+                        Err(_) => false,
+                    };
+                    Python::attach(|py| {
+                        let _ = call_soon.call1(
+                            py,
+                            (resolver.bind(py), fut_for_waiter.bind(py), ok),
+                        );
+                    });
+                });
+                Ok(fut)
+            }
+        }
+    }
+
+    /// Drop the Sender — called by `_drive_stream` on NORMAL completion so the
+    /// HTTP body's EOF doesn't wait for the task done-callback hop. The
+    /// `StreamCompleter` still runs (idempotent take) and owns the
+    /// exception-path close, which must happen AFTER capture.
+    fn close(&mut self) {
+        self.tx.take();
+    }
+}
+
+/// Enqueued via `loop.call_soon_threadsafe(job)` with a FRESH empty
+/// `contextvars.Context` (parity with the legacy dedicated thread, whose
+/// driver never saw the request thread's ambient contextvars). The
+/// `_drive_stream` coroutine object is pre-built on the REQUEST thread
+/// (creation doesn't execute the body) — `__call__` on the loop thread only
+/// does `create_task` + completer wiring, keeping the shared loop's
+/// per-stream burden minimal.
+#[pyclass]
+struct StreamJob {
+    coro: Option<Py<PyAny>>,
+    push: Option<Py<LoopChunkPush>>,
+    app: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl StreamJob {
+    fn __call__(&mut self, py: Python<'_>) {
+        let (Some(coro), Some(push)) = (self.coro.take(), self.push.take()) else {
+            return;
+        };
+        if let Err(e) = start_stream_task_on_loop(py, &coro, &push, &self.app) {
+            // Capture FIRST (TestClient must see the error once the body
+            // ends), THEN drop the Sender so the HTTP body terminates. The
+            // coro is closed/cancelled inside start_stream_task_on_loop —
+            // ownership is unambiguous there (pre- vs post-create_task).
+            capture_stream_err_on_app(py, self.app.as_ref(), &e);
+            eprintln!("fastapi-turbo: worker-loop stream start failed: {e}");
+            push.borrow_mut(py).tx.take();
+        }
+    }
+}
+
+/// Loop-thread body of `StreamJob`: spawn the pre-built
+/// `_drive_stream(body_iterator, push)` coroutine as a task on the worker
+/// loop via `_spawn_stream_task` (eager-start — a cooperative-only stream
+/// completes synchronously inside this call, channel already closed by the
+/// driver's `push.close()`). The driver was built over `body_iterator` itself
+/// (not its `__aiter__()`) so its `aclose()` fires on the WRAPPED gen —
+/// preserving request-scope yield-dep teardown (`_door_wrap_stream_teardown`'s
+/// `finally`), exactly like the legacy driver.
+fn start_stream_task_on_loop(
+    py: Python<'_>,
+    coro: &Py<PyAny>,
+    push: &Py<LoopChunkPush>,
+    app: &Option<Py<PyAny>>,
+) -> PyResult<()> {
+    let loop_obj = crate::handler_bridge::worker_loop().ok_or_else(|| {
+        let _ = coro.call_method0(py, "close");
+        pyo3::exceptions::PyRuntimeError::new_err("async worker loop not initialized")
+    })?;
+    // Build the completer BEFORE spawning: once the task exists, every
+    // failure path must still guarantee the Sender gets dropped.
+    let completer = match Py::new(
+        py,
+        StreamCompleter {
+            push: push.clone_ref(py),
+            app: app.as_ref().map(|a| a.clone_ref(py)),
+        },
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = coro.call_method0(py, "close");
+            return Err(e);
+        }
+    };
+    let spawner = match stream_task_spawner(py) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = coro.call_method0(py, "close");
+            return Err(e);
+        }
+    };
+    if let Err(e) = spawner.call1(
+        py,
+        (loop_obj.bind(py), coro.bind(py), completer.bind(py)),
+    ) {
+        // Task construction failed before it took ownership — close the
+        // coroutine (no-op if an eager step already finished it; throws
+        // GeneratorExit for teardown if it half-started). The caller then
+        // captures the error and closes the body channel.
+        let _ = coro.call_method0(py, "close");
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Driver-task done-callback (runs on the loop thread). Captures a mid-stream
+/// raise onto the app BEFORE dropping the body-channel Sender, so
+/// `_captured_server_exceptions` is populated by the time the client observes
+/// end-of-body — the same ordering the legacy thread driver had (its closure
+/// still held a Sender clone while capturing).
+#[pyclass]
+struct StreamCompleter {
+    push: Py<LoopChunkPush>,
+    app: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl StreamCompleter {
+    fn __call__(&self, py: Python<'_>, task: Bound<'_, PyAny>) {
+        let cancelled = task
+            .call_method0(pyo3::intern!(py, "cancelled"))
+            .and_then(|v| v.extract::<bool>())
+            .unwrap_or(false);
+        if !cancelled {
+            // `result()` re-raises the task's exception (mid-stream raise).
+            if let Err(e) = task.call_method0(pyo3::intern!(py, "result")) {
+                if !e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
+                    capture_stream_err_on_app(py, self.app.as_ref(), &e);
+                    eprintln!("fastapi-turbo: worker-loop streaming error: {e}");
+                }
+            }
+        }
+        // Drop the Sender NOW — closes the mpsc channel so the HTTP body
+        // terminates even if the driver frame is GC-cycle-retained.
+        self.push.borrow_mut(py).tx.take();
+    }
+}
+
+/// Tokio-side enqueue (one short GIL section, already held by the caller):
+/// wrap the stream parts in a `StreamJob` and `call_soon_threadsafe` it onto
+/// the shared worker loop. Returns `false` when the loop can't take it (no
+/// tokio runtime context for the backpressure waiter, loop missing/closed,
+/// alloc failure) — the caller then falls back to the legacy thread driver.
+fn schedule_stream_on_worker_loop(
+    py: Python<'_>,
+    iterator: &Py<PyAny>,
+    tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+) -> bool {
+    // The backpressure waiter needs a runtime to spawn onto; capture the
+    // handle HERE (request thread) — the loop thread has no runtime context.
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    crate::handler_bridge::init_async_worker();
+    let Some(call_soon) = crate::handler_bridge::worker_call_soon() else {
+        return false;
+    };
+    // Resolve the capture target while the request thread's CURRENT_APP
+    // binding is live (the loop thread's isn't) — see capture_stream_err_on_app.
+    let app = crate::router::current_app(py);
+    let Ok(push) = Py::new(
+        py,
+        LoopChunkPush {
+            tx: Some(tx.clone()),
+            rt,
+        },
+    ) else {
+        return false;
+    };
+    // Build the `_drive_stream(body_iterator, push)` coroutine HERE on the
+    // request thread — creating a coroutine object doesn't execute its body,
+    // and it keeps the shared loop's job callback down to create_task+wiring.
+    let Ok(drive) = drive_stream_fn(py) else {
+        return false;
+    };
+    let Ok(coro) = drive.call1(py, (iterator.bind(py), push.bind(py))) else {
+        return false;
+    };
+    let enqueued = (|| -> PyResult<()> {
+        let job = Py::new(
+            py,
+            StreamJob {
+                coro: Some(coro.clone_ref(py)),
+                push: Some(push),
+                app,
+            },
+        )?;
+        // Fresh EMPTY contextvars.Context: the legacy driver ran on a
+        // dedicated thread whose context never held the request thread's
+        // ambient contextvars — `create_task` inside the job snapshots the
+        // callback's context, so seed an empty one for parity.
+        let ctx = contextvars_context_type(py)?.call0(py)?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item(pyo3::intern!(py, "context"), ctx)?;
+        call_soon.call(py, (job.bind(py),), Some(&kwargs))?;
+        Ok(())
+    })();
+    match enqueued {
+        Ok(()) => true,
+        // Loop closed mid-shutdown / alloc failure — close the never-started
+        // coroutine (silences "never awaited" + drops its iterator/push refs);
+        // the legacy fallback still owns iterator + tx.
+        Err(_) => {
+            let _ = coro.call_method0(py, "close");
+            false
+        }
+    }
+}
+
+/// LEGACY FALLBACK: iterate an async Python generator on a thread-local event
+/// loop, pushing each chunk to the mpsc channel as soon as it's yielded.
+/// Await-streams normally multiplex on the shared worker loop instead
+/// (`schedule_stream_on_worker_loop`, Mechanism 2); this per-stream
+/// thread+loop driver runs only when that enqueue is unavailable (no tokio
+/// runtime context / loop closed) or `FASTAPI_TURBO_STREAM_THREAD=1`.
 ///
 /// Single-driver: instead of driving each `__anext__` through its own
 /// `run_until_complete` (one full asyncio loop iteration per chunk,

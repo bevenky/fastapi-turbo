@@ -18,6 +18,7 @@ resolve to the REAL packages; the bound references stay real after the shim runs
 """
 from __future__ import annotations
 
+import asyncio as _asyncio
 import types as _types
 
 from starlette.responses import (
@@ -44,7 +45,9 @@ __all__ = [
     "EventSourceResponse",
     "_json_default",
     "_drive_stream",
+    "_resolve_stream_future",
     "_resume_anext",
+    "_spawn_stream_task",
     "_stream_is_noawait",
 ]
 
@@ -121,28 +124,60 @@ async def _drive_stream(aiter, push):
     threadpool-wraps SYNC stream content into an async-gen via
     ``iterate_in_threadpool``, so this async driver handles sync content too.)
 
-    ``push`` is the Rust ``ChunkPush`` callback: ``push(item) -> bool``;
-    returns ``False`` when the receiver was dropped (client disconnect / door
-    closed the body). On ``False`` we ``break`` and ``aclose()`` — throwing
-    ``GeneratorExit`` into the gen so its ``try/finally`` fires (cancellation
-    parity). ``aclose()`` runs ONLY on the disconnect path: on normal
-    exhaustion / mid-stream raise the gen is already finished. A mid-stream
-    raise propagates out as a Rust ``Err``, captured onto
-    ``app._captured_server_exceptions`` (TestClient parity).
+    ``push`` is a Rust per-chunk callback with a tri-state result:
+
+    * ``True``  — chunk sent, keep going (the common case).
+    * ``False`` — the receiver was dropped (client disconnect / door closed
+      the body). We ``break`` and ``aclose()`` — throwing ``GeneratorExit``
+      into the gen so its ``try/finally`` fires (cancellation parity).
+    * an *awaitable* (worker-loop driver only, ``LoopChunkPush``) — the body
+      channel is FULL (slow-consumer backpressure). The legacy dedicated-
+      thread driver (``ChunkPush``) blocks the thread instead, but a task on
+      the SHARED worker loop must never block it — Rust hands back an asyncio
+      Future that resolves ``True`` once capacity freed (the pending chunk is
+      sent by the Rust waiter itself, order preserved) or ``False`` when the
+      receiver went away while waiting.
+
+    ``aclose()`` runs ONLY on the disconnect path: on normal exhaustion /
+    mid-stream raise the gen is already finished. A mid-stream raise
+    propagates out (task exception on the worker loop / Rust ``Err`` on the
+    legacy path), captured onto ``app._captured_server_exceptions``
+    (TestClient parity).
+
+    Fairness: ``_step_anext`` resumes cooperative checkpoints INLINE, so a
+    gen that only ever ``await sleep(0)``s between chunks would otherwise run
+    the WHOLE stream without yielding to the loop once — starving every other
+    task when this driver multiplexes on the shared worker loop. A real
+    ``sleep(0)`` every 64 chunks caps that burst (~0.2 µs/chunk amortized;
+    noise for gens that do real I/O).
     """
     it = aiter.__aiter__()
     disconnected = False
+    n = 0
     while True:
         chunk = await _step_anext(it.__anext__())
         if chunk is _STREAM_DONE:
             break
-        if not push(chunk):
-            disconnected = True
-            break
+        sent = push(chunk)
+        if sent is not True:
+            if sent is False or not await sent:
+                disconnected = True
+                break
+        n += 1
+        if not (n & 63):
+            await _asyncio.sleep(0)
     if disconnected:
         aclose = getattr(aiter, "aclose", None)
         if aclose is not None:
             await aclose()
+    # Normal completion: drop the channel Sender NOW so the HTTP body's EOF
+    # doesn't wait for the task done-callback (one loop-callback hop earlier).
+    # On a mid-stream raise we deliberately do NOT reach this line — the
+    # StreamCompleter captures the exception onto the app FIRST and closes
+    # after (TestClient must see the error once the body ends). The legacy
+    # ChunkPush also has close(); there it's a harmless early drop (the
+    # driving closure holds its own Sender clone until after capture).
+    push.close()
 
 
 async def _resume_anext(started):
@@ -165,6 +200,45 @@ async def _resume_anext(started):
     ``ensure_future`` producer task alive across chunks.
     """
     return await started
+
+
+def _spawn_stream_task(loop, coro, completer):
+    """Spawn the ``_drive_stream`` driver as a task on the worker loop.
+
+    Called from ``streaming.rs::StreamJob.__call__`` ON the loop thread (the
+    loop is running). ``eager_start=True`` (3.12+) runs the driver's first
+    step synchronously right here — a cooperative-only stream (checkpoints
+    fast-pathed inline by ``_step_anext``) completes its WHOLE body without a
+    single extra loop iteration, and ``push.close()`` at the driver's end has
+    already closed the body channel before this returns. Unlike a bare
+    ``coro.send(None)`` probe, an eager Task is a REAL current task —
+    ``asyncio.current_task()``-dependent code (``wait_for``/``timeout`` in the
+    SSE keepalive wrap) sees a proper task context.
+
+    The completer (exception capture + guaranteed channel close) is attached
+    AFTER an eager completion, which is fine: ``add_done_callback`` on a done
+    task schedules it via ``call_soon``, and the mid-stream-raise path leaves
+    the channel open until the completer captures-then-closes (ordering
+    parity with the legacy driver).
+    """
+    try:
+        task = _asyncio.Task(coro, loop=loop, eager_start=True)
+    except TypeError:  # Python < 3.12 — no eager_start
+        task = loop.create_task(coro)
+    task.add_done_callback(completer)
+
+
+def _resolve_stream_future(fut, ok):
+    """``call_soon_threadsafe`` target: resolve a stream-backpressure future.
+
+    The worker-loop stream driver (``streaming.rs::LoopChunkPush``) hands
+    ``_drive_stream`` an asyncio Future when the body channel is full; a Rust
+    waiter task awaits channel capacity, sends the pending chunk itself, then
+    schedules this resolver onto the worker loop. Guard on ``done()`` so a
+    future that was cancelled in the meantime (loop shutdown) doesn't raise
+    ``InvalidStateError`` into the loop's exception handler."""
+    if not fut.done():
+        fut.set_result(ok)
 
 
 _NOAWAIT_STREAM_CACHE: dict[int, bool] = {}
