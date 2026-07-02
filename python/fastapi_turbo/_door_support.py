@@ -262,9 +262,21 @@ def _make_fa_body_validator(annotation, combined_body_fields=None):
 
 
 def _has_await_in_source(func) -> bool:
-    """Best-effort static check: does this function's source text contain any
-    ``await`` expressions? Returns True on any detection failure so greenlet-bridge
-    libs (SQLAlchemy async, redis.asyncio) fall through to the safe path."""
+    """Best-effort static check: does this function's OWN body contain any
+    ``await`` expressions? Nested function/lambda bodies are skipped — an
+    ``await`` inside a nested ``async def`` (e.g. a streaming generator the
+    handler builds and returns) executes only when that inner object is
+    driven, never while the handler itself runs, so it must not misclassify
+    an await-free handler onto the worker-submit path (an Event round trip
+    per request). This matches code-object semantics exactly: a coroutine
+    can only suspend on an await/async-for/async-with compiled into its own
+    code object, and nested defs are separate code objects. Returns True on
+    any detection failure so greenlet-bridge libs (SQLAlchemy async,
+    redis.asyncio) fall through to the safe path.
+
+    NOTE: ``_uses_running_loop`` deliberately KEEPS whole-source semantics —
+    loop-affinity primitives (create_task, get_running_loop, ...) are
+    loop-binding even when they hide inside nested code that runs later."""
     try:
         import ast
         import inspect as _inspect
@@ -272,9 +284,17 @@ def _has_await_in_source(func) -> bool:
 
         src = _inspect.getsource(func)
         tree = ast.parse(textwrap.dedent(src))
-        for node in ast.walk(tree):
+        root = tree.body[0]
+        if not isinstance(root, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            return True
+        stack = list(ast.iter_child_nodes(root))
+        while stack:
+            node = stack.pop()
             if isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
                 return True
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Lambda)):
+                continue  # nested def: its awaits run when IT is driven, not now
+            stack.extend(ast.iter_child_nodes(node))
         return False
     except Exception:  # noqa: BLE001
         return True
@@ -345,11 +365,23 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
                 coro.send(None)
             except StopIteration as e:
                 return e.value
-            except BaseException:
+            except BaseException as exc:
                 try:
                     coro.close()
                 except Exception:  # noqa: BLE001
                     pass
+                # Misclassification safety net (same double-run semantics as
+                # the suspend fallback below): a loop-needing primitive raises
+                # this BEFORE suspending, e.g. when ``inspect.getsource``
+                # followed a ``__wrapped__`` chain to an await-free function
+                # while the wrapper actually awaits. Re-drive on the worker
+                # loop instead of 500ing.
+                if isinstance(exc, RuntimeError) and "no running event loop" in str(
+                    exc
+                ):
+                    from fastapi_turbo._async_worker import submit
+
+                    return submit(async_func(**kwargs), app=app)
                 raise
             try:
                 coro.close()
