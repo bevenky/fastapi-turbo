@@ -95,16 +95,28 @@ def group_pids(pgid):
     return pids
 
 
+# Python frameworks bench DB/redis endpoint groups in ISOLATED boots so one
+# backend's client pools (e.g. psycopg3-async worker tasks on the GIL-bound
+# worker loop) can't degrade another's numbers — measured contamination was
+# up to 4x on asyncpg. Go/Node/Rust have one native driver each; not needed.
+PY_ISOLATE = {
+    "redis": {"redis GET sync", "redis GET async", "redis SET sync", "redis SET async"},
+    "pg-sync": {"pg item sync", "pg list sync"},
+    "pg-async": {"pg item async", "pg list async"},
+}
+
+
 def registry():
     py = sys.executable
     return {
         "fastapi-turbo": dict(port=8902, cwd=HERE,
                               cmd=[py, "app.py", "8902"],
-                              env={"BENCH_ENGINE": "turbo", "FASTAPI_TURBO_WORKERS": str(WORKERS)}),
+                              env={"BENCH_ENGINE": "turbo", "FASTAPI_TURBO_WORKERS": str(WORKERS)},
+                              isolate=PY_ISOLATE),
         "FastAPI (uvicorn)": dict(port=8903, cwd=HERE,
                                   cmd=[py, "-m", "uvicorn", "app:app", "--host", HOST,
                                        "--port", "8903", "--workers", str(WORKERS), "--log-level", "warning"],
-                                  env={}),
+                                  env={}, isolate=PY_ISOLATE),
         "Gin (Go)": dict(port=8904, cwd=os.path.join(HERE, "go-gin"),
                          cmd=[os.path.join(HERE, "go-gin", "bench-gin")],
                          env={"PORT": "8904"}),
@@ -140,7 +152,7 @@ def run_one(port, method, path, body, procmap):
     return rps, peak
 
 
-def run_framework(name, fw):
+def _boot_and_bench(name, fw, endpoints, group):
     port = fw["port"]
     kill_port(port)
     time.sleep(1)
@@ -161,9 +173,9 @@ def run_framework(name, fw):
                 p = psutil.Process(pid); p.cpu_percent(interval=None); procmap[pid] = p
             except Exception:
                 pass
-        print(f"== {name}: {len(procmap)} procs in group, c={CONC}, workers={WORKERS}")
+        print(f"== {name} [{group}]: {len(procmap)} procs, c={CONC}, workers={WORKERS}")
         res = {}
-        for label, method, path, body in ENDPOINTS:
+        for label, method, path, body in endpoints:
             # refresh procmap (workers may have forked late)
             for pid in group_pids(pgid):
                 if pid not in procmap:
@@ -181,6 +193,23 @@ def run_framework(name, fw):
         except Exception:
             pass
         time.sleep(1.5)
+
+
+def run_framework(name, fw):
+    isolate = fw.get("isolate") or {}
+    used = set()
+    boots = []
+    for gname, labels in isolate.items():
+        eps = [e for e in ENDPOINTS if e[0] in labels]
+        used |= {e[0] for e in eps}
+        boots.append((gname, eps))
+    main = [e for e in ENDPOINTS if e[0] not in used]
+    boots.insert(0, ("main", main))
+    res = {}
+    for gname, eps in boots:
+        if eps:
+            res.update(_boot_and_bench(name, fw, eps, gname))
+    return res
 
 
 def main():

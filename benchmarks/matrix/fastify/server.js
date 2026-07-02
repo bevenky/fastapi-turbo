@@ -212,36 +212,18 @@ function commitFlag(req) {
   return c === undefined ? true : c !== "false";
 }
 
+// Reads: autocommit pool.query = 1 wire round trip (contract fairness: pgx
+// and psycopg3-autocommit reads are 1 RTT; explicit BEGIN/COMMIT would be 3).
 async function pgSelectOne() {
-  const client = await pg.connect();
-  try {
-    await client.query("BEGIN");
-    const { rows } = await client.query(SEL_ONE, [5]);
-    await client.query("COMMIT");
-    return pgRow(rows[0]);
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
-  }
+  const { rows } = await pg.query(SEL_ONE, [5]);
+  return pgRow(rows[0]);
 }
 fastify.get("/pg/select_one/sync", pgSelectOne);
 fastify.get("/pg/select_one/async", pgSelectOne);
 
 async function pgSelectList() {
-  const client = await pg.connect();
-  try {
-    await client.query("BEGIN");
-    const { rows } = await client.query(SEL_LIST, [10]);
-    await client.query("COMMIT");
-    return { items: rows.map(pgRow) };
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
-  }
+  const { rows } = await pg.query(SEL_LIST, [10]);
+  return { items: rows.map(pgRow) };
 }
 fastify.get("/pg/select_list/sync", pgSelectList);
 fastify.get("/pg/select_list/async", pgSelectList);

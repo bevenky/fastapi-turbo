@@ -108,47 +108,70 @@ def bench(port, method, path, procmap):
     return (float(m.group(1)) if m else 0.0), peak
 
 
+def _boots_for(fw):
+    """Endpoint groups, each run in a FRESH server boot.
+
+    Python frameworks get one boot per backend-driver group: pools are lazy
+    (app_db._pools), so a boot that only hits one driver's endpoints creates
+    ONLY that driver's pool — no co-resident pools sharing the GIL-bound
+    worker loop. Measured contamination without this: asyncpg dropped 8.9k →
+    3.5k rps when psycopg3-async's pool coexisted. Go/Node/Rust have one
+    native driver — a single boot is already clean.
+    """
+    if fw["scope"] != "py":
+        return [("all", list(CROSS))]
+    is_pg = lambda e: e[1] in ("pg-read", "pg-write")  # noqa: E731
+    boots = [
+        ("cross-pg-sync", [e for e in CROSS if is_pg(e) and "[sync]" in e[0]]),
+        ("cross-pg-async", [e for e in CROSS if is_pg(e) and "[async]" in e[0]]),
+        ("redis", [e for e in CROSS if e[1] == "redis"]),
+    ]
+    for drv in ("pg3sync", "pg2sync", "pg3async", "asyncpg"):
+        boots.append((f"pgm-{drv}", [e for e in PYMATRIX if e[0].startswith(drv)]))
+    return boots
+
+
 def run_fw(name, fw):
     port = fw["port"]
-    kill_port(port); time.sleep(1)
-    if port_open(port):
-        print(f"!! {name} port busy"); return {}
-    reseed_writes()
-    proc = subprocess.Popen(fw["cmd"], cwd=fw["cwd"], env=dict(os.environ, **fw["env"]),
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
-    try:
-        if not wait_up(port):
-            print(f"!! {name} boot FAILED"); return {}
-        time.sleep(3.0)
-        pgid = os.getpgid(proc.pid)
-        procmap = {}
-        for pid in group_pids(pgid):
+    res = {}
+    for group, eps in _boots_for(fw):
+        if not eps:
+            continue
+        kill_port(port); time.sleep(1)
+        if port_open(port):
+            print(f"!! {name} port busy"); return res
+        reseed_writes()
+        proc = subprocess.Popen(fw["cmd"], cwd=fw["cwd"], env=dict(os.environ, **fw["env"]),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
+        try:
+            if not wait_up(port):
+                print(f"!! {name} [{group}] boot FAILED"); continue
+            time.sleep(3.0)
+            pgid = os.getpgid(proc.pid)
+            procmap = {}
+            for pid in group_pids(pgid):
+                try:
+                    p = psutil.Process(pid); p.cpu_percent(interval=None); procmap[pid] = p
+                except Exception:
+                    pass
+            print(f"== {name} [{group}]: {len(procmap)} procs, {len(eps)} endpoints, c={CONC}")
+            for label, grp, method, path in eps:
+                for pid in group_pids(pgid):
+                    if pid not in procmap:
+                        try:
+                            p = psutil.Process(pid); p.cpu_percent(interval=None); procmap[pid] = p
+                        except Exception:
+                            pass
+                rps, cpu = bench(port, method, path, procmap)
+                res[label] = {"rps": rps, "cpu_pct": cpu, "cores": round(cpu / 100, 1), "group": grp}
+                print(f"  {label:34s} {rps:10,.0f} rps  ({cpu/100:.1f}c)")
+        finally:
             try:
-                p = psutil.Process(pid); p.cpu_percent(interval=None); procmap[pid] = p
+                os.killpg(os.getpgid(proc.pid), 9)
             except Exception:
                 pass
-        eps = list(CROSS)
-        if fw["scope"] == "py":
-            eps += PYMATRIX
-        print(f"== {name}: {len(procmap)} procs, {len(eps)} endpoints, c={CONC}")
-        res = {}
-        for label, grp, method, path in eps:
-            for pid in group_pids(pgid):
-                if pid not in procmap:
-                    try:
-                        p = psutil.Process(pid); p.cpu_percent(interval=None); procmap[pid] = p
-                    except Exception:
-                        pass
-            rps, cpu = bench(port, method, path, procmap)
-            res[label] = {"rps": rps, "cpu_pct": cpu, "cores": round(cpu / 100, 1), "group": grp}
-            print(f"  {label:34s} {rps:10,.0f} rps  ({cpu/100:.1f}c)")
-        return res
-    finally:
-        try:
-            os.killpg(os.getpgid(proc.pid), 9)
-        except Exception:
-            pass
-        time.sleep(1.5)
+            time.sleep(1.5)
+    return res
 
 
 def main():

@@ -78,6 +78,7 @@ def _chunk(i: int) -> bytes:
 # ── lazy connection pools (bind to the running loop on first use) ─────
 _sync_pg = None
 _async_pg = None
+_async_pg3 = None
 _sync_redis = None
 _async_redis = None
 
@@ -86,19 +87,50 @@ def _get_sync_pg():
     global _sync_pg
     if _sync_pg is None:
         from psycopg_pool import ConnectionPool
-        _sync_pg = ConnectionPool(PG_DSN, min_size=4, max_size=8, open=True)
+        # autocommit: this app's PG endpoints are read-only SELECTs. Without it
+        # psycopg3 wraps every read in BEGIN..COMMIT = 3 wire round trips where
+        # Gin/pgx and node-postgres do 1 (audited) — an unfair 2-RTT handicap.
+        _sync_pg = ConnectionPool(PG_DSN, min_size=4, max_size=8, open=True,
+                                  kwargs={"autocommit": True})
     return _sync_pg
+
+
+# Async PG driver: each engine runs its BEST driver (measured, benchmarks/
+# DEEPDIVE async deep-dive): under the turbo door psycopg3-async is healthy
+# (~25k rps) while asyncpg pays a pathological penalty; under uvicorn the
+# inverse holds (asyncpg healthy, psycopg3-async can deadlock). Overridable
+# via BENCH_PG_ASYNC_DRIVER=asyncpg|psycopg3 for driver-vs-driver runs.
+PG_ASYNC_DRIVER = os.environ.get("BENCH_PG_ASYNC_DRIVER") or (
+    "psycopg3" if os.environ.get("BENCH_ENGINE") == "turbo" else "asyncpg"
+)
 
 
 async def _get_async_pg():
     global _async_pg
     if _async_pg is None:
         import asyncpg
+
+        async def _no_reset(conn):
+            # skip the default 4-statement pool-release reset script (+1 RTT
+            # per request; audited) — bench conns hold no session state.
+            return None
+
         _async_pg = await asyncpg.create_pool(
             host="127.0.0.1", port=5432, database="fastapi_turbo_bench",
-            user="venky", min_size=4, max_size=8,
+            user="venky", min_size=4, max_size=8, reset=_no_reset,
         )
     return _async_pg
+
+
+async def _get_async_pg3():
+    global _async_pg3
+    if _async_pg3 is None:
+        from psycopg_pool import AsyncConnectionPool
+        pool = AsyncConnectionPool(PG_DSN, min_size=4, max_size=8, open=False,
+                                   kwargs={"autocommit": True})
+        await pool.open()
+        _async_pg3 = pool
+    return _async_pg3
 
 
 def _get_sync_redis():
@@ -246,16 +278,29 @@ def pg_item_sync(item_id: int):
     return {"id": row[0], "sku": row[1], "name": row[2], "qty": row[3]}
 
 
-@app.get("/pg/item/{item_id}/async")
-async def pg_item_async(item_id: int):
-    pool = await _get_async_pg()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, sku, name, qty FROM items WHERE id = $1", item_id
-        )
-    if row is None:
-        return Response(status_code=404)
-    return {"id": row["id"], "sku": row["sku"], "name": row["name"], "qty": row["qty"]}
+if PG_ASYNC_DRIVER == "asyncpg":
+    @app.get("/pg/item/{item_id}/async")
+    async def pg_item_async(item_id: int):
+        pool = await _get_async_pg()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, sku, name, qty FROM items WHERE id = $1", item_id
+            )
+        if row is None:
+            return Response(status_code=404)
+        return {"id": row["id"], "sku": row["sku"], "name": row["name"], "qty": row["qty"]}
+else:
+    @app.get("/pg/item/{item_id}/async")
+    async def pg_item_async(item_id: int):
+        pool = await _get_async_pg3()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT id, sku, name, qty FROM items WHERE id = %s", (item_id,)
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return Response(status_code=404)
+        return {"id": row[0], "sku": row[1], "name": row[2], "qty": row[3]}
 
 
 @app.get("/pg/items/sync")
@@ -268,15 +313,27 @@ def pg_items_sync(limit: int = 10):
     return {"items": [{"id": r[0], "sku": r[1], "name": r[2], "qty": r[3]} for r in rows]}
 
 
-@app.get("/pg/items/async")
-async def pg_items_async(limit: int = 10):
-    pool = await _get_async_pg()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, sku, name, qty FROM items ORDER BY id LIMIT $1", limit
-        )
-    return {"items": [{"id": r["id"], "sku": r["sku"], "name": r["name"], "qty": r["qty"]}
-                      for r in rows]}
+if PG_ASYNC_DRIVER == "asyncpg":
+    @app.get("/pg/items/async")
+    async def pg_items_async(limit: int = 10):
+        pool = await _get_async_pg()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, sku, name, qty FROM items ORDER BY id LIMIT $1", limit
+            )
+        return {"items": [{"id": r["id"], "sku": r["sku"], "name": r["name"], "qty": r["qty"]}
+                          for r in rows]}
+else:
+    @app.get("/pg/items/async")
+    async def pg_items_async(limit: int = 10):
+        pool = await _get_async_pg3()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT id, sku, name, qty FROM items ORDER BY id LIMIT %s", (limit,)
+            )
+            rows = await cur.fetchall()
+        return {"items": [{"id": r[0], "sku": r[1], "name": r[2], "qty": r[3]}
+                          for r in rows]}
 
 
 if __name__ == "__main__":

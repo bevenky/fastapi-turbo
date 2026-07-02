@@ -320,12 +320,16 @@ async fn pg_item(
     };
     // items.id is int4; bind an i32 so the parameter type matches the column.
     let pk = item_id as i32;
-    let row = client
-        .query_opt(
-            "SELECT id, sku, name, qty FROM items WHERE id = $1",
-            &[&pk],
-        )
-        .await;
+    // prepare_cached: a bare &str re-prepares on EVERY call (2 wire round
+    // trips); the cached statement makes reads 1 RTT, matching pgx.
+    let stmt = match client
+        .prepare_cached("SELECT id, sku, name, qty FROM items WHERE id = $1")
+        .await
+    {
+        Ok(s) => s,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let row = client.query_opt(&stmt, &[&pk]).await;
     match row {
         Ok(Some(r)) => Json(PgItem {
             id: r.get(0),
@@ -347,12 +351,14 @@ async fn pg_items(
         Ok(c) => c,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let rows = client
-        .query(
-            "SELECT id, sku, name, qty FROM items ORDER BY id LIMIT $1",
-            &[&q.limit],
-        )
-        .await;
+    let stmt = match client
+        .prepare_cached("SELECT id, sku, name, qty FROM items ORDER BY id LIMIT $1")
+        .await
+    {
+        Ok(s) => s,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let rows = client.query(&stmt, &[&q.limit]).await;
     match rows {
         Ok(rows) => {
             let items = rows
@@ -380,9 +386,14 @@ async fn pg_select_one(State(state): State<Arc<AppState>>) -> Response {
     };
     // items.id is int4 -> bind WHERE id=$1 as i32.
     let id: i32 = 5;
-    let row = client
-        .query_opt("SELECT id, sku, name, qty FROM items WHERE id = $1", &[&id])
-        .await;
+    let stmt = match client
+        .prepare_cached("SELECT id, sku, name, qty FROM items WHERE id = $1")
+        .await
+    {
+        Ok(s) => s,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let row = client.query_opt(&stmt, &[&id]).await;
     match row {
         Ok(Some(r)) => Json(PgItem {
             id: r.get(0),
@@ -402,12 +413,14 @@ async fn pg_select_list(State(state): State<Arc<AppState>>) -> Response {
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let limit: i64 = 10;
-    let rows = client
-        .query(
-            "SELECT id, sku, name, qty FROM items ORDER BY id LIMIT $1",
-            &[&limit],
-        )
-        .await;
+    let stmt = match client
+        .prepare_cached("SELECT id, sku, name, qty FROM items ORDER BY id LIMIT $1")
+        .await
+    {
+        Ok(s) => s,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let rows = client.query(&stmt, &[&limit]).await;
     match rows {
         Ok(rows) => {
             let items = rows

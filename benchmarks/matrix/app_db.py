@@ -37,7 +37,8 @@ app = FastAPI()
 PGHOST, PGPORT, PGDB, PGUSER = "127.0.0.1", 5432, "fastapi_turbo_bench", "venky"
 DSN = f"host={PGHOST} port={PGPORT} dbname={PGDB} user={PGUSER}"
 REDIS_URL = "redis://127.0.0.1:6379"
-PMIN, PMAX = 1, 2  # tiny pools — keep 100-conn budget across workers
+PMIN = int(os.environ.get("BENCH_POOL_MIN", "1"))
+PMAX = int(os.environ.get("BENCH_POOL_MAX", "2"))  # tiny default — 100-conn budget across workers
 
 SEL_ONE_3 = "SELECT id, sku, name, qty FROM items WHERE id = %s"
 SEL_ONE_PG = "SELECT id, sku, name, qty FROM items WHERE id = $1"
@@ -81,9 +82,17 @@ async def pg3async_pool():
 async def asyncpg_pool():
     if "asyncpg" not in _pools:
         import asyncpg
+
+        async def _no_reset(conn):
+            # Default pool release runs a 4-statement reset script = +1 wire
+            # round trip per request (audited). Bench conns hold no session
+            # state (reads autocommit; writes always commit/rollback), so a
+            # no-op reset gives asyncpg its true 1-RTT read cost.
+            return None
+
         _pools["asyncpg"] = await asyncpg.create_pool(
             host=PGHOST, port=PGPORT, database=PGDB, user=PGUSER,
-            min_size=PMIN, max_size=PMAX)
+            min_size=PMIN, max_size=PMAX, reset=_no_reset)
     return _pools["asyncpg"]
 
 
@@ -113,13 +122,16 @@ def _wrote(commit):
 def _pg3sync(op, commit):
     pool = pg3sync_pool()
     with pool.connection() as conn:
-        conn.autocommit = False
+        # Reads run autocommit = 1 wire round trip (parity with pgx/node-postgres,
+        # audited); writes keep the implicit txn so commit=false can roll back.
+        # Set unconditionally per checkout so the flag can't leak between ops.
+        conn.autocommit = op in ("select_one", "select_list")
         cur = conn.cursor()
         if op == "select_one":
-            cur.execute(SEL_ONE_3, (5,)); r = cur.fetchone(); conn.commit()
+            cur.execute(SEL_ONE_3, (5,)); r = cur.fetchone()
             return _row(r)
         if op == "select_list":
-            cur.execute(SEL_LIST_3, (10,)); rs = cur.fetchall(); conn.commit()
+            cur.execute(SEL_LIST_3, (10,)); rs = cur.fetchall()
             return {"items": [_row(x) for x in rs]}
         if op == "insert":
             cur.execute(INS_3, ("x",))
@@ -136,12 +148,14 @@ def _pg2sync(op, commit):
     pool = pg2_pool()
     conn = pool.getconn()
     try:
+        # Same read-autocommit fairness (1 RTT reads, txn writes).
+        conn.autocommit = op in ("select_one", "select_list")
         cur = conn.cursor()
         if op == "select_one":
-            cur.execute(SEL_ONE_3, (5,)); r = cur.fetchone(); conn.commit()
+            cur.execute(SEL_ONE_3, (5,)); r = cur.fetchone()
             return _row(r)
         if op == "select_list":
-            cur.execute(SEL_LIST_3, (10,)); rs = cur.fetchall(); conn.commit()
+            cur.execute(SEL_LIST_3, (10,)); rs = cur.fetchall()
             return {"items": [_row(x) for x in rs]}
         if op == "insert":
             cur.execute(INS_3, ("x",))
@@ -159,13 +173,14 @@ def _pg2sync(op, commit):
 async def _pg3async(op, commit):
     pool = await pg3async_pool()
     async with pool.connection() as conn:
-        await conn.set_autocommit(False)
+        # Same read-autocommit fairness as _pg3sync (1 RTT reads, txn writes).
+        await conn.set_autocommit(op in ("select_one", "select_list"))
         cur = conn.cursor()
         if op == "select_one":
-            await cur.execute(SEL_ONE_3, (5,)); r = await cur.fetchone(); await conn.commit()
+            await cur.execute(SEL_ONE_3, (5,)); r = await cur.fetchone()
             return _row(r)
         if op == "select_list":
-            await cur.execute(SEL_LIST_3, (10,)); rs = await cur.fetchall(); await conn.commit()
+            await cur.execute(SEL_LIST_3, (10,)); rs = await cur.fetchall()
             return {"items": [_row(x) for x in rs]}
         if op == "insert":
             await cur.execute(INS_3, ("x",))
@@ -207,6 +222,14 @@ async def _asyncpg(op, commit):
 DRIVERS_SYNC = {"pg3sync": _pg3sync, "pg2sync": _pg2sync}
 DRIVERS_ASYNC = {"pg3async": _pg3async, "asyncpg": _asyncpg}
 
+# Cross-framework /pg/*/async representative: each engine runs its BEST driver
+# (turbo door → psycopg3-async; uvicorn → asyncpg — measured, see async deep-dive).
+# Override with BENCH_PG_ASYNC_DRIVER=pg3async|asyncpg for driver-vs-driver runs.
+_CROSS_ASYNC_NAME = os.environ.get("BENCH_PG_ASYNC_DRIVER") or (
+    "pg3async" if os.environ.get("BENCH_ENGINE") == "turbo" else "asyncpg"
+)
+_cross_async = DRIVERS_ASYNC[_CROSS_ASYNC_NAME]
+
 
 # ── driver-matrix routes (Python only) ───────────────────────────────
 def _make_routes():
@@ -239,7 +262,7 @@ def x_so_s():
 
 @app.get("/pg/select_one/async")
 async def x_so_a():
-    return await _asyncpg("select_one", True)
+    return await _cross_async("select_one", True)
 
 
 @app.get("/pg/select_list/sync")
@@ -249,7 +272,7 @@ def x_sl_s():
 
 @app.get("/pg/select_list/async")
 async def x_sl_a():
-    return await _asyncpg("select_list", True)
+    return await _cross_async("select_list", True)
 
 
 @app.post("/pg/insert/sync")
@@ -259,7 +282,7 @@ def x_i_s(commit: bool = True):
 
 @app.post("/pg/insert/async")
 async def x_i_a(commit: bool = True):
-    return await _asyncpg("insert", commit)
+    return await _cross_async("insert", commit)
 
 
 @app.post("/pg/update/sync")
@@ -269,7 +292,7 @@ def x_u_s(commit: bool = True):
 
 @app.post("/pg/update/async")
 async def x_u_a(commit: bool = True):
-    return await _asyncpg("update", commit)
+    return await _cross_async("update", commit)
 
 
 @app.post("/pg/delete/sync")
@@ -279,7 +302,7 @@ def x_d_s(commit: bool = True):
 
 @app.post("/pg/delete/async")
 async def x_d_a(commit: bool = True):
-    return await _asyncpg("delete", commit)
+    return await _cross_async("delete", commit)
 
 
 # ── Redis ────────────────────────────────────────────────────────────
