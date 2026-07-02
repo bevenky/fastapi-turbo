@@ -85,23 +85,16 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
         .unwrap_or(false);
 
     // For async streams, decide up front whether the gen NEVER awaits a
-    // loop-needing primitive (``_stream_is_noawait`` — bytecode ``GET_AWAITABLE``
-    // absence on the real user gen). When true, the streaming task drives each
-    // ``__anext__`` with a bare ``send(None)`` reaching ``StopIteration`` —
-    // pushing the chunk INLINE, skipping the per-stream ``run_until_complete``
-    // event-loop tax. A gen that DOES await falls to the existing single
-    // ``run_until_complete`` driver (``_drive_stream``) — unchanged behavior.
-    // Resolved here under the GIL we already hold, off the streaming task's
-    // critical path. The probe MUST be conservative: a bare ``send(None)`` on a
-    // loop-needing gen raises ``RuntimeError`` and CORRUPTS it, so we only fast-
-    // path gens proven await-free.
-    let noawait = is_async
-        && py
-            .import("fastapi_turbo.responses")
-            .and_then(|m| m.getattr("_stream_is_noawait"))
-            .and_then(|f| f.call1((obj,)))
-            .and_then(|r| r.extract::<bool>())
-            .unwrap_or(false);
+    // loop-needing primitive (bytecode ``GET_AWAITABLE`` absence on the real
+    // user gen). When true, the streaming task drives each ``__anext__`` with
+    // a bare ``send(None)`` reaching ``StopIteration`` — pushing the chunk
+    // INLINE, skipping the per-stream ``run_until_complete`` event-loop tax.
+    // A gen that DOES await falls to the worker-loop driver (``_drive_stream``)
+    // — unchanged behavior. Resolved here under the GIL we already hold, off
+    // the streaming task's critical path. The probe MUST be conservative: a
+    // bare ``send(None)`` on a loop-needing gen raises ``RuntimeError`` and
+    // CORRUPTS it, so we only fast-path gens proven await-free.
+    let noawait = is_async && stream_noawait_verdict(py, obj, &iter_bound);
 
     // Pre-drain the first chunk synchronously so hyper can coalesce the
     // response headers and the first data frame into a single TCP write.
@@ -340,6 +333,67 @@ fn stream_thread_forced() -> bool {
             .map(|v| matches!(v.trim(), "1" | "true" | "True" | "TRUE" | "yes" | "on"))
             .unwrap_or(false)
     })
+}
+
+/// No-await verdict for an async streaming body, read as one precomputed
+/// flag instead of a per-request Python call (`_stream_is_noawait` cost:
+/// module import + getattr + call frame + getattr chain + dict ops, ~1.5-2µs
+/// on the TTFB hot path). Order mirrors the Python helper exactly:
+///
+///   1. A stamped `_fastapi_turbo_stream_noawait` bool on the RESPONSE wins —
+///      set once by `_door_wrap_stream_teardown` from the WRAPPED user gen. A
+///      teardown wrapper's own bytecode has no `GET_AWAITABLE` (it only does
+///      `async for ... yield`), so it must NEVER be bytecode-analyzed; the
+///      stamp carries the real gen's verdict. `getattr_opt` — no exception
+///      materialized on the (common) unstamped miss.
+///   2. Otherwise the verdict is keyed on the generator's CODE OBJECT in a
+///      Rust-side map — one getattr + one hash lookup per request. On a cold
+///      code object, `_gen_is_noawait` (Python, dis-based) runs ONCE; the map
+///      entry pins the code object (`Py<PyAny>` ref) so a freed code object's
+///      id can never alias a stale verdict.
+fn stream_noawait_verdict(
+    py: Python<'_>,
+    response: &Bound<'_, PyAny>,
+    iter_bound: &Bound<'_, PyAny>,
+) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    // 1. Response-stamped verdict (teardown-wrapped streams).
+    if let Ok(Some(flag)) = response.getattr_opt(pyo3::intern!(py, "_fastapi_turbo_stream_noawait"))
+    {
+        if !flag.is_none() {
+            return flag.extract::<bool>().unwrap_or(false);
+        }
+    }
+
+    // 2. Code-object-keyed cache. No ag_code → not an async generator we can
+    //    prove anything about → conservative false (same as _gen_is_noawait).
+    let Ok(Some(code)) = iter_bound.getattr_opt(pyo3::intern!(py, "ag_code")) else {
+        return false;
+    };
+    if code.is_none() {
+        return false;
+    }
+    static VERDICTS: OnceLock<Mutex<HashMap<usize, (bool, Py<PyAny>)>>> = OnceLock::new();
+    let cache = VERDICTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = code.as_ptr() as usize;
+    if let Ok(map) = cache.lock() {
+        if let Some((verdict, _)) = map.get(&key) {
+            return *verdict;
+        }
+    }
+    // Cold code object: one Python-side dis analysis, then memoize.
+    let verdict = py
+        .import("fastapi_turbo.responses")
+        .and_then(|m| m.getattr("_gen_is_noawait"))
+        .and_then(|f| f.call1((iter_bound,)))
+        .and_then(|r| r.extract::<bool>())
+        .unwrap_or(false);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, (verdict, code.unbind()));
+    }
+    verdict
 }
 
 /// Cached `fastapi_turbo.responses._resolve_stream_future` — the

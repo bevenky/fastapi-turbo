@@ -288,7 +288,9 @@ def _stream_is_noawait(response) -> bool:
     generators proven not to await a loop-needing primitive — see
     ``_gen_is_noawait``.
 
-    Called from ``streaming.rs`` with the StreamingResponse object. Order:
+    ``streaming.rs`` now reads the stamped flag / caches ``_gen_is_noawait``
+    verdicts per code object itself (``stream_noawait_verdict``); this helper
+    remains the reference implementation of the decision. Order:
       1. An explicit ``_fastapi_turbo_stream_noawait`` flag (a bool) on the
          response wins — set by ``_door_wrap_stream_teardown`` from the WRAPPED
          user gen, so a teardown wrapper inherits the real gen's verdict
