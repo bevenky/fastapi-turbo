@@ -2,14 +2,29 @@
 
 - Cross-framework (all 5): /pg/{op}/{sync,async} + /redis/{mode}/{op}, writes x commit.
 - Python driver matrix (turbo + uvicorn only): /pgm/{driver}/{op}, writes x commit.
-- Redis durability: enables AOF (appendfsync=always) around the set_durable test,
-  disables it after — so set_durable measures the real fsync cost vs set.
+- Redis durability: AOF is enabled ONCE per boot (not per row) and the bench
+  gates on the initial background rewrite completing (aof_rewrite_in_progress=0)
+  BEFORE flipping appendfsync=always; both set_durable rows then run
+  back-to-back in that steady state and AOF is disabled after. The old
+  per-row toggle benched DURING the CONFIG-SET-triggered rewrite fork
+  (no-appendfsync-on-rewrite=no => fsyncs contend with the rewrite child;
+  first run collapsed EVERY framework to 16-32 rps, later runs swung
+  3.5k-9k on AOF state). set_durable measures Redis's synchronous-fsync
+  group-commit floor (~66 rps per in-flight writer on this disk) — it scales
+  with the client's in-flight command count; compare within a run only.
 - bench_writes is TRUNCATE+reseeded before each framework (insert+commit grows it).
 - Python sync boots run workers=8 (conn budget); async-heavy boots (async PG
   drivers, redis) run workers=12 — the measured-best async worker count.
   Per-boot pool isolation keeps every config under max_connections(100).
 
 Usage: python run_db_matrix.py [framework ...]
+       BENCH_GROUPS=redis python run_db_matrix.py        # re-run one row-group
+       BENCH_GROUPS=pgm-pg2sync python run_db_matrix.py  # re-run one driver boot
+       results merge ROW-level into results_db.json (other rows preserved).
+
+Every row records oha's status-code distribution; >0.5% non-2xx marks the
+row INVALID (err_pct in results). Guard added after pg2sync's 5-15k "rps"
+turned out to be 55-64% HTTP 500s from psycopg2 pool-exhaustion raises.
 """
 from __future__ import annotations
 
@@ -65,6 +80,43 @@ def redis_cli(*args):
     subprocess.run(["/opt/homebrew/bin/redis-cli", *args], capture_output=True, text=True)
 
 
+def redis_cli_out(*args) -> str:
+    return subprocess.run(["/opt/homebrew/bin/redis-cli", *args],
+                          capture_output=True, text=True).stdout
+
+
+def aof_prewarm(timeout=60.0):
+    """Enable AOF once and gate on the fork'd initial rewrite completing.
+
+    CONFIG SET appendonly yes triggers a background AOF rewrite (fork).
+    Benching during it with appendfsync=always throttles wildly (fsyncs
+    contend with the rewrite child's disk I/O and can block the main
+    thread). Enable with everysec, WAIT for the rewrite to finish, kill
+    auto-rewrites (no mid-bench forks), then flip to always.
+    """
+    redis_cli("CONFIG", "SET", "appendfsync", "everysec")
+    redis_cli("CONFIG", "SET", "appendonly", "yes")
+    redis_cli("CONFIG", "SET", "auto-aof-rewrite-percentage", "0")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        info = redis_cli_out("INFO", "persistence")
+        if ("aof_rewrite_in_progress:0" in info
+                and "aof_rewrite_scheduled:0" in info
+                and "aof_last_bgrewrite_status:ok" in info):
+            break
+        time.sleep(0.2)
+    else:
+        print("!! aof_prewarm: rewrite-complete gate timed out")
+    redis_cli("CONFIG", "SET", "appendfsync", "always")
+    time.sleep(0.3)
+
+
+def aof_restore():
+    redis_cli("CONFIG", "SET", "appendfsync", "everysec")
+    redis_cli("CONFIG", "SET", "appendonly", "no")
+    redis_cli("CONFIG", "SET", "auto-aof-rewrite-percentage", "100")
+
+
 def reseed_writes():
     subprocess.run(["psql", "-d", "fastapi_turbo_bench", "-tAc",
                     "TRUNCATE bench_writes; INSERT INTO bench_writes (val) "
@@ -92,10 +144,6 @@ def registry():
 
 
 def bench(port, method, path, procmap):
-    durable = "set_durable" in path
-    if durable:
-        redis_cli("CONFIG", "SET", "appendonly", "yes")
-        redis_cli("CONFIG", "SET", "appendfsync", "always")
     cmd = [OHA, "-c", str(CONC), "-z", DUR, "--no-tui", "-m", method, f"http://{HOST}:{port}{path}"]
     oha = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     peak = 0.0
@@ -110,11 +158,15 @@ def bench(port, method, path, procmap):
         peak = max(peak, tot)
         time.sleep(0.4)
     out = oha.communicate()[0]
-    if durable:
-        redis_cli("CONFIG", "SET", "appendfsync", "everysec")
-        redis_cli("CONFIG", "SET", "appendonly", "no")
     m = re.search(r"Requests/sec:\s*([\d.]+)", out)
-    return (float(m.group(1)) if m else 0.0), peak
+    # Non-2xx guard: pg2sync once reported 5-15k rps that was 55-64% HTTP 500
+    # (psycopg2 pool exhaustion raises instead of blocking) — rps alone hides
+    # error storms. Parse oha's status distribution and surface the share.
+    codes = re.findall(r"\[(\d{3})\]\s+(\d+)\s+responses", out)
+    total = sum(int(n) for _, n in codes)
+    bad = sum(int(n) for c, n in codes if not c.startswith("2"))
+    err_pct = round(100.0 * bad / total, 2) if total else 0.0
+    return (float(m.group(1)) if m else 0.0), peak, err_pct
 
 
 def _boots_for(fw):
@@ -143,7 +195,10 @@ def _boots_for(fw):
 def run_fw(name, fw):
     port = fw["port"]
     res = {}
+    only = {g for g in os.environ.get("BENCH_GROUPS", "").split(",") if g}
     for group, eps in _boots_for(fw):
+        if only and group not in only:  # boot-group name (e.g. pgm-pg2sync) matches whole boot
+            eps = [e for e in eps if e[1] in only]  # else filter by row group (e.g. redis)
         if not eps:
             continue
         kill_port(port); time.sleep(1)
@@ -171,16 +226,33 @@ def run_fw(name, fw):
                 except Exception:
                     pass
             print(f"== {name} [{group}]: {len(procmap)} procs, {len(eps)} endpoints, c={CONC}, workers={workers}")
-            for label, grp, method, path in eps:
-                for pid in group_pids(pgid):
-                    if pid not in procmap:
-                        try:
-                            p = psutil.Process(pid); p.cpu_percent(interval=None); procmap[pid] = p
-                        except Exception:
-                            pass
-                rps, cpu = bench(port, method, path, procmap)
-                res[label] = {"rps": rps, "cpu_pct": cpu, "cores": round(cpu / 100, 1), "group": grp}
-                print(f"  {label:34s} {rps:10,.0f} rps  ({cpu/100:.1f}c)")
+
+            def run_eps(subset):
+                for label, grp, method, path in subset:
+                    for pid in group_pids(pgid):
+                        if pid not in procmap:
+                            try:
+                                p = psutil.Process(pid); p.cpu_percent(interval=None); procmap[pid] = p
+                            except Exception:
+                                pass
+                    rps, cpu, err_pct = bench(port, method, path, procmap)
+                    res[label] = {"rps": rps, "cpu_pct": cpu, "cores": round(cpu / 100, 1), "group": grp}
+                    warn = ""
+                    if err_pct > 0.5:
+                        res[label]["err_pct"] = err_pct
+                        warn = f"  !! {err_pct}% non-2xx — row is INVALID"
+                    print(f"  {label:34s} {rps:10,.0f} rps  ({cpu/100:.1f}c){warn}")
+
+            # durable rows LAST, back-to-back, in a pre-warmed steady AOF
+            # state (rewrite complete, appendfsync=always, no auto-rewrites).
+            run_eps([e for e in eps if "set_durable" not in e[3]])
+            durable = [e for e in eps if "set_durable" in e[3]]
+            if durable:
+                aof_prewarm()
+                try:
+                    run_eps(durable)
+                finally:
+                    aof_restore()
         finally:
             try:
                 os.killpg(os.getpgid(proc.pid), 9)
@@ -203,9 +275,11 @@ def main():
             out = {}
     print(f"cores={NCPU} db_workers={DBWORKERS} async_workers={DB_ASYNC_WORKERS} conc={CONC} dur={DUR}\n")
     for name in want:
-        out[name] = run_fw(name, reg[name])
+        merged = dict(out.get(name, {}))
+        merged.update(run_fw(name, reg[name]))
+        out[name] = merged
     # restore redis
-    redis_cli("CONFIG", "SET", "appendonly", "no")
+    aof_restore()
     with open(p, "w") as f:
         json.dump({"meta": {"cores": NCPU, "db_workers": DBWORKERS, "async_workers": DB_ASYNC_WORKERS,
                             "conc": CONC, "dur": DUR}, "data": out}, f, indent=2)

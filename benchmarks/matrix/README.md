@@ -59,6 +59,17 @@ byte-comparable responses, identical DB/Redis targets.
 - **Sync PG: psycopg3 with autocommit reads.** Without autocommit every
   SELECT is BEGIN..COMMIT = 3 wire round trips where pgx/node-postgres do 1.
   asyncpg equivalent: no-op pool `reset` (default reset script is +1 RTT/req).
+- **psycopg2 needs TWO fairness shims its successors don't** (both in
+  `app_db.pg2_pool`): (1) `getconn()` *raises* `PoolError` when the pool is
+  exhausted where psycopg3/asyncpg pools *block* — unguarded at w8/c64 the
+  pg2sync rows were 55-64% HTTP-500 error storms (5-15k rps, erratic); a
+  `BoundedSemaphore(PMAX)` restores blocking checkout. (2) `putconn()`
+  *closes* any connection beyond `minconn` idle, so `minconn=1` means
+  perpetual reconnect churn — PMAX=4 measured 2.5k rps of pure connect
+  handshakes; `minconn=maxconn` disables the churn. With both fixes psycopg2
+  lands within ~10% of psycopg3-sync (raw per-op cost: 34.8 vs 31.2µs read,
+  80.1 vs 74.4µs update+commit) — the legacy driver is fine, its *pool* is
+  the trap.
 - **redis-py: the pooled default client costs ~41µs/cmd; a
   `single_connection_client` measures 25.7µs.** The gap is pool
   checkout/return overhead, not the server. This is an app-level choice and
@@ -84,8 +95,25 @@ byte-comparable responses, identical DB/Redis targets.
 - **Python CPU work**: 1 core per process, period (GIL). Multi-worker gets
   throughput, never per-request latency. Free-threaded Python measured
   2-4x SLOWER on this workload — not a fix.
-- **Redis `set_durable`** (SET + WAITAOF, appendfsync=always) has high
-  run-to-run variance from AOF file state — compare within a run only.
+- **Postgres write transactions: ~28-34k txn/s on this box, period.** Raw
+  floor measured OUTSIDE HTTP (8 processes x 2 conns, psycopg3, tight
+  op+COMMIT loop): insert ~27.6k, update ~34.4k, delete ~33.1k txn/s; flat
+  from 8 to 64 connections. Two corollaries: (1) every framework's write
+  rows (17-25k, incl. raw-Axum at 1.8 cores) sit at 70-80% of that no-HTTP
+  ceiling while sharing cores with the PG backends — the uniform
+  commit=true band is the DATABASE ceiling, not framework overhead;
+  (2) commit=true vs rollback differs ≤10% here because macOS
+  `wal_sync_method=open_datasync` does not force a full platter flush —
+  this box measures txn machinery, not true fsync durability. Insert rows
+  are inherently ~15-20% below update/delete everywhere (new tuple + index
+  WAL, table grows during the run).
+- **Redis `set_durable`** (SET + WAITAOF, appendfsync=always) measures
+  Redis's group-commit fsync floor (~66 rps per in-flight writer on this
+  disk). AOF is pre-warmed once per boot (rewrite-complete gate) so rows
+  bench in a steady state — compare within a run only.
+- **Row validity**: `run_db_matrix.py` records oha's status-code
+  distribution per row; >0.5% non-2xx prints `!! row is INVALID` and stores
+  `err_pct` in results (added after the pg2sync 500-storm incident).
 
 ## Quick start
 

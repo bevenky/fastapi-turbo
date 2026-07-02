@@ -24,6 +24,10 @@ def cores(fw, label):
     return (DATA.get(fw, {}).get(label) or {}).get("cores")
 
 
+def err_pct(fw, label):
+    return (DATA.get(fw, {}).get(label) or {}).get("err_pct")
+
+
 def fnum(v):
     return '<span class=na>—</span>' if v is None else f"{v:,.0f}"
 
@@ -39,11 +43,14 @@ def table(cols, labels):
         best = max(present) if present else None
         h.append(f'<tr><td class=lab>{label}</td>')
         for fw in cols:
-            v = vals[fw]; c = cores(fw, label)
+            v = vals[fw]; c = cores(fw, label); e = err_pct(fw, label)
             cls = "turbo " if fw == "fastapi-turbo" else ""
             if v is not None and v == best:
                 cls += "best"
             sub = f' <span class=metric>{c}c</span>' if c is not None else ""
+            if e is not None:
+                cls += " bad"
+                sub += f' <span class=err>{e:.0f}% non-2xx</span>'
             h.append(f'<td class="{cls.strip()}">{fnum(v)}{sub}</td>')
         h.append('</tr>')
     h.append('</table>')
@@ -74,6 +81,7 @@ html = f"""<!doctype html><html><head><meta charset=utf-8><title>DB/Redis matrix
  th,td{{padding:5px 10px;text-align:right;border-bottom:1px solid #21262d}} th{{color:#8b949e;background:#161b22}}
  td.lab,th.lab{{text-align:left;white-space:nowrap}} .turbo{{background:#11261b}} th.turbo{{color:#3fb950}}
  .best{{color:#3fb950;font-weight:700}} .na{{color:#484f58}} .metric{{font-size:10px;color:#6e7681}} code{{color:#79c0ff}}
+ .bad{{background:#2d1214}} .err{{font-size:10px;color:#f85149;font-weight:700}}
 </style></head><body><div class=wrap>
 <h1>Postgres + Redis deep matrix</h1>
 <p class=sub>{datetime.now().strftime('%Y-%m-%d %H:%M')} · {META['cores']} cores · workers/cluster={META['db_workers']}
@@ -87,8 +95,17 @@ backend-driver group benches in an ISOLATED boot (co-resident driver pools conta
 Python async groups run their measured-best worker count ({META.get('async_workers', 12)}); sync groups keep
 workers={META['db_workers']} — the same each-at-its-best policy as the driver choice.
 turbo/FastAPI = multiprocess (one pool PER worker); Gin/Fastify/Axum = one shared pool.
-<b>set_durable</b> (SET + WAITAOF under appendfsync=always) measures Redis's fsync durability floor — high
-run-to-run variance (AOF file state); compare within a run only.</p>
+<b>set_durable</b> (SET + WAITAOF under appendfsync=always) measures Redis's synchronous-fsync durability floor.
+AOF is enabled once per boot with a rewrite-complete gate (aof_rewrite_in_progress=0) before flipping
+appendfsync=always; both rows then run back-to-back in that steady state (the old per-row toggle benched during
+the CONFIG-SET rewrite fork — first run collapsed all frameworks to 16-32 rps, later runs swung 3.5k-9k).
+Throughput here is Redis <i>group commit</i>: ~66 rps per in-flight writer on this disk, so the row scales with
+each client's in-flight command count (pool size × pipelining), not framework speed. Compare within a run only.
+<b>PG write ceiling:</b> raw op+COMMIT outside HTTP measures insert ~27.6k / update ~34.4k / delete ~33.1k txn/s
+(flat 8→64 conns) — the uniform 17-25k commit band across ALL frameworks is ~70-80% of that database ceiling
+(they share cores with the PG backends), not framework overhead. commit=true ≈ commit=false within ~10% because
+macOS open_datasync does not force a full flush; inserts are inherently ~15-20% below update/delete (tuple+index
+WAL, table growth). Every row is status-code-verified: cells flagged red had &gt;0.5% non-2xx and are invalid.</p>
 
 <h2>Cross-framework — Postgres reads (req/s)</h2>
 {table(FW, cross_reads)}
@@ -97,7 +114,10 @@ run-to-run variance (AOF file state); compare within a run only.</p>
 <h2>Cross-framework — Redis (req/s)</h2>
 {table(FW, cross_redis)}
 <h2>Python Postgres driver matrix (turbo vs uvicorn) — req/s</h2>
-<p class=sub>psycopg3-sync, psycopg2-sync, psycopg3-async, asyncpg — each driver in its own isolated boot. Post init-fix, asyncpg is the fastest async driver under both engines.</p>
+<p class=sub>psycopg3-sync, psycopg2-sync, psycopg3-async, asyncpg — each driver in its own isolated boot. Post init-fix, asyncpg is the fastest async driver under both engines.
+pg2sync runs with two pool-fairness shims (blocking checkout via semaphore; minconn=maxconn to stop putconn's
+beyond-minconn connection churn) — without them psycopg2's pool raises/reconnects instead of blocking/retaining and the
+rows were 55-64% HTTP-500 storms. Raw driver cost is within ~10% of psycopg3-sync.</p>
 {table(PYFW, pym)}
 </div></body></html>"""
 OUT.write_text(html)

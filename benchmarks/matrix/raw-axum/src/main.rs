@@ -27,7 +27,7 @@ use axum::{
     Json, Router,
 };
 use deadpool_postgres::{Manager, ManagerConfig, Pool as PgPool, RecyclingMethod};
-use deadpool_redis::{Config as RedisConfig, Pool as RedisPool, Runtime};
+use deadpool_redis::{Config as RedisConfig, Pool as RedisPool, PoolConfig, Runtime};
 use futures_util::stream;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -612,7 +612,15 @@ fn build_pg_pool() -> PgPool {
 }
 
 fn build_redis_pool() -> RedisPool {
-    let cfg = RedisConfig::from_url("redis://127.0.0.1:6379");
+    let mut cfg = RedisConfig::from_url("redis://127.0.0.1:6379");
+    // deadpool's default max_size is cpu_cores*2 (36 here) — BELOW the bench
+    // concurrency (64). That caps in-flight redis commands and binds hard on
+    // the fsync-bound set_durable row: Redis group-commits fsyncs across all
+    // in-flight writers (~66 rps/writer floor on this disk), so a 36-conn cap
+    // pinned raw-axum at ~2.4k rps while every other framework had >=64
+    // commands in flight. Size the pool above bench concurrency so the row
+    // measures Redis, not the pool.
+    cfg.pool = Some(PoolConfig::new(128));
     cfg.create_pool(Some(Runtime::Tokio1))
         .expect("build redis pool")
 }

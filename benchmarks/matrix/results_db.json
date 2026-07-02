@@ -105,254 +105,254 @@
         "group": "pg-write"
       },
       "redis get [sync]": {
-        "rps": 67242.7552,
-        "cpu_pct": 518.0,
+        "rps": 64093.5463,
+        "cpu_pct": 519.2,
         "cores": 5.2,
         "group": "redis"
       },
       "redis set [sync]": {
-        "rps": 66044.4752,
-        "cpu_pct": 504.7,
-        "cores": 5.0,
+        "rps": 62498.7717,
+        "cpu_pct": 515.4,
+        "cores": 5.2,
         "group": "redis"
       },
       "redis set_durable [sync]": {
-        "rps": 4234.267,
-        "cpu_pct": 171.2,
-        "cores": 1.7,
+        "rps": 4201.7362,
+        "cpu_pct": 160.7,
+        "cores": 1.6,
         "group": "redis"
       },
       "redis pipeline [sync]": {
-        "rps": 50815.3444,
-        "cpu_pct": 609.8000000000002,
-        "cores": 6.1,
+        "rps": 49694.2566,
+        "cpu_pct": 624.1999999999999,
+        "cores": 6.2,
         "group": "redis"
       },
       "redis multi [sync]": {
-        "rps": 42148.7923,
-        "cpu_pct": 601.8000000000001,
+        "rps": 47155.7336,
+        "cpu_pct": 604.9000000000001,
         "cores": 6.0,
         "group": "redis"
       },
       "redis get [async]": {
-        "rps": 42515.7261,
-        "cpu_pct": 795.2,
-        "cores": 8.0,
+        "rps": 51147.6118,
+        "cpu_pct": 784.6,
+        "cores": 7.8,
         "group": "redis"
       },
       "redis set [async]": {
-        "rps": 42424.166,
-        "cpu_pct": 839.3,
-        "cores": 8.4,
+        "rps": 46579.6128,
+        "cpu_pct": 760.3,
+        "cores": 7.6,
         "group": "redis"
       },
       "redis set_durable [async]": {
-        "rps": 3627.278,
-        "cpu_pct": 295.90000000000003,
-        "cores": 3.0,
+        "rps": 3611.6204,
+        "cpu_pct": 148.0,
+        "cores": 1.5,
         "group": "redis"
       },
       "redis pipeline [async]": {
-        "rps": 38794.8508,
-        "cpu_pct": 819.8000000000001,
-        "cores": 8.2,
+        "rps": 37886.7769,
+        "cpu_pct": 783.0,
+        "cores": 7.8,
         "group": "redis"
       },
       "redis multi [async]": {
-        "rps": 29873.2941,
-        "cpu_pct": 800.2,
-        "cores": 8.0,
+        "rps": 35395.4671,
+        "cpu_pct": 794.5,
+        "cores": 7.9,
         "group": "redis"
       },
       "pg3sync select_one": {
-        "rps": 49950.7035,
-        "cpu_pct": 720.5,
+        "rps": 48235.8702,
+        "cpu_pct": 723.4999999999999,
         "cores": 7.2,
         "group": "pgm"
       },
       "pg3sync select_list": {
-        "rps": 48019.9737,
-        "cpu_pct": 744.0000000000001,
-        "cores": 7.4,
+        "rps": 47895.8005,
+        "cpu_pct": 746.8000000000001,
+        "cores": 7.5,
         "group": "pgm"
       },
       "pg3sync insert commit=true": {
-        "rps": 20127.9718,
-        "cpu_pct": 466.7,
-        "cores": 4.7,
+        "rps": 23036.183,
+        "cpu_pct": 458.6,
+        "cores": 4.6,
         "group": "pgm"
       },
       "pg3sync insert commit=false": {
-        "rps": 21727.7324,
-        "cpu_pct": 483.4,
+        "rps": 27378.925,
+        "cpu_pct": 484.8,
         "cores": 4.8,
         "group": "pgm"
       },
       "pg3sync update commit=true": {
-        "rps": 23051.6931,
-        "cpu_pct": 486.59999999999997,
+        "rps": 28499.5233,
+        "cpu_pct": 485.7,
         "cores": 4.9,
         "group": "pgm"
       },
       "pg3sync update commit=false": {
-        "rps": 22521.0615,
-        "cpu_pct": 497.1,
-        "cores": 5.0,
+        "rps": 27822.7964,
+        "cpu_pct": 484.8,
+        "cores": 4.8,
         "group": "pgm"
       },
       "pg3sync delete commit=true": {
-        "rps": 23023.9266,
-        "cpu_pct": 488.40000000000003,
-        "cores": 4.9,
+        "rps": 28430.796,
+        "cpu_pct": 478.1,
+        "cores": 4.8,
         "group": "pgm"
       },
       "pg3sync delete commit=false": {
-        "rps": 21322.7836,
-        "cpu_pct": 492.8,
-        "cores": 4.9,
+        "rps": 27676.0202,
+        "cpu_pct": 484.09999999999997,
+        "cores": 4.8,
         "group": "pgm"
       },
       "pg2sync select_one": {
-        "rps": 14630.9531,
-        "cpu_pct": 511.8,
-        "cores": 5.1,
+        "rps": 53995.958,
+        "cpu_pct": 468.2,
+        "cores": 4.7,
         "group": "pgm"
       },
       "pg2sync select_list": {
-        "rps": 15338.3009,
-        "cpu_pct": 546.8,
-        "cores": 5.5,
+        "rps": 53619.581,
+        "cpu_pct": 496.40000000000003,
+        "cores": 5.0,
         "group": "pgm"
       },
       "pg2sync insert commit=true": {
-        "rps": 14770.7485,
-        "cpu_pct": 899.1,
-        "cores": 9.0,
+        "rps": 27711.4256,
+        "cpu_pct": 286.0,
+        "cores": 2.9,
         "group": "pgm"
       },
       "pg2sync insert commit=false": {
-        "rps": 14329.3886,
-        "cpu_pct": 866.0,
-        "cores": 8.7,
+        "rps": 29160.41,
+        "cpu_pct": 281.1,
+        "cores": 2.8,
         "group": "pgm"
       },
       "pg2sync update commit=true": {
-        "rps": 8482.0636,
-        "cpu_pct": 801.4,
-        "cores": 8.0,
+        "rps": 29988.4975,
+        "cpu_pct": 299.4,
+        "cores": 3.0,
         "group": "pgm"
       },
       "pg2sync update commit=false": {
-        "rps": 5216.744,
-        "cpu_pct": 355.8,
-        "cores": 3.6,
+        "rps": 29517.1487,
+        "cpu_pct": 291.79999999999995,
+        "cores": 2.9,
         "group": "pgm"
       },
       "pg2sync delete commit=true": {
-        "rps": 5401.155,
-        "cpu_pct": 83.39999999999999,
-        "cores": 0.8,
+        "rps": 29264.6654,
+        "cpu_pct": 296.20000000000005,
+        "cores": 3.0,
         "group": "pgm"
       },
       "pg2sync delete commit=false": {
-        "rps": 11102.9819,
-        "cpu_pct": 774.5999999999999,
-        "cores": 7.7,
+        "rps": 29565.9954,
+        "cpu_pct": 289.20000000000005,
+        "cores": 2.9,
         "group": "pgm"
       },
       "pg3async select_one": {
-        "rps": 46267.441,
-        "cpu_pct": 1050.4999999999998,
+        "rps": 40467.6757,
+        "cpu_pct": 1050.0000000000002,
         "cores": 10.5,
         "group": "pgm"
       },
       "pg3async select_list": {
-        "rps": 36672.4504,
-        "cpu_pct": 1032.4999999999998,
-        "cores": 10.3,
+        "rps": 35224.8501,
+        "cpu_pct": 1050.7,
+        "cores": 10.5,
         "group": "pgm"
       },
       "pg3async insert commit=true": {
-        "rps": 17475.2479,
-        "cpu_pct": 686.5999999999999,
-        "cores": 6.9,
+        "rps": 19163.0287,
+        "cpu_pct": 725.2,
+        "cores": 7.3,
         "group": "pgm"
       },
       "pg3async insert commit=false": {
-        "rps": 19757.3564,
-        "cpu_pct": 750.7,
-        "cores": 7.5,
-        "group": "pgm"
-      },
-      "pg3async update commit=true": {
-        "rps": 20699.809,
-        "cpu_pct": 750.3000000000002,
-        "cores": 7.5,
-        "group": "pgm"
-      },
-      "pg3async update commit=false": {
-        "rps": 20701.6983,
-        "cpu_pct": 763.9000000000001,
-        "cores": 7.6,
-        "group": "pgm"
-      },
-      "pg3async delete commit=true": {
-        "rps": 20621.8874,
-        "cpu_pct": 753.4,
-        "cores": 7.5,
-        "group": "pgm"
-      },
-      "pg3async delete commit=false": {
-        "rps": 20789.7541,
-        "cpu_pct": 763.8000000000001,
-        "cores": 7.6,
-        "group": "pgm"
-      },
-      "asyncpg select_one": {
-        "rps": 48242.0308,
-        "cpu_pct": 770.2,
+        "rps": 20416.5816,
+        "cpu_pct": 767.7,
         "cores": 7.7,
         "group": "pgm"
       },
+      "pg3async update commit=true": {
+        "rps": 20900.4684,
+        "cpu_pct": 757.9999999999999,
+        "cores": 7.6,
+        "group": "pgm"
+      },
+      "pg3async update commit=false": {
+        "rps": 20372.1316,
+        "cpu_pct": 788.4,
+        "cores": 7.9,
+        "group": "pgm"
+      },
+      "pg3async delete commit=true": {
+        "rps": 20701.5151,
+        "cpu_pct": 770.5999999999999,
+        "cores": 7.7,
+        "group": "pgm"
+      },
+      "pg3async delete commit=false": {
+        "rps": 20335.6978,
+        "cpu_pct": 783.5,
+        "cores": 7.8,
+        "group": "pgm"
+      },
+      "asyncpg select_one": {
+        "rps": 47759.5263,
+        "cpu_pct": 776.4,
+        "cores": 7.8,
+        "group": "pgm"
+      },
       "asyncpg select_list": {
-        "rps": 45021.4772,
-        "cpu_pct": 817.9,
-        "cores": 8.2,
+        "rps": 42310.0721,
+        "cpu_pct": 804.5000000000001,
+        "cores": 8.0,
         "group": "pgm"
       },
       "asyncpg insert commit=true": {
-        "rps": 20558.5051,
-        "cpu_pct": 513.8,
+        "rps": 19379.0444,
+        "cpu_pct": 509.99999999999994,
         "cores": 5.1,
         "group": "pgm"
       },
       "asyncpg insert commit=false": {
-        "rps": 21948.9634,
-        "cpu_pct": 522.4,
-        "cores": 5.2,
+        "rps": 21013.4829,
+        "cpu_pct": 526.0,
+        "cores": 5.3,
         "group": "pgm"
       },
       "asyncpg update commit=true": {
-        "rps": 23149.4798,
-        "cpu_pct": 540.0,
+        "rps": 20062.1799,
+        "cpu_pct": 535.3000000000001,
         "cores": 5.4,
         "group": "pgm"
       },
       "asyncpg update commit=false": {
-        "rps": 23179.1937,
-        "cpu_pct": 542.7000000000002,
-        "cores": 5.4,
+        "rps": 17080.7808,
+        "cpu_pct": 550.1999999999999,
+        "cores": 5.5,
         "group": "pgm"
       },
       "asyncpg delete commit=true": {
-        "rps": 23234.5222,
-        "cpu_pct": 538.9000000000001,
-        "cores": 5.4,
+        "rps": 17827.2019,
+        "cpu_pct": 548.3000000000001,
+        "cores": 5.5,
         "group": "pgm"
       },
       "asyncpg delete commit=false": {
-        "rps": 23072.5005,
-        "cpu_pct": 543.5999999999999,
+        "rps": 19628.112,
+        "cpu_pct": 544.5,
         "cores": 5.4,
         "group": "pgm"
       }
@@ -455,255 +455,255 @@
         "group": "pg-write"
       },
       "redis get [sync]": {
-        "rps": 36286.5966,
-        "cpu_pct": 1369.3000000000002,
-        "cores": 13.7,
+        "rps": 34668.8653,
+        "cpu_pct": 1352.0,
+        "cores": 13.5,
         "group": "redis"
       },
       "redis set [sync]": {
-        "rps": 26574.1006,
-        "cpu_pct": 1356.9,
-        "cores": 13.6,
+        "rps": 32559.9034,
+        "cpu_pct": 1335.6,
+        "cores": 13.4,
         "group": "redis"
       },
       "redis set_durable [sync]": {
-        "rps": 3467.1118,
-        "cpu_pct": 466.00000000000006,
-        "cores": 4.7,
+        "rps": 4035.2198,
+        "cpu_pct": 349.90000000000003,
+        "cores": 3.5,
         "group": "redis"
       },
       "redis pipeline [sync]": {
-        "rps": 26612.7734,
-        "cpu_pct": 1150.8,
-        "cores": 11.5,
+        "rps": 13277.8046,
+        "cpu_pct": 1111.1,
+        "cores": 11.1,
         "group": "redis"
       },
       "redis multi [sync]": {
-        "rps": 19788.5067,
-        "cpu_pct": 1104.6,
-        "cores": 11.0,
+        "rps": 15809.0125,
+        "cpu_pct": 1148.3,
+        "cores": 11.5,
         "group": "redis"
       },
       "redis get [async]": {
-        "rps": 46870.702,
-        "cpu_pct": 952.2,
+        "rps": 35965.9633,
+        "cpu_pct": 953.3000000000001,
         "cores": 9.5,
         "group": "redis"
       },
       "redis set [async]": {
-        "rps": 45083.103,
-        "cpu_pct": 975.2,
-        "cores": 9.8,
+        "rps": 32173.5695,
+        "cpu_pct": 992.2,
+        "cores": 9.9,
         "group": "redis"
       },
       "redis set_durable [async]": {
-        "rps": 3553.5513,
-        "cpu_pct": 378.9,
-        "cores": 3.8,
+        "rps": 3923.5125,
+        "cpu_pct": 207.1,
+        "cores": 2.1,
         "group": "redis"
       },
       "redis pipeline [async]": {
-        "rps": 45442.2757,
-        "cpu_pct": 1070.5,
-        "cores": 10.7,
+        "rps": 21903.3675,
+        "cpu_pct": 971.3000000000001,
+        "cores": 9.7,
         "group": "redis"
       },
       "redis multi [async]": {
-        "rps": 31663.3484,
-        "cpu_pct": 1062.4,
-        "cores": 10.6,
+        "rps": 25510.7665,
+        "cpu_pct": 1051.7000000000003,
+        "cores": 10.5,
         "group": "redis"
       },
       "pg3sync select_one": {
-        "rps": 22035.6141,
-        "cpu_pct": 1050.3,
+        "rps": 21330.3803,
+        "cpu_pct": 1046.7,
         "cores": 10.5,
         "group": "pgm"
       },
       "pg3sync select_list": {
-        "rps": 16423.4099,
-        "cpu_pct": 1001.3000000000001,
+        "rps": 16070.1878,
+        "cpu_pct": 997.5,
         "cores": 10.0,
         "group": "pgm"
       },
       "pg3sync insert commit=true": {
-        "rps": 10828.0777,
-        "cpu_pct": 982.0000000000001,
-        "cores": 9.8,
+        "rps": 7702.2076,
+        "cpu_pct": 994.9999999999999,
+        "cores": 9.9,
         "group": "pgm"
       },
       "pg3sync insert commit=false": {
-        "rps": 11559.5274,
-        "cpu_pct": 1049.4,
-        "cores": 10.5,
+        "rps": 10257.3923,
+        "cpu_pct": 1059.8,
+        "cores": 10.6,
         "group": "pgm"
       },
       "pg3sync update commit=true": {
-        "rps": 12023.1858,
-        "cpu_pct": 1101.0,
-        "cores": 11.0,
+        "rps": 9955.141,
+        "cpu_pct": 1079.1,
+        "cores": 10.8,
         "group": "pgm"
       },
       "pg3sync update commit=false": {
-        "rps": 11879.5629,
-        "cpu_pct": 1080.2,
-        "cores": 10.8,
+        "rps": 8982.4704,
+        "cpu_pct": 1024.7,
+        "cores": 10.2,
         "group": "pgm"
       },
       "pg3sync delete commit=true": {
-        "rps": 11945.7772,
-        "cpu_pct": 1090.4,
-        "cores": 10.9,
-        "group": "pgm"
-      },
-      "pg3sync delete commit=false": {
-        "rps": 12008.7439,
-        "cpu_pct": 1084.3999999999999,
+        "rps": 10012.0576,
+        "cpu_pct": 1084.6,
         "cores": 10.8,
         "group": "pgm"
       },
+      "pg3sync delete commit=false": {
+        "rps": 10067.6564,
+        "cpu_pct": 1088.9,
+        "cores": 10.9,
+        "group": "pgm"
+      },
       "pg2sync select_one": {
-        "rps": 10460.5902,
-        "cpu_pct": 667.4999999999999,
-        "cores": 6.7,
+        "rps": 22555.8383,
+        "cpu_pct": 1168.0,
+        "cores": 11.7,
         "group": "pgm"
       },
       "pg2sync select_list": {
-        "rps": 7857.7429,
-        "cpu_pct": 699.5,
-        "cores": 7.0,
+        "rps": 13268.5581,
+        "cpu_pct": 1080.8999999999999,
+        "cores": 10.8,
         "group": "pgm"
       },
       "pg2sync insert commit=true": {
-        "rps": 7367.1586,
-        "cpu_pct": 704.1000000000001,
-        "cores": 7.0,
+        "rps": 12883.0381,
+        "cpu_pct": 863.5,
+        "cores": 8.6,
         "group": "pgm"
       },
       "pg2sync insert commit=false": {
-        "rps": 7323.8825,
-        "cpu_pct": 706.0000000000001,
-        "cores": 7.1,
+        "rps": 13284.5153,
+        "cpu_pct": 895.5000000000001,
+        "cores": 9.0,
         "group": "pgm"
       },
       "pg2sync update commit=true": {
-        "rps": 7369.5052,
-        "cpu_pct": 704.5,
-        "cores": 7.0,
+        "rps": 14699.2458,
+        "cpu_pct": 933.0,
+        "cores": 9.3,
         "group": "pgm"
       },
       "pg2sync update commit=false": {
-        "rps": 7421.6589,
-        "cpu_pct": 700.6,
-        "cores": 7.0,
+        "rps": 15434.2219,
+        "cpu_pct": 917.0000000000001,
+        "cores": 9.2,
         "group": "pgm"
       },
       "pg2sync delete commit=true": {
-        "rps": 7446.5146,
-        "cpu_pct": 709.1999999999999,
-        "cores": 7.1,
+        "rps": 15637.8403,
+        "cpu_pct": 939.6999999999998,
+        "cores": 9.4,
         "group": "pgm"
       },
       "pg2sync delete commit=false": {
-        "rps": 5684.9674,
-        "cpu_pct": 704.8000000000001,
-        "cores": 7.0,
+        "rps": 15207.0203,
+        "cpu_pct": 938.1999999999999,
+        "cores": 9.4,
         "group": "pgm"
       },
       "pg3async select_one": {
-        "rps": 49195.1947,
-        "cpu_pct": 1066.4999999999998,
-        "cores": 10.7,
+        "rps": 46204.5718,
+        "cpu_pct": 1112.2,
+        "cores": 11.1,
         "group": "pgm"
       },
       "pg3async select_list": {
-        "rps": 28895.4029,
-        "cpu_pct": 1127.7,
-        "cores": 11.3,
+        "rps": 23011.8079,
+        "cpu_pct": 1043.2,
+        "cores": 10.4,
         "group": "pgm"
       },
       "pg3async insert commit=true": {
-        "rps": 17549.354,
-        "cpu_pct": 834.5,
-        "cores": 8.3,
+        "rps": 16952.6593,
+        "cpu_pct": 896.5000000000001,
+        "cores": 9.0,
         "group": "pgm"
       },
       "pg3async insert commit=false": {
-        "rps": 19284.2201,
-        "cpu_pct": 937.1000000000001,
+        "rps": 17650.9888,
+        "cpu_pct": 939.9,
         "cores": 9.4,
         "group": "pgm"
       },
       "pg3async update commit=true": {
-        "rps": 19834.1948,
-        "cpu_pct": 959.1999999999999,
-        "cores": 9.6,
+        "rps": 18531.5489,
+        "cpu_pct": 975.0,
+        "cores": 9.8,
         "group": "pgm"
       },
       "pg3async update commit=false": {
-        "rps": 18891.9935,
-        "cpu_pct": 967.8,
-        "cores": 9.7,
+        "rps": 18008.4989,
+        "cpu_pct": 992.5,
+        "cores": 9.9,
         "group": "pgm"
       },
       "pg3async delete commit=true": {
-        "rps": 19917.9549,
-        "cpu_pct": 952.6,
-        "cores": 9.5,
+        "rps": 18906.9364,
+        "cpu_pct": 972.6999999999999,
+        "cores": 9.7,
         "group": "pgm"
       },
       "pg3async delete commit=false": {
-        "rps": 19465.314,
-        "cpu_pct": 942.9,
-        "cores": 9.4,
+        "rps": 18058.7496,
+        "cpu_pct": 968.4999999999999,
+        "cores": 9.7,
         "group": "pgm"
       },
       "asyncpg select_one": {
-        "rps": 40352.5139,
-        "cpu_pct": 1039.5000000000002,
+        "rps": 47995.224,
+        "cpu_pct": 1042.5,
         "cores": 10.4,
         "group": "pgm"
       },
       "asyncpg select_list": {
-        "rps": 27134.917,
-        "cpu_pct": 1094.4,
-        "cores": 10.9,
+        "rps": 24243.0606,
+        "cpu_pct": 1107.1,
+        "cores": 11.1,
         "group": "pgm"
       },
       "asyncpg insert commit=true": {
-        "rps": 17554.7866,
-        "cpu_pct": 764.4,
-        "cores": 7.6,
+        "rps": 17969.6709,
+        "cpu_pct": 801.7,
+        "cores": 8.0,
         "group": "pgm"
       },
       "asyncpg insert commit=false": {
-        "rps": 19533.1281,
-        "cpu_pct": 815.5,
-        "cores": 8.2,
+        "rps": 19651.7298,
+        "cpu_pct": 865.6999999999999,
+        "cores": 8.7,
         "group": "pgm"
       },
       "asyncpg update commit=true": {
-        "rps": 20244.0814,
-        "cpu_pct": 840.3,
-        "cores": 8.4,
+        "rps": 19680.3142,
+        "cpu_pct": 831.8,
+        "cores": 8.3,
         "group": "pgm"
       },
       "asyncpg update commit=false": {
-        "rps": 20170.9941,
-        "cpu_pct": 835.4000000000001,
-        "cores": 8.4,
+        "rps": 19710.1786,
+        "cpu_pct": 851.1,
+        "cores": 8.5,
         "group": "pgm"
       },
       "asyncpg delete commit=true": {
-        "rps": 20266.4397,
-        "cpu_pct": 813.8999999999999,
-        "cores": 8.1,
+        "rps": 20155.2737,
+        "cpu_pct": 853.0,
+        "cores": 8.5,
         "group": "pgm"
       },
       "asyncpg delete commit=false": {
-        "rps": 20393.559,
-        "cpu_pct": 846.9000000000001,
-        "cores": 8.5,
+        "rps": 20226.0187,
+        "cpu_pct": 856.6999999999999,
+        "cores": 8.6,
         "group": "pgm"
       }
     },
@@ -805,63 +805,63 @@
         "group": "pg-write"
       },
       "redis get [sync]": {
-        "rps": 54553.6256,
-        "cpu_pct": 593.8,
-        "cores": 5.9,
+        "rps": 56090.1724,
+        "cpu_pct": 572.0,
+        "cores": 5.7,
         "group": "redis"
       },
       "redis set [sync]": {
-        "rps": 48298.4949,
-        "cpu_pct": 535.0,
-        "cores": 5.3,
+        "rps": 53176.2956,
+        "cpu_pct": 551.3,
+        "cores": 5.5,
         "group": "redis"
       },
       "redis set_durable [sync]": {
-        "rps": 6102.9091,
-        "cpu_pct": 172.8,
-        "cores": 1.7,
+        "rps": 4990.989,
+        "cpu_pct": 150.8,
+        "cores": 1.5,
         "group": "redis"
       },
       "redis pipeline [sync]": {
-        "rps": 45433.2894,
-        "cpu_pct": 511.5,
-        "cores": 5.1,
+        "rps": 40866.0713,
+        "cpu_pct": 495.2,
+        "cores": 5.0,
         "group": "redis"
       },
       "redis multi [sync]": {
-        "rps": 41646.5881,
-        "cpu_pct": 480.9,
-        "cores": 4.8,
+        "rps": 41989.0119,
+        "cpu_pct": 509.9,
+        "cores": 5.1,
         "group": "redis"
       },
       "redis get [async]": {
-        "rps": 49343.5915,
-        "cpu_pct": 529.1,
-        "cores": 5.3,
+        "rps": 54622.3072,
+        "cpu_pct": 568.3,
+        "cores": 5.7,
         "group": "redis"
       },
       "redis set [async]": {
-        "rps": 48487.4148,
-        "cpu_pct": 539.7,
-        "cores": 5.4,
+        "rps": 53322.441,
+        "cpu_pct": 579.8,
+        "cores": 5.8,
         "group": "redis"
       },
       "redis set_durable [async]": {
-        "rps": 6156.8378,
-        "cpu_pct": 190.5,
-        "cores": 1.9,
+        "rps": 4940.0582,
+        "cpu_pct": 115.8,
+        "cores": 1.2,
         "group": "redis"
       },
       "redis pipeline [async]": {
-        "rps": 45485.3475,
-        "cpu_pct": 515.0,
-        "cores": 5.2,
+        "rps": 42297.8569,
+        "cpu_pct": 527.5,
+        "cores": 5.3,
         "group": "redis"
       },
       "redis multi [async]": {
-        "rps": 41721.4392,
-        "cpu_pct": 485.6,
-        "cores": 4.9,
+        "rps": 43212.7119,
+        "cpu_pct": 529.0,
+        "cores": 5.3,
         "group": "redis"
       }
     },
@@ -963,63 +963,63 @@
         "group": "pg-write"
       },
       "redis get [sync]": {
-        "rps": 68792.5114,
-        "cpu_pct": 387.9,
-        "cores": 3.9,
+        "rps": 95903.2791,
+        "cpu_pct": 453.29999999999995,
+        "cores": 4.5,
         "group": "redis"
       },
       "redis set [sync]": {
-        "rps": 69185.069,
-        "cpu_pct": 358.0,
-        "cores": 3.6,
+        "rps": 98901.6637,
+        "cpu_pct": 385.6,
+        "cores": 3.9,
         "group": "redis"
       },
       "redis set_durable [sync]": {
-        "rps": 4984.8775,
-        "cpu_pct": 124.30000000000001,
-        "cores": 1.2,
+        "rps": 5709.1504,
+        "cpu_pct": 111.59999999999998,
+        "cores": 1.1,
         "group": "redis"
       },
       "redis pipeline [sync]": {
-        "rps": 80946.5891,
-        "cpu_pct": 518.0,
-        "cores": 5.2,
+        "rps": 92241.2344,
+        "cpu_pct": 489.7,
+        "cores": 4.9,
         "group": "redis"
       },
       "redis multi [sync]": {
-        "rps": 61891.3913,
-        "cpu_pct": 539.5,
-        "cores": 5.4,
+        "rps": 85280.5676,
+        "cpu_pct": 486.0,
+        "cores": 4.9,
         "group": "redis"
       },
       "redis get [async]": {
-        "rps": 71694.0253,
-        "cpu_pct": 348.99999999999994,
-        "cores": 3.5,
+        "rps": 98599.4851,
+        "cpu_pct": 335.5,
+        "cores": 3.4,
         "group": "redis"
       },
       "redis set [async]": {
-        "rps": 72531.7719,
-        "cpu_pct": 341.1,
+        "rps": 100311.4859,
+        "cpu_pct": 335.70000000000005,
         "cores": 3.4,
         "group": "redis"
       },
       "redis set_durable [async]": {
-        "rps": 4753.6765,
-        "cpu_pct": 111.60000000000001,
-        "cores": 1.1,
+        "rps": 6254.5493,
+        "cpu_pct": 67.8,
+        "cores": 0.7,
         "group": "redis"
       },
       "redis pipeline [async]": {
-        "rps": 81446.2203,
-        "cpu_pct": 513.3,
-        "cores": 5.1,
+        "rps": 78899.3526,
+        "cpu_pct": 490.8,
+        "cores": 4.9,
         "group": "redis"
       },
       "redis multi [async]": {
-        "rps": 64270.8206,
-        "cpu_pct": 522.6,
-        "cores": 5.2,
+        "rps": 68914.8746,
+        "cpu_pct": 508.00000000000006,
+        "cores": 5.1,
         "group": "redis"
       }
     },
@@ -1121,62 +1121,62 @@
         "group": "pg-write"
       },
       "redis get [sync]": {
-        "rps": 49473.7622,
-        "cpu_pct": 216.1,
-        "cores": 2.2,
+        "rps": 63308.828,
+        "cpu_pct": 238.3,
+        "cores": 2.4,
         "group": "redis"
       },
       "redis set [sync]": {
-        "rps": 56645.2549,
-        "cpu_pct": 239.4,
+        "rps": 62427.5432,
+        "cpu_pct": 235.2,
         "cores": 2.4,
         "group": "redis"
       },
       "redis set_durable [sync]": {
-        "rps": 2519.6913,
-        "cpu_pct": 62.5,
-        "cores": 0.6,
+        "rps": 3310.8025,
+        "cpu_pct": 43.8,
+        "cores": 0.4,
         "group": "redis"
       },
       "redis pipeline [sync]": {
-        "rps": 43939.6924,
-        "cpu_pct": 212.0,
-        "cores": 2.1,
+        "rps": 51041.5455,
+        "cpu_pct": 219.8,
+        "cores": 2.2,
         "group": "redis"
       },
       "redis multi [sync]": {
-        "rps": 43165.3841,
-        "cpu_pct": 210.5,
+        "rps": 48019.7847,
+        "cpu_pct": 211.5,
         "cores": 2.1,
         "group": "redis"
       },
       "redis get [async]": {
-        "rps": 49398.963,
-        "cpu_pct": 214.8,
-        "cores": 2.1,
+        "rps": 61940.3595,
+        "cpu_pct": 236.3,
+        "cores": 2.4,
         "group": "redis"
       },
       "redis set [async]": {
-        "rps": 47273.319,
-        "cpu_pct": 214.2,
-        "cores": 2.1,
+        "rps": 62132.8346,
+        "cpu_pct": 234.5,
+        "cores": 2.3,
         "group": "redis"
       },
       "redis set_durable [async]": {
-        "rps": 2594.2909,
-        "cpu_pct": 60.6,
-        "cores": 0.6,
+        "rps": 3229.3276,
+        "cpu_pct": 44.6,
+        "cores": 0.4,
         "group": "redis"
       },
       "redis pipeline [async]": {
-        "rps": 44147.079,
-        "cpu_pct": 206.8,
-        "cores": 2.1,
+        "rps": 50620.4476,
+        "cpu_pct": 219.5,
+        "cores": 2.2,
         "group": "redis"
       },
       "redis multi [async]": {
-        "rps": 45179.4854,
-        "cpu_pct": 213.4,
+        "rps": 43934.3462,
+        "cpu_pct": 207.5,
         "cores": 2.1,
         "group": "redis"
       }

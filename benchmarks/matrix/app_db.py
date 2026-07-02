@@ -81,7 +81,23 @@ def pg2_pool():
         import psycopg2.pool
         with _pool_lock:
             if "pg2" not in _pools:
-                _pools["pg2"] = psycopg2.pool.ThreadedConnectionPool(PMIN, PMAX, dsn=DSN)
+                # Two psycopg2 pool quirks the other drivers don't have:
+                # 1) getconn() RAISES PoolError when exhausted — psycopg3
+                #    sync/async and asyncpg all BLOCK. Unguarded at w8/c64
+                #    (~8 concurrent per worker vs max_size 2) 55-64% of
+                #    pg2sync responses were fast 500s and the rows were
+                #    error-storm artifacts (5-15k, erratic, once 0.8c).
+                #    The semaphore restores blocking-checkout parity.
+                # 2) putconn() CLOSES any connection beyond minconn idle
+                #    (`len(_pool) < minconn` retention) — minconn=1 meant
+                #    constant reconnect churn (PMAX=4 measured 2.5k rps of
+                #    pure connect handshakes). minconn=maxconn disables the
+                #    churn, matching the retention of every other pool.
+                # Raw psycopg2 is only ~8-11% slower per op than psycopg3.
+                _pools["pg2"] = (
+                    psycopg2.pool.ThreadedConnectionPool(PMAX, PMAX, dsn=DSN),
+                    threading.BoundedSemaphore(PMAX),
+                )
     return _pools["pg2"]
 
 
@@ -168,28 +184,32 @@ def _pg3sync(op, commit):
 
 # ════════════ psycopg2 SYNC ════════════
 def _pg2sync(op, commit):
-    pool = pg2_pool()
-    conn = pool.getconn()
-    try:
-        # Same read-autocommit fairness (1 RTT reads, txn writes).
-        conn.autocommit = op in ("select_one", "select_list")
-        cur = conn.cursor()
-        if op == "select_one":
-            cur.execute(SEL_ONE_3, (5,)); r = cur.fetchone()
-            return _row(r)
-        if op == "select_list":
-            cur.execute(SEL_LIST_3, (10,)); rs = cur.fetchall()
-            return {"items": [_row(x) for x in rs]}
-        if op == "insert":
-            cur.execute(INS_3, ("x",))
-        elif op == "update":
-            cur.execute(UPD_3, ("y",))
-        elif op == "delete":
-            cur.execute(DEL_3, (DEL_ID,))
-        conn.commit() if commit else conn.rollback()
-        return _wrote(commit)
-    finally:
-        pool.putconn(conn)
+    pool, gate = pg2_pool()
+    with gate:  # blocking checkout, same semantics as the other 3 pools
+        conn = pool.getconn()
+        try:
+            # Same read-autocommit fairness (1 RTT reads, txn writes).
+            # Safe per-checkout: putconn rolls back any non-IDLE conn, and
+            # this path always commits/rollbacks, so autocommit is never
+            # toggled mid-transaction (psycopg2 forbids that).
+            conn.autocommit = op in ("select_one", "select_list")
+            cur = conn.cursor()
+            if op == "select_one":
+                cur.execute(SEL_ONE_3, (5,)); r = cur.fetchone()
+                return _row(r)
+            if op == "select_list":
+                cur.execute(SEL_LIST_3, (10,)); rs = cur.fetchall()
+                return {"items": [_row(x) for x in rs]}
+            if op == "insert":
+                cur.execute(INS_3, ("x",))
+            elif op == "update":
+                cur.execute(UPD_3, ("y",))
+            elif op == "delete":
+                cur.execute(DEL_3, (DEL_ID,))
+            conn.commit() if commit else conn.rollback()
+            return _wrote(commit)
+        finally:
+            pool.putconn(conn)
 
 
 # ════════════ psycopg3 ASYNC ════════════
