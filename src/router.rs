@@ -2395,87 +2395,111 @@ async fn handle_request(
             });
         }
 
-        // Sync handler with params — use block_in_place for GIL-safe concurrency
-        return tokio::task::block_in_place(|| {
-            Python::attach(|py| {
-                set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
-                let body_json_opt = if state.has_body_params {
-                    body_json.as_ref()
-                } else {
-                    None
-                };
-                let kwargs = match extract_params_to_pydict_full(
-                    py,
-                    &state.params,
-                    &path_map,
-                    &query_params,
-                    &query_multi,
-                    &headers,
-                    content_type.as_ref().and_then(|v| v.to_str().ok()),
-                    &body_json_opt,
-                    &body_bytes,
-                    &mut multipart_fields,
-                    state.defers_extraction_errors,
-                    state.lax_content_type,
-                    state.has_param_model,
-                ) {
-                    Ok(kw) => kw,
-                    Err(resp) => return resp,
-                };
-                if let Err(e) = inject_framework_objects(
+        // Sync handler with params — direct GIL attach on the tokio worker,
+        // matching the zero-param ultra-fast path above.
+        //
+        // This arm deliberately does NOT use ``tokio::task::block_in_place``
+        // anymore. Measured with per-phase timers (20k-request medians,
+        // conn=1): block_in_place cost 1.3μs at entry + 1.4μs at exit on
+        // EVERY body/path-param request — the largest single non-work item
+        // in the PUT/POST hot path (wire p50 33μs → 30μs without it, and
+        // c8 throughput 63k → 76k rps, c64 p99 3.9ms → 1.7ms).
+        //
+        // The traded-away property: block_in_place hands the worker's core
+        // to a replacement thread, so sync handlers that block WITHOUT the
+        // GIL (DB drivers, file IO, time.sleep) could overlap beyond the
+        // worker count. Direct attach caps that overlap at the tokio worker
+        // count per process (measured: 5ms-sleep handler at c64 = ~10.4k rps
+        // with block_in_place vs ~2.9k rps capped). We take the cap because:
+        //   * GIL-bound handlers (the common case) serialize identically
+        //     either way — the cap only binds for GIL-releasing handlers
+        //     held longer than a few ms at concurrency > n_workers.
+        //   * block_in_place's replacement-worker spawn was catastrophically
+        //     fragile under exactly that load shape: a cold-start burst of
+        //     64 concurrent 5ms GIL-releasing handlers wedged the whole
+        //     server PERMANENTLY (all threads parked in take_gil, 12 rps
+        //     then zero; reproduced 2/3 attempts). The zero-param path never
+        //     wedges, and neither does this arm now.
+        //   * Recommended deployments run FASTAPI_TURBO_WORKERS processes;
+        //     blocking overlap scales with processes × tokio workers.
+        return Python::attach(|py| {
+            set_request_scope_ctxvar(py, &scope_method, &scope_path, &scope_query, &state);
+            let body_json_opt = if state.has_body_params {
+                body_json.as_ref()
+            } else {
+                None
+            };
+            let kwargs = match extract_params_to_pydict_full(
+                py,
+                &state.params,
+                &path_map,
+                &query_params,
+                &query_multi,
+                &headers,
+                content_type.as_ref().and_then(|v| v.to_str().ok()),
+                &body_json_opt,
+                &body_bytes,
+                &mut multipart_fields,
+                state.defers_extraction_errors,
+                state.lax_content_type,
+                state.has_param_model,
+            ) {
+                Ok(kw) => kw,
+                Err(resp) => return resp,
+            };
+            if let Err(e) = inject_framework_objects(
+                py,
+                &kwargs,
+                &state,
+                &scope_method,
+                &scope_path,
+                &scope_query,
+                &headers,
+                &path_map,
+                &query_params,
+                &body_bytes,
+                &client_addr,
+            ) {
+                return pyerr_to_response(py, &e);
+            }
+            if state.has_http_middleware {
+                inject_request_metadata(
                     py,
                     &kwargs,
-                    &state,
                     &scope_method,
                     &scope_path,
                     &scope_query,
                     &headers,
-                    &path_map,
-                    &query_params,
-                    &body_bytes,
-                    &client_addr,
-                ) {
-                    return pyerr_to_response(py, &e);
-                }
-                if state.has_http_middleware {
-                    inject_request_metadata(
-                        py,
-                        &kwargs,
-                        &scope_method,
-                        &scope_path,
-                        &scope_query,
-                        &headers,
-                    );
-                    // Seed the middleware Request's ``_body`` cache with
-                    // the raw (pre-multipart-parse) bytes.
-                    if let Some(ref raw) = raw_body_for_mw {
-                        if !raw.is_empty() {
-                            let _ = kwargs.set_item(
-                                "__fastapi_turbo_raw_body_bytes__",
-                                pyo3::types::PyBytes::new(py, raw),
-                            );
-                        }
-                    }
-                }
-                match state.handler.call(py, (), Some(&kwargs)) {
-                    Ok(py_result) => {
-                        // Gated: no BackgroundTasks param and no deps (a dep can share the
-                        // per-request instance) means there is provably nothing to drain.
-                        if state.has_inject_background_tasks || state.has_dep_params {
-                            drain_background_tasks(py, &kwargs, &state.params);
-                        }
-                        let mut resp = py_to_response_with_request(
-                            py,
-                            py_result.bind(py),
-                            range_header.as_deref(),
-                            if_range_header.as_deref(),
+                );
+                // Seed the middleware Request's ``_body`` cache with
+                // the raw (pre-multipart-parse) bytes.
+                if let Some(ref raw) = raw_body_for_mw {
+                    if !raw.is_empty() {
+                        let _ = kwargs.set_item(
+                            "__fastapi_turbo_raw_body_bytes__",
+                            pyo3::types::PyBytes::new(py, raw),
                         );
-                        apply_injected_response(py, &mut resp);
-                        resp
                     }
-                    Err(py_err) => pyerr_to_response(py, &py_err),
                 }
-            })
+            }
+            match state.handler.call(py, (), Some(&kwargs)) {
+                Ok(py_result) => {
+                    // Gated: no BackgroundTasks param and no deps (a dep can share the
+                    // per-request instance) means there is provably nothing to drain.
+                    if state.has_inject_background_tasks || state.has_dep_params {
+                        drain_background_tasks(py, &kwargs, &state.params);
+                    }
+                    let mut resp = py_to_response_with_request(
+                        py,
+                        py_result.bind(py),
+                        range_header.as_deref(),
+                        if_range_header.as_deref(),
+                    );
+                    apply_injected_response(py, &mut resp);
+                    resp
+                }
+                Err(py_err) => pyerr_to_response(py, &py_err),
+            }
         });
     }
 
