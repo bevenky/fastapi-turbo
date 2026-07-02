@@ -60,6 +60,22 @@ class _ImmediateNone:
 _IMMEDIATE_NONE = _ImmediateNone()
 
 
+def _ws_task_done(task):
+    """Done-callback for loop-resident WS handler tasks
+    (``FASTAPI_TURBO_WS_LOOP``): retrieve the exception so asyncio never
+    logs "Task exception was never retrieved". The ``_ws_entry`` wrapper
+    already routes real errors through the app's capture queues; anything
+    reaching here matches the thread path's silent ``let _ =`` drop."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        import logging
+        logging.getLogger("fastapi_turbo.websockets").debug(
+            "WS loop-mode handler task error: %r", exc
+        )
+
+
 class WebSocket:
     """Wraps the Rust PyWebSocket for FastAPI/Starlette compatibility.
 
@@ -288,7 +304,12 @@ class WebSocket:
                     k_s = k.decode("latin-1") if isinstance(k, (bytes, bytearray)) else str(k)
                     v_s = v.decode("latin-1") if isinstance(v, (bytes, bytearray)) else str(v)
                     rust_headers.append((k_s, v_s))
-            self._ws.accept(subprotocol, rust_headers if rust_headers else None)
+            # Thread mode returns None (blocked until the upgrade wired up);
+            # loop mode returns an asyncio Future resolved by the upgrade
+            # callback — awaiting it suspends this task, never the loop.
+            ready = self._ws.accept(subprotocol, rust_headers if rust_headers else None)
+            if ready is not None:
+                await ready
         elif self._is_asgi and self._receive is not None:
             # In-process ASGI door: consume the client's
             # ``websocket.connect`` then emit ``websocket.accept``.
@@ -394,9 +415,15 @@ class WebSocket:
                     'Cannot call "send" once a close message has been sent or before accept.'
                 )
             if message.get("text") is not None:
-                self._ws.send_text(message["text"])
+                pending = self._ws.send_text(message["text"])
             elif message.get("bytes") is not None:
-                self._ws.send_bytes(bytes(message["bytes"]))
+                pending = self._ws.send_bytes(bytes(message["bytes"]))
+            else:
+                pending = None
+            # Loop mode under backpressure: a capacity Future — await it so
+            # frame order is preserved before the caller's next send.
+            if pending is not None:
+                await pending
         elif msg_type == "websocket.close":
             await self.close(code=message.get("code", 1000), reason=message.get("reason"))
 
@@ -410,8 +437,10 @@ class WebSocket:
                 'Cannot call "send_text" before "accept" or after a close.'
             )
         if self._ws is not None:
-            self._ws.send_text(data)
-            return _IMMEDIATE_NONE
+            # Rust returns None when queued (common case) or, in loop mode
+            # under backpressure, an asyncio capacity Future to await.
+            pending = self._ws.send_text(data)
+            return _IMMEDIATE_NONE if pending is None else pending
         # ASGI door: return the send coroutine for the caller to await.
         return self._send({"type": "websocket.send", "text": data})
 
@@ -423,8 +452,8 @@ class WebSocket:
         if not isinstance(data, bytes):
             data = bytes(data)
         if self._ws is not None:
-            self._ws.send_bytes(data)
-            return _IMMEDIATE_NONE
+            pending = self._ws.send_bytes(data)
+            return _IMMEDIATE_NONE if pending is None else pending
         return self._send({"type": "websocket.send", "bytes": data})
 
     def send_json(self, data, mode: str = "text"):
@@ -437,10 +466,10 @@ class WebSocket:
         text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
         if self._ws is not None:
             if mode == "text":
-                self._ws.send_text(text)
+                pending = self._ws.send_text(text)
             else:
-                self._ws.send_bytes(text.encode("utf-8"))
-            return _IMMEDIATE_NONE
+                pending = self._ws.send_bytes(text.encode("utf-8"))
+            return _IMMEDIATE_NONE if pending is None else pending
         if mode == "text":
             return self._send({"type": "websocket.send", "text": text})
         return self._send(
