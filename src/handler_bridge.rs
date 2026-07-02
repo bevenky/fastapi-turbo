@@ -132,9 +132,20 @@ static WORKER_LOOP: OnceLock<Py<PyAny>> = OnceLock::new();
 /// Cached once so the per-request enqueue is a single positional call.
 static WORKER_CALL_SOON: OnceLock<Py<PyAny>> = OnceLock::new();
 
+/// `_door_support._inline_runner` — the ASYNC_INLINE task body. Awaits the
+/// handler coroutine and calls the Rust `InlineSend` as the LAST statement of
+/// the task, so the oneshot completes in the same loop iteration the handler
+/// finishes in (no `add_done_callback` → `call_soon` extra loop pass).
+static INLINE_RUNNER: OnceLock<Py<PyAny>> = OnceLock::new();
+
 /// The worker's event loop (populated by `init_async_worker`).
 pub fn worker_loop() -> Option<&'static Py<PyAny>> {
     WORKER_LOOP.get()
+}
+
+/// `_inline_runner` (populated by `init_async_worker`).
+pub fn inline_runner() -> Option<&'static Py<PyAny>> {
+    INLINE_RUNNER.get()
 }
 
 /// Bound `call_soon_threadsafe` on the worker's loop (populated by
@@ -162,6 +173,11 @@ pub fn init_async_worker() {
                 let _ = WORKER_CALL_SOON.set(call_soon.unbind());
             }
             let _ = WORKER_LOOP.set(loop_obj.unbind());
+        }
+        if let Ok(ds) = py.import("fastapi_turbo._door_support") {
+            if let Ok(runner) = ds.getattr("_inline_runner") {
+                let _ = INLINE_RUNNER.set(runner.unbind());
+            }
         }
         let _ = ASYNC_SUBMIT_FAST.set(submit_fast);
         let _ = ASYNC_SUBMIT.set(submit);

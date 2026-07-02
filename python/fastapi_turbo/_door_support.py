@@ -437,3 +437,25 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
         return _submit_partial(coro)
 
     return _stamp(_sync_caller)
+
+
+async def _inline_runner(coro, send):
+    """ASYNC_INLINE task body: complete the request INSIDE the task's final step.
+
+    The E-path previously wired ``task.add_done_callback(completer)`` — but
+    asyncio delivers done-callbacks via ``loop.call_soon``, i.e. one EXTRA
+    loop pass between the handler finishing and the tokio side being woken.
+    Awaiting the handler here and calling ``send`` (a Rust ``InlineSend``
+    pyclass: non-blocking ``oneshot::Sender::send``) as the last statement of
+    the task body delivers the outcome in the SAME loop iteration the handler
+    completes in.
+
+    ``except BaseException`` ships the exception object (CancelledError from a
+    timeout/disconnect cancel included) — byte-parity with the old completer's
+    ``task.result()`` re-raise, minus asyncio's "exception was never
+    retrieved" hazard (the task always finishes clean).
+    """
+    try:
+        send(await coro, None)
+    except BaseException as e:  # noqa: BLE001 — shipped to Rust, re-raised there
+        send(None, e)

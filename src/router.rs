@@ -2290,16 +2290,18 @@ fn run_inline_job(py: Python<'_>, state: &Arc<RouteState>, parts: InlineParts, r
             )),
         );
     };
-    let task = match loop_obj.call_method1(py, "create_task", (coro.bind(py),)) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = coro.call_method0(py, "close");
-            return send_inline_outcome(reply, LoopOutcome::Error(e));
-        }
+    let Some(runner) = crate::handler_bridge::inline_runner() else {
+        let _ = coro.call_method0(py, "close");
+        return send_inline_outcome(
+            reply,
+            LoopOutcome::Error(pyo3::exceptions::PyRuntimeError::new_err(
+                "_inline_runner not initialized",
+            )),
+        );
     };
-    let completer = match Py::new(
+    let send = match Py::new(
         py,
-        LoopCompleter {
+        InlineSend {
             reply: reply.clone(),
             kwargs: kwargs.unbind(),
             injected_bg,
@@ -2311,41 +2313,65 @@ fn run_inline_job(py: Python<'_>, state: &Arc<RouteState>, parts: InlineParts, r
     ) {
         Ok(c) => c,
         Err(e) => {
-            let _ = task.call_method0(py, "cancel");
+            let _ = coro.call_method0(py, "close");
             return send_inline_outcome(reply, LoopOutcome::Error(e));
         }
     };
-    // Timeout: schedule the completer's `_timeout` on the loop. Delivering the
-    // 504 AT the deadline (not from the cancelled task's done-callback)
-    // preserves `submit_fast` semantics — a handler that swallows
-    // CancelledError must not convert a guaranteed 504 into a late 200.
+    // Wrap the handler coroutine in `_inline_runner(coro, send)`: the oneshot
+    // fires as the LAST statement of the task body — same loop iteration the
+    // handler completes in. The old `add_done_callback(completer)` wiring
+    // delivered completion via `loop.call_soon`, i.e. one extra loop pass per
+    // request (the E-path's "second hop", audited).
+    let runner_coro = match runner.call1(py, (coro.bind(py), send.bind(py))) {
+        Ok(rc) => rc,
+        Err(e) => {
+            let _ = coro.call_method0(py, "close");
+            return send_inline_outcome(reply, LoopOutcome::Error(e));
+        }
+    };
+    let task = match loop_obj.call_method1(py, "create_task", (runner_coro.bind(py),)) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = runner_coro.call_method0(py, "close");
+            return send_inline_outcome(reply, LoopOutcome::Error(e));
+        }
+    };
+    // NOTE: with the eager task factory the runner may have ALREADY completed
+    // (and sent the outcome) inside `create_task` — the timer/task wiring
+    // below then arms against a taken sender, which is harmless: `_timeout`
+    // and disconnect-cancel both no-op once the reply slot is empty.
+    // Timeout: schedule `_timeout` on the loop. Delivering the 504 AT the
+    // deadline (not from the cancelled task) preserves `submit_fast`
+    // semantics — a handler that swallows CancelledError must not convert a
+    // guaranteed 504 into a late 200.
     if let Some(t) = state.worker_timeout {
-        if let Ok(cb) = completer.bind(py).getattr("_timeout") {
+        if let Ok(cb) = send.bind(py).getattr("_timeout") {
             if let Ok(timer) = loop_obj.call_method1(py, "call_later", (t, cb)) {
-                if let Ok(mut slot) = completer.borrow(py).timer.lock() {
+                let already_done = reply.lock().map(|g| g.is_none()).unwrap_or(false);
+                if already_done {
+                    // Eager completion raced ahead of the arming — don't
+                    // leave a live Handle parked until the deadline.
+                    let _ = timer.call_method0(py, "cancel");
+                } else if let Ok(mut slot) = send.borrow(py).timer.lock() {
                     *slot = Some(timer);
                 }
             }
         }
     }
-    if let Ok(mut slot) = completer.borrow(py).task.lock() {
+    let send_ref = send.borrow(py);
+    if let Ok(mut slot) = send_ref.task.lock() {
         *slot = Some(task.clone_ref(py));
     }
-    if let Err(e) = task.call_method1(py, "add_done_callback", (completer.bind(py),)) {
-        if let Ok(mut tslot) = completer.borrow(py).timer.lock() {
-            if let Some(timer) = tslot.take() {
-                let _ = timer.call_method0(py, "cancel");
-            }
-        }
-        let _ = task.call_method0(py, "cancel");
-        send_inline_outcome(reply, LoopOutcome::Error(e));
-    }
+    drop(send_ref);
 }
 
-/// Task done-callback + timeout timer target. Both run on the loop thread;
+/// ASYNC_INLINE completion sink. `__call__` is invoked by the Python
+/// `_inline_runner` as the LAST statement of the handler task (same loop
+/// iteration the handler completes in — no done-callback `call_soon` hop);
+/// `_timeout` is the `call_later` timer target. Both run on the loop thread;
 /// `oneshot::Sender::send` is non-blocking, so both are loop-safe.
 #[pyclass]
-struct LoopCompleter {
+struct InlineSend {
     reply: InlineReply,
     kwargs: Py<PyDict>,
     injected_bg: Option<Py<PyAny>>,
@@ -2356,8 +2382,12 @@ struct LoopCompleter {
 }
 
 #[pymethods]
-impl LoopCompleter {
-    fn __call__(&self, py: Python<'_>, task: Bound<'_, PyAny>) {
+impl InlineSend {
+    /// `send(result, None)` on success, `send(None, exc)` on any raise
+    /// (CancelledError from a timeout/disconnect cancel included — shipping
+    /// the exception object gives byte-identical conversion to the classic
+    /// path's re-raise → pyerr_to_response).
+    fn __call__(&self, py: Python<'_>, obj: Py<PyAny>, exc: Py<PyAny>) {
         // Cancel a still-pending timeout timer. asyncio Handle.cancel() also
         // suppresses an already-queued-but-not-run callback, so after this the
         // timer can no longer race us (the Mutex-take below is the backstop).
@@ -2367,33 +2397,22 @@ impl LoopCompleter {
             }
         }
         let Some(tx) = self.reply.lock().ok().and_then(|mut g| g.take()) else {
-            // Timed out (504 already delivered) or client disconnected.
-            // Retrieve the exception so asyncio doesn't warn
-            // "exception was never retrieved"; drop everything.
-            let cancelled = task
-                .call_method0("cancelled")
-                .and_then(|v| v.extract::<bool>())
-                .unwrap_or(false);
-            if !cancelled {
-                let _ = task.call_method0("exception");
-            }
+            // Timed out (504 already delivered) or client disconnected —
+            // drop everything. The runner already consumed the exception, so
+            // no "exception was never retrieved" warning can occur.
             return;
         };
-        // `result()` re-raises the task's exception (including CancelledError)
-        // — shipping the PyErr gives byte-identical conversion to the classic
-        // path's re-raise-on-caller-thread → pyerr_to_response.
-        match task.call_method0("result") {
-            Ok(obj) => {
-                let _ = tx.send(LoopOutcome::Result {
-                    obj: obj.unbind(),
-                    kwargs: self.kwargs.clone_ref(py),
-                    injected_bg: self.injected_bg.as_ref().map(|o| o.clone_ref(py)),
-                    injected_resp: self.injected_resp.as_ref().map(|o| o.clone_ref(py)),
-                });
-            }
-            Err(e) => {
-                let _ = tx.send(LoopOutcome::Error(e));
-            }
+        if exc.is_none(py) {
+            let _ = tx.send(LoopOutcome::Result {
+                obj,
+                kwargs: self.kwargs.clone_ref(py),
+                injected_bg: self.injected_bg.as_ref().map(|o| o.clone_ref(py)),
+                injected_resp: self.injected_resp.as_ref().map(|o| o.clone_ref(py)),
+            });
+        } else {
+            let _ = tx.send(LoopOutcome::Error(PyErr::from_value(
+                exc.bind(py).clone(),
+            )));
         }
     }
 
