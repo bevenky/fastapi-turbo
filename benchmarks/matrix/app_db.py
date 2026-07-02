@@ -24,7 +24,9 @@ Engine: BENCH_ENGINE=turbo → app.run() (Rust door); else uvicorn (real FastAPI
 """
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
 
 if os.environ.get("BENCH_ENGINE") == "turbo":
     import fastapi_turbo  # noqa: F401
@@ -54,28 +56,43 @@ DEL_ID = 999_999_999
 
 # ── lazy pools ────────────────────────────────────────────────────────
 _pools: dict = {}
+# First-touch guards. Without these the check-then-create races: sync
+# creators race across request threads; async creators AWAIT mid-create,
+# so a warmup burst of concurrent first requests each builds its own pool
+# and the losers leak their connections for the process lifetime →
+# Postgres max_connections exhaustion (TooManyConnectionsError 500s)
+# during warmup / after a few boots. Double-checked: steady state stays
+# lock-free.
+_pool_lock = threading.Lock()
+_apool_lock = asyncio.Lock()
 
 
 def pg3sync_pool():
     if "pg3sync" not in _pools:
         from psycopg_pool import ConnectionPool
-        _pools["pg3sync"] = ConnectionPool(DSN, min_size=PMIN, max_size=PMAX, open=True)
+        with _pool_lock:
+            if "pg3sync" not in _pools:
+                _pools["pg3sync"] = ConnectionPool(DSN, min_size=PMIN, max_size=PMAX, open=True)
     return _pools["pg3sync"]
 
 
 def pg2_pool():
     if "pg2" not in _pools:
         import psycopg2.pool
-        _pools["pg2"] = psycopg2.pool.ThreadedConnectionPool(PMIN, PMAX, dsn=DSN)
+        with _pool_lock:
+            if "pg2" not in _pools:
+                _pools["pg2"] = psycopg2.pool.ThreadedConnectionPool(PMIN, PMAX, dsn=DSN)
     return _pools["pg2"]
 
 
 async def pg3async_pool():
     if "pg3async" not in _pools:
         from psycopg_pool import AsyncConnectionPool
-        p = AsyncConnectionPool(DSN, min_size=PMIN, max_size=PMAX, open=False)
-        await p.open()
-        _pools["pg3async"] = p
+        async with _apool_lock:
+            if "pg3async" not in _pools:
+                p = AsyncConnectionPool(DSN, min_size=PMIN, max_size=PMAX, open=False)
+                await p.open()
+                _pools["pg3async"] = p
     return _pools["pg3async"]
 
 
@@ -90,23 +107,29 @@ async def asyncpg_pool():
             # no-op reset gives asyncpg its true 1-RTT read cost.
             return None
 
-        _pools["asyncpg"] = await asyncpg.create_pool(
-            host=PGHOST, port=PGPORT, database=PGDB, user=PGUSER,
-            min_size=PMIN, max_size=PMAX, reset=_no_reset)
+        async with _apool_lock:
+            if "asyncpg" not in _pools:
+                _pools["asyncpg"] = await asyncpg.create_pool(
+                    host=PGHOST, port=PGPORT, database=PGDB, user=PGUSER,
+                    min_size=PMIN, max_size=PMAX, reset=_no_reset)
     return _pools["asyncpg"]
 
 
 def sync_redis():
     if "rs" not in _pools:
         import redis
-        _pools["rs"] = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        with _pool_lock:
+            if "rs" not in _pools:
+                _pools["rs"] = redis.Redis.from_url(REDIS_URL, decode_responses=True)
     return _pools["rs"]
 
 
 async def async_redis():
     if "ra" not in _pools:
         import redis.asyncio as aioredis
-        _pools["ra"] = aioredis.Redis.from_url(REDIS_URL, decode_responses=True)
+        async with _apool_lock:
+            if "ra" not in _pools:
+                _pools["ra"] = aioredis.Redis.from_url(REDIS_URL, decode_responses=True)
     return _pools["ra"]
 
 

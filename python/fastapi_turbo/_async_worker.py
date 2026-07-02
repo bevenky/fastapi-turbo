@@ -46,6 +46,17 @@ from collections import deque
 _loop: asyncio.AbstractEventLoop | None = None
 _thread: threading.Thread | None = None
 _ready = threading.Event()
+# Serializes worker startup. The first submits can arrive concurrently from
+# multiple Rust/tokio threads; without this lock each racer that observed
+# ``_loop is None`` spawned its OWN worker thread + loop and the ``_loop``
+# global was overwritten — connection pools then got created on a different
+# loop than later requests ran on (asyncpg binds futures to the creating
+# loop → intermittent "got Future attached to a different loop" 500s).
+_init_lock = threading.Lock()
+# Debug/regression counter: how many worker loops this process has ever
+# started. Correct behaviour is exactly 1 (per init cycle) no matter how
+# many threads race the first submit.
+_loops_started = 0
 
 # Distinct sentinel so ``submit(coro, timeout=None)`` can mean "no
 # timeout" distinctly from "caller didn't pass a timeout, use the
@@ -60,29 +71,45 @@ _event_pool: deque[threading.Event] = deque()
 
 
 def init():
-    """Start the worker thread if not already running."""
+    """Start the worker thread if not already running.
+
+    Double-checked lock: the unlocked fast-path check keeps the steady
+    state free (one pointer read), while the locked re-check guarantees
+    exactly ONE worker thread/loop is ever created even when the first
+    submits race in from multiple threads. Racing callers block on the
+    lock until the winner's ready-wait completes, then see ``_loop`` set
+    and return — so every caller leaves ``init()`` with the ONE loop up.
+    """
     global _loop, _thread
     if _loop is not None:
         return
-    _ready.clear()
-    _thread = threading.Thread(target=_run, daemon=True, name="fastapi-turbo-async-worker")
-    _thread.start()
-    _ready.wait(timeout=10)
-    # Warm the event pool so the first N submits avoid allocations.
-    for _ in range(64):
-        _event_pool.append(threading.Event())
+    with _init_lock:
+        if _loop is not None:
+            return
+        _ready.clear()
+        _thread = threading.Thread(target=_run, daemon=True, name="fastapi-turbo-async-worker")
+        _thread.start()
+        _ready.wait(timeout=10)
+        # Warm the event pool so the first N submits avoid allocations.
+        for _ in range(64):
+            _event_pool.append(threading.Event())
 
 
 def _run():
-    global _loop
+    global _loop, _loops_started
     try:
         import uvloop
-        _loop = uvloop.new_event_loop()
+        loop = uvloop.new_event_loop()
     except ImportError:
-        _loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_loop)
+        loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _loops_started += 1
+    # Publish the loop only after it is fully constructed — unlocked
+    # fast-path readers (``submit_fast``/``get_loop``) must never observe
+    # a half-initialized loop.
+    _loop = loop
     _ready.set()
-    _loop.run_forever()
+    loop.run_forever()
 
 
 def _acquire_event() -> threading.Event:
