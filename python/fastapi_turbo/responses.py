@@ -215,17 +215,25 @@ def _spawn_stream_task(loop, coro, completer):
     ``asyncio.current_task()``-dependent code (``wait_for``/``timeout`` in the
     SSE keepalive wrap) sees a proper task context.
 
-    The completer (exception capture + guaranteed channel close) is attached
-    AFTER an eager completion, which is fine: ``add_done_callback`` on a done
-    task schedules it via ``call_soon``, and the mid-stream-raise path leaves
-    the channel open until the completer captures-then-closes (ordering
-    parity with the legacy driver).
+    When the eager start already COMPLETED the task (the whole cooperative
+    stream ran inside this call), the completer runs INLINE right here — we
+    are on the loop thread, so it's the same execution context a done-callback
+    would get, minus one ``call_soon`` hop (+12µs of post-close loop work that
+    landed in the NEXT request's gap at closed-loop conn=1). Ordering is
+    preserved for the done-but-FAILED case: the completer itself does
+    capture-then-close, exactly as on the callback path. Only a task still
+    pending after the eager step attaches the completer as a done-callback.
     """
     try:
         task = _asyncio.Task(coro, loop=loop, eager_start=True)
     except TypeError:  # Python < 3.12 — no eager_start
         task = loop.create_task(coro)
-    task.add_done_callback(completer)
+        task.add_done_callback(completer)
+        return
+    if task.done():
+        completer(task)
+    else:
+        task.add_done_callback(completer)
 
 
 def _resolve_stream_future(fut, ok):
