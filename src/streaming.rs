@@ -71,7 +71,11 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
     // Otherwise the wrapper's ``__anext__`` is an async iterator → the slow
     // (threadpool-per-chunk) async path. Detecting the source here lets the
     // first-chunk pre-drain and ``iterate_sync_generator`` run unchanged.
-    if let Ok(src) = iter_bound.getattr(pyo3::intern!(py, "_fastapi_turbo_sync_source")) {
+    // `getattr_opt`: raw async/sync generators MISS this attribute on every
+    // request — the plain `getattr` materialized a full AttributeError
+    // (instantiation + traceback machinery, ~1µs) per stream just to discard
+    // it.
+    if let Ok(Some(src)) = iter_bound.getattr_opt(pyo3::intern!(py, "_fastapi_turbo_sync_source")) {
         iter_bound = src;
     }
 
