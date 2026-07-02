@@ -76,13 +76,16 @@ html = f"""<!doctype html><html><head><meta charset=utf-8><title>DB/Redis matrix
  .best{{color:#3fb950;font-weight:700}} .na{{color:#484f58}} .metric{{font-size:10px;color:#6e7681}} code{{color:#79c0ff}}
 </style></head><body><div class=wrap>
 <h1>Postgres + Redis deep matrix</h1>
-<p class=sub>{datetime.now().strftime('%Y-%m-%d %H:%M')} · {META['cores']} cores · all frameworks workers/cluster={META['db_workers']}
-(Postgres 100-conn budget) · oha c={META['conc']}, {META['dur']} · req/s, higher better. <span class=best>green</span>=best in row.</p>
+<p class=sub>{datetime.now().strftime('%Y-%m-%d %H:%M')} · {META['cores']} cores · workers/cluster={META['db_workers']}
+(Python async-heavy boots: workers={META.get('async_workers', 12)}) · Postgres 100-conn budget · oha c={META['conc']},
+{META['dur']} · req/s, higher better. <span class=best>green</span>=best in row.</p>
 <p class=sub><b>Methodology (audited):</b> reads are 1 wire round trip in EVERY framework (psycopg3/psycopg2 autocommit reads,
 asyncpg no-op pool reset, pgx cached statements, axum prepare_cached, Fastify pool.query); writes use an explicit
 transaction everywhere (commit=true → COMMIT, false → ROLLBACK — isolates the WAL-fsync cost).
-Python engines run their measured-best async PG driver (turbo → psycopg3-async, uvicorn → asyncpg) and every
+Both Python engines run asyncpg for the cross-framework async endpoints (measured-best post async-worker init fix) and every
 backend-driver group benches in an ISOLATED boot (co-resident driver pools contaminated asyncpg up to 4x).
+Python async groups run their measured-best worker count ({META.get('async_workers', 12)}); sync groups keep
+workers={META['db_workers']} — the same each-at-its-best policy as the driver choice.
 turbo/FastAPI = multiprocess (one pool PER worker); Gin/Fastify/Axum = one shared pool.
 <b>set_durable</b> (SET + WAITAOF under appendfsync=always) measures Redis's fsync durability floor — high
 run-to-run variance (AOF file state); compare within a run only.</p>
@@ -94,7 +97,7 @@ run-to-run variance (AOF file state); compare within a run only.</p>
 <h2>Cross-framework — Redis (req/s)</h2>
 {table(FW, cross_redis)}
 <h2>Python Postgres driver matrix (turbo vs uvicorn) — req/s</h2>
-<p class=sub>psycopg3-sync, psycopg2-sync, psycopg3-async, asyncpg. Exposes which driver wins and whether the async catastrophe is asyncpg-specific.</p>
+<p class=sub>psycopg3-sync, psycopg2-sync, psycopg3-async, asyncpg — each driver in its own isolated boot. Post init-fix, asyncpg is the fastest async driver under both engines.</p>
 {table(PYFW, pym)}
 </div></body></html>"""
 OUT.write_text(html)

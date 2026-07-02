@@ -245,12 +245,12 @@ async def _asyncpg(op, commit):
 DRIVERS_SYNC = {"pg3sync": _pg3sync, "pg2sync": _pg2sync}
 DRIVERS_ASYNC = {"pg3async": _pg3async, "asyncpg": _asyncpg}
 
-# Cross-framework /pg/*/async representative: each engine runs its BEST driver
-# (turbo door → psycopg3-async; uvicorn → asyncpg — measured, see async deep-dive).
+# Cross-framework /pg/*/async representative: asyncpg for BOTH engines.
+# History: asyncpg looked pathological under the turbo door; root cause was an
+# async-worker loop init race (fixed) — post-fix asyncpg beats psycopg3-async
+# under the door as well (w8 45.3k vs ~40k rps; 26µs vs 45µs loop CPU per op).
 # Override with BENCH_PG_ASYNC_DRIVER=pg3async|asyncpg for driver-vs-driver runs.
-_CROSS_ASYNC_NAME = os.environ.get("BENCH_PG_ASYNC_DRIVER") or (
-    "pg3async" if os.environ.get("BENCH_ENGINE") == "turbo" else "asyncpg"
-)
+_CROSS_ASYNC_NAME = os.environ.get("BENCH_PG_ASYNC_DRIVER", "asyncpg")
 _cross_async = DRIVERS_ASYNC[_CROSS_ASYNC_NAME]
 
 

@@ -29,6 +29,12 @@ OHA = "/opt/homebrew/bin/oha"
 HERE = os.path.dirname(os.path.abspath(__file__))
 NCPU = psutil.cpu_count()
 WORKERS = int(os.environ.get("BENCH_WORKERS", NCPU))
+# Python ASYNC-heavy groups run at their measured-best worker count, not all
+# cores: each worker pins one event loop to one GIL core, and past ~12 workers
+# the extra processes only add thread thrash (audit: w18 is the WORST async
+# config; w12 beats it by ~25%). CPU-bound groups keep all cores — same
+# each-at-its-best policy as the driver choice.
+ASYNC_WORKERS = int(os.environ.get("BENCH_ASYNC_WORKERS", str(min(WORKERS, 12))))
 CONC = int(os.environ.get("BENCH_CONC", "100"))
 DUR = os.environ.get("BENCH_DUR", "6s")
 
@@ -104,6 +110,8 @@ PY_ISOLATE = {
     "pg-sync": {"pg item sync", "pg list sync"},
     "pg-async": {"pg item async", "pg list async"},
 }
+# Isolated groups dominated by Python async I/O boot at ASYNC_WORKERS.
+ASYNC_GROUPS = {"redis", "pg-async"}
 
 
 def registry():
@@ -152,14 +160,21 @@ def run_one(port, method, path, body, procmap):
     return rps, peak
 
 
-def _boot_and_bench(name, fw, endpoints, group):
+def _boot_and_bench(name, fw, endpoints, group, workers=WORKERS):
     port = fw["port"]
     kill_port(port)
     time.sleep(1)
     if port_open(port):
         print(f"!! {name}: port busy"); return {}
     env = dict(os.environ, **fw["env"])
-    proc = subprocess.Popen(fw["cmd"], cwd=fw["cwd"], env=env,
+    cmd = list(fw["cmd"])
+    if workers != WORKERS:
+        # per-group worker override (Python engines only)
+        if "FASTAPI_TURBO_WORKERS" in env:
+            env["FASTAPI_TURBO_WORKERS"] = str(workers)
+        if "--workers" in cmd:
+            cmd[cmd.index("--workers") + 1] = str(workers)
+    proc = subprocess.Popen(cmd, cwd=fw["cwd"], env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             preexec_fn=os.setsid)
     try:
@@ -173,7 +188,7 @@ def _boot_and_bench(name, fw, endpoints, group):
                 p = psutil.Process(pid); p.cpu_percent(interval=None); procmap[pid] = p
             except Exception:
                 pass
-        print(f"== {name} [{group}]: {len(procmap)} procs, c={CONC}, workers={WORKERS}")
+        print(f"== {name} [{group}]: {len(procmap)} procs, c={CONC}, workers={workers}")
         res = {}
         for label, method, path, body in endpoints:
             # refresh procmap (workers may have forked late)
@@ -208,7 +223,8 @@ def run_framework(name, fw):
     res = {}
     for gname, eps in boots:
         if eps:
-            res.update(_boot_and_bench(name, fw, eps, gname))
+            w = ASYNC_WORKERS if gname in ASYNC_GROUPS else WORKERS
+            res.update(_boot_and_bench(name, fw, eps, gname, workers=w))
     return res
 
 
@@ -223,13 +239,14 @@ def main():
             out = json.load(open(path)).get("data", {})
         except Exception:
             out = {}
-    print(f"cores={NCPU} workers={WORKERS} conc={CONC} dur={DUR}\n")
+    print(f"cores={NCPU} workers={WORKERS} async_workers={ASYNC_WORKERS} conc={CONC} dur={DUR}\n")
     for name in want:
         prev = out.get(name, {})
         fresh = run_framework(name, reg[name])
         out[name] = {**prev, **fresh}
     with open(path, "w") as f:
-        json.dump({"meta": {"cores": NCPU, "workers": WORKERS, "conc": CONC, "dur": DUR}, "data": out}, f, indent=2)
+        json.dump({"meta": {"cores": NCPU, "workers": WORKERS, "async_workers": ASYNC_WORKERS,
+                            "conc": CONC, "dur": DUR}, "data": out}, f, indent=2)
     print(f"\nwrote {path}")
 
 

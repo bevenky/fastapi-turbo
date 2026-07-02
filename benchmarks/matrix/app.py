@@ -103,14 +103,13 @@ def _get_sync_pg():
     return _sync_pg
 
 
-# Async PG driver: each engine runs its BEST driver (measured, benchmarks/
-# DEEPDIVE async deep-dive): under the turbo door psycopg3-async is healthy
-# (~25k rps) while asyncpg pays a pathological penalty; under uvicorn the
-# inverse holds (asyncpg healthy, psycopg3-async can deadlock). Overridable
-# via BENCH_PG_ASYNC_DRIVER=asyncpg|psycopg3 for driver-vs-driver runs.
-PG_ASYNC_DRIVER = os.environ.get("BENCH_PG_ASYNC_DRIVER") or (
-    "psycopg3" if os.environ.get("BENCH_ENGINE") == "turbo" else "asyncpg"
-)
+# Async PG driver: asyncpg for BOTH engines (measured post init-race fix).
+# History: asyncpg looked pathological under the turbo door, but that was a
+# race in the async-worker loop init (fixed) — with ONE loop per worker,
+# asyncpg is the best driver under the door too (audit: w8 45.3k submit /
+# 46.8k rps vs psycopg3-async ~40k; per-op loop CPU 26µs vs psycopg3's 45µs).
+# Overridable via BENCH_PG_ASYNC_DRIVER=asyncpg|psycopg3 for driver-vs-driver runs.
+PG_ASYNC_DRIVER = os.environ.get("BENCH_PG_ASYNC_DRIVER", "asyncpg")
 
 
 async def _get_async_pg():

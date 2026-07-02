@@ -5,7 +5,9 @@
 - Redis durability: enables AOF (appendfsync=always) around the set_durable test,
   disables it after — so set_durable measures the real fsync cost vs set.
 - bench_writes is TRUNCATE+reseeded before each framework (insert+commit grows it).
-- Postgres workers=8 (not 18): 4 driver pools x 8 workers x max 2 = 64 < max_connections(100).
+- Python sync boots run workers=8 (conn budget); async-heavy boots (async PG
+  drivers, redis) run workers=12 — the measured-best async worker count.
+  Per-boot pool isolation keeps every config under max_connections(100).
 
 Usage: python run_db_matrix.py [framework ...]
 """
@@ -26,6 +28,13 @@ from bench_throughput import (HOST, OHA, HERE, NCPU, port_open, wait_up,
 CONC = int(os.environ.get("BENCH_CONC", "64"))
 DUR = os.environ.get("BENCH_DUR", "4s")
 DBWORKERS = int(os.environ.get("BENCH_DB_WORKERS", "8"))
+# Python ASYNC-heavy boots (async PG drivers, redis) run at their measured-best
+# worker count: one event loop per worker on one GIL core, and past ~12 workers
+# extra processes only add thread thrash (w18 is the worst async config; w12
+# beats it ~25%). Per-boot isolation means only ONE driver pool exists, so the
+# conn budget stays tiny: 12 workers x max 2 = 24 << max_connections(100).
+DB_ASYNC_WORKERS = int(os.environ.get("BENCH_DB_ASYNC_WORKERS", "12"))
+ASYNC_BOOT_GROUPS = {"cross-pg-async", "redis", "pgm-pg3async", "pgm-asyncpg"}
 
 CT = ("true", "false")  # commit modes
 
@@ -141,7 +150,14 @@ def run_fw(name, fw):
         if port_open(port):
             print(f"!! {name} port busy"); return res
         reseed_writes()
-        proc = subprocess.Popen(fw["cmd"], cwd=fw["cwd"], env=dict(os.environ, **fw["env"]),
+        env = dict(os.environ, **fw["env"])
+        workers = DBWORKERS
+        if fw["scope"] == "py" and group in ASYNC_BOOT_GROUPS:
+            workers = DB_ASYNC_WORKERS
+            for k in ("FASTAPI_TURBO_WORKERS", "BENCH_WORKERS"):
+                if k in fw["env"]:
+                    env[k] = str(workers)
+        proc = subprocess.Popen(fw["cmd"], cwd=fw["cwd"], env=env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
         try:
             if not wait_up(port):
@@ -154,7 +170,7 @@ def run_fw(name, fw):
                     p = psutil.Process(pid); p.cpu_percent(interval=None); procmap[pid] = p
                 except Exception:
                     pass
-            print(f"== {name} [{group}]: {len(procmap)} procs, {len(eps)} endpoints, c={CONC}")
+            print(f"== {name} [{group}]: {len(procmap)} procs, {len(eps)} endpoints, c={CONC}, workers={workers}")
             for label, grp, method, path in eps:
                 for pid in group_pids(pgid):
                     if pid not in procmap:
@@ -185,13 +201,14 @@ def main():
             out = json.load(open(p)).get("data", {})
         except Exception:
             out = {}
-    print(f"cores={NCPU} db_workers={DBWORKERS} conc={CONC} dur={DUR}\n")
+    print(f"cores={NCPU} db_workers={DBWORKERS} async_workers={DB_ASYNC_WORKERS} conc={CONC} dur={DUR}\n")
     for name in want:
         out[name] = run_fw(name, reg[name])
     # restore redis
     redis_cli("CONFIG", "SET", "appendonly", "no")
     with open(p, "w") as f:
-        json.dump({"meta": {"cores": NCPU, "db_workers": DBWORKERS, "conc": CONC, "dur": DUR}, "data": out}, f, indent=2)
+        json.dump({"meta": {"cores": NCPU, "db_workers": DBWORKERS, "async_workers": DB_ASYNC_WORKERS,
+                            "conc": CONC, "dur": DUR}, "data": out}, f, indent=2)
     print(f"\nwrote {p}")
 
 

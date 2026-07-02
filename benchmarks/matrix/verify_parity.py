@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 from run_matrix import build_registry, boot, kill, wait_up, _port_open, HOST
@@ -87,9 +88,17 @@ def main():
                 print(f"!! {name}: boot FAILED"); overall_ok = False; continue
             time.sleep(1.0)
             fails = []
+            skipped = 0
             for method, path, body, expected in CHECKS:
                 try:
                     ok, detail = check(port, method, path, body, expected)
+                except urllib.error.HTTPError as e:
+                    if path == "/_ping" and e.code == 404:
+                        # documented asymmetry: only turbo serves the built-in
+                        # Rust /_ping (same skip policy as run_matrix.py)
+                        skipped += 1
+                        continue
+                    ok, detail = False, f"EXC {e}"
                 except Exception as e:
                     ok, detail = False, f"EXC {e}"
                 if not ok:
@@ -99,7 +108,8 @@ def main():
                 print(f"✗ {name}: {len(fails)} mismatch")
                 print("\n".join(fails))
             else:
-                print(f"✓ {name}: all {len(CHECKS)} endpoints match contract")
+                extra = f" ({skipped} not-served skipped)" if skipped else ""
+                print(f"✓ {name}: all {len(CHECKS) - skipped} endpoints match contract{extra}")
         finally:
             kill(proc)
             time.sleep(0.5)
