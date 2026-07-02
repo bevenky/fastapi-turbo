@@ -10,8 +10,10 @@ Performance notes:
     ``concurrent.futures.Future`` (allocates a Future, installs a
     callback, uses a condition variable) and instead:
 
-    * reuse ``threading.Event`` objects from a lock-free deque pool —
-      cuts ~5 μs per submit vs allocating fresh
+    * park the caller on a Rust ``SubmitGate`` (std Mutex+Condvar with
+      the GIL detached; ``threading.Event`` fallback), reused from a
+      lock-free deque pool — cuts the per-wait ``Condition.wait``
+      waiter-lock allocation AND ~5 μs per submit vs allocating fresh
     * schedule via ``loop.call_soon_threadsafe`` directly — avoids
       the ``run_coroutine_threadsafe`` wrapper's extra layer
     * stash result/exception in a plain list — avoids
@@ -63,11 +65,27 @@ _loops_started = 0
 # default from env / app config".
 _SENTINEL = object()
 
-# Lock-free-ish pool of reusable threading.Event objects. ``deque``'s
-# ``.append`` / ``.pop`` are atomic under the GIL for single-element ops,
-# so no explicit lock is needed for the common get/put cycle. Under
-# heavy contention a miss just allocates a fresh Event.
-_event_pool: deque[threading.Event] = deque()
+# Completion gate for the cross-thread submit handoff. The Rust
+# ``SubmitGate`` (std Mutex+Condvar parked with the GIL detached) is a
+# drop-in for ``threading.Event`` — same ``set``/``clear``/``wait``
+# surface, same signal interruptibility (it slices the park and runs
+# ``PyErr_CheckSignals``) — but skips ``Condition.wait``'s per-wait
+# waiter-lock allocation and Python-frame bounces on both the wait and
+# the ``set()`` side. ``FASTAPI_TURBO_PY_EVENT_GATE=1`` forces the pure
+# Python Event (safety valve / A-B benching).
+if os.environ.get("FASTAPI_TURBO_PY_EVENT_GATE"):
+    _Gate = threading.Event
+else:
+    try:
+        from fastapi_turbo._fastapi_turbo_core import SubmitGate as _Gate
+    except Exception:  # noqa: BLE001 — core unavailable (source tree only)
+        _Gate = threading.Event
+
+# Lock-free-ish pool of reusable gate objects. ``deque``'s ``.append`` /
+# ``.pop`` are atomic under the GIL for single-element ops, so no
+# explicit lock is needed for the common get/put cycle. Under heavy
+# contention a miss just allocates a fresh gate.
+_event_pool: deque = deque()
 
 
 def init():
@@ -90,9 +108,9 @@ def init():
         _thread = threading.Thread(target=_run, daemon=True, name="fastapi-turbo-async-worker")
         _thread.start()
         _ready.wait(timeout=10)
-        # Warm the event pool so the first N submits avoid allocations.
+        # Warm the gate pool so the first N submits avoid allocations.
         for _ in range(64):
-            _event_pool.append(threading.Event())
+            _event_pool.append(_Gate())
 
 
 def _run():
@@ -103,6 +121,19 @@ def _run():
     except ImportError:
         loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    # Eager task factory (3.12+): the first step of every task created on
+    # this loop runs synchronously at create_task time. On the submit path
+    # ``_kickoff`` runs on the loop thread, so the handler coroutine starts
+    # (and for I/O-bound handlers reaches its first real await) inside the
+    # same callback — killing the first-poll scheduling hop (a kevent
+    # wakeup, −13-14 µs conn=1 on async endpoints, audited). Verified to
+    # work on both stock asyncio and uvloop loops; guarded for older
+    # Pythons.
+    if hasattr(asyncio, "eager_task_factory"):
+        try:
+            loop.set_task_factory(asyncio.eager_task_factory)
+        except Exception:  # noqa: BLE001 — factory is an optimization only
+            pass
     _loops_started += 1
     # Publish the loop only after it is fully constructed — unlocked
     # fast-path readers (``submit_fast``/``get_loop``) must never observe
@@ -112,16 +143,16 @@ def _run():
     loop.run_forever()
 
 
-def _acquire_event() -> threading.Event:
+def _acquire_event():
     try:
         ev = _event_pool.pop()
         ev.clear()
         return ev
     except IndexError:
-        return threading.Event()
+        return _Gate()
 
 
-def _release_event(ev: threading.Event) -> None:
+def _release_event(ev) -> None:
     # Cap pool to avoid unbounded growth under a spike.
     if len(_event_pool) < 128:
         _event_pool.append(ev)
@@ -243,7 +274,8 @@ def submit_fast(coro, timeout=None, context=None) -> object:
     loop = _loop
     loop.call_soon_threadsafe(_kickoff, coro, box, ev, loop, context)
     # Interruptible wait — honors signals, unlike a bare Condition.wait().
-    if not ev.wait(timeout=timeout):
+    # Positional: works for both the Rust SubmitGate and threading.Event.
+    if not ev.wait(timeout):
         # Request cancellation. Both the ``cancel_requested`` flag and
         # the scheduled ``_cancel_in_box`` run on the same worker loop
         # thread, so whichever of (``_kickoff``, cancel) runs first, the

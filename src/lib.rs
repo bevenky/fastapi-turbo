@@ -40,6 +40,7 @@ fn _fastapi_turbo_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Multi-worker mode (fd-passing acceptor + workers).
     m.add_function(wrap_pyfunction!(server::run_acceptor, m)?)?;
     m.add_function(wrap_pyfunction!(server::run_worker, m)?)?;
+    m.add_class::<handler_bridge::SubmitGate>()?;
     m.add_class::<router::RouteInfo>()?;
     m.add_class::<router::ParamInfo>()?;
     m.add_class::<websocket::PyWebSocket>()?;

@@ -1,7 +1,119 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+// ── SubmitGate: Rust-side completion gate for the submit hot path ──
+
+/// How often a parked waiter re-attaches to the GIL to run
+/// `PyErr_CheckSignals` — keeps Ctrl-C responsive on main-thread waits
+/// (mirrors `threading.Event.wait`'s interruptibility) while costing one
+/// GIL round-trip per 50 ms on long waits (negligible).
+const GATE_SIGNAL_SLICE: Duration = Duration::from_millis(50);
+
+enum GateWait {
+    Done,
+    TimedOut,
+    CheckSignals,
+}
+
+/// Drop-in replacement for the `threading.Event` used by
+/// `_async_worker.submit/submit_fast` to park the calling thread until the
+/// worker loop finishes the coroutine.
+///
+/// Same duck-typed surface (`set()` / `clear()` / `is_set()` /
+/// `wait(timeout) -> bool`), but the park is a bare std `Mutex<bool>` +
+/// `Condvar` with the GIL detached — `threading.Event.wait` goes through
+/// `Condition.wait`, which allocates a fresh waiter lock and deque entry
+/// on EVERY wait and bounces through several Python frames on both the
+/// wait and the `set()` side.
+///
+/// Correctness contract (matches the Event-pool semantics in
+/// `_async_worker`):
+/// * signal-interruptible — the wait wakes every `GATE_SIGNAL_SLICE` to run
+///   `check_signals` (no-op off the main thread); a raised
+///   `KeyboardInterrupt` propagates and the caller DROPS the gate instead
+///   of pooling it,
+/// * `wait` returning `false` (timeout) leaves the caller's
+///   `task.cancel()` scheduling untouched,
+/// * exception re-raise stays on the Python side (the box), the gate only
+///   signals completion.
+#[pyclass(frozen, module = "fastapi_turbo._fastapi_turbo_core")]
+pub struct SubmitGate {
+    state: Mutex<bool>,
+    cond: Condvar,
+}
+
+#[pymethods]
+impl SubmitGate {
+    #[new]
+    fn new() -> Self {
+        SubmitGate {
+            state: Mutex::new(false),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Mark complete and wake the waiter. Called from the worker loop
+    /// (`_runner`'s `finally`) — and from `_kickoff`'s already-cancelled
+    /// short-circuit.
+    fn set(&self) {
+        let mut done = self.state.lock().unwrap();
+        *done = true;
+        self.cond.notify_all();
+    }
+
+    /// Reset for pool reuse (`_acquire_event` clears before handing out).
+    fn clear(&self) {
+        *self.state.lock().unwrap() = false;
+    }
+
+    fn is_set(&self) -> bool {
+        *self.state.lock().unwrap()
+    }
+
+    /// Park until `set()` or timeout; `true` if set, `false` on timeout —
+    /// mirroring `threading.Event.wait`. The GIL is released while parked
+    /// and re-attached each signal slice.
+    #[pyo3(signature = (timeout=None))]
+    fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<bool> {
+        let deadline =
+            timeout.map(|t| Instant::now() + Duration::from_secs_f64(t.max(0.0)));
+        loop {
+            let outcome = py.detach(|| {
+                let mut done = self.state.lock().unwrap();
+                let slice_end = Instant::now() + GATE_SIGNAL_SLICE;
+                let park_until = match deadline {
+                    Some(d) if d < slice_end => d,
+                    _ => slice_end,
+                };
+                loop {
+                    if *done {
+                        return GateWait::Done;
+                    }
+                    let now = Instant::now();
+                    if now >= park_until {
+                        return match deadline {
+                            Some(d) if now >= d => GateWait::TimedOut,
+                            _ => GateWait::CheckSignals,
+                        };
+                    }
+                    let (guard, _) = self
+                        .cond
+                        .wait_timeout(done, park_until - now)
+                        .unwrap();
+                    done = guard;
+                }
+            });
+            match outcome {
+                GateWait::Done => return Ok(true),
+                GateWait::TimedOut => return Ok(false),
+                GateWait::CheckSignals => py.check_signals()?,
+            }
+        }
+    }
+}
 
 // ── Async worker: drives suspending Python coroutines on the shared worker loop ──
 
