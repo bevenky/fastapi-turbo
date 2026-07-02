@@ -122,7 +122,15 @@ pub struct RecvAwaitable {
     rx: cb::Receiver<WsMessage>,
     state: Arc<AtomicU8>,
     kind: RecvKind,
+    // Batch-drain buffer — shared across the 3 kind-instances of one
+    // connection. One blocking recv per burst; frames already queued in the
+    // channel are drained into this buffer and served on later awaits
+    // without a GIL detach or cross-thread wake.
+    buf: Arc<std::sync::Mutex<std::collections::VecDeque<WsMessage>>>,
 }
+
+/// Max frames pulled per wake — bounds GIL-resident burst processing.
+const BATCH_DRAIN_CAP: usize = 64;
 
 #[pymethods]
 impl RecvAwaitable {
@@ -134,9 +142,30 @@ impl RecvAwaitable {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let rx = self.rx.clone();
-        let state = self.state.clone();
-        let msg = py.detach(|| rx.recv().map_err(|_| handle_close_err(&state)))?;
+        // Batch-drain fast path: serve from the shared buffer when a prior
+        // wake already pulled queued frames — no detach, no blocking recv.
+        let buffered = self.buf.lock().unwrap().pop_front();
+        let msg = match buffered {
+            Some(m) => m,
+            None => {
+                let rx = self.rx.clone();
+                let state = self.state.clone();
+                let first = py.detach(|| rx.recv().map_err(|_| handle_close_err(&state)))?;
+                // One wake, many frames: move whatever else is already queued
+                // into the buffer (bounded); later awaits pop without blocking.
+                // FIFO order is preserved; a Close is just a buffered message
+                // (the reader task stops after forwarding Close, so nothing
+                // ever follows it in the channel).
+                let mut b = self.buf.lock().unwrap();
+                while b.len() < BATCH_DRAIN_CAP {
+                    match self.rx.try_recv() {
+                        Ok(m) => b.push_back(m),
+                        Err(_) => break,
+                    }
+                }
+                first
+            }
+        };
         match self.kind {
             RecvKind::Dict => {
                 let dict = PyDict::new(py);
@@ -238,6 +267,10 @@ pub struct PyWebSocket {
     cached_dict: std::sync::OnceLock<Py<RecvAwaitable>>,
     cached_text: std::sync::OnceLock<Py<RecvAwaitable>>,
     cached_bytes: std::sync::OnceLock<Py<RecvAwaitable>>,
+    // Batch-drain frame buffer handed to every receive awaitable — see
+    // `RecvAwaitable::buf`. Shared so receive()/receive_text()/receive_bytes()
+    // interleave over one FIFO stream.
+    recv_buf: Arc<std::sync::Mutex<std::collections::VecDeque<WsMessage>>>,
     // Scope info populated by the Rust route handler from the inbound request.
     // Python reads via get_scope_dict() to build HTTPConnection-like properties.
     scope_info: Arc<WsScopeInfo>,
@@ -260,6 +293,7 @@ impl PyWebSocket {
                         rx: self.rx.clone(),
                         state: self.state.clone(),
                         kind: RecvKind::Dict,
+                        buf: self.recv_buf.clone(),
                     },
                 )
                 .expect("create dict awaitable")
@@ -276,6 +310,7 @@ impl PyWebSocket {
                         rx: self.rx.clone(),
                         state: self.state.clone(),
                         kind: RecvKind::Text,
+                        buf: self.recv_buf.clone(),
                     },
                 )
                 .expect("create text awaitable")
@@ -292,6 +327,7 @@ impl PyWebSocket {
                         rx: self.rx.clone(),
                         state: self.state.clone(),
                         kind: RecvKind::Bytes,
+                        buf: self.recv_buf.clone(),
                     },
                 )
                 .expect("create bytes awaitable")
@@ -583,6 +619,7 @@ pub async fn handle_ws_upgrade(
         tx: tx_out,
         rx: cb_rx,
         state: state.clone(),
+        recv_buf: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         cached_dict: std::sync::OnceLock::new(),
         cached_text: std::sync::OnceLock::new(),
         cached_bytes: std::sync::OnceLock::new(),
