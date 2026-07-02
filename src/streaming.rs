@@ -95,32 +95,52 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
     // CORRUPTS it, so we only fast-path gens proven await-free.
     let noawait = is_async && stream_noawait_verdict(py, obj, &iter_bound);
 
-    // Pre-drain the first chunk synchronously so hyper can coalesce the
-    // response headers and the first data frame into a single TCP write.
-    // For async generators we skip this optimization entirely: probing
-    // `__anext__()` with a partial `send(None)` leaves the generator in
-    // a non-recoverable state if it suspends on real I/O (asyncio.sleep,
-    // DB reads) — subsequent `__anext__()` calls then raise "asynchronous
-    // generator already running" and the body ends up empty. The
-    // thread-local loop in `iterate_async_generator` handles chunk #0
-    // reliably, at the cost of ~5µs extra TTFB vs the fast path.
-    let first_chunk: Option<bytes::Bytes> = if is_async {
-        None
-    } else {
-        drain_one_sync_chunk(&iter_bound)
-    };
-
-    let iterator: Py<PyAny> = iter_bound.unbind();
-
-    // Create a channel-backed stream.
+    // Create a channel-backed stream up front — the inline budget-drain fills
+    // it directly so no re-queue copy is ever needed.
     let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
 
-    // Prime the channel with the pre-drained first chunk so it's ready
-    // before the streaming task wakes up.
-    if let Some(chunk) = first_chunk {
-        // try_send never blocks here — channel is empty and has capacity 32.
-        let _ = tx.try_send(Ok(chunk));
+    let legacy_forced = stream_thread_forced();
+
+    // Inline budget-drain (the one-write fast path): short bodies from sync
+    // generators and PROVEN no-await async generators are fully drained into
+    // the channel HERE, and the Sender is dropped BEFORE `into_response` —
+    // hyper then sees headers + every data frame + EOF in one poll cycle and
+    // emits them as a SINGLE vectored write (verified raw-axum/Fastify wire
+    // behavior: 1 write syscall, 1 client read). This kills the header/body
+    // write split, the close→EOF gap, AND the per-stream driver dispatch for
+    // the common short-stream case. Bounds: channel capacity (32 chunks) and
+    // a wall-clock budget (~100µs) — anything left over falls to the existing
+    // drivers unchanged. `FASTAPI_TURBO_STREAM_THREAD=1` skips the inline
+    // drain entirely (legacy single-chunk pre-drain + dedicated thread).
+    let mut drained_complete = false;
+    // An `__anext__` coro that unexpectedly SUSPENDED during the no-await
+    // inline drain (defense-in-depth; the bytecode verdict means this should
+    // never fire). Handed to the blocking driver, which resumes it via
+    // `_resume_anext` on its thread-local `stream_loop` — the SAME
+    // conservative fallback the legacy inline driver uses.
+    let mut pending_coro: Option<Py<PyAny>> = None;
+
+    if legacy_forced {
+        // Legacy behavior, unchanged: pre-drain ONE chunk for sync iterators
+        // so hyper coalesces headers + first frame; the dedicated thread does
+        // the rest.
+        if !is_async {
+            if let Some(chunk) = drain_one_sync_chunk(&iter_bound) {
+                // try_send never blocks here — channel is empty (capacity 32).
+                let _ = tx.try_send(Ok(chunk));
+            }
+        }
+    } else if !is_async {
+        drained_complete = inline_drain_sync(&iter_bound, &tx);
+    } else if noawait {
+        match inline_drain_noawait(py, &iter_bound, &tx) {
+            InlineDrain::Complete => drained_complete = true,
+            InlineDrain::Leftover => {}
+            InlineDrain::Suspended(coro) => pending_coro = Some(coro),
+        }
     }
+
+    let iterator: Py<PyAny> = iter_bound.unbind();
 
     // Mechanism 2: an async gen with REAL awaits multiplexes as a TASK on the
     // shared `_async_worker` loop — no per-stream thread, no per-stream event
@@ -128,20 +148,21 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
     // across every in-flight stream). Falls back to the legacy dedicated-
     // thread driver when the loop is unavailable (closed / no tokio runtime
     // context) or when `FASTAPI_TURBO_STREAM_THREAD=1` forces it.
-    let worker_scheduled = is_async
+    let worker_scheduled = !drained_complete
+        && is_async
         && !noawait
-        && !stream_thread_forced()
+        && !legacy_forced
         && schedule_stream_on_worker_loop(py, &iterator, &tx);
 
     // Legacy paths: spawn a blocking task that iterates the Python generator
     // and pushes the remaining chunks through the channel. (Sync gens and
-    // proven-no-await async gens ALWAYS take this path — unchanged.)
-    if !worker_scheduled {
+    // proven-no-await async gens with leftover chunks take this path.)
+    if !drained_complete && !worker_scheduled {
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 if is_async {
                     if noawait {
-                        iterate_async_generator_inline(py, &iterator, &tx);
+                        iterate_async_generator_inline(py, &iterator, &tx, pending_coro);
                     } else {
                         iterate_async_generator(py, &iterator, &tx);
                     }
@@ -152,10 +173,141 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
             });
         });
     }
+    // When `drained_complete`, `tx` is dropped as this function returns —
+    // the channel is already closed by the time hyper polls the body, so the
+    // whole response (headers + coalesced chunks + EOF) leaves in one write.
 
     let body = Body::from_stream(CoalescingReceiver::new(rx));
 
     (status, headers, body).into_response()
+}
+
+/// Wall-clock budget for the inline drain at create-time. Bounds the extra
+/// time-to-headers a multi-chunk generator can add; a SINGLE slow step can
+/// still exceed it (same exposure `drain_one_sync_chunk` always had for
+/// chunk #1) — the budget is checked between steps.
+const INLINE_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_micros(100);
+
+/// Outcome of the no-await inline drain.
+enum InlineDrain {
+    /// Generator exhausted (or errored — captured onto the app first): the
+    /// caller drops the Sender before `into_response` → one-write response.
+    Complete,
+    /// Capacity/budget hit: chunks so far are queued; the leftover iterator
+    /// continues on the existing driver.
+    Leftover,
+    /// A bare `send(None)` unexpectedly suspended — this ALREADY-STARTED
+    /// `__anext__` coro must be resumed via `_resume_anext` (never re-sent
+    /// from the front) before normal iteration continues.
+    Suspended(Py<PyAny>),
+}
+
+/// Budget-drain a SYNC iterator into the body channel at create-time.
+/// Returns `true` when the iterator finished (exhausted or errored+captured)
+/// so the caller can close the channel before building the response. Skips
+/// plain iterables (no `__next__`) — same rule as `drain_one_sync_chunk`:
+/// the driver's `__iter__()` would restart them and duplicate chunks.
+fn inline_drain_sync(
+    iter_bound: &Bound<'_, PyAny>,
+    tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+) -> bool {
+    let py = iter_bound.py();
+    if !iter_bound
+        .hasattr(pyo3::intern!(py, "__next__"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let start = std::time::Instant::now();
+    loop {
+        // Reserve room BEFORE stepping the generator: nothing consumes the
+        // channel until hyper polls the body (after we return), so a full
+        // channel here means the leftover driver must take over.
+        if tx.capacity() == 0 {
+            return false;
+        }
+        match iter_bound.call_method0(pyo3::intern!(py, "__next__")) {
+            Ok(val) => {
+                let _ = tx.try_send(Ok(python_val_to_bytes(&val)));
+                if start.elapsed() >= INLINE_DRAIN_BUDGET {
+                    return false;
+                }
+            }
+            Err(e) => {
+                if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                    // Capture-then-close ordering: the exception lands on the
+                    // app HERE; the Sender drops when create returns.
+                    if let Some(app_obj) = crate::router::current_app(py) {
+                        if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
+                            let _ = lst.call_method1(py, "append", (e.value(py),));
+                        }
+                    }
+                }
+                return true;
+            }
+        }
+    }
+}
+
+/// Budget-drain a PROVEN no-await async generator into the body channel at
+/// create-time, driving each `__anext__` with a bare `send(None)` (no event
+/// loop) exactly like `iterate_async_generator_inline` — just on the request
+/// thread, under the GIL we already hold, with capacity/budget bounds.
+fn inline_drain_noawait(
+    py: Python<'_>,
+    iter_bound: &Bound<'_, PyAny>,
+    tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+) -> InlineDrain {
+    let aiter = match iter_bound.call_method0(pyo3::intern!(py, "__aiter__")) {
+        Ok(a) => a,
+        Err(e) => {
+            capture_or_eprint_stream_err(py, &e);
+            return InlineDrain::Complete;
+        }
+    };
+    let start = std::time::Instant::now();
+    loop {
+        if tx.capacity() == 0 {
+            return InlineDrain::Leftover;
+        }
+        let coro = match aiter.call_method0(pyo3::intern!(py, "__anext__")) {
+            Ok(c) => c,
+            Err(e) => {
+                capture_or_eprint_stream_err(py, &e);
+                return InlineDrain::Complete;
+            }
+        };
+        match coro.call_method1(pyo3::intern!(py, "send"), (py.None(),)) {
+            // SUSPENDED (should never happen for a proven no-await gen):
+            // hand the started coro to the blocking driver's conservative
+            // `_resume_anext`-on-`stream_loop` fallback — resuming from the
+            // suspension point is the only correct continuation.
+            Ok(_yielded) => return InlineDrain::Suspended(coro.unbind()),
+            Err(e) => {
+                if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                    // Normal per-chunk completion: chunk is the StopIteration value.
+                    match e.value(py).getattr(pyo3::intern!(py, "value")) {
+                        Ok(v) if !v.is_none() => {
+                            let _ = tx.try_send(Ok(python_val_to_bytes(&v)));
+                        }
+                        // StopIteration() with no value → empty chunk, skip.
+                        _ => {}
+                    }
+                    if start.elapsed() >= INLINE_DRAIN_BUDGET {
+                        return InlineDrain::Leftover;
+                    }
+                } else if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
+                    return InlineDrain::Complete; // gen exhausted
+                } else {
+                    // RuntimeError (destructive bare-send on a loop-needing
+                    // await) or a mid-stream raise — capture-then-close, same
+                    // as the inline driver.
+                    capture_or_eprint_stream_err(py, &e);
+                    return InlineDrain::Complete;
+                }
+            }
+        }
+    }
 }
 
 /// Body-channel consumer that coalesces back-to-back-READY chunks.
@@ -976,6 +1128,7 @@ fn iterate_async_generator_inline(
     py: Python<'_>,
     iterator: &Py<PyAny>,
     tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    pending: Option<Py<PyAny>>,
 ) {
     let aiter = match iterator.bind(py).call_method0(pyo3::intern!(py, "__aiter__")) {
         Ok(a) => a,
@@ -989,6 +1142,27 @@ fn iterate_async_generator_inline(
     // verdict should mean this never fires, but the fallback must be correct).
     let mut loop_obj: Option<Py<PyAny>> = None;
     let mut resume_helper: Option<Py<PyAny>> = None;
+
+    // An `__anext__` coro the create-time inline drain left SUSPENDED —
+    // resume it from its suspension point first (never re-send from the
+    // front), push its chunk, then continue normal iteration.
+    if let Some(started) = pending {
+        let started_bound = started.bind(py);
+        match resume_suspended_anext(py, started_bound, &mut loop_obj, &mut resume_helper) {
+            Ok(Some(chunk)) => {
+                let alive = py.detach(|| tx.blocking_send(Ok(chunk)).is_ok());
+                if !alive {
+                    close_aiter(py, &aiter, &mut loop_obj);
+                    return;
+                }
+            }
+            Ok(None) => return, // StopAsyncIteration — done
+            Err(e) => {
+                capture_or_eprint_stream_err(py, &e);
+                return;
+            }
+        }
+    }
 
     loop {
         let coro = match aiter.call_method0(pyo3::intern!(py, "__anext__")) {
