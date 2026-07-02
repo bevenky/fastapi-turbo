@@ -227,8 +227,6 @@ func main() {
 		panic(fmt.Sprintf("redis ping failed: %v", err))
 	}
 
-	largeJSON := largeList()
-
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 
@@ -243,7 +241,9 @@ func main() {
 	r.GET("/async/hello", hello)
 
 	// ── plain JSON: large ───────────────────────────────────────────
-	jsonLarge := func(c *gin.Context) { c.JSON(http.StatusOK, largeJSON) }
+	// CONTRACT: the payload is built PER REQUEST (all other frameworks do —
+	// caching it at startup understated Gin's cost by ~40µs/req; audited).
+	jsonLarge := func(c *gin.Context) { c.JSON(http.StatusOK, largeList()) }
 	r.GET("/json/large", jsonLarge)
 	r.GET("/async/json/large", jsonLarge)
 
