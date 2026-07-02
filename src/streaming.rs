@@ -4,7 +4,6 @@ use axum::response::{IntoResponse, Response};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
 /// Build an Axum streaming response from a Python `StreamingResponse` object.
 ///
@@ -154,10 +153,105 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
         });
     }
 
-    let stream = ReceiverStream::new(rx);
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(CoalescingReceiver::new(rx));
 
     (status, headers, body).into_response()
+}
+
+/// Body-channel consumer that coalesces back-to-back-READY chunks.
+///
+/// The stream drivers (worker-loop `_drive_stream`, inline no-await, sync
+/// generator loop) often push several small chunks between two hyper wakeups
+/// — e.g. a cooperative-yield SSE gen emits its whole burst while the
+/// consumer task is still scheduled. Emitting each as its own `Bytes` costs
+/// one body-frame poll + chunked-encoding write per chunk. After one chunk
+/// arrives, opportunistically `try_recv` chunks that are ALREADY queued and
+/// emit them as a single `Bytes`.
+///
+/// Latency rule: NEVER wait for more chunks — only what is already buffered
+/// is batched (`try_recv`, no extra poll registration). A lone chunk is
+/// forwarded zero-copy (no `BytesMut` round trip). `COALESCE_MAX` caps the
+/// batch so large-chunk streams (file bodies) keep their zero-copy
+/// forwarding instead of paying a memcpy.
+struct CoalescingReceiver {
+    rx: mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+    /// Item pulled by `try_recv` during a drain that must be emitted on the
+    /// NEXT poll (an error chunk; data order is preserved).
+    pending: Option<Result<bytes::Bytes, std::io::Error>>,
+    /// Sender side observed closed during a drain — emit EOF on the next poll.
+    done: bool,
+}
+
+/// Stop batching once the coalesced buffer reaches this size; bigger chunks
+/// are cheaper to forward as-is than to memcpy (SSE/token streams are far
+/// below this, file streams far above).
+const COALESCE_MAX: usize = 16 * 1024;
+
+impl CoalescingReceiver {
+    fn new(rx: mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>) -> Self {
+        Self {
+            rx,
+            pending: None,
+            done: false,
+        }
+    }
+}
+
+impl tokio_stream::Stream for CoalescingReceiver {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+
+        let this = self.get_mut();
+        if let Some(item) = this.pending.take() {
+            return Poll::Ready(Some(item));
+        }
+        if this.done {
+            return Poll::Ready(None);
+        }
+        let first = match this.rx.poll_recv(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+            Poll::Ready(Some(Ok(chunk))) => chunk,
+        };
+        if first.len() >= COALESCE_MAX {
+            return Poll::Ready(Some(Ok(first)));
+        }
+        // Batch chunks that are already queued. `buf` is only materialized
+        // once a SECOND chunk exists — the lone-chunk fast path stays
+        // zero-copy.
+        let mut buf: Option<bytes::BytesMut> = None;
+        loop {
+            match this.rx.try_recv() {
+                Ok(Ok(next)) => {
+                    let b = buf.get_or_insert_with(|| bytes::BytesMut::from(first.as_ref()));
+                    b.extend_from_slice(&next);
+                    if b.len() >= COALESCE_MAX {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => {
+                    // Emit batched data first; the error keeps its position.
+                    this.pending = Some(Err(e));
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    this.done = true;
+                    break;
+                }
+            }
+        }
+        match buf {
+            Some(b) => Poll::Ready(Some(Ok(b.freeze()))),
+            None => Poll::Ready(Some(Ok(first))),
+        }
+    }
 }
 
 /// Drive a sync iterator one step WITHOUT resetting state. Only safe when
