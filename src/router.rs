@@ -1696,8 +1696,23 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                 route_obj: route.handler.getattr(py, "_fastapi_turbo_route_obj").ok(),
                 status_code: route.status_code,
                 worker_timeout,
+                // Async-inline registration (FASTAPI_TURBO_ASYNC_INLINE) pre-marks
+                // known-suspending handlers with ``_fastapi_turbo_needs_worker`` so
+                // the door NEVER probes them with send(None) — the first request
+                // already takes the inline worker-loop path. Flag off: plain
+                // UNKNOWN, byte-identical to the classic build.
                 handler_async_class: std::sync::atomic::AtomicU8::new(
-                    crate::handler_bridge::ASYNC_CLASS_UNKNOWN,
+                    if async_inline_enabled()
+                        && route
+                            .handler
+                            .getattr(py, "_fastapi_turbo_needs_worker")
+                            .and_then(|v| v.extract::<bool>(py))
+                            .unwrap_or(false)
+                    {
+                        crate::handler_bridge::ASYNC_CLASS_NEEDS_WORKER
+                    } else {
+                        crate::handler_bridge::ASYNC_CLASS_UNKNOWN
+                    },
                 ),
             })
         });
@@ -2092,6 +2107,409 @@ async fn dispatch_404(req: axum::http::Request<axum::body::Body>) -> Response {
         .unwrap()
 }
 
+// ═══ FASTAPI_TURBO_ASYNC_INLINE (E): drive async requests on the worker loop ═══
+//
+// The classic needs-worker path builds the coroutine on the tokio thread,
+// ships it to the worker loop via `_async_worker.submit_fast`, and then BLOCKS
+// the tokio worker thread on a `threading.Event` for the whole request
+// (~25 μs/submit, one parked OS thread per in-flight async request).
+//
+// The inline path instead enqueues a small Rust pyclass job onto the loop via
+// `call_soon_threadsafe` and has the tokio task await a `oneshot::Receiver` —
+// zero blocked threads, zero Event handoff. Parameter extraction, framework
+// injection, and coroutine creation all run ON the loop thread (one GIL
+// context); response conversion runs back on the tokio side (the conversion
+// helpers read per-request thread-locals and `create_streaming_response`
+// needs a tokio runtime context — neither is loop-thread-safe).
+//
+// Opt-in via `FASTAPI_TURBO_ASYNC_INLINE=1`. v1 scope: async handlers without
+// dependencies, no http-middleware chain, no file/form params, and only once
+// the route has classified as ASYNC_CLASS_NEEDS_WORKER (UNKNOWN/SYNC_FAST
+// requests keep the classic probe path, which converges the route here after
+// its first observed suspension).
+
+/// Process-wide flag: `FASTAPI_TURBO_ASYNC_INLINE=1` (read once).
+fn async_inline_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("FASTAPI_TURBO_ASYNC_INLINE")
+            .map(|v| matches!(v.trim(), "1" | "true" | "True" | "TRUE" | "yes" | "on"))
+            .unwrap_or(false)
+    })
+}
+
+/// Everything the loop-side job needs, moved out of `handle_request`'s locals.
+/// All fields are owned/thread-agnostic — no borrow of the axum request
+/// survives into the loop thread.
+struct InlineParts {
+    path_map: HashMap<String, String>,
+    query_params: HashMap<String, String>,
+    query_multi: HashMap<String, Vec<String>>,
+    headers: Option<HeaderMap>,
+    /// Content-Type carrier for the body arm (refcounted `Bytes` clone; the
+    /// extractor reads it via `.to_str()` exactly like the classic call sites).
+    content_type: Option<HeaderValue>,
+    body_bytes: bytes::Bytes,
+    body_json: Option<serde_json::Value>,
+    scope_method: Option<String>,
+    scope_path: Option<String>,
+    scope_query: Option<String>,
+    client_addr: Option<SocketAddr>,
+    /// Shipped explicitly (NOT via the tokio-side thread-local) — the job seeds
+    /// the loop thread's `REQUEST_DISCONNECT_FLAG` from it.
+    disconnect_flag: Option<Py<PyAny>>,
+}
+
+/// What the loop thread sends back to the awaiting tokio task.
+enum LoopOutcome {
+    /// A fully-built response (Rust-side validation 422/400 — no conversion needed).
+    Ready(Response),
+    /// Handler completed: convert `obj` on the tokio side with the shipped
+    /// per-request context (kwargs for the background-task drain, the injected
+    /// Response/BackgroundTasks shells for merge/drain).
+    Result {
+        obj: Py<PyAny>,
+        kwargs: Py<PyDict>,
+        injected_bg: Option<Py<PyAny>>,
+        injected_resp: Option<Py<PyAny>>,
+    },
+    /// Handler (or extraction/injection plumbing) raised — converted via
+    /// `pyerr_to_response` on the tokio side (same arm the classic path uses,
+    /// including the TimeoutError→504 mapping and 500-capture-onto-app).
+    Error(PyErr),
+}
+
+/// Shared reply slot: whichever of {done-callback, timeout timer} takes the
+/// sender first wins; the loser observes `None` and stands down.
+type InlineReply = Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<LoopOutcome>>>>;
+
+fn send_inline_outcome(reply: &InlineReply, outcome: LoopOutcome) {
+    if let Some(tx) = reply.lock().ok().and_then(|mut g| g.take()) {
+        // Send failure = receiver dropped (client disconnected) — the outcome
+        // (and its Py refs) drop here on the loop thread under the GIL.
+        let _ = tx.send(outcome);
+    }
+}
+
+/// Enqueued via `loop.call_soon_threadsafe(job)`; `__call__` runs on the loop
+/// thread under the loop's GIL as a plain callback. The whole method is
+/// synchronous (no awaits), so loop-thread TL use inside it is race-free.
+#[pyclass]
+struct InlineJob {
+    state: Arc<RouteState>,
+    parts: Option<Box<InlineParts>>,
+    reply: InlineReply,
+}
+
+#[pymethods]
+impl InlineJob {
+    fn __call__(&mut self, py: Python<'_>) {
+        let Some(parts) = self.parts.take() else {
+            return;
+        };
+        run_inline_job(py, &self.state, *parts, &self.reply);
+    }
+}
+
+/// Loop-thread body of the job: ctxvar seed → extraction → injection →
+/// coroutine → `loop.create_task` → completer wiring (+ optional timeout timer).
+fn run_inline_job(py: Python<'_>, state: &Arc<RouteState>, parts: InlineParts, reply: &InlineReply) {
+    // Loop-thread TL guard: the single worker loop interleaves EVERY in-flight
+    // request between this synchronous block and the done-callback, so the
+    // per-request thread-locals must never survive past this function.
+    let _guard = DisconnectFlagGuard;
+    // Request-scope ContextVar: `Handle._run` executes this callback inside the
+    // context copied at `call_soon_threadsafe` time; setting the ctxvar here
+    // mutates that context, and `loop.create_task` below snapshots the current
+    // (mutated) context — so the request scope propagates into the handler
+    // task exactly like the classic tokio-thread set → `_kickoff` chain.
+    set_request_scope_ctxvar(
+        py,
+        &parts.scope_method,
+        &parts.scope_path,
+        &parts.scope_query,
+        state,
+    );
+    if let Some(flag) = parts.disconnect_flag {
+        REQUEST_DISCONNECT_FLAG.with(|f| *f.borrow_mut() = Some(flag));
+    }
+    let body_json_opt = if state.has_body_params {
+        parts.body_json.as_ref()
+    } else {
+        None
+    };
+    // v1 gate excludes file/form routes, so there are never multipart fields.
+    let mut multipart_fields: Option<HashMap<String, Vec<ParsedField>>> = None;
+    let kwargs = match extract_params_to_pydict_full(
+        py,
+        &state.params,
+        &parts.path_map,
+        &parts.query_params,
+        &parts.query_multi,
+        &parts.headers,
+        parts.content_type.as_ref().and_then(|v| v.to_str().ok()),
+        &body_json_opt,
+        &parts.body_bytes,
+        &mut multipart_fields,
+        state.defers_extraction_errors,
+        state.lax_content_type,
+        state.has_param_model,
+    ) {
+        Ok(kw) => kw,
+        Err(resp) => return send_inline_outcome(reply, LoopOutcome::Ready(resp)),
+    };
+    if let Err(e) = inject_framework_objects(
+        py,
+        &kwargs,
+        state,
+        &parts.scope_method,
+        &parts.scope_path,
+        &parts.scope_query,
+        &parts.headers,
+        &parts.path_map,
+        &parts.query_params,
+        &parts.body_bytes,
+        &parts.client_addr,
+    ) {
+        return send_inline_outcome(reply, LoopOutcome::Error(e));
+    }
+    // Take the injected shells OUT of the loop TLs now (the guard would clear
+    // them anyway) — they ride to the tokio side on the completer instead.
+    let injected_resp = INJECTED_RESPONSE.with(|c| c.borrow_mut().take());
+    let injected_bg = INJECTED_BACKGROUND_TASKS.with(|c| c.borrow_mut().take());
+    // Build the coroutine (body not executed at creation).
+    let coro = match state.handler.call(py, (), Some(&kwargs)) {
+        Ok(c) => c,
+        Err(e) => return send_inline_outcome(reply, LoopOutcome::Error(e)),
+    };
+    let Some(loop_obj) = crate::handler_bridge::worker_loop() else {
+        let _ = coro.call_method0(py, "close");
+        return send_inline_outcome(
+            reply,
+            LoopOutcome::Error(pyo3::exceptions::PyRuntimeError::new_err(
+                "async worker loop not initialized",
+            )),
+        );
+    };
+    let task = match loop_obj.call_method1(py, "create_task", (coro.bind(py),)) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = coro.call_method0(py, "close");
+            return send_inline_outcome(reply, LoopOutcome::Error(e));
+        }
+    };
+    let completer = match Py::new(
+        py,
+        LoopCompleter {
+            reply: reply.clone(),
+            kwargs: kwargs.unbind(),
+            injected_bg,
+            injected_resp,
+            timer: std::sync::Mutex::new(None),
+            task: std::sync::Mutex::new(None),
+            timeout_secs: state.worker_timeout,
+        },
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = task.call_method0(py, "cancel");
+            return send_inline_outcome(reply, LoopOutcome::Error(e));
+        }
+    };
+    // Timeout: schedule the completer's `_timeout` on the loop. Delivering the
+    // 504 AT the deadline (not from the cancelled task's done-callback)
+    // preserves `submit_fast` semantics — a handler that swallows
+    // CancelledError must not convert a guaranteed 504 into a late 200.
+    if let Some(t) = state.worker_timeout {
+        if let Ok(cb) = completer.bind(py).getattr("_timeout") {
+            if let Ok(timer) = loop_obj.call_method1(py, "call_later", (t, cb)) {
+                if let Ok(mut slot) = completer.borrow(py).timer.lock() {
+                    *slot = Some(timer);
+                }
+            }
+        }
+    }
+    if let Ok(mut slot) = completer.borrow(py).task.lock() {
+        *slot = Some(task.clone_ref(py));
+    }
+    if let Err(e) = task.call_method1(py, "add_done_callback", (completer.bind(py),)) {
+        if let Ok(mut tslot) = completer.borrow(py).timer.lock() {
+            if let Some(timer) = tslot.take() {
+                let _ = timer.call_method0(py, "cancel");
+            }
+        }
+        let _ = task.call_method0(py, "cancel");
+        send_inline_outcome(reply, LoopOutcome::Error(e));
+    }
+}
+
+/// Task done-callback + timeout timer target. Both run on the loop thread;
+/// `oneshot::Sender::send` is non-blocking, so both are loop-safe.
+#[pyclass]
+struct LoopCompleter {
+    reply: InlineReply,
+    kwargs: Py<PyDict>,
+    injected_bg: Option<Py<PyAny>>,
+    injected_resp: Option<Py<PyAny>>,
+    timer: std::sync::Mutex<Option<Py<PyAny>>>,
+    task: std::sync::Mutex<Option<Py<PyAny>>>,
+    timeout_secs: Option<f64>,
+}
+
+#[pymethods]
+impl LoopCompleter {
+    fn __call__(&self, py: Python<'_>, task: Bound<'_, PyAny>) {
+        // Cancel a still-pending timeout timer. asyncio Handle.cancel() also
+        // suppresses an already-queued-but-not-run callback, so after this the
+        // timer can no longer race us (the Mutex-take below is the backstop).
+        if let Ok(mut slot) = self.timer.lock() {
+            if let Some(timer) = slot.take() {
+                let _ = timer.call_method0(py, "cancel");
+            }
+        }
+        let Some(tx) = self.reply.lock().ok().and_then(|mut g| g.take()) else {
+            // Timed out (504 already delivered) or client disconnected.
+            // Retrieve the exception so asyncio doesn't warn
+            // "exception was never retrieved"; drop everything.
+            let cancelled = task
+                .call_method0("cancelled")
+                .and_then(|v| v.extract::<bool>())
+                .unwrap_or(false);
+            if !cancelled {
+                let _ = task.call_method0("exception");
+            }
+            return;
+        };
+        // `result()` re-raises the task's exception (including CancelledError)
+        // — shipping the PyErr gives byte-identical conversion to the classic
+        // path's re-raise-on-caller-thread → pyerr_to_response.
+        match task.call_method0("result") {
+            Ok(obj) => {
+                let _ = tx.send(LoopOutcome::Result {
+                    obj: obj.unbind(),
+                    kwargs: self.kwargs.clone_ref(py),
+                    injected_bg: self.injected_bg.as_ref().map(|o| o.clone_ref(py)),
+                    injected_resp: self.injected_resp.as_ref().map(|o| o.clone_ref(py)),
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(LoopOutcome::Error(e));
+            }
+        }
+    }
+
+    /// Timer callback: take the sender and deliver the TimeoutError NOW, then
+    /// cancel the task. `pyerr_to_response` maps PyTimeoutError → 504
+    /// text/plain "Gateway Timeout", NOT captured onto the app — the exact arm
+    /// the classic `submit_fast` timeout takes.
+    fn _timeout(&self, py: Python<'_>) {
+        if let Some(tx) = self.reply.lock().ok().and_then(|mut g| g.take()) {
+            let secs = self.timeout_secs.unwrap_or(f64::NAN);
+            let _ = tx.send(LoopOutcome::Error(pyo3::exceptions::PyTimeoutError::new_err(
+                format!("fastapi-turbo worker-loop submit timed out after {secs:?}s"),
+            )));
+        }
+        if let Ok(slot) = self.task.lock() {
+            if let Some(task) = slot.as_ref() {
+                let _ = task.call_method0(py, "cancel");
+            }
+        }
+    }
+}
+
+/// Why an inline enqueue didn't happen.
+enum InlineEnqueueError {
+    /// Loop unavailable (closed / not yet cached) — parts returned intact so
+    /// the caller can fall back to the classic needs-worker path.
+    Recovered(Box<InlineParts>),
+    /// Parts were consumed before the failure (allocation error) — unrecoverable.
+    Lost(PyErr),
+}
+
+/// One short GIL tap on the tokio thread: wrap the parts in an `InlineJob` and
+/// `call_soon_threadsafe` it onto the worker loop.
+fn enqueue_inline_job(
+    state: Arc<RouteState>,
+    parts: Box<InlineParts>,
+) -> Result<tokio::sync::oneshot::Receiver<LoopOutcome>, InlineEnqueueError> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<LoopOutcome>();
+    let reply: InlineReply = Arc::new(std::sync::Mutex::new(Some(tx)));
+    Python::attach(|py| {
+        let Some(call_soon) = crate::handler_bridge::worker_call_soon() else {
+            return Err(InlineEnqueueError::Recovered(parts));
+        };
+        let job = match Py::new(
+            py,
+            InlineJob {
+                state,
+                parts: Some(parts),
+                reply,
+            },
+        ) {
+            Ok(j) => j,
+            Err(e) => return Err(InlineEnqueueError::Lost(e)),
+        };
+        match call_soon.call1(py, (job.bind(py),)) {
+            Ok(_) => Ok(rx),
+            // RuntimeError (loop closed) — take the parts back for the fallback.
+            Err(e) => match job.borrow_mut(py).parts.take() {
+                Some(p) => Err(InlineEnqueueError::Recovered(p)),
+                None => Err(InlineEnqueueError::Lost(e)),
+            },
+        }
+    })
+}
+
+/// Tokio-side epilogue: convert the loop's outcome into the HTTP response.
+/// Runs on a tokio worker thread (post-await, possibly a different one than
+/// enqueued) — per-request TLs are seeded HERE, inside one synchronous attach,
+/// so the conversion helpers (`route_default_status` / `has_injected_response`
+/// / `apply_injected_response` / `drain_background_tasks`) see them, and
+/// `create_streaming_response`'s `spawn_blocking` has its runtime context.
+fn finish_inline_outcome(
+    state: &Arc<RouteState>,
+    outcome: Result<LoopOutcome, tokio::sync::oneshot::error::RecvError>,
+    range_header: Option<&str>,
+    if_range_header: Option<&str>,
+) -> Response {
+    match outcome {
+        // Sender dropped without sending (job dropped unrun — loop shutdown
+        // mid-flight). Nothing to convert.
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [("content-type", "text/plain; charset=utf-8")],
+            "Internal Server Error",
+        )
+            .into_response(),
+        Ok(LoopOutcome::Ready(resp)) => resp,
+        Ok(LoopOutcome::Error(err)) => Python::attach(|py| pyerr_to_response(py, &err)),
+        Ok(LoopOutcome::Result {
+            obj,
+            kwargs,
+            injected_bg,
+            injected_resp,
+        }) => Python::attach(|py| {
+            // No await between here and return — thread-stable, guard-safe.
+            let _guard = DisconnectFlagGuard;
+            ROUTE_DEFAULT_STATUS.with(|s| s.set(state.status_code));
+            if let Some(r) = injected_resp {
+                INJECTED_RESPONSE.with(|c| *c.borrow_mut() = Some(r));
+            }
+            if let Some(b) = injected_bg {
+                INJECTED_BACKGROUND_TASKS.with(|c| *c.borrow_mut() = Some(b));
+            }
+            // Same gate as the classic arms (has_dep_params is always false here).
+            if state.has_inject_background_tasks || state.has_dep_params {
+                drain_background_tasks(py, kwargs.bind(py), &state.params);
+            }
+            let mut resp =
+                py_to_response_with_request(py, obj.bind(py), range_header, if_range_header);
+            apply_injected_response(py, &mut resp);
+            resp
+        }),
+    }
+}
+
 // ── Request handler (HOT PATH — optimized for minimal GIL acquisitions) ──
 
 async fn handle_request(
@@ -2328,6 +2746,154 @@ async fn handle_request(
         (bytes::Bytes::new(), None, None, None)
     };
 
+    let path_map = path_params.map(|Path(m)| m).unwrap_or_default();
+
+    // === FASTAPI_TURBO_ASYNC_INLINE (E): async request runs ENTIRELY on the
+    // persistent worker loop; this tokio task awaits a oneshot instead of
+    // blocking an OS thread on a threading.Event. Dispatched BEFORE the
+    // thread-local guard/status set below — the oneshot await may resume this
+    // future on a DIFFERENT tokio worker thread, so no pre-await TLs are
+    // allowed on this path (finish_inline_outcome seeds its own, post-await).
+    if state.is_async
+        && !state.has_dep_params
+        && async_inline_enabled()
+        && !state.has_http_middleware
+        && !state.has_file_params
+        && !state.has_form_params
+        && state
+            .handler_async_class
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == crate::handler_bridge::ASYNC_CLASS_NEEDS_WORKER
+    {
+        // A route only classifies NEEDS_WORKER via the classic path, which
+        // already initialized the worker — defensive init all the same.
+        crate::handler_bridge::init_async_worker();
+        let parts = Box::new(InlineParts {
+            path_map,
+            query_params,
+            query_multi,
+            headers,
+            content_type,
+            body_bytes,
+            body_json,
+            scope_method,
+            scope_path,
+            scope_query,
+            client_addr,
+            disconnect_flag,
+        });
+        match enqueue_inline_job(state.clone(), parts) {
+            Ok(rx) => {
+                let outcome = rx.await;
+                return finish_inline_outcome(
+                    &state,
+                    outcome,
+                    range_header.as_deref(),
+                    if_range_header.as_deref(),
+                );
+            }
+            Err(InlineEnqueueError::Lost(e)) => {
+                return Python::attach(|py| pyerr_to_response(py, &e));
+            }
+            Err(InlineEnqueueError::Recovered(p)) => {
+                // Loop unavailable (closed) — classic needs-worker dispatch with
+                // the recovered parts. Mirrors the block below for the gated
+                // subset (no deps, no http-middleware, no file/form).
+                let InlineParts {
+                    path_map,
+                    query_params,
+                    query_multi,
+                    headers,
+                    content_type,
+                    body_bytes,
+                    body_json,
+                    scope_method,
+                    scope_path,
+                    scope_query,
+                    client_addr,
+                    disconnect_flag,
+                } = *p;
+                let _disc_guard = DisconnectFlagGuard;
+                if let Some(flag) = disconnect_flag {
+                    REQUEST_DISCONNECT_FLAG.with(|f| *f.borrow_mut() = Some(flag));
+                }
+                ROUTE_DEFAULT_STATUS.with(|s| s.set(state.status_code));
+                return tokio::task::block_in_place(|| {
+                    Python::attach(|py| {
+                        set_request_scope_ctxvar(
+                            py,
+                            &scope_method,
+                            &scope_path,
+                            &scope_query,
+                            &state,
+                        );
+                        let body_json_opt = if state.has_body_params {
+                            body_json.as_ref()
+                        } else {
+                            None
+                        };
+                        let mut multipart_fields: Option<HashMap<String, Vec<ParsedField>>> = None;
+                        let kwargs = match extract_params_to_pydict_full(
+                            py,
+                            &state.params,
+                            &path_map,
+                            &query_params,
+                            &query_multi,
+                            &headers,
+                            content_type.as_ref().and_then(|v| v.to_str().ok()),
+                            &body_json_opt,
+                            &body_bytes,
+                            &mut multipart_fields,
+                            state.defers_extraction_errors,
+                            state.lax_content_type,
+                            state.has_param_model,
+                        ) {
+                            Ok(kw) => kw,
+                            Err(resp) => return resp,
+                        };
+                        if let Err(e) = inject_framework_objects(
+                            py,
+                            &kwargs,
+                            &state,
+                            &scope_method,
+                            &scope_path,
+                            &scope_query,
+                            &headers,
+                            &path_map,
+                            &query_params,
+                            &body_bytes,
+                            &client_addr,
+                        ) {
+                            return pyerr_to_response(py, &e);
+                        }
+                        match crate::handler_bridge::call_async_on_local_loop_classified(
+                            py,
+                            &state.handler,
+                            &kwargs,
+                            &state.handler_async_class,
+                            state.worker_timeout,
+                        ) {
+                            Ok(r) => {
+                                if state.has_inject_background_tasks || state.has_dep_params {
+                                    drain_background_tasks(py, &kwargs, &state.params);
+                                }
+                                let mut resp = py_to_response_with_request(
+                                    py,
+                                    r.bind(py),
+                                    range_header.as_deref(),
+                                    if_range_header.as_deref(),
+                                );
+                                apply_injected_response(py, &mut resp);
+                                resp
+                            }
+                            Err(e) => pyerr_to_response(py, &e),
+                        }
+                    })
+                });
+            }
+        }
+    }
+
     // Publish the disconnect flag to the per-request thread-local NOW — after the
     // body await, so we're on the same worker thread the dispatch (and the
     // Request-scope build) runs on. The guard clears it when handle_request
@@ -2339,8 +2905,6 @@ async fn handle_request(
     // Route-level default status (``status_code=201``) for py_to_response to apply
     // to non-Response handler results; the guard clears it after the request.
     ROUTE_DEFAULT_STATUS.with(|s| s.set(state.status_code));
-
-    let path_map = path_params.map(|Path(m)| m).unwrap_or_default();
 
     // === Fast path: sync handler with NO dependencies ===
     // Do everything in a SINGLE block_in_place → with_gil (1 GIL acquisition, no thread hop)

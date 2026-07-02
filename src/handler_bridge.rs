@@ -12,6 +12,25 @@ static ASYNC_SUBMIT: OnceLock<Py<PyAny>> = OnceLock::new();
 /// `_default_timeout` resolution (the timeout was resolved at route build).
 static ASYNC_SUBMIT_FAST: OnceLock<Py<PyAny>> = OnceLock::new();
 
+/// The worker's event loop object (``_async_worker.get_loop()``) — used by the
+/// async-inline path (`FASTAPI_TURBO_ASYNC_INLINE`) to `create_task` /
+/// `call_later` from the loop thread itself.
+static WORKER_LOOP: OnceLock<Py<PyAny>> = OnceLock::new();
+/// Bound ``loop.call_soon_threadsafe`` — the async-inline enqueue entry point.
+/// Cached once so the per-request enqueue is a single positional call.
+static WORKER_CALL_SOON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// The worker's event loop (populated by `init_async_worker`).
+pub fn worker_loop() -> Option<&'static Py<PyAny>> {
+    WORKER_LOOP.get()
+}
+
+/// Bound `call_soon_threadsafe` on the worker's loop (populated by
+/// `init_async_worker`).
+pub fn worker_call_soon() -> Option<&'static Py<PyAny>> {
+    WORKER_CALL_SOON.get()
+}
+
 /// Initialize the async worker (Python-managed thread with `run_forever()`).
 pub fn init_async_worker() {
     if ASYNC_SUBMIT.get().is_some() {
@@ -24,6 +43,14 @@ pub fn init_async_worker() {
         worker.call_method0("init").expect("worker init");
         let submit = worker.getattr("submit").expect("submit").unbind();
         let submit_fast = worker.getattr("submit_fast").expect("submit_fast").unbind();
+        // Cache the loop + bound call_soon_threadsafe BEFORE ASYNC_SUBMIT so a
+        // racing thread that observes ASYNC_SUBMIT set also sees these.
+        if let Ok(loop_obj) = worker.call_method0("get_loop") {
+            if let Ok(call_soon) = loop_obj.getattr("call_soon_threadsafe") {
+                let _ = WORKER_CALL_SOON.set(call_soon.unbind());
+            }
+            let _ = WORKER_LOOP.set(loop_obj.unbind());
+        }
         let _ = ASYNC_SUBMIT_FAST.set(submit_fast);
         let _ = ASYNC_SUBMIT.set(submit);
     });

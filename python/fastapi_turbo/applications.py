@@ -1253,6 +1253,69 @@ def _wrap_with_exception_handlers(handler, app):
     return wrapped
 
 
+def _async_inline_enabled() -> bool:
+    """``FASTAPI_TURBO_ASYNC_INLINE=1``: register eligible coroutine handlers
+    as genuinely async (``is_async=True``) so the Rust door drives the request
+    on the persistent worker loop end-to-end (router.rs async-inline path)
+    instead of wrapping them in the SYNC submit-caller (which blocks a tokio
+    thread on a ``threading.Event`` for the whole request)."""
+    import os
+
+    return os.environ.get("FASTAPI_TURBO_ASYNC_INLINE", "").strip() in (
+        "1",
+        "true",
+        "True",
+        "TRUE",
+        "yes",
+        "on",
+    )
+
+
+def _wrap_with_exception_handlers_async(handler, app):
+    """Async twin of ``_wrap_with_exception_handlers``: same custom-handler
+    dispatch + capture bookkeeping, but awaits the coroutine INSIDE the wrapper
+    so handler-raised exceptions (raised during await, not at coroutine
+    creation) are actually caught. Returns the handler unchanged when the app
+    has no custom handlers. Used by the async-inline registration path, which
+    must keep the handler a genuine coroutine function."""
+    if not getattr(app, "exception_handlers", None):
+        return handler
+
+    async def wrapped(**kwargs):
+        try:
+            return await handler(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            result = None
+            raised = False
+            try:
+                result = await app._ainvoke_exception_handler(exc)
+            except Exception:  # noqa: BLE001
+                raised = True
+            handled_specific = False
+            if result is not None and not raised:
+                for exc_cls in app.exception_handlers:
+                    if exc_cls is Exception:
+                        continue
+                    if isinstance(exc_cls, type) and isinstance(exc, exc_cls):
+                        handled_specific = True
+                        break
+            try:
+                from fastapi_turbo.exceptions import HTTPException as _HE
+
+                if not isinstance(exc, _HE) and not handled_specific:
+                    captured = getattr(app, "_captured_server_exceptions", None)
+                    if captured is not None:
+                        captured.append(exc)
+            except Exception:  # noqa: BLE001
+                pass
+            if result is not None and not raised:
+                return result
+            raise
+
+    wrapped.__name__ = getattr(handler, "__name__", "handler")
+    return wrapped
+
+
 def _clone_framework_types() -> tuple:
     """Clone framework types whose presence in a handler signature forces the
     route onto the clone path. Request / HTTPConnection / BackgroundTasks /
@@ -2545,6 +2608,26 @@ class FastAPI(_real_fastapi.FastAPI):
                     return None
             return handler(request, exc)
         except Exception:
+            return None
+
+    async def _ainvoke_exception_handler(self, exc: BaseException):
+        """Async twin of ``_invoke_exception_handler`` for the async-inline
+        path: runs INSIDE a live event-loop task, so a coroutine handler is
+        awaited directly (once — matching real FastAPI) instead of the
+        send(None)-probe + new-event-loop fallback, which cannot run on a
+        thread whose loop is already running."""
+        _maybe_sentry_capture_failed_request(exc)
+        handler = self._lookup_exception_handler(exc)
+        if handler is None:
+            return None
+        from fastapi_turbo.requests import _door_make_request
+        scope = _current_request_scope.get() or {}
+        request = _door_make_request({**scope, "type": "http", "app": self})
+        try:
+            if inspect.iscoroutinefunction(handler):
+                return await handler(request, exc)
+            return handler(request, exc)
+        except Exception:  # noqa: BLE001
             return None
 
     def _door_handle_dep_exception(self, exc: BaseException):
@@ -4850,8 +4933,34 @@ class FastAPI(_real_fastapi.FastAPI):
         # instruction), then wrap in the ``@app.middleware("http")`` chain so those
         # middlewares (which the clone applies by wrapping the handler) still run.
         if _inspect.iscoroutinefunction(handler):
-            from fastapi_turbo._door_support import _make_sync_wrapper
+            from fastapi_turbo._door_support import (
+                _has_await_in_source,
+                _make_sync_wrapper,
+                _uses_running_loop,
+            )
 
+            if (
+                _async_inline_enabled()
+                and not getattr(self, "_http_middlewares", None)
+                and not any(p.kind == "dependency" for p in params)
+                and (_has_await_in_source(handler) or _uses_running_loop(handler))
+            ):
+                # FASTAPI_TURBO_ASYNC_INLINE: register the coroutine function
+                # itself (is_async=True) so the door drives the request on the
+                # worker loop end-to-end — no SYNC submit-caller, no Event
+                # handoff. Pre-mark needs-worker so the door NEVER probes it
+                # with send(None) (a probe-close on these known-suspending
+                # handlers could double-run pre-await side effects). No-await
+                # handlers keep the classic wrap (their probe path is faster).
+                inline_handler = _wrap_with_exception_handlers_async(handler, self)
+                try:
+                    inline_handler._fastapi_turbo_needs_worker = True
+                    if inline_handler is not handler:
+                        inline_handler._fastapi_turbo_original_endpoint = handler
+                except (AttributeError, TypeError):
+                    pass
+                else:
+                    return params, inline_handler, True
             handler = _make_sync_wrapper(handler, for_handler=True, app=self)
         # Dispatch handler-raised exceptions to the app's custom exception handlers
         # (the clone does this in its compiled handler) — innermost, so middleware
@@ -5071,6 +5180,38 @@ class FastAPI(_real_fastapi.FastAPI):
         # real FastAPI's RequestValidationError/HTTPException dispatch to the app's
         # handlers), then the @app.middleware("http") chain.
         from fastapi_turbo._door_support import _make_sync_wrapper
+
+        if _async_inline_enabled() and not getattr(self, "_http_middlewares", None):
+            # FASTAPI_TURBO_ASYNC_INLINE: the delegated pipeline is always a
+            # suspending coroutine function (real FastAPI's route handler) with
+            # a single inject_request param and no Rust-level deps — register
+            # it as genuinely async + pre-marked needs-worker so the door
+            # drives it on the worker loop end-to-end (no Event handoff, no
+            # send(None) probe).
+            inline_handler = _wrap_with_exception_handlers_async(handler, self)
+            try:
+                inline_handler._fastapi_turbo_needs_worker = True
+                if inline_handler is not handler:
+                    inline_handler._fastapi_turbo_original_endpoint = handler
+                inline_handler._fastapi_turbo_route_obj = route
+            except (AttributeError, TypeError):
+                pass
+            else:
+                inline_params = [
+                    ParamInfo(
+                        name="request",
+                        kind="inject_request",
+                        type_hint="any",
+                        required=False,
+                        default_value=None,
+                        has_default=False,
+                        model_class=None,
+                        alias=None,
+                        is_handler_param=True,
+                        scalar_validator=None,
+                    )
+                ]
+                return inline_params, inline_handler, True
 
         handler = _make_sync_wrapper(handler, for_handler=True, app=self)
         handler = _wrap_with_exception_handlers(handler, self)
