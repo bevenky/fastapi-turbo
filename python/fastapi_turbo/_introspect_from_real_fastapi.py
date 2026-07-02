@@ -244,6 +244,17 @@ def _param_from_field(
         alias=alias,
         scalar_validator=_field_validator(mf, is_body_model, kind),
         is_handler_param=is_handler_param,
+        # Rust-side fast lane: an UNCONSTRAINED path param annotated EXACTLY
+        # ``int`` or ``str`` (no Field metadata → no gt/le/strict/min_length/
+        # pattern, not Optional/enum/uuid/bool) is coerced in Rust without the
+        # per-request TypeAdapter round-trip. Anything else — and any input
+        # shape outside the strict digits-only lane — still runs the
+        # TypeAdapter, so constraints and 422 shapes stay FA-exact.
+        fast_path_coerce=(
+            kind == "path"
+            and not getattr(fi, "metadata", None)
+            and (ann is int or ann is str)
+        ),
     )
 
 

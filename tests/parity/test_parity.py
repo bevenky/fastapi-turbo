@@ -79,6 +79,39 @@ class TestRouting:
         fa, rs = hit(client, dual_servers, "get", "/p006-path-int/42")
         assert_json_match(fa, rs)
 
+    # P006b-g: Rust fast-lane int path-param edges — the door fast-parses
+    # `-?[0-9]+` (i64 range) in Rust and MUST fall back to the Pydantic
+    # TypeAdapter for every other shape so lax coercions and 422 bodies
+    # stay FA-exact.
+    def test_P006b_path_int_negative(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/p006-path-int/-3")
+        assert_json_match(fa, rs)
+
+    def test_P006c_path_int_leading_zeros(self, client, dual_servers):
+        # Pydantic lax accepts int("007") == 7 — the Rust fast lane must too.
+        fa, rs = hit(client, dual_servers, "get", "/p006-path-int/007")
+        assert_json_match(fa, rs)
+
+    def test_P006d_path_int_invalid_422(self, client, dual_servers):
+        fa, rs = hit(client, dual_servers, "get", "/p006-path-int/abc")
+        assert_json_match(fa, rs)
+
+    def test_P006e_path_int_beyond_i64(self, client, dual_servers):
+        # > i64::MAX — outside the Rust fast lane; Pydantic accepts big ints.
+        fa, rs = hit(client, dual_servers, "get",
+                     "/p006-path-int/99999999999999999999")
+        assert_json_match(fa, rs)
+
+    def test_P006f_path_int_plus_sign(self, client, dual_servers):
+        # "+7" is outside the fast lane; Pydantic lax parses it as 7.
+        fa, rs = hit(client, dual_servers, "get", "/p006-path-int/+7")
+        assert_json_match(fa, rs)
+
+    def test_P006g_path_int_underscore(self, client, dual_servers):
+        # "1_0" is outside the fast lane; Pydantic lax parses it as 10.
+        fa, rs = hit(client, dual_servers, "get", "/p006-path-int/1_0")
+        assert_json_match(fa, rs)
+
     def test_P007_path_str(self, client, dual_servers):
         fa, rs = hit(client, dual_servers, "get", "/p007-path-str/hello")
         assert_json_match(fa, rs)
