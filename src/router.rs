@@ -1633,6 +1633,30 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                             native.getattr("validate_json").ok().map(|m| m.unbind())
                         });
                         param.cached_validator = cached;
+                    } else if param.cached_validator.is_none() && param.scalar_validator.is_some()
+                    {
+                        // NON-model body (typed dict / container / scalar via the
+                        // field TypeAdapter): wrap the adapter in the FA-shaping
+                        // two-pass validator. Real FastAPI parses the body with
+                        // stdlib ``json`` FIRST and only then validates in Python
+                        // mode — so malformed JSON must yield FA's hardcoded
+                        // ``json_invalid`` shape (loc=("body", pos), msg "JSON
+                        // decode error", input={}, ctx.error=<json.msg>), NOT
+                        // pydantic-core's own JSON-parse error (loc=("body",),
+                        // "Invalid JSON: ...") which the raw ``TypeAdapter
+                        // .validate_json`` emits (R2 deep-validation J001).
+                        if let Ok(ref factory) = py
+                            .import("fastapi_turbo._door_support")
+                            .and_then(|m| m.getattr("_make_fa_body_validator_from_adapter"))
+                        {
+                            if let Some(ref adapter) = param.scalar_validator {
+                                if let Ok(v) = factory.call1((adapter.bind(py),)) {
+                                    if !v.is_none() {
+                                        param.cached_validator = Some(v.unbind());
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -3903,8 +3927,19 @@ fn extract_params_to_pydict_full<'py>(
                     }
                     if param.scalar_validator.is_some() {
                         let raw_py = pyo3::types::PyString::new(py, raw).into_any();
-                        let validated = run_scalar_validator(py, param, "path", &raw_py)?;
-                        let _ = kwargs.set_item(param.name_pystr(py), validated);
+                        // Accumulate (don't short-circuit) so multiple bad PATH
+                        // params surface ALL their errors in one 422, matching
+                        // FA (`/p/{a}/{b}/{c}` with 3 bad ints → 3 int_parsing
+                        // entries) — same contract as the query branch below.
+                        match run_scalar_validator_detail(py, param, "path", &raw_py) {
+                            Ok(validated) => {
+                                let _ = kwargs.set_item(param.name_pystr(py), validated);
+                            }
+                            Err(mut errs) => {
+                                extraction_errors.append(&mut errs);
+                                continue;
+                            }
+                        }
                     } else {
                         match try_coerce_str_to_py(py, raw, &param.type_hint) {
                             Some(v) => {

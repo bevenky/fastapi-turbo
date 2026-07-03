@@ -255,6 +255,36 @@ def _make_fa_body_validator(annotation, combined_body_fields=None):
         return None
 
 
+def _make_fa_body_validator_from_adapter(adapter):
+    """Wrap an EXISTING pydantic ``TypeAdapter`` (real FastAPI's
+    ``ModelField._type_adapter`` for a NON-model body: typed ``dict[K, V]``,
+    containers, constrained scalars) in the FA-shaping ``_FABodyValidator``.
+
+    Why: the raw adapter's ``validate_json`` parses with pydantic-core, so a
+    malformed body yields pydantic-core's JSON error (``loc=("body",)``,
+    ``msg="Invalid JSON: ..."``, ``input=None``). Real FastAPI parses the body
+    with stdlib ``json`` FIRST and only then validates in Python mode — a
+    decode failure is its hardcoded ``json_invalid`` shape
+    (``loc=("body", e.pos)``, ``msg="JSON decode error"``, ``input={}``,
+    ``ctx.error=e.msg``). ``_FABodyValidator.validate_json`` reproduces exactly
+    that two-pass flow (R2 deep-validation J001). The adapter is reused as
+    built (its FieldInfo constraints stay baked in); returns ``None`` when the
+    object doesn't expose a pydantic-core validator (Rust keeps the raw path).
+    """
+    try:
+        validator = getattr(adapter, "validator", None)
+        if validator is None or not hasattr(validator, "validate_python"):
+            return None
+        wrapper = _FABodyValidator.__new__(_FABodyValidator)
+        wrapper._validator = validator
+        wrapper._is_model = False
+        wrapper._native = None
+        wrapper._combined_body_fields = None
+        return wrapper
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ── Async-handler driving glue (relocated from _resolution.py) ──────────────
 # Door glue, NOT introspection: the door drives an ``async def`` handler/dep from
 # sync code (block_in_place → with_gil). Kept here so _resolution.py (clone
