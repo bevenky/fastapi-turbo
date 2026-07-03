@@ -9,114 +9,114 @@
   "data": {
     "fastapi-turbo": {
       "GET hello sync": {
-        "rps": 129732.8675,
-        "cpu_pct": 363.7,
+        "rps": 133942.3901,
+        "cpu_pct": 355.20000000000005,
         "cores": 3.6
       },
       "GET hello async": {
-        "rps": 128869.4936,
-        "cpu_pct": 373.9,
+        "rps": 133608.1243,
+        "cpu_pct": 365.2,
         "cores": 3.7
       },
       "GET large JSON": {
-        "rps": 59083.2035,
-        "cpu_pct": 1412.7999999999997,
-        "cores": 14.1
+        "rps": 71383.4748,
+        "cpu_pct": 1485.1000000000001,
+        "cores": 14.9
       },
       "GET large JSON async": {
-        "rps": 57359.6861,
-        "cpu_pct": 1443.6000000000004,
-        "cores": 14.4
+        "rps": 67164.9091,
+        "cpu_pct": 1484.8,
+        "cores": 14.8
       },
       "POST items sync": {
-        "rps": 111405.6871,
-        "cpu_pct": 502.2,
+        "rps": 111802.3021,
+        "cpu_pct": 496.0,
         "cores": 5.0
       },
       "POST items async": {
-        "rps": 109434.1114,
-        "cpu_pct": 512.5,
+        "rps": 111537.1107,
+        "cpu_pct": 506.99999999999994,
         "cores": 5.1
       },
       "PUT items": {
-        "rps": 110671.776,
-        "cpu_pct": 509.2,
-        "cores": 5.1
-      },
-      "PATCH items": {
-        "rps": 110852.3355,
-        "cpu_pct": 498.19999999999993,
+        "rps": 112376.1975,
+        "cpu_pct": 503.6,
         "cores": 5.0
       },
-      "DELETE items": {
-        "rps": 124901.4698,
-        "cpu_pct": 383.29999999999995,
-        "cores": 3.8
-      },
-      "XML small": {
-        "rps": 123930.5723,
-        "cpu_pct": 402.3,
-        "cores": 4.0
-      },
-      "XML large": {
-        "rps": 93334.6385,
-        "cpu_pct": 379.6,
-        "cores": 3.8
-      },
-      "stream sync": {
-        "rps": 111118.5957,
-        "cpu_pct": 491.4,
+      "PATCH items": {
+        "rps": 112017.7559,
+        "cpu_pct": 493.3999999999999,
         "cores": 4.9
       },
+      "DELETE items": {
+        "rps": 122703.0946,
+        "cpu_pct": 374.7,
+        "cores": 3.7
+      },
+      "XML small": {
+        "rps": 122097.7421,
+        "cpu_pct": 393.8,
+        "cores": 3.9
+      },
+      "XML large": {
+        "rps": 97806.8763,
+        "cpu_pct": 359.50000000000006,
+        "cores": 3.6
+      },
+      "stream sync": {
+        "rps": 118257.1377,
+        "cpu_pct": 484.6000000000001,
+        "cores": 4.8
+      },
       "stream async": {
-        "rps": 107214.9496,
-        "cpu_pct": 504.9000000000001,
+        "rps": 118452.823,
+        "cpu_pct": 500.3,
         "cores": 5.0
       },
       "stream await": {
-        "rps": 59698.6066,
-        "cpu_pct": 703.3000000000001,
-        "cores": 7.0
+        "rps": 113700.7591,
+        "cpu_pct": 591.7,
+        "cores": 5.9
       },
       "redis GET sync": {
-        "rps": 64302.9276,
-        "cpu_pct": 617.4,
-        "cores": 6.2
+        "rps": 67974.3208,
+        "cpu_pct": 592.2,
+        "cores": 5.9
       },
       "redis GET async": {
-        "rps": 52625.3122,
-        "cpu_pct": 875.8000000000001,
-        "cores": 8.8
+        "rps": 55199.929,
+        "cpu_pct": 861.0,
+        "cores": 8.6
       },
       "redis SET sync": {
-        "rps": 59681.6489,
-        "cpu_pct": 595.9999999999999,
-        "cores": 6.0
+        "rps": 65610.9839,
+        "cpu_pct": 605.8000000000001,
+        "cores": 6.1
       },
       "redis SET async": {
-        "rps": 42816.6535,
-        "cpu_pct": 837.4,
+        "rps": 51546.4958,
+        "cpu_pct": 844.6999999999999,
         "cores": 8.4
       },
       "pg item sync": {
-        "rps": 58291.3397,
-        "cpu_pct": 621.9000000000001,
-        "cores": 6.2
+        "rps": 58873.4154,
+        "cpu_pct": 596.8,
+        "cores": 6.0
       },
       "pg list sync": {
-        "rps": 45706.4111,
-        "cpu_pct": 621.7,
-        "cores": 6.2
+        "rps": 59455.9177,
+        "cpu_pct": 661.3,
+        "cores": 6.6
       },
       "pg item async": {
-        "rps": 42487.132,
-        "cpu_pct": 859.0,
-        "cores": 8.6
+        "rps": 46475.8864,
+        "cpu_pct": 914.5999999999999,
+        "cores": 9.1
       },
       "pg list async": {
-        "rps": 30492.8894,
-        "cpu_pct": 888.3,
-        "cores": 8.9
+        "rps": 45390.4527,
+        "cpu_pct": 874.3,
+        "cores": 8.7
       }
     },
     "FastAPI (uvicorn)": {
