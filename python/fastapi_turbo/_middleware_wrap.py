@@ -523,6 +523,12 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
         # inject_framework_objects can reuse it instead of creating a new one.
         # This ensures request.state set by middleware propagates to the handler.
         kwargs["_middleware_request"] = request
+        # Mark that THIS request has a post-chain drain owner (the finally
+        # below). The delegated real-FastAPI handler defers yield-dep teardown
+        # + background tasks onto ``request._pending_teardowns`` only when it
+        # sees this stamp — the ``_drive_async_fallback`` path builds a
+        # different Request with no drain, so it finalizes inline instead.
+        request._fastapi_turbo_defer_ok = True
         try:
             try:
                 return runner(request, kwargs)

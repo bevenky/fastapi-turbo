@@ -4393,6 +4393,27 @@ class FastAPI(_real_fastapi.FastAPI):
         adapter_names = {p.name for p in params if p.is_handler_param}
         if adapter_names != sig_names:
             return None
+        # DEEP-BEHAVIOR PARITY (R2 dep-trace cluster): when the app has
+        # ``@app.middleware("http")`` middlewares AND this route resolves
+        # dependencies, decline the lean adapter so the route delegates to REAL
+        # FastAPI's route handler (_delegated_route_info, default-on). The lean
+        # path runs deps in Rust BEFORE the Python middleware chain and hands
+        # each dep its own Request object; FastAPI runs deps INSIDE the
+        # middleware stack sharing ONE Request with the handler — so a dep's
+        # ``request.state`` writes (auth context, traces) are visible to later
+        # deps/handler/middleware, and dep side effects sequence after MW_in.
+        # Delegation restores both. Perf: MW apps already pay the Python-chain
+        # cost per request on every route; non-MW dep routes (the perf-relevant
+        # majority) keep the fast Rust dep engine. Raw-ASGI shims composed by
+        # the door as an OUTER chain (for_door_mix) don't force the decline —
+        # the Rust dispatch (deps included) already runs inside them.
+        _mw_list = getattr(self, "_http_middlewares", None) or []
+        if for_door_mix:
+            _mw_list = [
+                m for m in _mw_list if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
+            ]
+        if _mw_list and any(p.kind == "dependency" for p in params):
+            return None
         # Match the clone's compile order so the door drives the adapter handler
         # identically: async → SYNC submit-caller (running loop from the first
         # instruction), then wrap in the ``@app.middleware("http")`` chain so those
@@ -4588,55 +4609,126 @@ class FastAPI(_real_fastapi.FastAPI):
         import fastapi.exception_handlers as _fa_eh
         from fastapi.exceptions import RequestValidationError as _RVE
 
+        # Set to True after the @app.middleware("http") wrap below is applied.
+        # The handler reads it per request to decide whether the post-chain
+        # drain (``wrapped_sync``'s finally → ``_run_pending_teardowns``)
+        # exists to consume deferred yield-dep teardowns.
+        _mw_defer_state = {"enabled": False}
+
         async def handler(**kwargs):
             request = kwargs["request"]
             # Real FastAPI's route handler reads three nested AsyncExitStacks from the
             # scope (``fastapi_middleware_astack`` files ⊃ ``fastapi_inner_astack``
             # request-scoped deps ⊃ ``fastapi_function_astack`` function-scoped deps),
             # normally set by AsyncExitStackMiddleware + the request_response wrapper —
-            # both bypassed when we call get_route_handler() directly. ``async with
-            # A, B, C`` tears them down C→B→A INSIDE the request (so file/temp cleanup
-            # runs and a yield-dep's after-yield raise propagates to the caller) AND
-            # propagates a handler exception into the yield-dep finalizers (so their
-            # except/finally observe it) — matching FA's semantics. (Teardown can't be
-            # deferred past send to mirror FA's middleware/bg dep-observation ordering:
-            # the door owns send, and deferring breaks teardown-exception propagation +
-            # leaks temp files. We instead run background tasks before teardown below,
-            # which covers the common case.)
-            async with (
-                _AsyncExitStack() as _file_stack,
-                _AsyncExitStack() as _inner_stack,
-                _AsyncExitStack() as _function_stack,
+            # both bypassed when we call get_route_handler() directly. Teardown
+            # mirrors ``async with A, B, C`` (C→B→A, handler exceptions thrown
+            # into the yield-dep finalizers so their except/finally observe them)
+            # — with ONE refinement for @app.middleware("http") apps: on the
+            # SUCCESS path the REQUEST-scope + file stacks (and the response's
+            # background tasks) are deferred onto ``request._pending_teardowns``,
+            # drained by the MW wrapper's finally AFTER the chain unwinds. FA
+            # semantics: middleware bodies observe deps in their "started"
+            # state and background tasks run BEFORE yield-dep teardown
+            # (upstream test_dependency_contextmanager::test_background_tasks).
+            # FUNCTION-scope deps still close inline before the response (their
+            # post-yield raise becomes the response, FA 0.120+), and every
+            # error path unwinds inline so teardown-exception propagation and
+            # temp-file cleanup keep exact ``async with`` semantics. Deferral
+            # engages only when BOTH the route was MW-wrapped AND this request
+            # object is the MW wrapper's own Request (``_fastapi_turbo_defer_ok``
+            # stamp) — the rare ``_drive_async_fallback`` path uses a different
+            # Request with no drain owner, so it stays inline.
+            _file_stack = _AsyncExitStack()
+            _inner_stack = _AsyncExitStack()
+            _function_stack = _AsyncExitStack()
+            request.scope["fastapi_middleware_astack"] = _file_stack
+            request.scope["fastapi_inner_astack"] = _inner_stack
+            request.scope["fastapi_function_astack"] = _function_stack
+
+            async def _unwind_clean():
+                await _function_stack.__aexit__(None, None, None)
+                await _inner_stack.__aexit__(None, None, None)
+                await _file_stack.__aexit__(None, None, None)
+
+            try:
+                response = await real_handler(request)
+            except _RVE as exc:
+                # The door validates in Rust → 422; a real-FastAPI-raised
+                # RequestValidationError would otherwise be captured as a SERVER
+                # exception (re-raised). Render 422 via a user-registered handler
+                # (specific RVE only — matches FA, where RVE's registered handler
+                # beats the Exception catch-all) or FA's default. HTTPException
+                # propagates (Rust renders it). Clean unwind — same as a
+                # ``return`` from inside ``async with`` (the old shape).
+                _uh = (self.exception_handlers or {}).get(_RVE)
+                _res = (_uh or _fa_eh.request_validation_exception_handler)(
+                    request, exc
+                )
+                if inspect.isawaitable(_res):
+                    _res = await _res
+                await _unwind_clean()
+                return _res
+            except BaseException as exc:
+                # ``async with A, B, C`` error semantics: throw the ACTIVE
+                # exception into C→B→A; a teardown-raised exception replaces
+                # it for the outer stacks; a suppressing manager clears it.
+                _cur: BaseException | None = exc
+                for _st in (_function_stack, _inner_stack, _file_stack):
+                    try:
+                        if _cur is not None:
+                            if await _st.__aexit__(
+                                type(_cur), _cur, _cur.__traceback__
+                            ):
+                                _cur = None
+                        else:
+                            await _st.__aexit__(None, None, None)
+                    except BaseException as _e2:  # noqa: BLE001
+                        _cur = _e2
+                if _cur is not None:
+                    raise _cur
+                # Suppressed by a dep — same visible result as falling off the
+                # end of the old ``async with`` block.
+                return None
+            _bg = getattr(response, "background", None)
+            # FUNCTION-scope deps close before the response in FA — inline
+            # (a post-yield raise propagates and becomes the response).
+            await _function_stack.__aexit__(None, None, None)
+            if _mw_defer_state["enabled"] and getattr(
+                request, "_fastapi_turbo_defer_ok", False
             ):
-                request.scope["fastapi_middleware_astack"] = _file_stack
-                request.scope["fastapi_inner_astack"] = _inner_stack
-                request.scope["fastapi_function_astack"] = _function_stack
-                try:
-                    response = await real_handler(request)
-                except _RVE as exc:
-                    # The door validates in Rust → 422; a real-FastAPI-raised
-                    # RequestValidationError would otherwise be captured as a SERVER
-                    # exception (re-raised). Render 422 via a user-registered handler
-                    # (specific RVE only — matches FA, where RVE's registered handler
-                    # beats the Exception catch-all) or FA's default. HTTPException
-                    # propagates (Rust renders it).
-                    _uh = (self.exception_handlers or {}).get(_RVE)
-                    _res = (_uh or _fa_eh.request_validation_exception_handler)(
-                        request, exc
-                    )
-                    if inspect.isawaitable(_res):
-                        _res = await _res
-                    return _res
-                # Run background tasks before yield-dep teardown (FA order: they
-                # observe deps in their pre-teardown state), then clear so the door
-                # doesn't double-run them.
-                _bg = getattr(response, "background", None)
-                if _bg is not None:
-                    _bgr = _bg()
-                    if inspect.isawaitable(_bgr):
-                        await _bgr
-                    response.background = None
+                # Defer background + request-scope/file teardown past the MW
+                # chain: one primed async-gen shim on the wrapper's drain list
+                # (``_run_pending_teardowns`` resumes it on the worker loop).
+                async def _deferred_finalize():
+                    yield
+                    if _bg is not None:
+                        _bgr = _bg()
+                        if inspect.isawaitable(_bgr):
+                            await _bgr
+                    await _inner_stack.__aexit__(None, None, None)
+                    await _file_stack.__aexit__(None, None, None)
+
+                _agen = _deferred_finalize()
+                await _agen.__anext__()  # prime to the yield
+                _tears = getattr(request, "_pending_teardowns", None)
+                if _tears is None:
+                    _tears = []
+                    request._pending_teardowns = _tears
+                _tears.append((_agen, "worker"))
+                response.background = None
                 return response
+            # No MW drain owner: run background before teardown (FA order —
+            # tasks observe deps pre-teardown), then close inline, and clear
+            # so the door doesn't double-run the tasks.
+            if _bg is not None:
+                _bgr = _bg()
+                if inspect.isawaitable(_bgr):
+                    _bgr = await _bgr
+                response.background = None
+            await _inner_stack.__aexit__(None, None, None)
+            await _file_stack.__aexit__(None, None, None)
+            return response
 
         handler.__name__ = getattr(endpoint, "__name__", "endpoint")
 
@@ -4696,6 +4788,10 @@ class FastAPI(_real_fastapi.FastAPI):
                     handler._has_http_middleware = True
                 except (AttributeError, TypeError):
                     pass
+                # The MW wrapper's finally now owns yield-dep/background
+                # finalization for this route (see the deferral block in the
+                # delegated handler above).
+                _mw_defer_state["enabled"] = True
 
         try:
             handler._fastapi_turbo_route_obj = route

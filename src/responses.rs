@@ -520,22 +520,29 @@ fn response_object_to_response(
     // Drain `Response(..., background=BackgroundTask(...))` or
     // `Response.background = BackgroundTasks()`. Matches FastAPI /
     // Starlette: tasks fire after the response is sent to the client.
+    // Delegated to ``fastapi_turbo.background._run_background_obj``: the old
+    // inline fallback drove ``BackgroundTask.__call__()`` via ``send(None)``,
+    // but real Starlette's ``__call__`` wraps SYNC funcs in
+    // ``run_in_threadpool`` (needs a running anyio loop) — the coroutine
+    // raised on first send and the task silently never ran (R2 deep-behavior
+    // T0059). The helper runs sync tasks inline and submits async ones to the
+    // shared worker loop (loop affinity, like ``BackgroundTasks.run_sync``).
     if let Ok(bg) = obj.getattr("background") {
         if !bg.is_none() {
             let bg_py: Py<PyAny> = bg.unbind();
+            // Capture the owning app on the REQUEST thread (thread-local) so
+            // async tasks keep per-app worker-loop affinity after the hop.
+            let app_py: Option<Py<PyAny>> = crate::router::current_app(obj.py());
             tokio::task::spawn_blocking(move || {
                 Python::attach(|py| {
-                    let bound = bg_py.bind(py);
-                    // BackgroundTasks has `run_sync`; bare BackgroundTask
-                    // is an awaitable, so fall back to `__call__()` to run
-                    // the task synchronously on this worker thread.
-                    if bound.call_method0("run_sync").is_ok() {
-                        return;
-                    }
-                    // Not a BackgroundTasks — treat as single BackgroundTask
-                    // (`__call__` returns a coroutine we must drive).
-                    if let Ok(coro) = bound.call0() {
-                        let _ = coro.call_method1("send", (py.None(),));
+                    let runner = py
+                        .import("fastapi_turbo.background")
+                        .and_then(|m| m.getattr("_run_background_obj"));
+                    if let Ok(runner) = runner {
+                        let app_arg = app_py
+                            .map(|a| a.into_bound(py).into_any())
+                            .unwrap_or_else(|| py.None().into_bound(py));
+                        let _ = runner.call1((bg_py.bind(py), app_arg));
                     }
                 });
             });

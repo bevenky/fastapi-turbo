@@ -105,6 +105,17 @@ thread_local! {
     static INJECTED_BACKGROUND_TASKS: std::cell::RefCell<Option<Py<PyAny>>> =
         const { std::cell::RefCell::new(None) };
 
+    /// Per-request SHARED injected ``Request``. FastAPI hands the handler AND
+    /// every dependency that takes ``request: Request`` the SAME object, so a
+    /// dep's ``request.state`` writes (auth context, traces) are visible to
+    /// later deps and the handler. ``build_injected_object`` builds it lazily
+    /// (first need wins — the dep-resolution loop runs before handler-kwarg
+    /// injection, so deps and handler share one instance). Reset per request
+    /// (worker-thread invariant, like INJECTED_RESPONSE); the async-inline
+    /// path takes it off the loop thread's TL alongside the other shells.
+    static INJECTED_REQUEST: std::cell::RefCell<Option<Py<PyAny>>> =
+        const { std::cell::RefCell::new(None) };
+
     /// Per-request route-level default status code (``@app.get(status_code=201)``).
     /// Set by handle_request from RouteState; read by ``py_to_response`` to status
     /// non-Response handler results. Reset per request (worker-thread invariant).
@@ -174,6 +185,9 @@ impl Drop for DisconnectFlagGuard {
         });
         INJECTED_BACKGROUND_TASKS.with(|b| {
             *b.borrow_mut() = None;
+        });
+        INJECTED_REQUEST.with(|r| {
+            *r.borrow_mut() = None;
         });
         ROUTE_DEFAULT_STATUS.with(|s| s.set(None));
     }
@@ -316,6 +330,15 @@ fn build_injected_object(
 ) -> PyResult<Py<PyAny>> {
     match kind {
         "inject_request" => {
+            // Per-request SHARED Request (FastAPI semantics): the first need
+            // builds it, every later one — a second dep, the handler kwarg —
+            // reuses the same object so ``request.state`` writes relay across
+            // deps and into the handler.
+            if let Some(existing) =
+                INJECTED_REQUEST.with(|cell| cell.borrow().as_ref().map(|o| o.clone_ref(py)))
+            {
+                return Ok(existing);
+            }
             // Build an ASGI-ish scope dict
             let scope = PyDict::new(py);
             scope.set_item("type", "http")?;
@@ -415,7 +438,9 @@ fn build_injected_object(
                 }
             });
 
-            Ok(request_cls(py)?.bind(py).call1((scope,))?.unbind())
+            let req = request_cls(py)?.bind(py).call1((scope,))?.unbind();
+            INJECTED_REQUEST.with(|cell| *cell.borrow_mut() = Some(req.clone_ref(py)));
+            Ok(req)
         }
         "inject_background_tasks" => INJECTED_BACKGROUND_TASKS.with(|cell| {
             // Return the per-request SHARED BackgroundTasks (FastAPI semantics) so
@@ -2298,8 +2323,11 @@ fn run_inline_job(py: Python<'_>, state: &Arc<RouteState>, parts: InlineParts, r
     }
     // Take the injected shells OUT of the loop TLs now (the guard would clear
     // them anyway) — they ride to the tokio side on the completer instead.
+    // The shared Request is only dropped (it already rode into kwargs);
+    // leaving it would leak it to the NEXT request served on this loop thread.
     let injected_resp = INJECTED_RESPONSE.with(|c| c.borrow_mut().take());
     let injected_bg = INJECTED_BACKGROUND_TASKS.with(|c| c.borrow_mut().take());
+    let _ = INJECTED_REQUEST.with(|c| c.borrow_mut().take());
     // Build the coroutine (body not executed at creation).
     let coro = match state.handler.call(py, (), Some(&kwargs)) {
         Ok(c) => c,

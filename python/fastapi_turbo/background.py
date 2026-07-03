@@ -60,3 +60,53 @@ class BackgroundTasks(_RealBackgroundTasks):
             else:
                 func(*task.args, **task.kwargs)
         self.tasks.clear()
+
+
+def _run_background_obj(bg: Any, app: Any = None) -> None:
+    """Door drain for ``Response.background`` (called from Rust
+    ``responses.rs::py_to_response`` after the response is produced).
+
+    Starlette runs ``await response.background()`` after sending; the door has
+    no ASGI server awaiting it, and real Starlette's ``BackgroundTask.__call__``
+    wraps SYNC funcs in ``run_in_threadpool`` (requires a running anyio loop) —
+    so a bare ``send(None)`` drive dies on the first suspend and the task
+    silently never runs (R2 deep-behavior T0059). Mirror ``run_sync``'s
+    semantics instead for every shape a user can attach:
+
+    * our ``BackgroundTasks`` (has ``run_sync``) — drain via ``run_sync``;
+    * real Starlette ``BackgroundTasks`` (has ``.tasks``) — per-task drain;
+    * a single ``BackgroundTask`` (has ``.func``) — sync inline, async via the
+      shared worker loop (loop affinity, same as ``run_sync``);
+    * any bare callable — call it; drive a returned coroutine on the loop.
+    """
+    from fastapi_turbo._async_worker import submit
+
+    if bg is None:
+        return
+    run_sync = getattr(bg, "run_sync", None)
+    if callable(run_sync):
+        if app is not None and getattr(bg, "_door_app", None) is None:
+            try:
+                bg._door_app = app
+            except (AttributeError, TypeError):
+                pass
+        run_sync()
+        return
+    tasks = getattr(bg, "tasks", None)
+    if tasks is not None and getattr(bg, "func", None) is None:
+        for task in list(tasks):
+            _run_background_obj(task, app=app)
+        return
+    func = getattr(bg, "func", None)
+    if func is not None:
+        args = getattr(bg, "args", ()) or ()
+        kwargs = getattr(bg, "kwargs", None) or {}
+        if getattr(bg, "is_async", False) or inspect.iscoroutinefunction(func):
+            submit(func(*args, **kwargs), app=app)
+        else:
+            func(*args, **kwargs)
+        return
+    if callable(bg):
+        result = bg()
+        if inspect.iscoroutine(result):
+            submit(result, app=app)
