@@ -211,13 +211,23 @@ def start_uvicorn(port):
 def start_fastapi_turbo(port):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
+    # workers=1 (probe-read race fix): this runner diffs turbo against a
+    # SINGLE-process uvicorn, and many tests observe cross-request in-process
+    # state via a second "probe" request (module-global dep counters,
+    # /yield/events, /bg/log, /router/seen, app.state mutation). app.run()
+    # defaults to one worker PROCESS per CPU (edefb2f, 2026-06-01 — after this
+    # runner was written); under N processes each worker has its own module
+    # globals, so the probe read lands on an arbitrary worker and flaps
+    # (2-8 failures per run depending on connection distribution). Same fix
+    # as the R2 runner. Multi-worker scale-out is exercised by the
+    # bench/CONCURRENCY suites, not behavior parity.
     script = f"""
 import sys
 sys.path.insert(0, '{PROJECT_ROOT}')
 from fastapi_turbo.compat import install
 install()
 from tests.parity.parity_app_deep_behavior import app
-app.run(host='{HOST}', port={port})
+app.run(host='{HOST}', port={port}, workers=1)
 """
     log = open("/tmp/parity_fastapi_turbo.log", "w")
     return subprocess.Popen(
@@ -262,6 +272,25 @@ def server_alive(port, timeout=1.5):
         return st == 200
     except Exception:
         return False
+
+
+def poll_until(port, path, predicate, deadline=3.0, interval=0.02):
+    """Poll ``path`` until ``predicate(parsed_json)`` is truthy or deadline.
+
+    Post-response work (yield-dep teardown, background tasks) settles at a
+    scheduler-dependent time after the triggering response; a fixed sleep
+    flaps under load. Returns the last parsed body either way so the caller's
+    assertion still reports what was actually observed on timeout.
+    """
+    end = time.time() + deadline
+    data = None
+    while time.time() < end:
+        _, _, body, _ = http_request(port, path)
+        data = _jbody(body)
+        if predicate(data):
+            break
+        time.sleep(interval)
+    return data
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -640,10 +669,13 @@ def run_all_tests(fa_port, rs_port):
              category="yield_deps")
 
         t = next_id()
-        # After handler returns, teardown should run in reverse order
-        time.sleep(0.05)
-        st2, hd2, body2, _ = http_request(port, "/yield/events")
-        evs = (_jbody(body2) or {}).get("events", [])
+        # After handler returns, teardown should run in reverse order.
+        # Teardown fires after the response is sent — poll until it lands.
+        data = poll_until(
+            port, "/yield/events",
+            lambda d: len([e for e in (d or {}).get("events", []) if "teardown" in e]) >= 3,
+        )
+        evs = (data or {}).get("events", [])
         teardown_order = [e for e in evs if "teardown" in e]
         _try(t, f"{label} yield teardown reverse order (C, B, A)",
              lambda teardown=teardown_order: _verify(
@@ -652,13 +684,15 @@ def run_all_tests(fa_port, rs_port):
              ),
              category="yield_deps")
 
-        # Handler raises → teardown still runs
+        # Handler raises → teardown still runs (poll: it fires post-response)
         http_request(port, "/yield/clear")
         t = next_id()
         st, hd, body, _ = http_request(port, "/yield/raise-in-handler")
-        time.sleep(0.05)
-        st2, hd2, body2, _ = http_request(port, "/yield/events")
-        evs = (_jbody(body2) or {}).get("events", [])
+        data = poll_until(
+            port, "/yield/events",
+            lambda d: "yield_a_teardown" in (d or {}).get("events", []),
+        )
+        evs = (data or {}).get("events", [])
         _try(t, f"{label} yield teardown runs on handler exception",
              lambda st=st, evs=evs: (
                  _verify(st == 500, f"status={st}"),
@@ -1177,14 +1211,16 @@ def run_all_tests(fa_port, rs_port):
              lambda body=body: _verify(_jbody(body) == {"scheduled": True}, f"body={body}"),
              category="background_tasks")
 
-        # Wait for task to complete
-        time.sleep(0.2)
+        # Background task runs after the response — poll until it lands
+        data = poll_until(
+            port, "/bg/log",
+            lambda d: "task1" in (d or {}).get("log", []),
+        )
         t = next_id()
-        st, hd, body, _ = http_request(port, "/bg/log")
         _try(t, f"{label} bg task ran after response",
-             lambda body=body: _verify(
-                 "task1" in (_jbody(body) or {}).get("log", []),
-                 f"body={body}"
+             lambda data=data: _verify(
+                 "task1" in (data or {}).get("log", []),
+                 f"body={data}"
              ),
              category="background_tasks")
 
