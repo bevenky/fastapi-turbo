@@ -29,6 +29,15 @@
 //! at 5.6µs p50 / 17.3µs p99 per message — the entire server-side latency
 //! tail. Contended/not-ready/ordered-behind-queued-commands cases fall back
 //! to the legacy channel; an atomic in-flight count keeps ordering strict.
+//!
+//! WRITE COALESCING (both modes, `FASTAPI_TURBO_WS_COALESCE=0` to disable):
+//! when the handler already has more inbound frames pending (batch buffer /
+//! channel non-empty), direct sends `start_send` into the sink's write
+//! buffer without the per-frame flush syscall; ONE flush fires at the batch
+//! boundary (see `ws_coalesce_enabled` docs). N pipelined echoes leave as
+//! one syscall + one TCP segment, which keeps the peer's replies batched —
+//! the defense against the per-frame-lockstep slow basin the WS fleet bench
+//! exposed (bimodal 390k/128k msgs/s at 48 conns x pipeline 16).
 
 use axum::extract::ws::Message;
 use bytes::Bytes;
@@ -109,6 +118,75 @@ fn ws_direct_enabled() -> bool {
         Ok(v) => !matches!(v.trim(), "0" | "false" | "False" | "FALSE" | "no" | "off"),
         Err(_) => true,
     })
+}
+
+/// Write-coalescing on the direct-send path (`FASTAPI_TURBO_WS_COALESCE`,
+/// default ON): when MORE inbound frames are already queued for this handler
+/// (batch-drain buffer or channel non-empty), an outbound data frame is
+/// `start_send`-committed to the sink's write buffer WITHOUT the per-frame
+/// flush syscall. The flush happens once at the batch boundary — the send
+/// that finds no more inbound frames pending, the receive that is about to
+/// suspend/park, a 32KB byte cap, or a 1ms debounce net (a handler that
+/// feeds replies then awaits something foreign can't strand them).
+///
+/// Under pipelining this turns N echo round trips into ONE write syscall and
+/// ONE TCP segment. The segment matters more than the syscall: the WS fleet
+/// bench showed a bimodal 390k/128k msgs/s regime (48 conns x pipeline 16)
+/// whose slow basin is per-frame lockstep — 16 separate echo segments make
+/// the client reply one-at-a-time, which keeps every hop (kevent, crossbeam
+/// unpark, GIL attach) paying per-frame wake latency. One batched segment
+/// keeps the client's replies batched too, defending the fast basin.
+fn ws_coalesce_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| match std::env::var("FASTAPI_TURBO_WS_COALESCE") {
+        Ok(v) => !matches!(v.trim(), "0" | "false" | "False" | "FALSE" | "no" | "off"),
+        Err(_) => true,
+    })
+}
+
+/// Unflushed-bytes cap for write coalescing — a batch of large frames flushes
+/// early instead of accumulating unboundedly in the sink's write buffer.
+const WS_COALESCE_MAX_BYTES: usize = 32 * 1024;
+
+/// Flush deferred (coalesced) outbound bytes. Non-blocking single-poll
+/// attempt first; a contended or partial flush is handed to a spawned driver
+/// (the sink lock serializes it with every other writer). Callable from any
+/// thread, with or without the GIL — touches no Python objects.
+fn flush_deferred(
+    rt: Option<&tokio::runtime::Handle>,
+    sink: &WsSink,
+    unflushed: &Arc<AtomicUsize>,
+) {
+    use futures_util::Sink;
+    use std::pin::Pin;
+    use std::task::{Context, Waker};
+    if unflushed.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    unflushed.store(0, Ordering::Release);
+    if let Ok(mut guard) = sink.try_lock() {
+        let Some(s) = guard.as_mut() else {
+            return; // torn down — bytes died with the connection
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        if Pin::new(s).poll_flush(&mut cx).is_ready() {
+            return; // fully written (or sink broken — next op raises)
+        }
+        // Partial write (kernel buffer full) — fall through to the driver.
+        drop(guard);
+    }
+    // Lock contended (select task mid-write — its own send flushes
+    // everything anyway) or flush Pending: drive it from a task.
+    if let Some(rt) = rt {
+        let sink = sink.clone();
+        rt.spawn(async move {
+            use futures_util::SinkExt;
+            let mut g = sink.lock().await;
+            if let Some(s) = g.as_mut() {
+                let _ = s.flush().await;
+            }
+        });
+    }
 }
 
 /// Outbound-queue capacity in loop mode. Deep enough that echo/burst
@@ -346,6 +424,12 @@ pub struct RecvAwaitable {
     // handler TASK suspends on it natively.
     loop_mode: bool,
     wake: Arc<LoopWake>,
+    // Write-coalescing flush hooks: a receive that is about to suspend
+    // (thread park / loop future) first flushes any deferred echo bytes so
+    // the peer is never left waiting on frames parked in the sink buffer.
+    sink: WsSink,
+    rt: Option<tokio::runtime::Handle>,
+    unflushed: Arc<AtomicUsize>,
 }
 
 /// Max frames pulled per wake — bounds GIL-resident burst processing.
@@ -391,6 +475,10 @@ impl RecvAwaitable {
             Ok(None) => {}
             Err(()) => return Err(handle_close_err(&self.state)),
         }
+        // About to suspend the handler task — the peer only sends more once
+        // it sees our replies, so any coalesced echo bytes must hit the wire
+        // NOW (no-op unless the direct path deferred a flush).
+        flush_deferred(self.rt.as_ref(), &self.sink, &self.unflushed);
         let fut = create_loop_future(py)?;
         // Yielding a raw Future from a custom awaitable requires the
         // `_asyncio_future_blocking = True` protocol marker (asyncio's
@@ -440,6 +528,10 @@ impl RecvAwaitable {
                 LoopStep::Pending(fut) => return Ok(fut),
             },
             None => {
+                // About to park this thread until the peer sends more — and
+                // the peer may be waiting on OUR coalesced replies. Flush
+                // deferred bytes first (no-op when nothing was deferred).
+                flush_deferred(self.rt.as_ref(), &self.sink, &self.unflushed);
                 let rx = self.rx.clone();
                 let state = self.state.clone();
                 let first = py.detach(|| rx.recv().map_err(|_| handle_close_err(&state)))?;
@@ -626,6 +718,13 @@ pub struct PyWebSocket {
     // every channel push, decremented by the select task AFTER the sink
     // write completes.
     queued: Arc<AtomicUsize>,
+    // Write-coalescing state: bytes start_send-committed to the sink buffer
+    // but not yet flushed, and the debounce-net arm flag (one 1ms flush
+    // timer per deferred burst — the batch-boundary flush almost always
+    // wins the race; the timer only matters for handlers that feed replies
+    // and then await something foreign).
+    unflushed: Arc<AtomicUsize>,
+    flush_armed: Arc<AtomicBool>,
     // Receive-wake slot shared with the reader task.
     wake: Arc<LoopWake>,
     // Accept-ready future slot — resolved by the on_upgrade callback (or its
@@ -663,6 +762,9 @@ impl PyWebSocket {
                 buf: self.recv_buf.clone(),
                 loop_mode: self.loop_mode,
                 wake: self.wake.clone(),
+                sink: self.sink.clone(),
+                rt: self.rt.clone(),
+                unflushed: self.unflushed.clone(),
             },
         )
         .expect("create recv awaitable")
@@ -694,7 +796,12 @@ impl PyWebSocket {
     /// operation surfaces the error). Returns `Some(msg)` when the caller
     /// must fall back to the channel (sink busy/not ready/not yet upgraded,
     /// or commands already queued ahead of us).
-    fn try_direct_send(&self, msg: Message) -> Option<Message> {
+    /// `defer_flush`: commit the frame to the sink's write buffer WITHOUT
+    /// the flush syscall — the caller has established that more inbound
+    /// frames are already pending, so a batch-boundary flush is coming
+    /// (send-with-nothing-pending, pre-suspend receive, byte cap, or the
+    /// 1ms debounce net armed by `queue_send`).
+    fn try_direct_send(&self, msg: Message, defer_flush: bool, msg_len: usize) -> Option<Message> {
         use futures_util::Sink;
         use std::pin::Pin;
         use std::task::{Context, Poll, Waker};
@@ -729,6 +836,13 @@ impl PyWebSocket {
             // way); the next send/receive raises.
             return None;
         }
+        if defer_flush {
+            // Batched: leave the frame in the sink buffer; account for it
+            // so the boundary flushers know there is work.
+            self.unflushed.fetch_add(msg_len + 8, Ordering::AcqRel);
+            return None;
+        }
+        self.unflushed.store(0, Ordering::Release); // this flush covers any deferred bytes
         match s.as_mut().poll_flush(&mut cx) {
             Poll::Ready(_) => None, // written (or sink broken — see above)
             Poll::Pending => {
@@ -757,13 +871,52 @@ impl PyWebSocket {
     /// waiter `reserve()`s a slot, delivers the pending command itself (order
     /// preserved: the handler task is suspended on the Future until then) and
     /// resolves it via `call_soon_threadsafe`.
-    fn queue_send(&self, py: Python<'_>, msg: Message) -> PyResult<Option<Py<PyAny>>> {
+    fn queue_send(&self, py: Python<'_>, msg: Message, msg_len: usize) -> PyResult<Option<Py<PyAny>>> {
         let msg = if ws_direct_enabled() && self.queued.load(Ordering::Acquire) == 0 {
-            // GIL released around the write syscall (~3µs) — a broadcast
-            // from another connection's thread must not stall this worker's
-            // Python threads for it. No Python objects are touched inside.
-            match py.detach(|| self.try_direct_send(msg)) {
-                None => return Ok(None),
+            // Write coalescing: when the handler ALREADY has more inbound
+            // frames waiting (batch buffer or channel), it will come
+            // straight back here — defer the flush syscall to the batch
+            // boundary. One TCP segment per burst instead of per frame
+            // keeps the peer's replies batched too (fast-basin defense).
+            let defer_flush = ws_coalesce_enabled()
+                && self.unflushed.load(Ordering::Acquire) + msg_len <= WS_COALESCE_MAX_BYTES
+                && (!self.recv_buf.lock().unwrap().is_empty() || !self.rx.is_empty());
+            // NOTE: no `py.detach` here — every branch below is a single
+            // non-blocking poll (noop waker), so the GIL is held for ~1-3µs
+            // of syscall at most. Detaching cost more than it saved: each
+            // detach invites a GIL steal mid-burst, which spreads a batch
+            // of echoes across GIL handoffs and shatters the write batch.
+            match self.try_direct_send(msg, defer_flush, msg_len) {
+                None => {
+                    if defer_flush
+                        && self
+                            .flush_armed
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                    {
+                        // Debounce net: one 1ms timer per deferred burst.
+                        // Usually a no-op (boundary flush wins); guarantees
+                        // a handler that stops echoing can't strand replies
+                        // in the sink buffer for more than ~1ms.
+                        if let Some(rt) = self.rt.as_ref() {
+                            let sink = self.sink.clone();
+                            let unflushed = self.unflushed.clone();
+                            let armed = self.flush_armed.clone();
+                            rt.spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                                armed.store(false, Ordering::Release);
+                                if unflushed.swap(0, Ordering::AcqRel) > 0 {
+                                    use futures_util::SinkExt;
+                                    let mut g = sink.lock().await;
+                                    if let Some(s) = g.as_mut() {
+                                        let _ = s.flush().await;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    return Ok(None);
+                }
                 Some(m) => m,
             }
         } else {
@@ -978,14 +1131,16 @@ impl PyWebSocket {
     /// backpressure, an asyncio Future the caller must await (resolves when
     /// the frame has been handed to the outbound queue).
     fn send_text(&self, py: Python<'_>, data: String) -> PyResult<Option<Py<PyAny>>> {
-        self.queue_send(py, Message::Text(data.into()))
+        let len = data.len();
+        self.queue_send(py, Message::Text(data.into()), len)
     }
 
     /// Accept `bytes` directly (no Vec<u8> intermediate).
     fn send_bytes(&self, py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<Option<Py<PyAny>>> {
         let slice = data.as_bytes();
         let owned = Bytes::copy_from_slice(slice);
-        self.queue_send(py, Message::Binary(owned))
+        let len = owned.len();
+        self.queue_send(py, Message::Binary(owned), len)
     }
 
     /// Build the ASGI-style scope dict on demand. Called by Python properties
@@ -1209,6 +1364,8 @@ pub async fn handle_ws_upgrade(
         rt: tokio::runtime::Handle::try_current().ok(),
         sink: sink.clone(),
         queued: queued.clone(),
+        unflushed: Arc::new(AtomicUsize::new(0)),
+        flush_armed: Arc::new(AtomicBool::new(false)),
         wake: wake.clone(),
         ready_fut: ready_fut.clone(),
         recv_buf: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),

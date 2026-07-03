@@ -176,11 +176,20 @@ def rust_latency(uri):
 
 
 def rust_throughput(uri):
-    out = subprocess.run(
-        [WS_RS, "tp", uri, "--conns", str(RS_TP_CONNS),
-         "--pipeline", str(PIPELINE), "--dur", str(DUR), "--json"],
-        capture_output=True, text=True, check=True).stdout
-    return json.loads(out)["msgs_per_s"]
+    """Median of RS_REPEATS runs (same protocol as rust_latency): the WS
+    echo pipeline is bimodal under load — a batch basin and a per-frame
+    lockstep basin (see src/websocket.rs write-coalescing docs) — so a
+    single 5s shot is a die roll on which basin the scheduler lands in."""
+    rates = []
+    for _ in range(RS_REPEATS):
+        out = subprocess.run(
+            [WS_RS, "tp", uri, "--conns", str(RS_TP_CONNS),
+             "--pipeline", str(PIPELINE), "--dur", str(DUR), "--json"],
+            capture_output=True, text=True, check=True).stdout
+        rates.append(json.loads(out)["msgs_per_s"])
+        time.sleep(1.0)
+    rates.sort()
+    return rates[len(rates) // 2], rates
 
 
 # ── smoke check: contract echo before measuring ──────────────────────
@@ -215,12 +224,14 @@ def run_fw(name, fw):
         rs_note = ""
         if os.path.exists(WS_RS):
             med, runs = rust_latency(uri)
+            tp_med, tp_runs = rust_throughput(uri)
             res.update(rust_p50_us=med["p50_us"], rust_p90_us=med["p90_us"],
                        rust_p99_us=med["p99_us"],
                        rust_lat_runs=[{k: r[k] for k in
                                        ("p50_us", "p90_us", "p99_us")}
                                       for r in runs],
-                       rust_msgs_per_s=round(rust_throughput(uri)))
+                       rust_msgs_per_s=round(tp_med),
+                       rust_tp_runs=[round(r) for r in tp_runs])
             rs_note = (f"  | rust p50={med['p50_us']:6.1f} p99={med['p99_us']:6.1f}"
                        f"  {res['rust_msgs_per_s']:10,d} msgs/s")
         print(f"  {name:20s} p50={p50:8.1f}us  p99={p99:8.1f}us  "
@@ -265,6 +276,7 @@ def main():
                             "rust_lat_n": RS_N, "rust_lat_warmup": RS_WARMUP,
                             "rust_lat_repeats": RS_REPEATS,
                             "rust_tp_conns": RS_TP_CONNS,
+                            "rust_tp_repeats": RS_REPEATS,
                             "note": "p50/p99_us + msgs_per_s = pure-Python "
                                     "client (websockets+uvloop): ~25-30us "
                                     "client-side overhead per RT, tops out "
