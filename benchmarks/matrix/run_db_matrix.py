@@ -66,6 +66,15 @@ for mode in ("sync", "async"):
         m = "GET" if rop == "get" else "POST"
         CROSS.append((f"redis {rop} [{mode}]", "redis", m, f"/redis/{mode}/{rop}"))
 
+# "turbo mux client" rows (Python engines only): fastapi_turbo.contrib_redis —
+# ONE multiplexed RESP2 socket per event loop (the ioredis topology; measured
+# 8 conns for 8 workers vs 64 for the redis-py pool at c64).  Fairness: pure
+# asyncio, runs identically under uvicorn.  Rides the "redis" boot group.
+REDIS_MUX = [
+    ("redis get [turbo mux client]", "redis", "GET", "/redis/mux/get"),
+    ("redis set [turbo mux client]", "redis", "POST", "/redis/mux/set"),
+]
+
 # Python driver matrix (turbo + uvicorn). scope="py"
 PYMATRIX = []
 for drv in ("pg3sync", "pg2sync", "pg3async", "asyncpg"):
@@ -185,7 +194,7 @@ def _boots_for(fw):
     boots = [
         ("cross-pg-sync", [e for e in CROSS if is_pg(e) and "[sync]" in e[0]]),
         ("cross-pg-async", [e for e in CROSS if is_pg(e) and "[async]" in e[0]]),
-        ("redis", [e for e in CROSS if e[1] == "redis"]),
+        ("redis", [e for e in CROSS if e[1] == "redis"] + REDIS_MUX),
     ]
     for drv in ("pg3sync", "pg2sync", "pg3async", "asyncpg"):
         boots.append((f"pgm-{drv}", [e for e in PYMATRIX if e[0].startswith(drv)]))

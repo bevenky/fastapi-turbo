@@ -149,6 +149,28 @@ async def async_redis():
     return _pools["ra"]
 
 
+def _mux_module():
+    # fastapi_turbo.contrib_redis is framework-neutral (stdlib + optional
+    # hiredis).  Under BENCH_ENGINE=turbo the package is already imported;
+    # under uvicorn we must NOT import the fastapi_turbo package (it installs
+    # the fastapi compat shims), so load the single file standalone by path.
+    import sys
+    if "muxmod" not in _pools:
+        with _pool_lock:
+            if "muxmod" not in _pools:
+                if "fastapi_turbo" in sys.modules:
+                    from fastapi_turbo import contrib_redis as cr
+                else:
+                    import importlib.util
+                    pkg = importlib.util.find_spec("fastapi_turbo")
+                    path = os.path.join(pkg.submodule_search_locations[0], "contrib_redis.py")
+                    spec = importlib.util.spec_from_file_location("_contrib_redis_standalone", path)
+                    cr = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(cr)
+                _pools["muxmod"] = cr
+    return _pools["muxmod"]
+
+
 def _row(r):
     return {"id": r[0], "sku": r[1], "name": r[2], "qty": r[3]}
 
@@ -363,6 +385,23 @@ def r_get_s():
 async def r_get_a():
     r = await async_redis()
     return Response(content=await r.get(RKEY), media_type="application/json")
+
+
+# "turbo mux client" row: fastapi_turbo.contrib_redis — ONE multiplexed
+# RESP2 socket per event loop (the ioredis topology), commands interleaved
+# in flight, writes batched per loop tick.  Fairness: pure asyncio, runs
+# identically under uvicorn; redis-py rows above use a conn-per-command pool.
+@app.get("/redis/mux/get")
+async def r_get_m():
+    m = _mux_module().mux_for_loop()
+    return Response(content=await m.get(RKEY), media_type="application/json")
+
+
+@app.post("/redis/mux/set")
+async def r_set_m():
+    m = _mux_module().mux_for_loop()
+    await m.set(RWKEY, RVAL)
+    return {"ok": True}
 
 
 @app.post("/redis/sync/set")
