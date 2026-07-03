@@ -67,6 +67,25 @@ and `tests/test_plain_import_stack.py` (live third-party stack under one
   asyncpg w8 45.3k rps vs psycopg3-async ~40k, and 26µs loop CPU per op vs
   psycopg3's 45µs. Default in `app.py`/`app_db.py`; override with
   `BENCH_PG_ASYNC_DRIVER` for driver-vs-driver runs.
+- **psqlpy (Rust PyO3 + tokio-postgres driver): measured, SKIP.** The parked
+  in-house Rust-PG experiment predicted any side-runtime Rust driver pays
+  2 cross-thread wakes + 1 GIL attach per query where asyncpg's socket lives
+  ON the loop; psqlpy 0.12.1 (same architecture) confirms it
+  (`micro_psqlpy.py`, one uvloop, select-by-id, medians of 3, 2026-07-03):
+  serial acquire 106.4 vs asyncpg 83.1µs/op (1.28x slower); held-connection
+  79.6 vs 31.2µs (2.55x — the gap is per-query driver cost, not pool
+  checkout); gather-64 14.4k vs 25.8k ops/s at pool=2 and 22.2k vs 71.0k at
+  pool=8 (0.31x). psqlpy barely scales 2→8 conns (1.5x vs asyncpg's 2.8x):
+  it is wake/GIL-bound, not connection-bound. Raw failed the ≥0.8x gate, so
+  door endpoints were not benched — the parked rustpg (same architecture,
+  fully optimized: pipelining, dispatcher task, coalescing hub) already
+  measured −20% under the door (40.2k vs 50.1k w8c64, 92 vs 73µs conn=1),
+  and psqlpy starts further behind at raw than rustpg did. SQLAlchemy
+  dialect (`psqlpy-sqlalchemy` 0.1.1b4): installs and WORKS with SQLA 2.0.49
+  (Core + ORM smoke pass, correct rows) but the ORM does not dilute the
+  driver tax — ORM select-one serial 167.3 vs asyncpg-ORM 117.1µs/op (1.43x).
+  Verdict: **keep asyncpg**; a loop-owned socket beats a side-runtime Rust
+  bridge at localhost RTTs, exactly as the parked experiment predicted.
 - **Sync PG: psycopg3 with autocommit reads.** Without autocommit every
   SELECT is BEGIN..COMMIT = 3 wire round trips where pgx/node-postgres do 1.
   asyncpg equivalent: no-op pool `reset` (default reset script is +1 RTT/req).
