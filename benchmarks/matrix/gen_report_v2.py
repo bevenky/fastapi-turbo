@@ -66,16 +66,21 @@ for op in ("insert", "update", "delete"):
             PG_WRITES.append((f"{op} · commit={c} · {io}", f"PG {op} commit={c} [{io}]"))
 REDIS_ROWS = [(f"{op.replace('_', ' ')} · {m}", f"redis {op} [{m}]")
               for op in ("get", "set", "pipeline", "multi", "set_durable") for m in ("sync", "async")]
+# turbo's multiplexed client (fastapi_turbo.contrib_redis) — opt-in, labeled
+MUX_ROWS = [("get · turbo mux client", "redis get [turbo mux client]"),
+            ("set · turbo mux client", "redis set [turbo mux client]")]
 
 DRIVERS = ["pg3sync", "pg2sync", "pg3async", "asyncpg"]
 DRIVER_OPS = ["select_one", "select_list", "insert commit=true", "insert commit=false",
               "update commit=true", "update commit=false", "delete commit=true", "delete commit=false"]
 
 CAMPAIGN = [
-    ("stream · real await", "284 µs", "51 µs", "5.6×", "conn=1 p50"),
-    ("stream · sync generator", "852 µs", "43 µs", "20×", "conn=1 p50"),
+    ("stream · sync gen", "852 µs", "28 µs", "30×", "conn=1 · beats Fastify"),
+    ("stream · async gen", "546 µs", "29 µs", "19×", "conn=1 · beats Fastify"),
+    ("stream · real await", "284 µs", "50 µs", "5.7×", "conn=1 p50"),
     ("Postgres · async", "1.8k", "47.7k", "26×", "req/s all-core"),
-    ("Postgres · reads", "25.5k", "49.3k", "1.9×", "req/s (wire-fair)"),
+    ("redis · turbo mux", "98 µs", "53 µs", "9.5× raw", "opt-in multiplexed client"),
+    ("WS server RTT p99", "49.7 µs", "40 µs", "−20%", "Rust client · direct-send"),
     ("PUT /items", "33 µs", "27 µs", "at Gin", "conn=1 p50"),
     ("regressions", "—", "0", "4,500+ tests", "parity · local · upstream"),
 ]
@@ -178,7 +183,10 @@ def driver_table():
 
 def ws_table():
     d = WS.get("data", WS)
-    rows = [("round-trip p50", "p50_us", "low", " µs"), ("round-trip p99", "p99_us", "low", " µs"),
+    rows = [("server RTT p50 · Rust client", "rust_p50_us", "low", " µs"),
+            ("server RTT p99 · Rust client", "rust_p99_us", "low", " µs"),
+            ("round-trip p50 · Python client", "p50_us", "low", " µs"),
+            ("round-trip p99 · Python client", "p99_us", "low", " µs"),
             ("throughput · fleet", "msgs_per_s", "high", " msg/s")]
     out = ['<div class="tscroll"><table><thead><tr><th class="lab">64-byte echo · /ws</th>']
     for f in FW:
@@ -195,7 +203,7 @@ def ws_table():
             cls = "tcol " if f == "fastapi-turbo" else ""
             if v is not None and v == best:
                 cls += "lead tlead" if f == "fastapi-turbo" else "lead"
-            txt = "—" if v is None else (fmt_rps(v) if key == "msgs_per_s" else f"{v:,.1f}")
+            txt = "—" if v is None else (fmt_rps(v) if key == "msgs_per_s" else f"{float(v):,.1f}")
             out.append(f'<td class="{cls.strip()}">{txt}</td>')
         chip = (f'<b class="chip">{esc(SHORT[leader])}</b>' if leader and leader != "fastapi-turbo"
                 else '<b class="chip amber">turbo</b>' if leader else "")
@@ -392,9 +400,12 @@ td.lanecell {{ min-width:190px; text-align:left; padding-left:22px; }}
 <section>
   <div class="ch"><span class="num">CH-04</span><h2>Redis</h2>
     <span class="cond">req/s · c={esc(dbm.get("conc"))} · higher is better</span></div>
-  {metric_table([("Single ops · pipeline ×10 · MULTI/EXEC ×10 · durable = SET + WAITAOF fsync", REDIS_ROWS)], get_db, fmt_rps, "high", "req/s",
+  {metric_table([("Single ops · pipeline ×10 · MULTI/EXEC ×10 · durable = SET + WAITAOF fsync", REDIS_ROWS),
+                 ("turbo multiplexed client · fastapi_turbo.contrib_redis · opt-in", MUX_ROWS)], get_db, fmt_rps, "high", "req/s",
      "<b>set_durable</b> measures Redis's synchronous-fsync group-commit floor in a pre-warmed steady AOF state "
-     "(rewrite complete, appendfsync=always) — compare within a run only.")}
+     "(rewrite complete, appendfsync=always) — compare within a run only. "
+     "<b>mux client</b>: one multiplexed socket per event loop (the ioredis architecture — proven via CLIENT LIST) — "
+     "same idiomatic <code>await client.get(...)</code>, works under uvicorn too; standard-client rows above stay the defaults.")}
 </section>
 
 <section>
@@ -410,9 +421,11 @@ td.lanecell {{ min-width:190px; text-align:left; padding-left:22px; }}
   <div class="ch"><span class="num">CH-06</span><h2>WebSocket</h2>
     <span class="cond">64-byte text echo · workers=8 · Python bench client</span></div>
   {ws_table()}
-  <p class="note">Fleet throughput is bounded by the pure-Python bench client (~185k msg/s per 6-process client) —
-  per-worker with an unconstrained client, turbo's thread mode measures <b>622k msg/s</b>. Loop-residency mode
-  (FASTAPI_TURBO_WS_LOOP) trades +16 µs p50 for steadier p99 and fixes a receive-then-await hang.</p>
+  <p class="note"><b>Rust-client rows are the true server RTT</b> (tokio-tungstenite, no Python-client jitter);
+  Python-client rows include ~12-25 µs of client overhead. Direct-send (default on) writes outbound frames inline —
+  no select-task wake — cutting server p99 20%. Fleet throughput is client-bounded; per-worker with an unconstrained
+  client, turbo's thread mode measures <b>622k msg/s</b>. Loop-residency mode (FASTAPI_TURBO_WS_LOOP) trades +16 µs
+  p50 for steadier p99 and fixes a receive-then-await hang.</p>
 </section>
 
 <div class="cert">
