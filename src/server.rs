@@ -52,9 +52,11 @@ fn static_cache() -> &'static Mutex<HashMap<String, CachedFile>> {
 /// Keys are lowercase extensions WITHOUT the dot (e.g. "js").
 static STATIC_MIME_MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
 
-/// Starlette's fallback when ``mimetypes.guess_type`` returns None:
-/// ``media_type = "text/plain"`` then ``; charset=utf-8`` (it's ``text/*``).
-const STATIC_MIME_FALLBACK: &str = "text/plain; charset=utf-8";
+/// Starlette's fallback when ``mimetypes.guess_type`` returns None. As of
+/// Starlette 1.1+ (responses.py: ``guess_type(...)[0] or "application/octet-stream"``)
+/// this is ``application/octet-stream`` — NOT ``text/*``, so no charset suffix.
+/// (Older Starlette used ``text/plain; charset=utf-8``.)
+const STATIC_MIME_FALLBACK: &str = "application/octet-stream";
 
 /// Install the Python-derived extension→Content-Type map. Idempotent
 /// (first call wins; later ``run_server`` calls in a test session reuse

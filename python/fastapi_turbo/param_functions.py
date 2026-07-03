@@ -13,24 +13,15 @@ from __future__ import annotations
 
 from abc import ABCMeta
 
-# Real FastAPI's param classes. Imported during package init BEFORE the compat
-# shim installs, so this resolves to the REAL module; the bound reference stays
-# real after the shim rebinds ``sys.modules['fastapi']``. Each marker below
+# Real FastAPI's param classes. Imported during package init BEFORE
+# ``compat.install()`` patches attributes onto the real package, so this binds
+# the GENUINE classes (``fastapi.params`` is never patched). Each marker below
 # multiply-inherits from the matching ``_real_params.*`` so REAL FastAPI
 # introspection (the pivot adapter) recognizes it (correct ``in_`` / Body class),
 # while the clone's ``_introspect`` keeps reading our custom attrs (``_kind`` …).
 import fastapi.params as _real_params
 from starlette.datastructures import UploadFile as _RealUploadFile
 from pydantic.fields import FieldInfo
-
-
-# Keys that we handle ourselves and must NOT be forwarded to FieldInfo.__init__
-# (FieldInfo silently accepts them but discards the values).
-_CUSTOM_KEYS = frozenset({
-    "example",       # singular example (FieldInfo only has 'examples')
-    "regex",         # legacy alias for 'pattern'
-    "include_in_schema",  # not a FieldInfo kwarg
-})
 
 
 class _ParamMarker(FieldInfo):
@@ -242,6 +233,17 @@ class UploadFile(_RealUploadFile, metaclass=ABCMeta):
     def __subclasshook__(cls, other):
         if cls is not UploadFile:
             return NotImplemented
+        # REAL Starlette/FastAPI UploadFile (sub)classes count as instances of
+        # the turbo class. Post shim-flip the real form parsers keep their
+        # load-time binding and build REAL UploadFile objects, while
+        # ``starlette.datastructures.UploadFile`` (the name real
+        # ``FormData.close`` isinstance-checks through at call time) is
+        # patched to THIS class — without this branch those parsed uploads
+        # would silently stop matching (and stop being closed). hasattr on
+        # the real CLASS can't catch this: ``filename`` is a plain instance
+        # attribute there.
+        if isinstance(other, type) and issubclass(other, _RealUploadFile):
+            return True
         if all(hasattr(other, attr) for attr in ("filename", "content_type", "read")):
             return True
         return NotImplemented

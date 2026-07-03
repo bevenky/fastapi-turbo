@@ -114,7 +114,7 @@ class _FABodyValidator:
     polymorphically alongside Pydantic's own SchemaValidator.
     """
 
-    __slots__ = ("_validator", "_is_model", "_combined_body_fields")
+    __slots__ = ("_validator", "_is_model", "_combined_body_fields", "_native")
 
     def __init__(self, annotation, combined_body_fields=None):
         from pydantic import TypeAdapter
@@ -133,6 +133,19 @@ class _FABodyValidator:
             ta = TypeAdapter(annotation)
         self._validator = ta.validator
         self._is_model = is_model
+        # Fused happy-path validator: a real BaseModel exposes
+        # ``__pydantic_validator__`` whose ``validate_json(bytes)`` does a
+        # single jiter parse + validate pass (no json.loads + validate_python
+        # two-pass). For a JSON object body this is byte-identical to the
+        # wrapped ``validate_python(json.loads(body), from_attributes=True)``
+        # path (``from_attributes`` only affects non-dict inputs). Left None
+        # for ``_TypeAdapterProxy``/dataclass/scalar annotations that lack it,
+        # and never used when this is a combined-body wrapper (the cold path
+        # owns the per-field ``missing`` shaping for non-dict bodies).
+        if combined_body_fields:
+            self._native = None
+        else:
+            self._native = getattr(annotation, "__pydantic_validator__", None)
         # When set, this is a ``_combined_body`` wrapper — a list of
         # field names that produce per-field ``missing`` errors when
         # the raw body isn't a dict (FA parity — ``PUT`` with body
@@ -159,6 +172,22 @@ class _FABodyValidator:
 
     def validate_json(self, body):
         import json as _json
+
+        # Happy-path fast lane: a real BaseModel's fused jiter validator
+        # parses + validates in one pass. On ANY exception fall through to
+        # the existing two-pass path below, which preserves FA-exact error
+        # shapes (json_invalid loc=byte_pos, model_attributes_type for
+        # non-object bodies, combined-body per-field missing).
+        if self._native is not None:
+            try:
+                if isinstance(body, (bytes, bytearray)):
+                    return self._native.validate_json(body)
+                if isinstance(body, memoryview):
+                    return self._native.validate_json(bytes(body))
+                if isinstance(body, str):
+                    return self._native.validate_json(body)
+            except Exception:  # noqa: BLE001
+                pass
 
         if isinstance(body, (bytes, bytearray, memoryview)):
             raw = bytes(body)
@@ -226,6 +255,36 @@ def _make_fa_body_validator(annotation, combined_body_fields=None):
         return None
 
 
+def _make_fa_body_validator_from_adapter(adapter):
+    """Wrap an EXISTING pydantic ``TypeAdapter`` (real FastAPI's
+    ``ModelField._type_adapter`` for a NON-model body: typed ``dict[K, V]``,
+    containers, constrained scalars) in the FA-shaping ``_FABodyValidator``.
+
+    Why: the raw adapter's ``validate_json`` parses with pydantic-core, so a
+    malformed body yields pydantic-core's JSON error (``loc=("body",)``,
+    ``msg="Invalid JSON: ..."``, ``input=None``). Real FastAPI parses the body
+    with stdlib ``json`` FIRST and only then validates in Python mode — a
+    decode failure is its hardcoded ``json_invalid`` shape
+    (``loc=("body", e.pos)``, ``msg="JSON decode error"``, ``input={}``,
+    ``ctx.error=e.msg``). ``_FABodyValidator.validate_json`` reproduces exactly
+    that two-pass flow (R2 deep-validation J001). The adapter is reused as
+    built (its FieldInfo constraints stay baked in); returns ``None`` when the
+    object doesn't expose a pydantic-core validator (Rust keeps the raw path).
+    """
+    try:
+        validator = getattr(adapter, "validator", None)
+        if validator is None or not hasattr(validator, "validate_python"):
+            return None
+        wrapper = _FABodyValidator.__new__(_FABodyValidator)
+        wrapper._validator = validator
+        wrapper._is_model = False
+        wrapper._native = None
+        wrapper._combined_body_fields = None
+        return wrapper
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ── Async-handler driving glue (relocated from _resolution.py) ──────────────
 # Door glue, NOT introspection: the door drives an ``async def`` handler/dep from
 # sync code (block_in_place → with_gil). Kept here so _resolution.py (clone
@@ -233,9 +292,21 @@ def _make_fa_body_validator(annotation, combined_body_fields=None):
 
 
 def _has_await_in_source(func) -> bool:
-    """Best-effort static check: does this function's source text contain any
-    ``await`` expressions? Returns True on any detection failure so greenlet-bridge
-    libs (SQLAlchemy async, redis.asyncio) fall through to the safe path."""
+    """Best-effort static check: does this function's OWN body contain any
+    ``await`` expressions? Nested function/lambda bodies are skipped — an
+    ``await`` inside a nested ``async def`` (e.g. a streaming generator the
+    handler builds and returns) executes only when that inner object is
+    driven, never while the handler itself runs, so it must not misclassify
+    an await-free handler onto the worker-submit path (an Event round trip
+    per request). This matches code-object semantics exactly: a coroutine
+    can only suspend on an await/async-for/async-with compiled into its own
+    code object, and nested defs are separate code objects. Returns True on
+    any detection failure so greenlet-bridge libs (SQLAlchemy async,
+    redis.asyncio) fall through to the safe path.
+
+    NOTE: ``_uses_running_loop`` deliberately KEEPS whole-source semantics —
+    loop-affinity primitives (create_task, get_running_loop, ...) are
+    loop-binding even when they hide inside nested code that runs later."""
     try:
         import ast
         import inspect as _inspect
@@ -243,9 +314,17 @@ def _has_await_in_source(func) -> bool:
 
         src = _inspect.getsource(func)
         tree = ast.parse(textwrap.dedent(src))
-        for node in ast.walk(tree):
+        root = tree.body[0]
+        if not isinstance(root, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            return True
+        stack = list(ast.iter_child_nodes(root))
+        while stack:
+            node = stack.pop()
             if isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
                 return True
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Lambda)):
+                continue  # nested def: its awaits run when IT is driven, not now
+            stack.extend(ast.iter_child_nodes(node))
         return False
     except Exception:  # noqa: BLE001
         return True
@@ -316,11 +395,23 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
                 coro.send(None)
             except StopIteration as e:
                 return e.value
-            except BaseException:
+            except BaseException as exc:
                 try:
                     coro.close()
                 except Exception:  # noqa: BLE001
                     pass
+                # Misclassification safety net (same double-run semantics as
+                # the suspend fallback below): a loop-needing primitive raises
+                # this BEFORE suspending, e.g. when ``inspect.getsource``
+                # followed a ``__wrapped__`` chain to an await-free function
+                # while the wrapper actually awaits. Re-drive on the worker
+                # loop instead of 500ing.
+                if isinstance(exc, RuntimeError) and "no running event loop" in str(
+                    exc
+                ):
+                    from fastapi_turbo._async_worker import submit
+
+                    return submit(async_func(**kwargs), app=app)
                 raise
             try:
                 coro.close()
@@ -333,11 +424,21 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
         return _stamp(_noawait_caller)
 
     if for_handler:
+        from fastapi_turbo._async_worker import _default_timeout, submit_fast
+
+        # Door hot path: resolve the effective timeout ONCE at wrapper build —
+        # the same moment router.rs resolves ``RouteState.worker_timeout`` (the
+        # door re-registers and rebuilds these wrappers whenever
+        # ``_door_fingerprint`` changes, so per-app isolation is preserved).
+        # Requests then skip the per-request function-body import, the kwargs
+        # ``submit()`` middle frame, and the ``_default_timeout`` env read +
+        # getattr chain. Direct ``submit()`` callers keep fully dynamic
+        # resolution (tests monkeypatch FASTAPI_TURBO_WORKER_TIMEOUT at
+        # runtime against that path).
+        route_timeout = _default_timeout(app)
 
         def _submit_caller(**kwargs):
-            from fastapi_turbo._async_worker import submit
-
-            return submit(async_func(**kwargs), app=app)
+            return submit_fast(async_func(**kwargs), route_timeout)
 
         return _stamp(_submit_caller)
 
@@ -376,3 +477,25 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
         return _submit_partial(coro)
 
     return _stamp(_sync_caller)
+
+
+async def _inline_runner(coro, send):
+    """ASYNC_INLINE task body: complete the request INSIDE the task's final step.
+
+    The E-path previously wired ``task.add_done_callback(completer)`` — but
+    asyncio delivers done-callbacks via ``loop.call_soon``, i.e. one EXTRA
+    loop pass between the handler finishing and the tokio side being woken.
+    Awaiting the handler here and calling ``send`` (a Rust ``InlineSend``
+    pyclass: non-blocking ``oneshot::Sender::send``) as the last statement of
+    the task body delivers the outcome in the SAME loop iteration the handler
+    completes in.
+
+    ``except BaseException`` ships the exception object (CancelledError from a
+    timeout/disconnect cancel included) — byte-parity with the old completer's
+    ``task.result()`` re-raise, minus asyncio's "exception was never
+    retrieved" hazard (the task always finishes clean).
+    """
+    try:
+        send(await coro, None)
+    except BaseException as e:  # noqa: BLE001 — shipped to Rust, re-raised there
+        send(None, e)

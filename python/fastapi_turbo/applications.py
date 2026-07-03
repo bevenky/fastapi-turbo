@@ -11,11 +11,23 @@ import os
 from typing import Any, Callable, Sequence
 
 # Real pip FastAPI for the "accelerate real FastAPI" pivot. This module is imported
-# by fastapi_turbo/__init__.py BEFORE the compat shim installs (see __init__.py),
-# so `import fastapi` here resolves to the REAL package — captured before any
-# sys.modules shadowing. fastapi_turbo.FastAPI subclasses it; later pivot steps
-# delete the clone overrides so the real base's routing/openapi/deps show through.
+# by fastapi_turbo/__init__.py BEFORE ``compat.install()`` patches the accelerated
+# entry points onto the real package (see __init__.py), so the class statement
+# below subclasses the GENUINE ``fastapi.FastAPI``.
 import fastapi as _real_fastapi
+
+# NOTE on patched-name lookups: the patch-on-real compat installer
+# setattr-patches ``fastapi.routing.APIRoute`` (and friends) to the turbo
+# subclasses on this SAME live module object, so a runtime lookup through
+# ``_real_fastapi.routing.APIRoute`` returns the turbo subclass once the
+# patcher has run. That is deliberately what the internal real-route
+# construction sites below use: real ``get_openapi`` (and real
+# ``include_router``) isinstance-check through the SAME live attribute, so
+# constructing with the live class keeps checker and instances consistent
+# both pre- and post-install. Only resolve through ``_real_fastapi`` paths
+# the installer never patches (``openapi.utils.get_openapi``,
+# ``datastructures.Default``, ``responses.JSONResponse``, ...) when the
+# genuine object is required.
 
 # Module logger for the silently-swallowed paths. ``except Exception:
 # pass`` used to be the default; where the swallow is genuinely
@@ -51,7 +63,10 @@ from fastapi_turbo.routing import (
     _mark_starlette_compat_route,
     _unset_to_none,
 )
-from fastapi_turbo._ws_support import _adapt_websocket_endpoint_class
+from fastapi_turbo._ws_support import (
+    _adapt_websocket_endpoint_class,
+    _wrap_websocket_endpoint,
+)
 
 
 class URLPath(str):
@@ -71,15 +86,12 @@ class URLPath(str):
 # Route-handler helpers extracted to ``_route_helpers.py``.
 from fastapi_turbo._route_helpers import (  # noqa: F401 — re-exports
     _apply_response_model,
-    _apply_status_code,
     _build_custom_route_handler_endpoint,
     _close_one_upload,
     _close_upload_files,
     _has_overridden_get_route_handler,
     _is_async_callable,
-    _maybe_print_debug_traceback,
     _model_needs_full_dump,
-    _wrap_response_class,
 )
 
 
@@ -260,92 +272,6 @@ from fastapi_turbo.responses import JSONResponse as _JSONResponse
 from fastapi_turbo.responses import Response as _real_starlette_response
 
 
-async def _ws_entry_with_asgi_chain(app_self, ws, path_params, inner_ws_entry):
-    """Dispatch a synthesised ``scope['type'] == 'websocket'`` through the
-    app's raw ASGI middleware chain, then call ``inner_ws_entry(ws, **path_params)``.
-
-    Gives Sentry / OTel / rate-limit middleware connection-level visibility
-    and exception capture. Per-message (``websocket.send`` / ``websocket.receive``)
-    observation isn't plumbed — most tracing middleware keys off scope,
-    not individual frames.
-    """
-    import asyncio
-
-    # Build the ASGI scope from the WebSocket object.
-    url = getattr(ws, "url", None)
-    path = url.path if url is not None else "/"
-    query = (url.query or "") if url is not None else ""
-    raw_headers = []
-    try:
-        for k, v in (ws.headers.raw or []):
-            kk = k.encode("latin-1") if isinstance(k, str) else k
-            vv = v.encode("latin-1") if isinstance(v, str) else v
-            raw_headers.append((kk, vv))
-    except Exception as _exc:  # noqa: BLE001
-        _log.debug("silent catch in applications: %r", _exc)
-    scope = {
-        "type": "websocket",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
-        "http_version": "1.1",
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("utf-8"),
-        "query_string": query.encode("latin-1"),
-        "headers": raw_headers,
-        "client": getattr(ws, "client", None),
-        "server": getattr(ws, "server", None),
-        "subprotocols": getattr(ws, "_subprotocols", []) or [],
-        "state": {},
-        "app": app_self,
-    }
-
-    # Receive queue: start with websocket.connect so the MW sees the handshake.
-    recv_q: asyncio.Queue = asyncio.Queue()
-    await recv_q.put({"type": "websocket.connect"})
-
-    async def _recv():
-        return await recv_q.get()
-
-    async def _send(_msg):
-        # Phase 1: no-op observer. MW still sees the scope and can catch
-        # exceptions from ``await self.app(scope, receive, send)``.
-        return None
-
-    inner_exc: list = []
-
-    async def _inner(s, r, _s):
-        # Pull the connect event so MW-side ``receive()`` wrappers that
-        # only consume one message stay consistent.
-        msg = await r()
-        if msg.get("type") != "websocket.connect":
-            return
-        # Run the actual WS handler. If it raises, propagate so an outer
-        # MW's ``try/except`` can observe (Sentry / OTel).
-        try:
-            await inner_ws_entry(ws, **path_params)
-        except BaseException as e:  # noqa: BLE001
-            inner_exc.append(e)
-            raise
-
-    # Compose raw ASGI MW chain around the inner app (outer-most first).
-    composed = _inner
-    for mw_cls, kwargs in reversed(app_self._raw_asgi_middlewares):
-        try:
-            composed = mw_cls(app=composed, **kwargs)
-        except TypeError:
-            composed = mw_cls(**kwargs)
-
-    try:
-        await composed(scope, _recv, _send)
-    except BaseException:  # noqa: BLE001
-        # If the MW didn't swallow the handler's exception, surface it the
-        # same way the non-chained path would: raise in the worker loop so
-        # ``_ws_server_exceptions`` / TestClient capture logic fires.
-        if inner_exc:
-            raise inner_exc[0]
-        raise
-
-
 # Middleware-wrap machinery extracted to ``_middleware_wrap.py``.
 from fastapi_turbo._middleware_wrap import (  # noqa: F401 — public-shape re-exports
     _drive_async_fallback,
@@ -362,6 +288,28 @@ def _door_wrap_stream_teardown(app, stream_response, req_gens):
     itself stays in Python — drive each generator past its yield (LIFO), capturing
     a post-yield raise onto the app since the response is already streaming."""
     inner = stream_response.body_iterator
+
+    # Propagate the no-await verdict of the REAL user gen (``inner``) onto the
+    # response BEFORE wrapping. The async ``_wrapped`` below only does
+    # ``async for ... : yield`` (no ``GET_AWAITABLE`` of its own), so bytecode
+    # analysis of the wrapper would wrongly green-light the Rust inline-drive
+    # fast path even when ``inner`` awaits. Stamping the wrapped gen's verdict
+    # here keeps that decision keyed on the real body. (Only meaningful for
+    # async ``inner``; sync ``inner`` doesn't reach the async fast path.)
+    if hasattr(inner, "__aiter__"):
+        try:
+            from fastapi_turbo.responses import _gen_is_noawait as _gina
+
+            stream_response._fastapi_turbo_stream_noawait = _gina(inner)
+        except Exception:  # noqa: BLE001
+            stream_response._fastapi_turbo_stream_noawait = False
+        # The wrapper below shares ONE code object across every wrapped route,
+        # so the Rust runtime-cooperative classification (trampoline vs worker
+        # loop, streaming.rs) must key on the REAL user gen's code — stamp it
+        # alongside the no-await verdict.
+        stream_response._fastapi_turbo_stream_code = getattr(
+            inner, "ag_code", None
+        )
 
     def _teardown():
         for g in reversed(req_gens):
@@ -401,499 +349,37 @@ def _door_wrap_stream_teardown(app, stream_response, req_gens):
     stream_response.body_iterator = _wrapped()
 
 
-def _collect_dependencies_from_markers(dependencies):
-    """Convert a list of Depends markers into introspection-ready param dicts."""
-    from fastapi_turbo.dependencies import Depends as DependsClass
-
-    result = []
-    for i, dep in enumerate(dependencies):
-        if isinstance(dep, DependsClass):
-            dep_func = dep.dependency
-            result.append({
-                "name": f"_global_dep_{i}_{id(dep_func)}",
-                "kind": "dependency",
-                "type_hint": "any",
-                "required": False,
-                "default_value": None,
-                "model_class": None,
-                "alias": None,
-                "dep_callable": dep_func,
-                "use_cache": dep.use_cache,
-            })
-    return result
-
-
-def _parse_range_header(header_val: str, total_len: int):
-    """Parse an RFC 7233 ``Range:`` header against a known file length.
-
-    Implements Starlette 1.0's exact semantics:
-
-      * Unit must be ``bytes`` (case-insensitive token — ``Bytes=`` is
-        accepted, ``items=`` is rejected).
-      * Per sub-range, parse ``start-end`` as Starlette does
-        (internally end-exclusive: ``start = file_size - n`` for the
-        ``-n`` suffix form; ``end = end_str + 1`` if both halves are
-        present and ``end_str < file_size``, else ``end = file_size``).
-      * Sub-ranges that fail to parse (``abc-def``, empty, no dash) are
-        silently dropped (matches Starlette's ``_parse_ranges``).
-      * Validation order: zero parseable → 400; any out-of-bounds
-        start → 416; any reversed ``start > end`` → 400.
-      * Overlapping/adjacent sub-ranges are merged before deciding
-        single vs multipart (so ``0-19,0-19`` → single, ``0-9,10-19``
-        → single).
-
-    Returns one of:
-      * ``('full',)`` — header absent. Caller serves 200 full body.
-      * ``('range', start, end_inclusive)`` — single satisfiable
-        coalesced range.
-      * ``('multi', [(s0, e0), ...])`` — multiple satisfiable
-        coalesced ranges. Caller emits 206 multipart/byteranges.
-      * ``('unsatisfiable',)`` — well-formed but at least one
-        sub-range start is out of bounds. Caller returns 416.
-      * ``('malformed', detail)`` — Starlette ``MalformedRangeHeader``
-        equivalent. Caller returns 400.
-
-    No range-count cap: post-coalesce the byte sum is bounded by
-    ``total_len`` (coalesced ranges are non-overlapping within the
-    file), so the only "amplification" is the multipart envelope
-    overhead (~150 bytes per range). At 1000 ranges that's ~150 KiB
-    of framing — not a DoS surface — and it matches upstream's lack
-    of a cap.
-    """
-    if not header_val:
-        return ("full",)
-    v = header_val.strip()
-    # Error message strings match Starlette 1.0 byte-for-byte so
-    # error-body comparisons across the two stacks pass.
-    if "=" not in v:
-        return ("malformed", "Malformed range header.")
-    unit, _, rest = v.partition("=")
-    if unit.strip().lower() != "bytes":
-        return ("malformed", "Only support bytes range")
-    rest = rest.strip()
-    if total_len == 0:
-        # Any well-formed range against an empty resource is
-        # unsatisfiable per RFC 7233.
-        return ("unsatisfiable",)
-
-    # Parse sub-ranges in Starlette's half-open ``[start, end)``
-    # representation. Per-sub-range errors are silently dropped.
-    raw: list[tuple[int, int]] = []
-    for part in rest.split(","):
-        part = part.strip()
-        if not part or part == "-":
-            continue
-        if "-" not in part:
-            continue
-        start_str, _, end_str = part.partition("-")
-        start_str = start_str.strip()
-        end_str = end_str.strip()
-        try:
-            if start_str:
-                start = int(start_str)
-            else:
-                # ``-N`` suffix: start = file_size - N. Note this can
-                # go negative for ``-N`` where N > file_size, which
-                # the bounds check below catches as 416.
-                start = total_len - int(end_str)
-            if start_str and end_str and int(end_str) < total_len:
-                end = int(end_str) + 1
-            else:
-                end = total_len
-        except (ValueError, TypeError):
-            continue
-        raw.append((start, end))
-
-    if not raw:
-        return ("malformed", "Range header: range must be requested")
-
-    # Bounds check (fires BEFORE the reversed check — matches
-    # Starlette's order). Any start outside ``[0, total_len)`` → 416.
-    if any(not (0 <= s < total_len) for s, _ in raw):
-        return ("unsatisfiable",)
-
-    if any(s > e for s, e in raw):
-        return ("malformed", "Range header: start must be less than end")
-
-    # Coalesce in half-open form (touching: ``s <= prev_end``).
-    raw.sort()
-    coalesced: list[tuple[int, int]] = []
-    for s, e in raw:
-        if coalesced and s <= coalesced[-1][1]:
-            ps, pe = coalesced[-1]
-            coalesced[-1] = (ps, max(pe, e))
-        else:
-            coalesced.append((s, e))
-
-    # Convert half-open back to inclusive for the wire / caller.
-    inclusive = [(s, e - 1) for s, e in coalesced]
-    if len(inclusive) == 1:
-        s, e = inclusive[0]
-        return ("range", s, e)
-    return ("multi", inclusive)
-
-
-def _make_byteranges_boundary() -> str:
-    """Generate a multipart/byteranges boundary. 26 hex chars —
-    process-nanos ⊕ per-call counter for uniqueness across bursts."""
-    import secrets
-    import time
-    return f"{int(time.time() * 1e9):016x}{secrets.token_hex(5)}"
-
-
-async def _send_file_response_asgi(send, response, scope=None) -> None:
-    """Serialize a ``FileResponse`` over ASGI, honouring the request's
-    ``Range:`` header when present.
-
-    ``FileResponse`` stores ``content=b""`` and relies on the Rust
-    server to read ``self.path`` from disk at serve-time. Over the
-    in-process ASGI path that never runs, so we open the file here,
-    compute the slice we actually need, and stream it via
-    ``http.response.body`` frames."""
-    import os
-    from fastapi_turbo.responses import JSONResponse as _JR_file
-
-    path = getattr(response, "path", None)
-    if path is None:
-        await _send_asgi_response(send, _JR_file(
-            content={"detail": "FileResponse has no path"},
-            status_code=500,
-        ))
-        return
-
-    try:
-        stat = os.stat(path)
-    except FileNotFoundError:
-        await _send_asgi_response(send, _JR_file(
-            content={"detail": f"File not found: {path}"},
-            status_code=404,
-        ))
-        return
-    except OSError as e:
-        await _send_asgi_response(send, _JR_file(
-            content={"detail": f"File stat error: {e}"},
-            status_code=500,
-        ))
-        return
-
-    import stat as _stat_mod
-    if not _stat_mod.S_ISREG(stat.st_mode):
-        # A directory (or device / fifo) reached FileResponse — this
-        # is a server-side routing bug, not a client error. Match
-        # Starlette: raise RuntimeError so the traceback surfaces in
-        # dev logs; the ASGI error handler (or the surrounding
-        # exception middleware) converts it to 500 for the client.
-        # Silently returning a JSON 500 here would mask the misuse.
-        raise RuntimeError(f"File at path {path} is not a file.")
-
-    total_len = stat.st_size
-
-    # Stamp Last-Modified + ETag at serve-time (matches Starlette).
-    # ``set_stat_headers`` uses ``setdefault`` so any user-supplied
-    # overrides on the response survive.
-    try:
-        response.set_stat_headers(stat)
-    except Exception:
-        # Don't let a header-stamp failure break the response.
-        pass
-
-    # Extract Range + If-Range from scope headers (if provided).
-    range_header = ""
-    if_range_header = ""
-    if scope is not None:
-        for hk, hv in scope.get("headers", []) or []:
-            hkn = hk.decode("latin-1") if isinstance(hk, bytes) else hk
-            kl = hkn.lower()
-            if kl == "range":
-                range_header = hv.decode("latin-1") if isinstance(hv, bytes) else hv
-            elif kl == "if-range":
-                if_range_header = hv.decode("latin-1") if isinstance(hv, bytes) else hv
-
-    # If-Range gating: ignore Range when the validator doesn't match.
-    # Per RFC 7233 §3.2, If-Range carries either the entity's ETag or
-    # its Last-Modified — if neither matches, the server must serve the
-    # full representation (status 200) rather than a 206.
-    if range_header and if_range_header:
-        lm = response.headers.get("last-modified", "")
-        et = response.headers.get("etag", "")
-        if if_range_header != lm and if_range_header != et:
-            range_header = ""
-
-    parsed = _parse_range_header(range_header, total_len) if range_header else ("full",)
-
-    # 400 short-circuit (Starlette ``MalformedRangeHeader``).
-    if parsed[0] == "malformed":
-        detail = parsed[1] if len(parsed) > 1 else "malformed Range header"
-        body = detail.encode("latin-1")
-        await send({
-            "type": "http.response.start",
-            "status": 400,
-            "headers": [
-                (b"content-type", b"text/plain; charset=utf-8"),
-                (b"content-length", str(len(body)).encode("latin-1")),
-            ],
-        })
-        await send({"type": "http.response.body", "body": body})
-        return
-
-    # 416 short-circuit. Header shape matches Starlette 1.0 exactly:
-    # only Content-Range, Content-Length: 0, and Content-Type:
-    # text/plain; charset=utf-8. No accept-ranges, no last-modified,
-    # no etag — Starlette treats 416 as a generic PlainTextResponse.
-    if parsed[0] == "unsatisfiable":
-        await send({
-            "type": "http.response.start",
-            "status": 416,
-            "headers": [
-                (b"content-range", f"bytes */{total_len}".encode("latin-1")),
-                (b"content-length", b"0"),
-                (b"content-type", b"text/plain; charset=utf-8"),
-            ],
-        })
-        await send({"type": "http.response.body", "body": b""})
-        return
-
-    # Multi-range: emit 206 multipart/byteranges, streaming each part.
-    # Wire format mirrors Starlette 1.0's ``generate_multipart`` exactly
-    # (CRLF separators, no leading CRLF, ``\r\n`` between body and next
-    # part, closing ``--{boundary}--`` with no trailing CRLF):
-    #
-    #   --{boundary}\r\n
-    #   Content-Type: {part_ct}\r\n
-    #   Content-Range: bytes {start}-{end}/{total}\r\n
-    #   \r\n
-    #   <body bytes>
-    #   \r\n--{boundary}\r\n
-    #   Content-Type: {part_ct}\r\n
-    #   ...
-    #   \r\n--{boundary}--
-    if parsed[0] == "multi":
-        ranges: list[tuple[int, int]] = parsed[1]
-        # Per-part Content-Type echoes the response's full content-
-        # type (the FileResponse __init__ already augments textual
-        # types with ``; charset=utf-8`` — same as Starlette). Falling
-        # back to ``media_type`` would drop the charset.
-        part_ct = (
-            response.headers.get("content-type")
-            or getattr(response, "media_type", None)
-            or "application/octet-stream"
-        )
-        boundary = _make_byteranges_boundary()
-
-        # Precompute each part's preamble and the total body length.
-        # First preamble has no leading separator (matches Starlette);
-        # subsequent preambles are prefixed with ``\r\n`` to terminate
-        # the prior body (the body bytes end raw).
-        preambles: list[bytes] = []
-        body_len = 0
-        for idx, (start, end) in enumerate(ranges):
-            sep = "" if idx == 0 else "\r\n"
-            pre = (
-                f"{sep}--{boundary}\r\n"
-                f"Content-Type: {part_ct}\r\n"
-                f"Content-Range: bytes {start}-{end}/{total_len}\r\n"
-                f"\r\n"
-            ).encode("latin-1")
-            preambles.append(pre)
-            body_len += len(pre) + (end - start + 1)
-        closing = f"\r\n--{boundary}--".encode("latin-1")
-        body_len += len(closing)
-
-        # Override headers for multipart response. We drop the upstream
-        # response's content-type/content-length — the part media_type
-        # lives inside each preamble now.
-        response.headers["content-length"] = str(body_len)
-        response.headers["content-type"] = (
-            f"multipart/byteranges; boundary={boundary}"
-        )
-        if "accept-ranges" not in response.headers:
-            response.headers["accept-ranges"] = "bytes"
-        # Drop any single-range content-range left by earlier logic.
-        response.headers.pop("content-range", None)
-
-        norm_headers = _pack_asgi_headers(response)
-        await send({
-            "type": "http.response.start",
-            "status": 206,
-            "headers": norm_headers,
-        })
-
-        CHUNK = 64 * 1024
-        try:
-            with open(path, "rb") as fh:
-                for (start, end), pre in zip(ranges, preambles):
-                    await send({
-                        "type": "http.response.body",
-                        "body": pre,
-                        "more_body": True,
-                    })
-                    fh.seek(start)
-                    remaining = end - start + 1
-                    while remaining > 0:
-                        chunk = fh.read(min(CHUNK, remaining))
-                        if not chunk:
-                            break
-                        remaining -= len(chunk)
-                        await send({
-                            "type": "http.response.body",
-                            "body": chunk,
-                            "more_body": True,
-                        })
-        except OSError:
-            pass
-        await send({
-            "type": "http.response.body",
-            "body": closing,
-            "more_body": False,
-        })
-        return
-
-    # Compute slice window.
-    if parsed[0] == "range":
-        _, start_off, end_incl = parsed
-        slice_len = end_incl - start_off + 1
-        status_code = 206
-        content_range = f"bytes {start_off}-{end_incl}/{total_len}"
-    else:
-        start_off = 0
-        slice_len = total_len
-        status_code = int(getattr(response, "status_code", 200) or 200)
-        content_range = None
-
-    # Stamp Content-Length from the slice we're about to send.
-    response.headers["content-length"] = str(slice_len)
-    if "content-type" not in response.headers:
-        media = getattr(response, "media_type", None) or "application/octet-stream"
-        response.headers["content-type"] = media
-    if content_range is not None:
-        response.headers["content-range"] = content_range
-    if "accept-ranges" not in response.headers:
-        response.headers["accept-ranges"] = "bytes"
-
-    norm_headers = _pack_asgi_headers(response)
-
-    await send({
-        "type": "http.response.start",
-        "status": status_code,
-        "headers": norm_headers,
-    })
-
-    # Stream 64 KiB chunks, bounded to the requested slice.
-    CHUNK = 64 * 1024
-    remaining = slice_len
-    try:
-        with open(path, "rb") as fh:
-            if start_off > 0:
-                fh.seek(start_off)
-            while remaining > 0:
-                chunk = fh.read(min(CHUNK, remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-                await send({
-                    "type": "http.response.body",
-                    "body": chunk,
-                    "more_body": remaining > 0,
-                })
-    except OSError:
-        # File disappeared mid-stream — client sees a truncated body.
-        pass
-    if remaining == slice_len:
-        # We sent no body frames (zero-length file) — emit the
-        # terminator.
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
-
-
-def _pack_asgi_headers(response) -> list[tuple[bytes, bytes]]:
-    """Serialize a Response's headers into ASGI's ``[(bytes, bytes)]``
-    shape, honouring both the ``MutableHeaders`` view (the canonical
-    single-value-per-name dict-ish) and any ``raw_headers`` (preserves
-    duplicate-allowed names like ``Set-Cookie``). De-duplicates exact
-    (name, value) collisions between the two sources."""
-    hdrs = response.headers
-    raw_headers = getattr(response, "raw_headers", None) or []
-    norm_headers: list[tuple[bytes, bytes]] = []
-    seen_exact: set[tuple[str, str]] = set()
-    if hdrs is not None and hasattr(hdrs, "items"):
-        for k, v in hdrs.items():
-            kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
-            vs = v if isinstance(v, str) else v.decode("latin-1")
-            seen_exact.add((kl, vs))
-            norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
-    for k, v in raw_headers:
-        kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
-        vs = v if isinstance(v, str) else v.decode("latin-1")
-        if (kl, vs) in seen_exact:
-            continue
-        seen_exact.add((kl, vs))
-        norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
-    return norm_headers
-
-
-_REAL_STARLETTE_CLASS_CACHE: dict[tuple[str, str], object] = {}
-_REAL_STARLETTE_LOAD_LOCK = __import__("threading").RLock()
-
-
 def _load_real_starlette_class(submodule: str, classname: str):
-    """Bypass the fastapi_turbo shim to load the REAL Starlette class.
+    """Load the GENUINE Starlette class for the in-process dispatcher.
 
-    The shim hijacks ``sys.modules['starlette.*']`` so user code's
-    ``from starlette.middleware.cors import CORSMiddleware`` resolves
-    to our Tower-bound marker stub (which has no ``__call__``). For
-    the in-process dispatcher we need the real Starlette
-    implementation so CORS / GZip / HTTPSRedirect actually work for
-    TestClient / ASGITransport users.
+    Post shim-flip, ``starlette.*`` modules in ``sys.modules`` ARE the real
+    package — but the compat patcher rebinds a few attributes (the
+    Tower-marker middleware classes among them) to turbo stand-ins that are
+    inert as ASGI. When the in-process / TestClient path needs the real
+    implementation (so CORS / GZip / HTTPSRedirect actually run), consult
+    the patcher's saved original for that exact (module, attribute) first;
+    fall back to the live attribute when it was never patched.
 
-    Snapshots ``starlette.*`` from ``sys.modules``, evicts them,
-    forces a fresh import (which finds the real installed package on
-    disk), captures the class reference, then restores the shim
-    modules so subsequent user-land imports still see our shim.
-    Cached so the snapshot only happens once per (submodule, class).
-
-    Thread-safety: the snapshot/restore window is guarded by a
-    process-wide reentrant lock. ``add_middleware`` pre-loads each
-    Tower-bound class at registration so the dispatcher's hot path
-    is just a dict lookup — the slow path only runs during app
-    construction (single-threaded by convention) or if a user
-    side-channel adds middleware mid-request (uncommon)."""
-    cache_key = (submodule, classname)
-    cached = _REAL_STARLETTE_CLASS_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    import sys
+    This replaces the pre-flip snapshot/evict/re-import dance (which dodged
+    the fake sys.modules entries at the cost of a process-wide lock and
+    duplicate class identities from the fresh import)."""
     import importlib
 
-    with _REAL_STARLETTE_LOAD_LOCK:
-        # Re-check inside the lock to avoid duplicate loads when two
-        # callers race past the unsynchronised lookup above.
-        cached = _REAL_STARLETTE_CLASS_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
+    try:
+        mod = importlib.import_module(f"starlette.{submodule}")
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        from fastapi_turbo import compat as _compat
 
-        saved: dict[str, object] = {}
-        for m in list(sys.modules):
-            if m == "starlette" or m.startswith("starlette."):
-                saved[m] = sys.modules[m]
-                del sys.modules[m]
-
-        importlib.invalidate_caches()
-        try:
-            mod = importlib.import_module(f"starlette.{submodule}")
-            cls = getattr(mod, classname, None)
-        except Exception:  # noqa: BLE001
-            cls = None
-        finally:
-            # Drop anything imported during the un-shimmed window so the
-            # shim remains canonical in sys.modules. THEN restore.
-            for m in list(sys.modules):
-                if (m == "starlette" or m.startswith("starlette.")) and m not in saved:
-                    del sys.modules[m]
-            for m, original in saved.items():
-                sys.modules[m] = original
-
-        _REAL_STARLETTE_CLASS_CACHE[cache_key] = cls
-        return cls
+        for patched_mod, attr, original in _compat._PATCHES:
+            if patched_mod is mod and attr == classname:
+                # First record for this (module, attr) holds the genuine
+                # pre-patch value.
+                return None if original is _compat._MISSING else original
+    except Exception as _exc:  # noqa: BLE001
+        _log.debug("compat original lookup failed: %r", _exc)
+    return getattr(mod, classname, None)
 
 
 # Real Starlette/FastAPI middleware class names → fastapi-turbo
@@ -960,141 +446,6 @@ def _resolve_tower_bound_to_asgi_class(mw_cls):
             "middleware.httpsredirect", "HTTPSRedirectMiddleware"
         )
     return None
-
-
-async def _run_response_background(response) -> None:
-    background = getattr(response, "background", None)
-    if background is None:
-        return
-    result = background()
-    if inspect.isawaitable(result):
-        await result
-
-
-async def _send_asgi_response(send, response, scope=None) -> None:
-    # ``FileResponse`` stores ``content=b""`` because the Rust server
-    # reads ``response.path`` from disk at serve time. Over the in-
-    # process ASGI path no Rust runs, so we must open + stream the
-    # file ourselves — and honour the request's ``Range:`` header.
-    try:
-        from fastapi_turbo.responses import FileResponse as _FR
-    except ImportError:
-        _FR = None  # type: ignore[assignment]
-    if _FR is not None and isinstance(response, _FR):
-        # Bare propagation — if ``_send_file_response_asgi`` raises
-        # (e.g. ``RuntimeError`` on directory paths, mirroring
-        # Starlette), let the ASGI error handler surface it with a
-        # traceback. The previous ``except Exception: pass`` swallowed
-        # these and fell through to the generic path, which then
-        # emitted a 200-empty body for a FileResponse that never
-        # legitimately ran.
-        await _send_file_response_asgi(send, response, scope=scope)
-        await _run_response_background(response)
-        return
-    """Serialize a fastapi-turbo ``Response`` (or Starlette-compatible
-    response with ``status_code`` / ``headers`` / ``body``) into ASGI
-    ``http.response.start`` + ``http.response.body`` messages.
-
-    Emits:
-      * Every unique header via the dict-like ``.headers`` view
-        (which includes mutations done via ``response.headers[k]=v``
-        inside middleware).
-      * Every duplicate (``Set-Cookie`` etc.) present in
-        ``raw_headers`` / ``._extras`` that isn't already covered.
-
-    Together this gives middleware a simple way to inject headers
-    (``resp.headers['X-Traced'] = '1'``) AND preserves duplicate-header
-    responses (two ``set_cookie`` calls → two ``Set-Cookie`` lines).
-    """
-    status_code = int(getattr(response, "status_code", 200) or 200)
-    hdrs = getattr(response, "headers", None)
-    raw_headers = getattr(response, "raw_headers", None) or []
-
-    # De-dup via the dict view first; then append any raw entries
-    # that differ from what the dict reports. ``_MutableHeadersDict``
-    # guarantees key-canonical lowercase but value may have diverged
-    # if the user called ``.append()`` for a second value.
-    norm_headers: list[tuple[bytes, bytes]] = []
-    seen_exact: set[tuple[str, str]] = set()
-    if hdrs is not None and hasattr(hdrs, "items"):
-        for k, v in hdrs.items():
-            kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
-            vs = v if isinstance(v, str) else v.decode("latin-1")
-            seen_exact.add((kl, vs))
-            norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
-    for k, v in raw_headers:
-        kl = (k if isinstance(k, str) else k.decode("latin-1")).lower()
-        vs = v if isinstance(v, str) else v.decode("latin-1")
-        if (kl, vs) in seen_exact:
-            continue
-        seen_exact.add((kl, vs))
-        norm_headers.append((kl.encode("latin-1"), vs.encode("latin-1")))
-    # StreamingResponse / SSE: iterate ``body_iterator`` and emit
-    # multiple ``http.response.body`` frames with ``more_body=True``.
-    # Handles both sync and async iterables.
-    body_iter = getattr(response, "body_iterator", None)
-    if body_iter is not None:
-        await send({
-            "type": "http.response.start",
-            "status": status_code,
-            "headers": norm_headers,
-        })
-        import inspect as _insp_send
-        # ``await asyncio.sleep(0)`` between chunks yields control to
-        # the event loop so a ``task.cancel()`` issued from the
-        # client side (TestClient stream early-exit, real-client
-        # disconnect) can propagate as ``CancelledError``. Without
-        # this, a sync generator that runs in a tight loop (the
-        # ``while True: yield b'x'`` shape) never gives the
-        # scheduler a chance to deliver the cancellation, and
-        # ``cli.stream(...)`` exit hangs indefinitely.
-        if hasattr(body_iter, "__anext__") or _insp_send.isasyncgen(body_iter):
-            async for chunk in body_iter:
-                if isinstance(chunk, str):
-                    chunk = chunk.encode("utf-8")
-                await send({
-                    "type": "http.response.body",
-                    "body": bytes(chunk),
-                    "more_body": True,
-                })
-                await asyncio.sleep(0)
-        else:
-            for chunk in body_iter:
-                if isinstance(chunk, str):
-                    chunk = chunk.encode("utf-8")
-                await send({
-                    "type": "http.response.body",
-                    "body": bytes(chunk),
-                    "more_body": True,
-                })
-                await asyncio.sleep(0)
-        await send({
-            "type": "http.response.body",
-            "body": b"",
-            "more_body": False,
-        })
-        await _run_response_background(response)
-        return
-
-    body = getattr(response, "body", b"") or b""
-    if not isinstance(body, (bytes, bytearray)):
-        # Unknown body shape — try a str fallback or bail.
-        if isinstance(body, str):
-            body = body.encode("utf-8")
-        else:
-            raise NotImplementedError(
-                f"in-process ASGI: cannot serialise body of type {type(body).__name__}"
-            )
-    await send({
-        "type": "http.response.start",
-        "status": status_code,
-        "headers": norm_headers,
-    })
-    await send({
-        "type": "http.response.body",
-        "body": bytes(body),
-    })
-    await _run_response_background(response)
 
 
 def _request_injection_param(
@@ -1342,6 +693,69 @@ def _wrap_with_exception_handlers(handler, app):
             # Starlette parity bookkeeping: capture non-HTTPException exceptions
             # not handled by a SPECIFIC handler (the ``Exception`` catch-all still
             # re-raises) for raise_server_exceptions / Sentry.
+            handled_specific = False
+            if result is not None and not raised:
+                for exc_cls in app.exception_handlers:
+                    if exc_cls is Exception:
+                        continue
+                    if isinstance(exc_cls, type) and isinstance(exc, exc_cls):
+                        handled_specific = True
+                        break
+            try:
+                from fastapi_turbo.exceptions import HTTPException as _HE
+
+                if not isinstance(exc, _HE) and not handled_specific:
+                    captured = getattr(app, "_captured_server_exceptions", None)
+                    if captured is not None:
+                        captured.append(exc)
+            except Exception:  # noqa: BLE001
+                pass
+            if result is not None and not raised:
+                return result
+            raise
+
+    wrapped.__name__ = getattr(handler, "__name__", "handler")
+    return wrapped
+
+
+def _async_inline_enabled() -> bool:
+    """``FASTAPI_TURBO_ASYNC_INLINE=1``: register eligible coroutine handlers
+    as genuinely async (``is_async=True``) so the Rust door drives the request
+    on the persistent worker loop end-to-end (router.rs async-inline path)
+    instead of wrapping them in the SYNC submit-caller (which blocks a tokio
+    thread on a ``threading.Event`` for the whole request)."""
+    import os
+
+    return os.environ.get("FASTAPI_TURBO_ASYNC_INLINE", "").strip() in (
+        "1",
+        "true",
+        "True",
+        "TRUE",
+        "yes",
+        "on",
+    )
+
+
+def _wrap_with_exception_handlers_async(handler, app):
+    """Async twin of ``_wrap_with_exception_handlers``: same custom-handler
+    dispatch + capture bookkeeping, but awaits the coroutine INSIDE the wrapper
+    so handler-raised exceptions (raised during await, not at coroutine
+    creation) are actually caught. Returns the handler unchanged when the app
+    has no custom handlers. Used by the async-inline registration path, which
+    must keep the handler a genuine coroutine function."""
+    if not getattr(app, "exception_handlers", None):
+        return handler
+
+    async def wrapped(**kwargs):
+        try:
+            return await handler(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            result = None
+            raised = False
+            try:
+                result = await app._ainvoke_exception_handler(exc)
+            except Exception:  # noqa: BLE001
+                raised = True
             handled_specific = False
             if result is not None and not raised:
                 for exc_cls in app.exception_handlers:
@@ -1680,78 +1094,6 @@ def _build_stream_handler(orig_endpoint, response_model, response_class, app):
             return _SR(_iter_sync(), media_type="application/jsonl")
 
     return _json_lines_wrap
-
-
-def _shim_get_openapi(*, title, version, routes=None, webhooks=None, **kw):
-    """Shim for ``fastapi.openapi.utils.get_openapi`` — the clone ``_openapi.py``
-    generator is deleted, so user code doing
-    ``from fastapi.openapi.utils import get_openapi; get_openapi(routes=app.routes, ...)``
-    (e.g. a custom ``app.openapi``) must convert the CLONE route objects to real
-    ``APIRoute``s before calling REAL get_openapi. Builds from each route's own-level
-    attributes (mount/include prefixing is already baked into ``route.path``)."""
-    _RealRoute = _real_fastapi.routing.APIRoute
-    _http = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
-
-    def _convert(route_list):
-        out = []
-        for route in route_list or []:
-            ep = getattr(route, "endpoint", None)
-            path = getattr(route, "path", None)
-            methods = getattr(route, "methods", None)
-            if ep is None or path is None or not methods:
-                continue  # Mount / WebSocket / non-API routes
-            rc = _unset_to_none(getattr(route, "response_class", None))
-            try:
-                rc_ok = isinstance(rc, type) and issubclass(rc, _real_starlette_response)
-            except TypeError:
-                rc_ok = False
-            rm = getattr(route, "response_model", None)
-            needs_none, is_sse, is_json, inner = _oa_stream_info(rm, rc, ep)
-            if needs_none:
-                rm = None
-            oe = dict(getattr(route, "openapi_extra", None) or {})
-            if getattr(route, "servers", None):
-                oe["servers"] = route.servers
-            if getattr(route, "external_docs", None):
-                oe["externalDocs"] = route.external_docs
-            if getattr(route, "security", None) is not None:
-                oe["security"] = route.security
-            rkw = dict(
-                methods=[m for m in methods if m in _http] or list(methods),
-                response_model=rm,
-                status_code=getattr(route, "status_code", None),
-                tags=getattr(route, "tags", None) or None,
-                summary=getattr(route, "summary", None),
-                description=getattr(route, "description", None) or "",
-                response_description=getattr(
-                    route, "response_description", "Successful Response"
-                ),
-                responses=getattr(route, "responses", None) or None,
-                deprecated=getattr(route, "deprecated", None),
-                operation_id=getattr(route, "operation_id", None),
-                dependencies=getattr(route, "dependencies", None) or None,
-                include_in_schema=getattr(route, "include_in_schema", True),
-                name=getattr(route, "name", None),
-                openapi_extra=oe or None,
-            )
-            if rc_ok:
-                rkw["response_class"] = rc
-            try:
-                rr = _RealRoute(path, ep, **rkw)
-            except Exception:  # noqa: BLE001
-                continue
-            if is_sse or is_json:
-                _oa_apply_stream(rr, is_sse, is_json, inner)
-            out.append(rr)
-        return out
-
-    return _real_fastapi.openapi.utils.get_openapi(
-        title=title,
-        version=version,
-        routes=_convert(routes),
-        webhooks=_convert(webhooks) if webhooks else None,
-        **kw,
-    )
 
 
 class FastAPI(_real_fastapi.FastAPI):
@@ -2733,6 +2075,26 @@ class FastAPI(_real_fastapi.FastAPI):
         except Exception:
             return None
 
+    async def _ainvoke_exception_handler(self, exc: BaseException):
+        """Async twin of ``_invoke_exception_handler`` for the async-inline
+        path: runs INSIDE a live event-loop task, so a coroutine handler is
+        awaited directly (once — matching real FastAPI) instead of the
+        send(None)-probe + new-event-loop fallback, which cannot run on a
+        thread whose loop is already running."""
+        _maybe_sentry_capture_failed_request(exc)
+        handler = self._lookup_exception_handler(exc)
+        if handler is None:
+            return None
+        from fastapi_turbo.requests import _door_make_request
+        scope = _current_request_scope.get() or {}
+        request = _door_make_request({**scope, "type": "http", "app": self})
+        try:
+            if inspect.iscoroutinefunction(handler):
+                return await handler(request, exc)
+            return handler(request, exc)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _door_handle_dep_exception(self, exc: BaseException):
         """Door dep-resolution error path: route a dependency-raised exception
         through user ``@app.exception_handler`` handlers, mirroring the Python
@@ -2775,927 +2137,6 @@ class FastAPI(_real_fastapi.FastAPI):
     # Route collection & introspection
     # ------------------------------------------------------------------
 
-    def _wrap_websocket_endpoint(
-        self,
-        endpoint,
-        route_path: str = "",
-        extra_dependencies: list | None = None,
-    ):
-        """Build a thin wrapper around a WebSocket endpoint that
-        - attaches ``ws.app`` so handlers can reach ``app.state``,
-        - resolves ``Depends(...)`` parameters (incl. sub-deps + yield),
-        - validates scalar params via Pydantic TypeAdapter,
-        - catches ``WebSocketException`` (before accept → HTTP reject via
-          ``ws._reject``; after accept → close with the given code), and
-        - invokes the user handler with the right kwargs.
-
-        Captures server-side exceptions onto ``app._ws_server_exceptions``
-        so ``TestClient`` can re-raise them on session close — matches
-        Starlette/FastAPI TestClient behaviour where a handler raising
-        ``WebSocketDisconnect`` on client close propagates out of the
-        ``with client.websocket_connect(...)`` block.
-        """
-        import inspect as _inspect
-        from fastapi_turbo.dependencies import Depends as _Depends
-        from fastapi_turbo.websockets import WebSocket as _WebSocket, WebSocketState as _WSState
-        from fastapi_turbo.exceptions import WebSocketException as _WSExc
-
-        try:
-            sig = _inspect.signature(endpoint)
-        except (TypeError, ValueError):
-            sig = None
-
-        # Resolve stringified annotations (`from __future__ import
-        # annotations`) so we can identify the WebSocket parameter by
-        # class identity rather than by string name — some handlers
-        # pass the WS under different aliases (`websocket`, `conn`…).
-        import typing as _typing_mod
-        try:
-            type_hints = _typing_mod.get_type_hints(endpoint, include_extras=True)
-        except Exception as _exc:  # noqa: BLE001
-            _log.debug("silent catch in applications: %r", _exc)
-            type_hints = {}
-
-        def _is_websocket_annotation(name: str, raw_ann) -> bool:
-            ann = type_hints.get(name, raw_ann)
-            if ann is _WebSocket:
-                return True
-            if isinstance(ann, type) and issubclass(ann, _WebSocket):
-                return True
-            # Fall back to string comparison for deferred-eval
-            # annotations that ``get_type_hints`` couldn't resolve
-            # (e.g. referenced modules that weren't importable).
-            if isinstance(raw_ann, str) and raw_ann in ("WebSocket", "fastapi_turbo.websockets.WebSocket"):
-                return True
-            return False
-
-        from fastapi_turbo.param_functions import (
-            Query as _Query,
-            Header as _Header,
-            Cookie as _Cookie,
-            _ParamMarker,
-        )
-
-        def _extract_marker(annotation, default):
-            """Find a Query/Header/Cookie marker on this param either
-            via ``Annotated[T, Query()]`` or ``= Query(...)`` default.
-            Returns (marker, effective_default_value).
-            """
-            import typing as _t
-            marker = None
-            if isinstance(default, _ParamMarker):
-                marker = default
-            if _t.get_origin(annotation) is _t.Annotated:
-                for m in _t.get_args(annotation)[1:]:
-                    if isinstance(m, _ParamMarker):
-                        marker = m
-                        break
-            if marker is None:
-                return None, None
-            return marker, marker.default
-
-        def _extract_depends(annotation, default):
-            """Find a ``Depends(...)`` in an ``Annotated[...]`` metadata
-            tuple or as the default value."""
-            import typing as _t
-            if isinstance(default, _Depends):
-                return default
-            if _t.get_origin(annotation) is _t.Annotated:
-                for m in _t.get_args(annotation)[1:]:
-                    if isinstance(m, _Depends):
-                        return m
-            return None
-
-        def _inner_type(annotation):
-            """Strip ``Annotated[T, ...]`` to get the underlying type."""
-            import typing as _t
-            if _t.get_origin(annotation) is _t.Annotated:
-                return _t.get_args(annotation)[0]
-            return annotation
-
-        def _resolve_ws_scalar_raw(ws, p_name, marker):
-            """Pull a query/cookie/header value off the WebSocket scope."""
-            alias = marker.alias or p_name
-            if isinstance(marker, _Query):
-                return ws.query_params.get(alias)
-            if isinstance(marker, _Cookie):
-                return ws.cookies.get(alias)
-            if isinstance(marker, _Header):
-                wire = alias
-                if getattr(marker, "convert_underscores", True) and "_" in wire:
-                    wire = wire.replace("_", "-")
-                return ws.headers.get(wire)
-            return None
-
-        # Build a cached endpoint context for ValidationException msgs.
-        import inspect as _insp_mod
-        _ws_endpoint_ctx: dict = {}
-        try:
-            _ws_endpoint_ctx["function"] = getattr(endpoint, "__name__", None)
-            _ws_endpoint_ctx["file"] = _insp_mod.getsourcefile(endpoint)
-            _ws_endpoint_ctx["line"] = _insp_mod.getsourcelines(endpoint)[1]
-        except (TypeError, OSError):
-            pass
-        if route_path:
-            _ws_endpoint_ctx["path"] = route_path
-
-        def _build_ctx(ws=None):
-            """Build endpoint_ctx dict; prefer the route path from the
-            matched scope (covers mount-prefixed sub-apps) over the
-            static decoration-time path."""
-            ctx = dict(_ws_endpoint_ctx)
-            if ws is not None:
-                try:
-                    rt = ws.scope.get("route") if isinstance(ws.scope, dict) else None
-                    if rt is not None and getattr(rt, "path", None):
-                        ctx["path"] = rt.path
-                except Exception as _exc:  # noqa: BLE001
-                    _log.debug("silent catch in applications: %r", _exc)
-            return ctx
-
-        def _validate_scalar(val, ann, p_name, kind, ws=None):
-            """Validate + coerce ``val`` against ``ann`` using pydantic
-            ``TypeAdapter``. On failure raise
-            ``WebSocketRequestValidationError`` — routed through app
-            exception_handlers when registered, otherwise translated
-            into a ``WebSocketException(1008)`` by the outer wrapper."""
-            if val is None or ann is _inspect.Parameter.empty or ann is None:
-                return val
-            from pydantic import TypeAdapter
-            try:
-                return TypeAdapter(ann).validate_python(val)
-            except Exception as exc:
-                from fastapi_turbo.exceptions import (
-                    _DoorWebSocketRequestValidationError as _WRVE,
-                )
-                errors = []
-                try:
-                    errors = exc.errors()  # Pydantic ValidationError
-                except AttributeError:
-                    errors = [{
-                        "loc": (kind.lower(), p_name),
-                        "msg": str(exc),
-                        "type": "value_error",
-                    }]
-                raise _WRVE(errors, endpoint_ctx=_build_ctx(ws)) from exc
-
-        # Extract path parameter names from the route path. Supports both
-        # plain ``{name}`` and Starlette-style ``{name:path}`` converter
-        # syntax. These are injected as kwargs by the Rust router bridge
-        # and must NOT be re-resolved as query/scalar params.
-        import re as _re
-        path_params_names: set[str] = set()
-        if route_path:
-            for m in _re.finditer(r"\{([^{}:]+)(?::[^{}]+)?\}", route_path):
-                path_params_names.add(m.group(1))
-
-        # Identify the WebSocket parameter. Prefer a ``WebSocket``-annotated
-        # param; otherwise fall back to the FIRST positional param (FastAPI
-        # tutorial style ``async def ws(websocket, ...)`` where the connection
-        # arg is often untyped). Mirrors the in-process dispatcher the door
-        # replaced — without this, an untyped ``websocket`` would be
-        # misclassified as a required Query param and close the socket 1008.
-        _ws_fallback_name = None
-        if sig is not None:
-            _has_annotated_ws = any(
-                _is_websocket_annotation(n, p.annotation)
-                for n, p in sig.parameters.items()
-            )
-            if not _has_annotated_ws:
-                for n, p in sig.parameters.items():
-                    if p.kind not in (
-                        _inspect.Parameter.POSITIONAL_ONLY,
-                        _inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    ):
-                        continue
-                    _r_ann = type_hints.get(n, p.annotation)
-                    if _extract_depends(_r_ann, p.default) is not None:
-                        continue
-                    if _extract_marker(_r_ann, p.default)[0] is not None:
-                        continue
-                    _ws_fallback_name = n
-                    break
-
-        # Classify every handler parameter up-front.
-        # Each entry: ("dep"|"scalar"|"ws"|"path"|"skip", name, meta)
-        param_spec: list[tuple] = []
-        if sig is not None:
-            for name, param in sig.parameters.items():
-                default = param.default
-                raw_ann = param.annotation
-                resolved_ann = type_hints.get(name, raw_ann)
-
-                # Depends (either annotated or as default)
-                dep_marker = _extract_depends(resolved_ann, default)
-                if dep_marker is not None:
-                    if dep_marker.dependency is None:
-                        # Blank Depends() — resolve via declared type
-                        continue
-                    param_spec.append(("dep", name, dep_marker))
-                    continue
-
-                if _is_websocket_annotation(name, raw_ann) or name == _ws_fallback_name:
-                    param_spec.append(("ws", name, None))
-                    continue
-
-                # Path param — injected by the router bridge as kwargs.
-                if name in path_params_names:
-                    param_spec.append(("path", name, _inner_type(resolved_ann)))
-                    continue
-
-                marker, _ = _extract_marker(resolved_ann, default)
-                if marker is not None:
-                    param_spec.append(
-                        ("scalar", name, (marker, _inner_type(resolved_ann))),
-                    )
-                    continue
-
-                # Plain-typed param without marker → Query (FA default for WS).
-                # Skip **kwargs/*args/positional-only oddities.
-                if param.kind in (
-                    _inspect.Parameter.VAR_POSITIONAL,
-                    _inspect.Parameter.VAR_KEYWORD,
-                ):
-                    continue
-
-                # FA treats plain-typed WS params as Query (path params are
-                # injected separately by the router bridge).
-                if resolved_ann is _inspect.Parameter.empty:
-                    # Untyped — best-effort: pass through as Query string.
-                    default_val = None if default is _inspect.Parameter.empty else default
-                    q = _Query(default=default_val if default_val is not None else ...)
-                    param_spec.append(("scalar", name, (q, str)))
-                    continue
-
-                default_val = None if default is _inspect.Parameter.empty else default
-                from pydantic_core import PydanticUndefined as _PU
-                q_default = default_val if default is not _inspect.Parameter.empty else ...
-                q = _Query(default=q_default)
-                param_spec.append(("scalar", name, (q, resolved_ann)))
-
-        is_async_endpoint = _inspect.iscoroutinefunction(endpoint)
-        app_ref = self
-
-        # Build scope-mismatch check at decoration time (FastAPI 0.120+):
-        # a ``request``-scope yield dep cannot depend on a ``function``-scope
-        # yield dep. Raise ``FastAPIError`` immediately on violation.
-        def _get_dep_scope(dep) -> str:
-            s = getattr(dep, "scope", None)
-            return s if s in ("function", "request") else "request"
-
-        def _check_scope_mismatch(dep: "_Depends", visited: set):
-            dep_func = dep.dependency
-            if dep_func is None or id(dep_func) in visited:
-                return
-            visited.add(id(dep_func))
-            try:
-                dep_sig = _inspect.signature(dep_func)
-            except (TypeError, ValueError):
-                return
-            try:
-                dep_hints = _typing_mod.get_type_hints(dep_func, include_extras=True)
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("silent catch in applications: %r", _exc)
-                dep_hints = {}
-            outer_scope = _get_dep_scope(dep)
-            outer_is_yield = (
-                _inspect.isgeneratorfunction(dep_func)
-                or _inspect.isasyncgenfunction(dep_func)
-            )
-            for p_name, p in dep_sig.parameters.items():
-                ann = dep_hints.get(p_name, p.annotation)
-                sub = _extract_depends(ann, p.default)
-                if sub is None or sub.dependency is None:
-                    continue
-                sub_scope = _get_dep_scope(sub)
-                sub_is_yield = (
-                    _inspect.isgeneratorfunction(sub.dependency)
-                    or _inspect.isasyncgenfunction(sub.dependency)
-                )
-                if (
-                    outer_is_yield
-                    and sub_is_yield
-                    and outer_scope == "request"
-                    and sub_scope == "function"
-                ):
-                    from fastapi_turbo.exceptions import FastAPIError as _FE
-                    outer_name = getattr(dep_func, "__name__", repr(dep_func))
-                    raise _FE(
-                        f'The dependency "{outer_name}" has a scope of "request", '
-                        f'it cannot depend on dependencies with scope "function"'
-                    )
-                _check_scope_mismatch(sub, visited)
-
-        for kind, _name, meta in param_spec:
-            if kind == "dep":
-                _check_scope_mismatch(meta, set())
-        if extra_dependencies:
-            for extra_dep in extra_dependencies:
-                if extra_dep is not None and getattr(extra_dep, "dependency", None) is not None:
-                    _check_scope_mismatch(extra_dep, set())
-
-        def _effective_dep_callable(dep_callable):
-            """Honour ``app.dependency_overrides``."""
-            if app_ref is not None and app_ref.dependency_overrides:
-                return app_ref.dependency_overrides.get(dep_callable, dep_callable)
-            return dep_callable
-
-        async def _call_maybe_async(fn, kwargs):
-            """Call ``fn``; await the result if it's a coroutine."""
-            r = fn(**kwargs)
-            if _inspect.iscoroutine(r):
-                return await r
-            return r
-
-        async def _resolve_dep_async(dep, ws, generators, cache):
-            """Recursively resolve a ``Depends(...)`` chain for the WS
-            endpoint. Returns the resolved value. ``generators`` is a
-            list of ``(gen, is_async, scope)`` pushed onto by yield-deps
-            for later teardown. ``cache`` de-duplicates by dep callable
-            when ``use_cache=True``."""
-            original = dep.dependency
-            effective = _effective_dep_callable(original)
-            use_cache = getattr(dep, "use_cache", True)
-            cache_key = id(original)
-            if use_cache and cache_key in cache:
-                return cache[cache_key]
-
-            import typing as _typing
-            try:
-                dep_sig = _inspect.signature(effective)
-            except (TypeError, ValueError):  # noqa: BLE001
-                dep_sig = None
-            try:
-                dep_hints = _typing.get_type_hints(effective, include_extras=True)
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("silent catch in applications: %r", _exc)
-                dep_hints = {}
-
-            dep_kwargs: dict = {}
-            if dep_sig is not None:
-                try:
-                    from fastapi_turbo.requests import HTTPConnection as _HTTPConn
-                except ImportError:
-                    _HTTPConn = None
-                for p_name, p in dep_sig.parameters.items():
-                    ann = dep_hints.get(p_name, p.annotation)
-                    raw = p.annotation
-                    # WebSocket / HTTPConnection injection. WS deps can
-                    # accept either ``WebSocket`` or its parent
-                    # ``HTTPConnection`` (Starlette parity — FA apps
-                    # often inject ``HTTPConnection`` so one dep works
-                    # for HTTP + WS routes alike).
-                    if (
-                        ann is _WebSocket
-                        or (isinstance(ann, type) and issubclass(ann, _WebSocket))
-                        or (
-                            _HTTPConn is not None
-                            and isinstance(ann, type)
-                            and issubclass(ann, _HTTPConn)
-                        )
-                        or (
-                            isinstance(raw, str)
-                            and raw in (
-                                "WebSocket",
-                                "fastapi_turbo.websockets.WebSocket",
-                                "HTTPConnection",
-                                "fastapi_turbo.requests.HTTPConnection",
-                            )
-                        )
-                    ):
-                        dep_kwargs[p_name] = ws
-                        continue
-                    # Sub-dependency
-                    sub_dep = _extract_depends(ann, p.default)
-                    if sub_dep is not None and sub_dep.dependency is not None:
-                        dep_kwargs[p_name] = await _resolve_dep_async(
-                            sub_dep, ws, generators, cache,
-                        )
-                        continue
-                    # Scalar (Query/Header/Cookie) with validation
-                    marker, default_val = _extract_marker(ann, p.default)
-                    if marker is not None:
-                        raw_val = _resolve_ws_scalar_raw(ws, p_name, marker)
-                        if raw_val is None:
-                            from pydantic_core import PydanticUndefined as _PU
-                            if default_val is not _PU and default_val is not ...:
-                                dep_kwargs[p_name] = default_val
-                                continue
-                            # Missing required scalar → 1008.
-                            raise _WSExc(
-                                code=1008,
-                                reason=f"missing {marker.__class__.__name__} {p_name!r}",
-                            )
-                        inner = _inner_type(ann)
-                        if inner is _inspect.Parameter.empty:
-                            dep_kwargs[p_name] = raw_val
-                        else:
-                            dep_kwargs[p_name] = _validate_scalar(
-                                raw_val, inner, p_name,
-                                marker.__class__.__name__,
-                            )
-                        continue
-
-                    # Plain-typed param without marker → Query (FA default,
-                    # matching the handler-level fallback at _wrap_websocket_
-                    # endpoint's param_spec build). Lets
-                    # ``def dep(token: str = "")`` pull ``token`` from
-                    # ``?token=...`` on the connect URL.
-                    if p.kind in (
-                        _inspect.Parameter.VAR_POSITIONAL,
-                        _inspect.Parameter.VAR_KEYWORD,
-                    ):
-                        continue
-                    default_val = (
-                        _inspect.Parameter.empty
-                        if p.default is _inspect.Parameter.empty
-                        else p.default
-                    )
-                    raw_val = ws.query_params.get(p_name)
-                    if raw_val is None:
-                        if default_val is not _inspect.Parameter.empty:
-                            dep_kwargs[p_name] = default_val
-                            continue
-                        raise _WSExc(
-                            code=1008,
-                            reason=f"missing query parameter {p_name!r}",
-                        )
-                    if ann is _inspect.Parameter.empty or ann is None:
-                        dep_kwargs[p_name] = raw_val
-                    else:
-                        dep_kwargs[p_name] = _validate_scalar(
-                            raw_val, _inner_type(ann), p_name, "Query",
-                        )
-
-            # Invoke the dependency (sync/async, function/generator).
-            scope = _get_dep_scope(dep)
-            is_async_gen = _inspect.isasyncgenfunction(effective)
-            is_gen = _inspect.isgeneratorfunction(effective)
-
-            if is_async_gen:
-                agen = effective(**dep_kwargs)
-                value = await agen.__anext__()
-                generators.append((agen, True, scope))
-            elif is_gen:
-                gen = effective(**dep_kwargs)
-                value = next(gen)
-                generators.append((gen, False, scope))
-            elif _inspect.iscoroutinefunction(effective):
-                value = await effective(**dep_kwargs)
-            else:
-                value = effective(**dep_kwargs)
-
-            if use_cache:
-                cache[cache_key] = value
-            return value
-
-        async def _teardown_generators(generators, scope_filter=None):
-            """Run yield-dep teardown in reverse. When ``scope_filter`` is
-            set, only teardown generators matching that scope."""
-            remaining = []
-            # iterate in reverse so innermost teardown first
-            for gen, is_async, scope in reversed(generators):
-                if scope_filter is not None and scope != scope_filter:
-                    remaining.append((gen, is_async, scope))
-                    continue
-                try:
-                    if is_async:
-                        try:
-                            await gen.__anext__()
-                        except StopAsyncIteration:
-                            pass
-                    else:
-                        try:
-                            next(gen)
-                        except StopIteration:
-                            pass
-                except Exception:
-                    # Teardown errors shouldn't mask primary flow.
-                    pass
-            # remaining is in reversed order; flip back to original order
-            generators[:] = list(reversed(remaining))
-
-        def _handle_ws_exc(ws, exc: _WSExc) -> None:
-            # Starlette: pre-accept → reject the HTTP handshake with a
-            # non-2xx status; post-accept → close with the WS code.
-            code = exc.code if exc.code is not None else 1000
-            reason = exc.reason or ""
-            # Push a WebSocketDisconnect so the testclient surfaces the
-            # ACTUAL close code (e.g. 1008 for POLICY_VIOLATION) rather
-            # than the HTTP rejection status (403). Matches FA parity.
-            try:
-                from fastapi_turbo.exceptions import WebSocketDisconnect as _WD
-                app_ref._ws_server_exceptions.append(_WD(code=code, reason=reason))
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("silent catch in applications: %r", _exc)
-            if getattr(ws, "_ws", None) is None:
-                # In-process ASGI door: emit the WS close with the REAL code
-                # regardless of accept state (a pre-accept close IS the
-                # handshake rejection here, and the TestClient reads this
-                # frame's code — so it must be 1008 etc., not the HTTP 403).
-                ws._asgi_queue_close(code, reason)
-                return
-            if ws.application_state == _WSState.CONNECTING:
-                ws._reject(403)
-                return
-            try:
-                ws._ws.close(code, reason)
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("silent catch in applications: %r", _exc)
-
-        def _capture_server_exception(exc):
-            """Push onto the app's capture queues so TestClient can
-            re-raise on session close."""
-            try:
-                app_ref._ws_server_exceptions.append(exc)
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("silent catch in applications: %r", _exc)
-
-        async def _build_kwargs(ws, path_kwargs):
-            """Resolve all handler kwargs. Returns (kwargs, generators).
-            Raises on dep failure — caller decides how to surface."""
-            kwargs: dict = dict(path_kwargs)
-            generators: list = []
-            cache: dict = {}
-            for kind, name, meta in param_spec:
-                if kind == "ws":
-                    kwargs[name] = ws
-                elif kind == "path":
-                    # Path params are injected by the router. Validate
-                    # via TypeAdapter if a non-str type was declared.
-                    val = path_kwargs.get(name)
-                    if val is not None and meta is not _inspect.Parameter.empty and meta is not str:
-                        kwargs[name] = _validate_scalar(val, meta, name, "Path", ws=ws)
-                    else:
-                        kwargs[name] = val
-                elif kind == "scalar":
-                    marker, inner = meta
-                    raw_val = _resolve_ws_scalar_raw(ws, name, marker)
-                    if raw_val is None:
-                        default_val = marker.default
-                        from pydantic_core import PydanticUndefined as _PU
-                        if default_val is _PU or default_val is ...:
-                            # Required — 1008.
-                            raise _WSExc(
-                                code=1008,
-                                reason=f"missing {marker.__class__.__name__} {name!r}",
-                            )
-                        kwargs[name] = default_val
-                        continue
-                    if inner is _inspect.Parameter.empty:
-                        kwargs[name] = raw_val
-                    else:
-                        kwargs[name] = _validate_scalar(
-                            raw_val, inner, name,
-                            marker.__class__.__name__, ws=ws,
-                        )
-                elif kind == "dep":
-                    kwargs[name] = await _resolve_dep_async(
-                        meta, ws, generators, cache,
-                    )
-            # Resolve extra (app/router/include/route-level) dependencies
-            # AFTER handler params are satisfied. Their values aren't
-            # bound to a kwarg — run for side-effects only (matches FA:
-            # these deps run but their return value is discarded).
-            if extra_dependencies:
-                for extra_dep in extra_dependencies:
-                    if extra_dep is None or getattr(extra_dep, "dependency", None) is None:
-                        continue
-                    await _resolve_dep_async(extra_dep, ws, generators, cache)
-            return kwargs, generators
-
-        # Build a synthetic route object for ``ws.scope["route"]``. FA
-        # exposes the matched ``APIWebSocketRoute`` here; third-party
-        # code (e.g. route introspection in handlers) uses it to pull
-        # the path template. ``WSRoute`` IS the class the shim binds as
-        # ``fastapi.routing.APIWebSocketRoute``, so isinstance checks
-        # see one consistent type.
-        from fastapi_turbo._ws_support import WSRoute as _APIWSRoute
-        _synthetic_route = _APIWSRoute(
-            route_path,
-            endpoint,
-            name=getattr(endpoint, "__name__", "") or None,
-        )
-
-        async def _ws_entry(ws, **path_kwargs):
-            ws._app = app_ref
-            # Inject ``route`` into the ASGI-style scope dict.
-            try:
-                scope = ws.scope
-                if isinstance(scope, dict):
-                    scope["route"] = _synthetic_route
-                    scope["app"] = app_ref
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("silent catch in applications: %r", _exc)
-            # Replay the TestClient's captured contextvars. This lets
-            # ``ContextVar``-based state set in the test thread
-            # (e.g. ``global_context.set({}); gs = global_context.get()``)
-            # be observable from the handler/teardown that runs on the
-            # server's async worker thread — mutations to values
-            # retrieved via ``.get()`` from within replayed vars mutate
-            # the SAME objects the test holds a reference to.
-            try:
-                q = getattr(app_ref, "_ws_pending_test_contexts", None)
-                if q:
-                    try:
-                        test_ctx = q.pop(0)
-                    except IndexError:
-                        test_ctx = None
-                    if test_ctx is not None:
-                        for _var, _val in test_ctx.items():
-                            try:
-                                _var.set(_val)
-                            except Exception as _exc:  # noqa: BLE001
-                                _log.debug("silent catch in applications: %r", _exc)
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("silent catch in applications: %r", _exc)
-            # WS middleware chain (Starlette-style ``Middleware(cls)`` where
-            # ``cls`` is a factory: ``cls(app) -> wrapped_app``). FA parity:
-            # tests register a ``websocket_middleware`` that wraps the
-            # app in a ``try/except`` and calls ``websocket.close(code)``
-            # on error. Build the chain here so the innermost "app" calls
-            # the real handler logic; the middleware sees a
-            # ``WebSocket(scope, receive, send)`` it can close via our
-            # ``send``-bridge.
-            ws_mw_factories = []
-            try:
-                for _cls, _kw in getattr(app_ref, "_middleware_stack", []):
-                    if callable(_cls) and not isinstance(_cls, type):
-                        ws_mw_factories.append((_cls, _kw))
-            except Exception as _exc:  # noqa: BLE001
-                _log.debug("silent catch in applications: %r", _exc)
-
-            generators: list = []
-
-            async def _run_handler_inner():
-                nonlocal generators
-                try:
-                    kwargs, generators = await _build_kwargs(ws, path_kwargs)
-                except _WSExc as _vexc:
-                    # FA parity: validation-origin WebSocketException
-                    # (e.g. missing required Header) is handled
-                    # internally — close the WS with its code but do
-                    # NOT let user WS middleware observe it as a raised
-                    # error (test_depend_validation asserts the
-                    # middleware never catches it).
-                    _handle_ws_exc(ws, _vexc)
-                    return
-                if is_async_endpoint:
-                    # Fast path: drive the user handler on the current
-                    # thread via ``coro.send``. Works when the handler
-                    # only awaits our ChannelAwaitable (thread-safe,
-                    # releases GIL via py.detach). Fails with
-                    # ``RuntimeError: no running event loop`` when the
-                    # user calls real asyncio primitives
-                    # (``asyncio.sleep(delay)``, ``asyncio.wait``, etc.)
-                    # — in that case re-run on the shared async worker
-                    # loop where ``get_running_loop()`` resolves.
-                    try:
-                        await endpoint(**kwargs)
-                    except RuntimeError as _rt_exc:
-                        msg = str(_rt_exc)
-                        if (
-                            "no running event loop" in msg
-                            or "no current event loop" in msg
-                        ):
-                            from fastapi_turbo._async_worker import (
-                                submit as _w_submit,
-                            )
-                            _w_submit(endpoint(**kwargs), app=app_ref)
-                        else:
-                            raise
-                else:
-                    endpoint(**kwargs)
-
-            async def _invoke_with_middleware():
-                if not ws_mw_factories:
-                    await _run_handler_inner()
-                    return
-                # Inner ASGI app — delegates to handler, re-raises errors
-                # so middleware can observe/catch them.
-                async def _inner_app(scope, receive, send):
-                    await _run_handler_inner()
-                # Bridge send messages to the real ws
-                async def _bridge_send(message):
-                    mt = message.get("type", "")
-                    if mt == "websocket.close":
-                        code = message.get("code", 1000)
-                        reason = message.get("reason", "") or ""
-                        try:
-                            await ws.close(code=code, reason=reason)
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                        # Push a ``WebSocketDisconnect`` so the
-                        # TestClient's ``__exit__`` surfaces the close
-                        # code to ``pytest.raises(WebSocketDisconnect)``.
-                        try:
-                            from fastapi_turbo.exceptions import (
-                                WebSocketDisconnect as _WD_MW,
-                            )
-                            app_ref._ws_server_exceptions.append(
-                                _WD_MW(code=code, reason=reason)
-                            )
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                    elif mt == "websocket.accept":
-                        try:
-                            await ws.accept(
-                                subprotocol=message.get("subprotocol"),
-                                headers=message.get("headers"),
-                            )
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                    elif mt == "websocket.send":
-                        if message.get("text") is not None:
-                            try:
-                                await ws.send_text(message["text"])
-                            except Exception as _exc:  # noqa: BLE001
-                                _log.debug("silent catch in applications: %r", _exc)
-                        elif message.get("bytes") is not None:
-                            try:
-                                await ws.send_bytes(bytes(message["bytes"]))
-                            except Exception as _exc:  # noqa: BLE001
-                                _log.debug("silent catch in applications: %r", _exc)
-                async def _bridge_receive():
-                    try:
-                        return await ws.receive()
-                    except Exception as _exc:  # noqa: BLE001
-                        _log.debug("silent catch in applications: %r", _exc)
-                        return {"type": "websocket.disconnect", "code": 1000}
-                # Build the chain outermost-first: final_app wraps each.
-                current_app = _inner_app
-                # Reverse: the first middleware added should be outermost.
-                for cls, kw in reversed(ws_mw_factories):
-                    try:
-                        current_app = cls(current_app, **kw)
-                    except TypeError:
-                        try:
-                            current_app = cls(current_app)
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                mw_scope = ws.scope if isinstance(ws.scope, dict) else {"type": "websocket"}
-                await current_app(mw_scope, _bridge_receive, _bridge_send)
-
-            try:
-                await _invoke_with_middleware()
-            except _WSExc as exc:
-                _handle_ws_exc(ws, exc)
-                # Run teardown even on exception so yield-deps release
-                # resources.
-                await _teardown_generators(generators)
-                return
-            except Exception as exc:
-                # Route WebSocketRequestValidationError through the app's
-                # exception handlers if registered. FA parity:
-                # @app.exception_handler(WebSocketRequestValidationError)
-                # receives the validation error; re-raise reaches here.
-                try:
-                    from fastapi_turbo.exceptions import (
-                        WebSocketRequestValidationError as _WRVE,
-                    )
-                except ImportError:
-                    _WRVE = None
-                if (
-                    _WRVE is not None
-                    and isinstance(exc, _WRVE)
-                    and app_ref is not None
-                    and getattr(app_ref, "exception_handlers", None)
-                ):
-                    # Capture first so tests checking the exc object see it
-                    # even when the handler re-raises.
-                    _capture_server_exception(exc)
-                    handler = app_ref.exception_handlers.get(_WRVE)
-                    if handler is not None:
-                        try:
-                            r = handler(ws, exc)
-                            if _inspect.iscoroutine(r):
-                                await r
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                    # Close with 1008 policy-violation regardless of what
-                    # the handler did.
-                    try:
-                        from fastapi_turbo.exceptions import (
-                            WebSocketDisconnect as _WD,
-                        )
-                        app_ref._ws_server_exceptions.append(
-                            _WD(code=1008, reason="validation error")
-                        )
-                    except Exception as _exc:  # noqa: BLE001
-                        _log.debug("silent catch in applications: %r", _exc)
-                    if getattr(ws, "_ws", None) is None:
-                        ws._asgi_queue_close(1008, "validation error")
-                    elif ws.application_state == _WSState.CONNECTING:
-                        ws._reject(403)
-                    else:
-                        try:
-                            ws._ws.close(1008, "validation error")
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                    await _teardown_generators(generators)
-                    return
-                # Route through app-registered exception_handlers if
-                # one matches this exception type. FA parity: a handler
-                # registered on ``@app.exception_handler(MyError)`` for
-                # WebSocket routes runs with ``(websocket, exc)`` and
-                # is expected to call ``websocket.close(code, reason)``
-                # itself. If it does, the client sees that close code.
-                handled = False
-                if app_ref is not None and getattr(app_ref, "exception_handlers", None):
-                    handler_cls = type(exc)
-                    handler = None
-                    for k, v in app_ref.exception_handlers.items():
-                        try:
-                            if isinstance(exc, k):
-                                handler = v
-                                handler_cls = k
-                                break
-                        except TypeError:
-                            continue
-                    if handler is not None:
-                        try:
-                            r = handler(ws, exc)
-                            if _inspect.iscoroutine(r):
-                                await r
-                            handled = True
-                            # Push a disconnect so TestClient surfaces
-                            # the WS close code. The handler will have
-                            # already called ``ws.close(...)`` but our
-                            # testclient runs the client in the same
-                            # test thread and can't observe the close
-                            # frame after the ``__exit__`` hook — so we
-                            # explicitly raise from the capture queue.
-                            try:
-                                from fastapi_turbo.exceptions import (
-                                    WebSocketDisconnect as _WD,
-                                )
-                                last = getattr(ws, "_last_close_code", None) or 1000
-                                last_reason = getattr(ws, "_last_close_reason", "") or ""
-                                app_ref._ws_server_exceptions.append(
-                                    _WD(code=last, reason=last_reason)
-                                )
-                            except Exception as _exc:  # noqa: BLE001
-                                _log.debug("silent catch in applications: %r", _exc)
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                # Capture for TestClient re-raise semantics BEFORE we
-                # disturb the WS state.
-                if not handled:
-                    _capture_server_exception(exc)
-                if not handled:
-                    # Abort the handshake cleanly if still pre-accept so the
-                    # client sees an HTTP 500 instead of hanging.
-                    if getattr(ws, "_ws", None) is None:
-                        # In-process ASGI door: close with 1011 (internal
-                        # error) regardless of accept state — matches the
-                        # generic-error close code the dispatcher emitted.
-                        ws._asgi_queue_close(1011, "")
-                    elif ws.application_state == _WSState.CONNECTING:
-                        ws._reject(500)
-                    else:
-                        # Post-accept unhandled exception — close cleanly so
-                        # the client's ``recv()`` sees a close frame.
-                        try:
-                            ws._ws.close(1006, "")
-                        except Exception as _exc:  # noqa: BLE001
-                            _log.debug("silent catch in applications: %r", _exc)
-                await _teardown_generators(generators)
-                return
-            # Normal exit — drain teardowns (both scopes; no response
-            # body to stream for WS).
-            await _teardown_generators(generators)
-
-        # Expose the synthetic route + endpoint_ctx as attributes so
-        # that mount-prefixing can patch the path once the full URL
-        # is known (mounted sub-apps are collected with an inner path).
-        _ws_entry._ws_synthetic_route = _synthetic_route  # type: ignore[attr-defined]
-        _ws_entry._ws_endpoint_ctx = _ws_endpoint_ctx  # type: ignore[attr-defined]
-
-        # If raw ASGI middleware is registered, dispatch the WS invocation
-        # through the composed MW chain so middlewares that key off
-        # ``scope['type'] == 'websocket'`` (Sentry's connection-span, OTel
-        # tracing, rate-limit gates, logging) see the connection, can
-        # wrap receive/send, and can capture exceptions from the user
-        # handler via ``try/except await self.app(scope, receive, send)``.
-        app_self = self
-
-        async def _ws_asgi_chain_entry(ws, **path_params):
-            # Fast path: no ASGI MW registered — behaviour identical to
-            # the pre-chain path.
-            if not app_self._raw_asgi_middlewares:
-                return await _ws_entry(ws, **path_params)
-            return await _ws_entry_with_asgi_chain(app_self, ws, path_params, _ws_entry)
-
-        # Forward the WS-synthetic-route + endpoint_ctx attrs that
-        # route collection relies on for OpenAPI / mount-prefix logic.
-        _ws_asgi_chain_entry._ws_synthetic_route = _synthetic_route  # type: ignore[attr-defined]
-        _ws_asgi_chain_entry._ws_endpoint_ctx = _ws_endpoint_ctx  # type: ignore[attr-defined]
-
-        # Always return an async entry: Rust treats both sync/async the
-        # same way via the worker loop, and this lets us await deps and
-        # teardown uniformly even for sync endpoints.
-        return _ws_asgi_chain_entry
-
     def _get_all_dependencies_for_route(
         self, router: APIRouter, route, include_deps: list | None = None,
     ) -> list:
@@ -3729,20 +2170,24 @@ class FastAPI(_real_fastapi.FastAPI):
         precedence over an ``include_router(..., generate_unique_id_function
         =...)`` override — matches FA's resolution order.
         """
-        fn = (
-            getattr(route, "generate_unique_id_function", None)
-            or getattr(router, "generate_unique_id_function", None)
-            or include_fn
-            or getattr(self, "generate_unique_id_function", None)
-        )
-        if fn is None:
-            return None
-        # FA parity: when users write ``generate_unique_id_function=
-        # Default(my_fn)``, the value is wrapped in a ``DefaultPlaceholder``.
-        # Unwrap here before invoking.
+        # FA parity: a ``DefaultPlaceholder`` (``Default(generate_unique_id)``,
+        # what real APIRouter/strawberry pass when the user did NOT set one)
+        # means UNSET — fall through to the next cascade level. If every
+        # level is unset, return None so real ``get_openapi`` applies its own
+        # default on the CONVERTED route (which carries the full include
+        # prefix in ``path``; the live route object here does not, so calling
+        # the default fn on it would drop the prefix from the operationId).
         from fastapi_turbo.datastructures import DefaultPlaceholder as _DP
-        if isinstance(fn, _DP):
-            fn = fn.value
+
+        def _set_or_none(v):
+            return None if v is None or isinstance(v, _DP) else v
+
+        fn = (
+            _set_or_none(getattr(route, "generate_unique_id_function", None))
+            or _set_or_none(getattr(router, "generate_unique_id_function", None))
+            or _set_or_none(include_fn)
+            or _set_or_none(getattr(self, "generate_unique_id_function", None))
+        )
         if fn is None or not callable(fn):
             return None
         # Skip internal routes (docs, openapi.json) — user's
@@ -3882,8 +2327,8 @@ class FastAPI(_real_fastapi.FastAPI):
                     router, route, include_deps=include_deps,
                 )
                 ws_endpoint = _adapt_websocket_endpoint_class(route.endpoint)
-                wrapped_ws = self._wrap_websocket_endpoint(
-                    ws_endpoint, full_path, extra_dependencies=merged_ws_deps,
+                wrapped_ws = _wrap_websocket_endpoint(
+                    self, ws_endpoint, full_path, extra_dependencies=merged_ws_deps,
                 )
                 collected.append(
                     {
@@ -4030,7 +2475,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 }]
                 collected.append({
                     "path": full_path,
-                    "methods": route.methods,
+                    "methods": sorted(route.methods),
                     "endpoint": custom_ep,
                     "is_async": True,
                     "handler_name": route.name,
@@ -4131,7 +2576,7 @@ class FastAPI(_real_fastapi.FastAPI):
             collected.append(
                 {
                     "path": full_path,
-                    "methods": route.methods,
+                    "methods": sorted(route.methods),
                     "endpoint": endpoint,
                     "_endpoint_door": _endpoint_door,
                     "is_async": is_async,
@@ -5459,10 +3904,8 @@ class FastAPI(_real_fastapi.FastAPI):
         # ``fastapi.openapi.docs`` helpers.
         if self.docs_url is not None and _openapi_url_val:
             try:
-                import fastapi_turbo.compat as _c
-                _c.install()
-                import sys as _sys
-                _docs_mod = _sys.modules.get("fastapi.openapi.docs")
+                import importlib as _importlib
+                _docs_mod = _importlib.import_module("fastapi.openapi.docs")
             except Exception:  # noqa: BLE001
                 _docs_mod = None
             if _docs_mod is not None and hasattr(_docs_mod, "get_swagger_ui_html"):
@@ -5494,10 +3937,8 @@ class FastAPI(_real_fastapi.FastAPI):
 
         if self.redoc_url is not None and _openapi_url_val:
             try:
-                import fastapi_turbo.compat as _c
-                _c.install()
-                import sys as _sys
-                _docs_mod = _sys.modules.get("fastapi.openapi.docs")
+                import importlib as _importlib
+                _docs_mod = _importlib.import_module("fastapi.openapi.docs")
             except Exception:  # noqa: BLE001
                 _docs_mod = None
             if _docs_mod is not None and hasattr(_docs_mod, "get_redoc_html"):
@@ -5538,10 +3979,8 @@ class FastAPI(_real_fastapi.FastAPI):
             and _openapi_url_val
         ):
             try:
-                import fastapi_turbo.compat as _c
-                _c.install()
-                import sys as _sys
-                _docs_mod = _sys.modules.get("fastapi.openapi.docs")
+                import importlib as _importlib
+                _docs_mod = _importlib.import_module("fastapi.openapi.docs")
             except Exception:  # noqa: BLE001
                 _docs_mod = None
             if _docs_mod is not None and hasattr(
@@ -5725,10 +4164,73 @@ class FastAPI(_real_fastapi.FastAPI):
             except OSError:
                 pass
 
+    def _route_obj_reusable(self, rd: dict, route, allow_prefixed: bool = False) -> bool:
+        """P10.4 collection inversion: True when the decoration-built REAL
+        route can BE the adapter/delegation source directly — i.e. the
+        collection walker added nothing on top of what the route object's
+        own ctor already baked into its ``dependant``/response fields.
+
+        The per-route rebuild in ``_adapter_route_info`` /
+        ``_delegated_route_info`` exists precisely for the divergent
+        cases, which must KEEP rebuilding:
+
+        - include_router()/router/mount prefixes: ``rd["path"]`` carries
+          the full prefixed path; ``route.path`` does not. With
+          ``allow_prefixed=True`` (the ADAPTER site) a brace-free added
+          prefix still reuses — the dependant only ever consumed the
+          path-param NAME set from the path, and the caller passes
+          ``ctx_path`` to ``build_handler`` so error contexts keep the
+          full path. A ``{param}`` inside the added prefix was classified
+          as a QUERY param by the decoration-time dependant, so those
+          rebuild. The DELEGATED site requires strict path equality:
+          real 0.136's request/response validation-error endpoint
+          context renders ``METHOD {route.path}`` from the route object
+          itself (upstream's ``test_validation_error_context`` asserts
+          the full ``/sub/items/`` mount path);
+        - app/include/router-level dependencies: they live ONLY in
+          ``rd["_combined_dependencies"]`` and reach a dependant solely
+          via the rebuild's ``dependencies=`` ctor arg. The live route's
+          dependant holds route-level deps only — and the same route
+          object can be included into multiple apps with different
+          cascades, so it must NOT be mutated in place;
+        - cascaded ``default_response_class`` (router/include/app-level)
+          — the route's own attr is a ``DefaultPlaceholder`` when unset;
+        - rd's ``-> None``/NoneType ``response_model`` normalization
+          (a rebuild-input fix; caught by the ``is`` check below).
+        """
+        try:
+            rd_path = rd["path"]
+            route_path = route.path
+            if rd_path != route_path:
+                if not allow_prefixed:
+                    return False
+                # Prefixed (include_router/router-prefix/mount): reusable
+                # only when the ADDED prefix is brace-free — it then adds
+                # no path-param names, which is all the decoration-time
+                # dependant consumed from the path.
+                if not rd_path.endswith(route_path):
+                    return False
+                if "{" in rd_path[: len(rd_path) - len(route_path)]:
+                    return False
+            merged = rd.get("_combined_dependencies") or []
+            own = list(getattr(route, "dependencies", None) or [])
+            if len(merged) != len(own) or any(
+                a is not b for a, b in zip(merged, own)
+            ):
+                return False
+            if rd.get("response_class") is not _unset_to_none(
+                getattr(route, "response_class", None)
+            ):
+                return False
+            if rd.get("response_model") is not getattr(route, "response_model", None):
+                return False
+        except (KeyError, TypeError, AttributeError):
+            return False
+        return True
+
     def _adapter_route_info(self, rd: dict, for_door_mix: bool = False):
-        """Stage D (DEFAULT-ON; opt OUT via ``FASTAPI_TURBO_ADAPTER=0``): drive a
-        route's door params off REAL FastAPI introspection instead of the clone's
-        ``_introspect``.
+        """Stage D: drive a route's door params off REAL FastAPI introspection
+        instead of the clone's ``_introspect``.
 
         Rebuilds a real ``fastapi.routing.APIRoute`` from the route's effective
         config (full path, original endpoint, combined dependencies, response_model
@@ -5737,10 +4239,6 @@ class FastAPI(_real_fastapi.FastAPI):
         to the clone path — for WebSocket/mounted routes, non-default response
         classes (the adapter applies response_model but not a custom response_class),
         or anything the adapter declines (e.g. async-generator deps)."""
-        import os
-
-        if os.environ.get("FASTAPI_TURBO_ADAPTER") == "0":
-            return None
         if rd.get("is_websocket") or rd.get("_from_mount"):
             return None
         # dependency_overrides (a testing feature) is resolved at request time by
@@ -5814,35 +4312,48 @@ class FastAPI(_real_fastapi.FastAPI):
         except Exception:
             return None
         try:
-            _http_methods = [
-                m
-                for m in rd["methods"]
-                if m in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
-            ]
-            real = _RealRoute(
-                rd["path"],
-                endpoint,
-                methods=_http_methods or rd["methods"],
-                dependencies=rd.get("_combined_dependencies") or None,
-                # A generator return is AsyncIterable[Item] / Iterable[Item] which
-                # real get_dependant can't field — build with response_model=None;
-                # item validation happens in _build_stream_handler instead.
-                response_model=None if _is_gen else rd.get("response_model"),
-                status_code=(
-                    rd["status_code"] if rd.get("status_code") not in (None, 200) else None
-                ),
-                response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
-                    _real_fastapi.responses.JSONResponse
-                ),
-                response_model_include=getattr(route, "response_model_include", None),
-                response_model_exclude=getattr(route, "response_model_exclude", None),
-                response_model_by_alias=getattr(route, "response_model_by_alias", True),
-                response_model_exclude_unset=getattr(route, "response_model_exclude_unset", False),
-                response_model_exclude_defaults=getattr(
-                    route, "response_model_exclude_defaults", False
-                ),
-                response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
-            )
+            if self._route_obj_reusable(rd, route, allow_prefixed=True):
+                # P10.4 inversion: the decoration-built real-APIRoute subclass
+                # already carries the exact dependant/response fields the
+                # rebuild below would reproduce — use it as the source of
+                # truth (skips a per-route real-APIRoute construction on
+                # every _build_server_args / door re-registration).
+                real = route
+            else:
+                _http_methods = [
+                    m
+                    for m in rd["methods"]
+                    if m
+                    in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+                ]
+                real = _RealRoute(
+                    rd["path"],
+                    endpoint,
+                    methods=_http_methods or rd["methods"],
+                    dependencies=rd.get("_combined_dependencies") or None,
+                    # A generator return is AsyncIterable[Item] / Iterable[Item] which
+                    # real get_dependant can't field — build with response_model=None;
+                    # item validation happens in _build_stream_handler instead.
+                    response_model=None if _is_gen else rd.get("response_model"),
+                    status_code=(
+                        rd["status_code"] if rd.get("status_code") not in (None, 200) else None
+                    ),
+                    response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
+                        _real_fastapi.responses.JSONResponse
+                    ),
+                    response_model_include=getattr(route, "response_model_include", None),
+                    response_model_exclude=getattr(route, "response_model_exclude", None),
+                    response_model_by_alias=getattr(route, "response_model_by_alias", True),
+                    response_model_exclude_unset=getattr(
+                        route, "response_model_exclude_unset", False
+                    ),
+                    response_model_exclude_defaults=getattr(
+                        route, "response_model_exclude_defaults", False
+                    ),
+                    response_model_exclude_none=getattr(
+                        route, "response_model_exclude_none", False
+                    ),
+                )
             # SecurityScopes: the adapter accumulates the ``Security(...,
             # scopes=[...])`` chain into each dependant's ``oauth_scopes`` and the
             # door builds ``SecurityScopes(scopes=...)`` from it (with scope-aware
@@ -5856,7 +4367,7 @@ class FastAPI(_real_fastapi.FastAPI):
                     endpoint, rd.get("response_model"), rd.get("response_class"), self
                 )
             else:
-                handler = build_handler(real)
+                handler = build_handler(real, ctx_path=rd["path"])
         except Undelegable:
             return None
         except Exception:
@@ -5882,13 +4393,60 @@ class FastAPI(_real_fastapi.FastAPI):
         adapter_names = {p.name for p in params if p.is_handler_param}
         if adapter_names != sig_names:
             return None
+        # DEEP-BEHAVIOR PARITY (R2 dep-trace cluster): when the app has
+        # ``@app.middleware("http")`` middlewares AND this route resolves
+        # dependencies, decline the lean adapter so the route delegates to REAL
+        # FastAPI's route handler (_delegated_route_info, default-on). The lean
+        # path runs deps in Rust BEFORE the Python middleware chain and hands
+        # each dep its own Request object; FastAPI runs deps INSIDE the
+        # middleware stack sharing ONE Request with the handler — so a dep's
+        # ``request.state`` writes (auth context, traces) are visible to later
+        # deps/handler/middleware, and dep side effects sequence after MW_in.
+        # Delegation restores both. Perf: MW apps already pay the Python-chain
+        # cost per request on every route; non-MW dep routes (the perf-relevant
+        # majority) keep the fast Rust dep engine. Raw-ASGI shims composed by
+        # the door as an OUTER chain (for_door_mix) don't force the decline —
+        # the Rust dispatch (deps included) already runs inside them.
+        _mw_list = getattr(self, "_http_middlewares", None) or []
+        if for_door_mix:
+            _mw_list = [
+                m for m in _mw_list if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)
+            ]
+        if _mw_list and any(p.kind == "dependency" for p in params):
+            return None
         # Match the clone's compile order so the door drives the adapter handler
         # identically: async → SYNC submit-caller (running loop from the first
         # instruction), then wrap in the ``@app.middleware("http")`` chain so those
         # middlewares (which the clone applies by wrapping the handler) still run.
         if _inspect.iscoroutinefunction(handler):
-            from fastapi_turbo._door_support import _make_sync_wrapper
+            from fastapi_turbo._door_support import (
+                _has_await_in_source,
+                _make_sync_wrapper,
+                _uses_running_loop,
+            )
 
+            if (
+                _async_inline_enabled()
+                and not getattr(self, "_http_middlewares", None)
+                and not any(p.kind == "dependency" for p in params)
+                and (_has_await_in_source(handler) or _uses_running_loop(handler))
+            ):
+                # FASTAPI_TURBO_ASYNC_INLINE: register the coroutine function
+                # itself (is_async=True) so the door drives the request on the
+                # worker loop end-to-end — no SYNC submit-caller, no Event
+                # handoff. Pre-mark needs-worker so the door NEVER probes it
+                # with send(None) (a probe-close on these known-suspending
+                # handlers could double-run pre-await side effects). No-await
+                # handlers keep the classic wrap (their probe path is faster).
+                inline_handler = _wrap_with_exception_handlers_async(handler, self)
+                try:
+                    inline_handler._fastapi_turbo_needs_worker = True
+                    if inline_handler is not handler:
+                        inline_handler._fastapi_turbo_original_endpoint = handler
+                except (AttributeError, TypeError):
+                    pass
+                else:
+                    return params, inline_handler, True
             handler = _make_sync_wrapper(handler, for_handler=True, app=self)
         # Dispatch handler-raised exceptions to the app's custom exception handlers
         # (the clone does this in its compiled handler) — innermost, so middleware
@@ -5975,33 +4533,49 @@ class FastAPI(_real_fastapi.FastAPI):
         try:
             from fastapi_turbo._fastapi_turbo_core import ParamInfo
 
-            _RealRoute = _real_fastapi.routing.APIRoute
-            _http_methods = [
-                m
-                for m in rd["methods"]
-                if m in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
-            ]
-            real = _RealRoute(
-                rd["path"],
-                endpoint,
-                methods=_http_methods or rd["methods"],
-                dependencies=rd.get("_combined_dependencies") or None,
-                response_model=rd.get("response_model"),
-                status_code=(
-                    rd["status_code"] if rd.get("status_code") not in (None, 200) else None
-                ),
-                response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
-                    _real_fastapi.responses.JSONResponse
-                ),
-                response_model_include=getattr(route, "response_model_include", None),
-                response_model_exclude=getattr(route, "response_model_exclude", None),
-                response_model_by_alias=getattr(route, "response_model_by_alias", True),
-                response_model_exclude_unset=getattr(route, "response_model_exclude_unset", False),
-                response_model_exclude_defaults=getattr(
-                    route, "response_model_exclude_defaults", False
-                ),
-                response_model_exclude_none=getattr(route, "response_model_exclude_none", False),
-            )
+            if self._route_obj_reusable(rd, route) and getattr(
+                route, "dependency_overrides_provider", None
+            ) in (None, self):
+                # P10.4 inversion: reuse the decoration-built real-APIRoute
+                # subclass directly (its dependant/response fields match what
+                # the rebuild below would reproduce). The provider guard keeps
+                # a router shared across DIFFERENT apps on the rebuild path —
+                # we stamp ``dependency_overrides_provider = self`` below, and
+                # that must never be flipped between apps on a live route.
+                real = route
+            else:
+                _RealRoute = _real_fastapi.routing.APIRoute
+                _http_methods = [
+                    m
+                    for m in rd["methods"]
+                    if m
+                    in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
+                ]
+                real = _RealRoute(
+                    rd["path"],
+                    endpoint,
+                    methods=_http_methods or rd["methods"],
+                    dependencies=rd.get("_combined_dependencies") or None,
+                    response_model=rd.get("response_model"),
+                    status_code=(
+                        rd["status_code"] if rd.get("status_code") not in (None, 200) else None
+                    ),
+                    response_class=rd.get("response_class") or _real_fastapi.datastructures.Default(
+                        _real_fastapi.responses.JSONResponse
+                    ),
+                    response_model_include=getattr(route, "response_model_include", None),
+                    response_model_exclude=getattr(route, "response_model_exclude", None),
+                    response_model_by_alias=getattr(route, "response_model_by_alias", True),
+                    response_model_exclude_unset=getattr(
+                        route, "response_model_exclude_unset", False
+                    ),
+                    response_model_exclude_defaults=getattr(
+                        route, "response_model_exclude_defaults", False
+                    ),
+                    response_model_exclude_none=getattr(
+                        route, "response_model_exclude_none", False
+                    ),
+                )
             # Async-generator yield-dependencies: their teardown ordering relative
             # to an outer @app.middleware can't be replicated at the handler level
             # (the door applies middleware outside the delegated handler, and a
@@ -6035,55 +4609,126 @@ class FastAPI(_real_fastapi.FastAPI):
         import fastapi.exception_handlers as _fa_eh
         from fastapi.exceptions import RequestValidationError as _RVE
 
+        # Set to True after the @app.middleware("http") wrap below is applied.
+        # The handler reads it per request to decide whether the post-chain
+        # drain (``wrapped_sync``'s finally → ``_run_pending_teardowns``)
+        # exists to consume deferred yield-dep teardowns.
+        _mw_defer_state = {"enabled": False}
+
         async def handler(**kwargs):
             request = kwargs["request"]
             # Real FastAPI's route handler reads three nested AsyncExitStacks from the
             # scope (``fastapi_middleware_astack`` files ⊃ ``fastapi_inner_astack``
             # request-scoped deps ⊃ ``fastapi_function_astack`` function-scoped deps),
             # normally set by AsyncExitStackMiddleware + the request_response wrapper —
-            # both bypassed when we call get_route_handler() directly. ``async with
-            # A, B, C`` tears them down C→B→A INSIDE the request (so file/temp cleanup
-            # runs and a yield-dep's after-yield raise propagates to the caller) AND
-            # propagates a handler exception into the yield-dep finalizers (so their
-            # except/finally observe it) — matching FA's semantics. (Teardown can't be
-            # deferred past send to mirror FA's middleware/bg dep-observation ordering:
-            # the door owns send, and deferring breaks teardown-exception propagation +
-            # leaks temp files. We instead run background tasks before teardown below,
-            # which covers the common case.)
-            async with (
-                _AsyncExitStack() as _file_stack,
-                _AsyncExitStack() as _inner_stack,
-                _AsyncExitStack() as _function_stack,
+            # both bypassed when we call get_route_handler() directly. Teardown
+            # mirrors ``async with A, B, C`` (C→B→A, handler exceptions thrown
+            # into the yield-dep finalizers so their except/finally observe them)
+            # — with ONE refinement for @app.middleware("http") apps: on the
+            # SUCCESS path the REQUEST-scope + file stacks (and the response's
+            # background tasks) are deferred onto ``request._pending_teardowns``,
+            # drained by the MW wrapper's finally AFTER the chain unwinds. FA
+            # semantics: middleware bodies observe deps in their "started"
+            # state and background tasks run BEFORE yield-dep teardown
+            # (upstream test_dependency_contextmanager::test_background_tasks).
+            # FUNCTION-scope deps still close inline before the response (their
+            # post-yield raise becomes the response, FA 0.120+), and every
+            # error path unwinds inline so teardown-exception propagation and
+            # temp-file cleanup keep exact ``async with`` semantics. Deferral
+            # engages only when BOTH the route was MW-wrapped AND this request
+            # object is the MW wrapper's own Request (``_fastapi_turbo_defer_ok``
+            # stamp) — the rare ``_drive_async_fallback`` path uses a different
+            # Request with no drain owner, so it stays inline.
+            _file_stack = _AsyncExitStack()
+            _inner_stack = _AsyncExitStack()
+            _function_stack = _AsyncExitStack()
+            request.scope["fastapi_middleware_astack"] = _file_stack
+            request.scope["fastapi_inner_astack"] = _inner_stack
+            request.scope["fastapi_function_astack"] = _function_stack
+
+            async def _unwind_clean():
+                await _function_stack.__aexit__(None, None, None)
+                await _inner_stack.__aexit__(None, None, None)
+                await _file_stack.__aexit__(None, None, None)
+
+            try:
+                response = await real_handler(request)
+            except _RVE as exc:
+                # The door validates in Rust → 422; a real-FastAPI-raised
+                # RequestValidationError would otherwise be captured as a SERVER
+                # exception (re-raised). Render 422 via a user-registered handler
+                # (specific RVE only — matches FA, where RVE's registered handler
+                # beats the Exception catch-all) or FA's default. HTTPException
+                # propagates (Rust renders it). Clean unwind — same as a
+                # ``return`` from inside ``async with`` (the old shape).
+                _uh = (self.exception_handlers or {}).get(_RVE)
+                _res = (_uh or _fa_eh.request_validation_exception_handler)(
+                    request, exc
+                )
+                if inspect.isawaitable(_res):
+                    _res = await _res
+                await _unwind_clean()
+                return _res
+            except BaseException as exc:
+                # ``async with A, B, C`` error semantics: throw the ACTIVE
+                # exception into C→B→A; a teardown-raised exception replaces
+                # it for the outer stacks; a suppressing manager clears it.
+                _cur: BaseException | None = exc
+                for _st in (_function_stack, _inner_stack, _file_stack):
+                    try:
+                        if _cur is not None:
+                            if await _st.__aexit__(
+                                type(_cur), _cur, _cur.__traceback__
+                            ):
+                                _cur = None
+                        else:
+                            await _st.__aexit__(None, None, None)
+                    except BaseException as _e2:  # noqa: BLE001
+                        _cur = _e2
+                if _cur is not None:
+                    raise _cur
+                # Suppressed by a dep — same visible result as falling off the
+                # end of the old ``async with`` block.
+                return None
+            _bg = getattr(response, "background", None)
+            # FUNCTION-scope deps close before the response in FA — inline
+            # (a post-yield raise propagates and becomes the response).
+            await _function_stack.__aexit__(None, None, None)
+            if _mw_defer_state["enabled"] and getattr(
+                request, "_fastapi_turbo_defer_ok", False
             ):
-                request.scope["fastapi_middleware_astack"] = _file_stack
-                request.scope["fastapi_inner_astack"] = _inner_stack
-                request.scope["fastapi_function_astack"] = _function_stack
-                try:
-                    response = await real_handler(request)
-                except _RVE as exc:
-                    # The door validates in Rust → 422; a real-FastAPI-raised
-                    # RequestValidationError would otherwise be captured as a SERVER
-                    # exception (re-raised). Render 422 via a user-registered handler
-                    # (specific RVE only — matches FA, where RVE's registered handler
-                    # beats the Exception catch-all) or FA's default. HTTPException
-                    # propagates (Rust renders it).
-                    _uh = (self.exception_handlers or {}).get(_RVE)
-                    _res = (_uh or _fa_eh.request_validation_exception_handler)(
-                        request, exc
-                    )
-                    if inspect.isawaitable(_res):
-                        _res = await _res
-                    return _res
-                # Run background tasks before yield-dep teardown (FA order: they
-                # observe deps in their pre-teardown state), then clear so the door
-                # doesn't double-run them.
-                _bg = getattr(response, "background", None)
-                if _bg is not None:
-                    _bgr = _bg()
-                    if inspect.isawaitable(_bgr):
-                        await _bgr
-                    response.background = None
+                # Defer background + request-scope/file teardown past the MW
+                # chain: one primed async-gen shim on the wrapper's drain list
+                # (``_run_pending_teardowns`` resumes it on the worker loop).
+                async def _deferred_finalize():
+                    yield
+                    if _bg is not None:
+                        _bgr = _bg()
+                        if inspect.isawaitable(_bgr):
+                            await _bgr
+                    await _inner_stack.__aexit__(None, None, None)
+                    await _file_stack.__aexit__(None, None, None)
+
+                _agen = _deferred_finalize()
+                await _agen.__anext__()  # prime to the yield
+                _tears = getattr(request, "_pending_teardowns", None)
+                if _tears is None:
+                    _tears = []
+                    request._pending_teardowns = _tears
+                _tears.append((_agen, "worker"))
+                response.background = None
                 return response
+            # No MW drain owner: run background before teardown (FA order —
+            # tasks observe deps pre-teardown), then close inline, and clear
+            # so the door doesn't double-run the tasks.
+            if _bg is not None:
+                _bgr = _bg()
+                if inspect.isawaitable(_bgr):
+                    _bgr = await _bgr
+                response.background = None
+            await _inner_stack.__aexit__(None, None, None)
+            await _file_stack.__aexit__(None, None, None)
+            return response
 
         handler.__name__ = getattr(endpoint, "__name__", "endpoint")
 
@@ -6092,6 +4737,38 @@ class FastAPI(_real_fastapi.FastAPI):
         # real FastAPI's RequestValidationError/HTTPException dispatch to the app's
         # handlers), then the @app.middleware("http") chain.
         from fastapi_turbo._door_support import _make_sync_wrapper
+
+        if _async_inline_enabled() and not getattr(self, "_http_middlewares", None):
+            # FASTAPI_TURBO_ASYNC_INLINE: the delegated pipeline is always a
+            # suspending coroutine function (real FastAPI's route handler) with
+            # a single inject_request param and no Rust-level deps — register
+            # it as genuinely async + pre-marked needs-worker so the door
+            # drives it on the worker loop end-to-end (no Event handoff, no
+            # send(None) probe).
+            inline_handler = _wrap_with_exception_handlers_async(handler, self)
+            try:
+                inline_handler._fastapi_turbo_needs_worker = True
+                if inline_handler is not handler:
+                    inline_handler._fastapi_turbo_original_endpoint = handler
+                inline_handler._fastapi_turbo_route_obj = route
+            except (AttributeError, TypeError):
+                pass
+            else:
+                inline_params = [
+                    ParamInfo(
+                        name="request",
+                        kind="inject_request",
+                        type_hint="any",
+                        required=False,
+                        default_value=None,
+                        has_default=False,
+                        model_class=None,
+                        alias=None,
+                        is_handler_param=True,
+                        scalar_validator=None,
+                    )
+                ]
+                return inline_params, inline_handler, True
 
         handler = _make_sync_wrapper(handler, for_handler=True, app=self)
         handler = _wrap_with_exception_handlers(handler, self)
@@ -6111,6 +4788,10 @@ class FastAPI(_real_fastapi.FastAPI):
                     handler._has_http_middleware = True
                 except (AttributeError, TypeError):
                     pass
+                # The MW wrapper's finally now owns yield-dep/background
+                # finalization for this route (see the deferral block in the
+                # delegated handler above).
+                _mw_defer_state["enabled"] = True
 
         try:
             handler._fastapi_turbo_route_obj = route
@@ -6631,10 +5312,8 @@ class FastAPI(_real_fastapi.FastAPI):
         redoc_html_str: str | None = None
         if self.docs_url is not None and self.openapi_url is not None:
             try:
-                import fastapi_turbo.compat as _c
-                _c.install()
-                import sys
-                _docs_mod = sys.modules.get("fastapi.openapi.docs")
+                import importlib as _importlib
+                _docs_mod = _importlib.import_module("fastapi.openapi.docs")
                 if _docs_mod is not None:
                     resp = _docs_mod.get_swagger_ui_html(
                         openapi_url=self.openapi_url,
@@ -6649,10 +5328,8 @@ class FastAPI(_real_fastapi.FastAPI):
                 swagger_ui_html_str = None
         if self.redoc_url is not None and self.openapi_url is not None:
             try:
-                import fastapi_turbo.compat as _c
-                _c.install()
-                import sys
-                _docs_mod = sys.modules.get("fastapi.openapi.docs")
+                import importlib as _importlib
+                _docs_mod = _importlib.import_module("fastapi.openapi.docs")
                 if _docs_mod is not None:
                     resp = _docs_mod.get_redoc_html(
                         openapi_url=self.openapi_url,
@@ -6829,6 +5506,11 @@ class FastAPI(_real_fastapi.FastAPI):
         # when it changes — override-active routes then decline to the clone path
         # (which resolves overrides per request, incl. different-signature ones).
         _ov = getattr(self, "dependency_overrides", None)
+        # The door caches a per-route ``wants_request_scope`` flag (skips the
+        # request-scope ctxvar set when no consumer exists). Its inputs are the
+        # exception-handler count and the Sentry-installed flag; include both so
+        # a handler registered AFTER the first request forces a RouteState
+        # rebuild instead of leaving the scope permanently un-populated.
         return (
             len(getattr(router, "routes", None) or ()),
             len(getattr(self, "_http_middlewares", None) or ()),
@@ -6836,6 +5518,8 @@ class FastAPI(_real_fastapi.FastAPI):
             len(getattr(self, "_raw_asgi_middlewares", None) or ()),
             len(getattr(self, "_mounts", None) or ()),
             frozenset(id(k) for k in _ov) if _ov else None,
+            bool(getattr(self, "exception_handlers", None)),
+            bool(getattr(self, "_fastapi_turbo_sentry_installed", False)),
         )
 
     def _ensure_oneshot_registered(self, scope: dict) -> None:

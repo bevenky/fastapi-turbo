@@ -1,0 +1,1047 @@
+{
+  "raw-axum": {
+    "ping": {
+      "p50_us": 18,
+      "p99_us": 33,
+      "rps_c1": 44141.0,
+      "rps_c8": 147731.5123,
+      "category": "baseline",
+      "method": "GET",
+      "path": "/_ping"
+    },
+    "GET hello (sync)": {
+      "p50_us": 18,
+      "p99_us": 32,
+      "rps_c1": 47294.0,
+      "rps_c8": 151392.1965,
+      "category": "simple",
+      "method": "GET",
+      "path": "/hello"
+    },
+    "GET hello (async)": {
+      "p50_us": 17,
+      "p99_us": 30,
+      "rps_c1": 50572.0,
+      "rps_c8": 145403.9224,
+      "category": "simple",
+      "method": "GET",
+      "path": "/async/hello"
+    },
+    "GET large JSON": {
+      "p50_us": 81,
+      "p99_us": 158,
+      "rps_c1": 10461.0,
+      "rps_c8": 63367.7831,
+      "category": "json",
+      "method": "GET",
+      "path": "/json/large"
+    },
+    "GET large JSON async": {
+      "p50_us": 80,
+      "p99_us": 115,
+      "rps_c1": 10747.0,
+      "rps_c8": 62920.1713,
+      "category": "json",
+      "method": "GET",
+      "path": "/async/json/large"
+    },
+    "POST items (sync)": {
+      "p50_us": 19,
+      "p99_us": 33,
+      "rps_c1": 45729.0,
+      "rps_c8": 141153.2592,
+      "category": "post",
+      "method": "POST",
+      "path": "/items"
+    },
+    "POST items (async)": {
+      "p50_us": 18,
+      "p99_us": 32,
+      "rps_c1": 46250.0,
+      "rps_c8": 131841.1557,
+      "category": "post",
+      "method": "POST",
+      "path": "/async/items"
+    },
+    "PUT items/{id}": {
+      "p50_us": 18,
+      "p99_us": 32,
+      "rps_c1": 46461.0,
+      "rps_c8": 139462.7046,
+      "category": "put",
+      "method": "PUT",
+      "path": "/items/7"
+    },
+    "PATCH items/{id}": {
+      "p50_us": 18,
+      "p99_us": 33,
+      "rps_c1": 46467.0,
+      "rps_c8": 143680.7322,
+      "category": "patch",
+      "method": "PATCH",
+      "path": "/items/7"
+    },
+    "DELETE items/{id}": {
+      "p50_us": 17,
+      "p99_us": 28,
+      "rps_c1": 51105.0,
+      "rps_c8": 152634.9818,
+      "category": "delete",
+      "method": "DELETE",
+      "path": "/items/7"
+    },
+    "GET XML small": {
+      "p50_us": 17,
+      "p99_us": 25,
+      "rps_c1": 52602.0,
+      "rps_c8": 155748.5865,
+      "category": "xml",
+      "method": "GET",
+      "path": "/xml/small"
+    },
+    "GET XML large": {
+      "p50_us": 29,
+      "p99_us": 45,
+      "rps_c1": 28050.0,
+      "rps_c8": 116793.7525,
+      "category": "xml",
+      "method": "GET",
+      "path": "/xml/large"
+    },
+    "stream sync": {
+      "p50_us": 18,
+      "p99_us": 30,
+      "rps_c1": 47179.0,
+      "rps_c8": 62507.712,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-sync"
+    },
+    "stream async": {
+      "p50_us": 18,
+      "p99_us": 31,
+      "rps_c1": 46904.0,
+      "rps_c8": 61148.6398,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-async"
+    },
+    "stream await": {
+      "p50_us": 18,
+      "p99_us": 32,
+      "rps_c1": 46415.0,
+      "rps_c8": 62349.1139,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-await"
+    },
+    "redis GET sync": {
+      "p50_us": 52,
+      "p99_us": 74,
+      "rps_c1": 16576.0,
+      "rps_c8": 58755.6092,
+      "category": "redis",
+      "method": "GET",
+      "path": "/redis/get/sync"
+    },
+    "redis GET async": {
+      "p50_us": 53,
+      "p99_us": 84,
+      "rps_c1": 16399.0,
+      "rps_c8": 56459.7279,
+      "category": "redis",
+      "method": "GET",
+      "path": "/redis/get/async"
+    },
+    "redis SET sync": {
+      "p50_us": 52,
+      "p99_us": 76,
+      "rps_c1": 16674.0,
+      "rps_c8": 58275.4003,
+      "category": "redis",
+      "method": "POST",
+      "path": "/redis/set/sync"
+    },
+    "redis SET async": {
+      "p50_us": 52,
+      "p99_us": 74,
+      "rps_c1": 16741.0,
+      "rps_c8": 58539.3125,
+      "category": "redis",
+      "method": "POST",
+      "path": "/redis/set/async"
+    },
+    "pg item sync": {
+      "p50_us": 43,
+      "p99_us": 62,
+      "rps_c1": 19549.0,
+      "rps_c8": 67028.0997,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/item/5/sync"
+    },
+    "pg item async": {
+      "p50_us": 44,
+      "p99_us": 64,
+      "rps_c1": 19992.0,
+      "rps_c8": 66742.9576,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/item/5/async"
+    },
+    "pg list sync": {
+      "p50_us": 57,
+      "p99_us": 75,
+      "rps_c1": 15658.0,
+      "rps_c8": 57114.8426,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/items/sync?limit=10"
+    },
+    "pg list async": {
+      "p50_us": 58,
+      "p99_us": 79,
+      "rps_c1": 15233.0,
+      "rps_c8": 55676.5711,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/items/async?limit=10"
+    }
+  },
+  "fastapi-turbo": {
+    "ping": {
+      "p50_us": 19,
+      "p99_us": 34,
+      "rps_c1": 39966.0,
+      "rps_c8": 139105.9106,
+      "category": "baseline",
+      "method": "GET",
+      "path": "/_ping"
+    },
+    "GET hello (sync)": {
+      "p50_us": 22,
+      "p99_us": 41,
+      "rps_c1": 38355.0,
+      "rps_c8": 86166.2396,
+      "category": "simple",
+      "method": "GET",
+      "path": "/hello"
+    },
+    "GET hello (async)": {
+      "p50_us": 22,
+      "p99_us": 36,
+      "rps_c1": 39825.0,
+      "rps_c8": 82956.6186,
+      "category": "simple",
+      "method": "GET",
+      "path": "/async/hello"
+    },
+    "GET large JSON": {
+      "p50_us": 148,
+      "p99_us": 183,
+      "rps_c1": 5947.0,
+      "rps_c8": 7379.7932,
+      "category": "json",
+      "method": "GET",
+      "path": "/json/large"
+    },
+    "GET large JSON async": {
+      "p50_us": 148,
+      "p99_us": 193,
+      "rps_c1": 5918.0,
+      "rps_c8": 7411.3822,
+      "category": "json",
+      "method": "GET",
+      "path": "/async/json/large"
+    },
+    "POST items (sync)": {
+      "p50_us": 27,
+      "p99_us": 46,
+      "rps_c1": 31769.0,
+      "rps_c8": 71338.4619,
+      "category": "post",
+      "method": "POST",
+      "path": "/items"
+    },
+    "POST items (async)": {
+      "p50_us": 28,
+      "p99_us": 48,
+      "rps_c1": 31174.0,
+      "rps_c8": 70211.8387,
+      "category": "post",
+      "method": "POST",
+      "path": "/async/items"
+    },
+    "PUT items/{id}": {
+      "p50_us": 28,
+      "p99_us": 55,
+      "rps_c1": 29378.0,
+      "rps_c8": 76256.5671,
+      "category": "put",
+      "method": "PUT",
+      "path": "/items/7"
+    },
+    "PATCH items/{id}": {
+      "p50_us": 27,
+      "p99_us": 44,
+      "rps_c1": 31747.0,
+      "rps_c8": 78058.2282,
+      "category": "patch",
+      "method": "PATCH",
+      "path": "/items/7"
+    },
+    "DELETE items/{id}": {
+      "p50_us": 23,
+      "p99_us": 39,
+      "rps_c1": 37430.0,
+      "rps_c8": 87982.1626,
+      "category": "delete",
+      "method": "DELETE",
+      "path": "/items/7"
+    },
+    "GET XML small": {
+      "p50_us": 23,
+      "p99_us": 39,
+      "rps_c1": 37628.0,
+      "rps_c8": 84574.6321,
+      "category": "xml",
+      "method": "GET",
+      "path": "/xml/small"
+    },
+    "GET XML large": {
+      "p50_us": 37,
+      "p99_us": 53,
+      "rps_c1": 22019.0,
+      "rps_c8": 79269.017,
+      "category": "xml",
+      "method": "GET",
+      "path": "/xml/large"
+    },
+    "stream sync": {
+      "p50_us": 26,
+      "p99_us": 42,
+      "rps_c1": 32562.0,
+      "rps_c8": 71028.0182,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-sync"
+    },
+    "stream async": {
+      "p50_us": 29,
+      "p99_us": 48,
+      "rps_c1": 28844.0,
+      "rps_c8": 66478.721,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-async"
+    },
+    "stream await": {
+      "p50_us": 32,
+      "p99_us": 48,
+      "rps_c1": 26098.0,
+      "rps_c8": 54278.0209,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-await"
+    },
+    "redis GET sync": {
+      "p50_us": 56,
+      "p99_us": 75,
+      "rps_c1": 15672.0,
+      "rps_c8": 23005.3164,
+      "category": "redis",
+      "method": "GET",
+      "path": "/redis/get/sync"
+    },
+    "redis GET async": {
+      "p50_us": 98,
+      "p99_us": 122,
+      "rps_c1": 9099.0,
+      "rps_c8": 22405.196,
+      "category": "redis",
+      "method": "GET",
+      "path": "/redis/get/async"
+    },
+    "redis SET sync": {
+      "p50_us": 56,
+      "p99_us": 76,
+      "rps_c1": 15824.0,
+      "rps_c8": 22703.1805,
+      "category": "redis",
+      "method": "POST",
+      "path": "/redis/set/sync"
+    },
+    "redis SET async": {
+      "p50_us": 100,
+      "p99_us": 126,
+      "rps_c1": 8969.0,
+      "rps_c8": 21758.8404,
+      "category": "redis",
+      "method": "POST",
+      "path": "/redis/set/async"
+    },
+    "pg item sync": {
+      "p50_us": 71,
+      "p99_us": 94,
+      "rps_c1": 12491.0,
+      "rps_c8": 16880.0867,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/item/5/sync"
+    },
+    "pg item async": {
+      "p50_us": 73,
+      "p99_us": 99,
+      "rps_c1": 12026.0,
+      "rps_c8": 23637.5038,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/item/5/async"
+    },
+    "pg list sync": {
+      "p50_us": 84,
+      "p99_us": 107,
+      "rps_c1": 10763.0,
+      "rps_c8": 16272.5528,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/items/sync?limit=10"
+    },
+    "pg list async": {
+      "p50_us": 84,
+      "p99_us": 107,
+      "rps_c1": 10709.0,
+      "rps_c8": 21729.743,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/items/async?limit=10"
+    }
+  },
+  "FastAPI (uvicorn)": {
+    "ping": {
+      "category": "baseline",
+      "method": "GET",
+      "path": "/_ping",
+      "p50_us": null,
+      "p99_us": null,
+      "rps_c1": null,
+      "rps_c8": null
+    },
+    "GET hello (sync)": {
+      "p50_us": 125,
+      "p99_us": 150,
+      "rps_c1": 7089.0,
+      "rps_c8": 15921.3464,
+      "category": "simple",
+      "method": "GET",
+      "path": "/hello"
+    },
+    "GET hello (async)": {
+      "p50_us": 53,
+      "p99_us": 67,
+      "rps_c1": 17256.0,
+      "rps_c8": 32202.5098,
+      "category": "simple",
+      "method": "GET",
+      "path": "/async/hello"
+    },
+    "GET large JSON": {
+      "p50_us": 1875,
+      "p99_us": 4644,
+      "rps_c1": 468.0,
+      "rps_c8": 539.6577,
+      "category": "json",
+      "method": "GET",
+      "path": "/json/large"
+    },
+    "GET large JSON async": {
+      "p50_us": 1824,
+      "p99_us": 4623,
+      "rps_c1": 481.0,
+      "rps_c8": 551.7433,
+      "category": "json",
+      "method": "GET",
+      "path": "/async/json/large"
+    },
+    "POST items (sync)": {
+      "p50_us": 144,
+      "p99_us": 171,
+      "rps_c1": 6243.0,
+      "rps_c8": 12674.5627,
+      "category": "post",
+      "method": "POST",
+      "path": "/items"
+    },
+    "POST items (async)": {
+      "p50_us": 71,
+      "p99_us": 90,
+      "rps_c1": 12700.0,
+      "rps_c8": 21483.1954,
+      "category": "post",
+      "method": "POST",
+      "path": "/async/items"
+    },
+    "PUT items/{id}": {
+      "p50_us": 153,
+      "p99_us": 180,
+      "rps_c1": 5933.0,
+      "rps_c8": 11532.7945,
+      "category": "put",
+      "method": "PUT",
+      "path": "/items/7"
+    },
+    "PATCH items/{id}": {
+      "p50_us": 151,
+      "p99_us": 180,
+      "rps_c1": 5975.0,
+      "rps_c8": 11800.788,
+      "category": "patch",
+      "method": "PATCH",
+      "path": "/items/7"
+    },
+    "DELETE items/{id}": {
+      "p50_us": 138,
+      "p99_us": 159,
+      "rps_c1": 6577.0,
+      "rps_c8": 13623.0055,
+      "category": "delete",
+      "method": "DELETE",
+      "path": "/items/7"
+    },
+    "GET XML small": {
+      "p50_us": 124,
+      "p99_us": 143,
+      "rps_c1": 7301.0,
+      "rps_c8": 16395.7755,
+      "category": "xml",
+      "method": "GET",
+      "path": "/xml/small"
+    },
+    "GET XML large": {
+      "p50_us": 131,
+      "p99_us": 152,
+      "rps_c1": 6717.0,
+      "rps_c8": 15505.6582,
+      "category": "xml",
+      "method": "GET",
+      "path": "/xml/large"
+    },
+    "stream sync": {
+      "p50_us": 896,
+      "p99_us": 998,
+      "rps_c1": 1010.0,
+      "rps_c8": 2546.2922,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-sync"
+    },
+    "stream async": {
+      "p50_us": 110,
+      "p99_us": 134,
+      "rps_c1": 8181.0,
+      "rps_c8": 15034.701,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-async"
+    },
+    "stream await": {
+      "p50_us": 282,
+      "p99_us": 327,
+      "rps_c1": 3193.0,
+      "rps_c8": 8726.0523,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-await"
+    },
+    "redis GET sync": {
+      "p50_us": 189,
+      "p99_us": 218,
+      "rps_c1": 4774.0,
+      "rps_c8": 9653.3999,
+      "category": "redis",
+      "method": "GET",
+      "path": "/redis/get/sync"
+    },
+    "redis GET async": {
+      "p50_us": 135,
+      "p99_us": 155,
+      "rps_c1": 6672.0,
+      "rps_c8": 17271.2623,
+      "category": "redis",
+      "method": "GET",
+      "path": "/redis/get/async"
+    },
+    "redis SET sync": {
+      "p50_us": 182,
+      "p99_us": 220,
+      "rps_c1": 4924.0,
+      "rps_c8": 8915.3226,
+      "category": "redis",
+      "method": "POST",
+      "path": "/redis/set/sync"
+    },
+    "redis SET async": {
+      "p50_us": 148,
+      "p99_us": 168,
+      "rps_c1": 6113.0,
+      "rps_c8": 14742.3745,
+      "category": "redis",
+      "method": "POST",
+      "path": "/redis/set/async"
+    },
+    "pg item sync": {
+      "p50_us": 238,
+      "p99_us": 295,
+      "rps_c1": 3746.0,
+      "rps_c8": 7145.3876,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/item/5/sync"
+    },
+    "pg item async": {
+      "p50_us": 172,
+      "p99_us": 213,
+      "rps_c1": 5149.0,
+      "rps_c8": 13628.6735,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/item/5/async"
+    },
+    "pg list sync": {
+      "p50_us": 279,
+      "p99_us": 346,
+      "rps_c1": 3261.0,
+      "rps_c8": 5737.6574,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/items/sync?limit=10"
+    },
+    "pg list async": {
+      "p50_us": 245,
+      "p99_us": 353,
+      "rps_c1": 3623.0,
+      "rps_c8": 9080.1352,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/items/async?limit=10"
+    }
+  },
+  "Gin (Go)": {
+    "ping": {
+      "p50_us": 24,
+      "p99_us": 76,
+      "rps_c1": 30912.0,
+      "rps_c8": 101767.2671,
+      "category": "baseline",
+      "method": "GET",
+      "path": "/_ping"
+    },
+    "GET hello (sync)": {
+      "p50_us": 23,
+      "p99_us": 35,
+      "rps_c1": 37796.0,
+      "rps_c8": 103420.5503,
+      "category": "simple",
+      "method": "GET",
+      "path": "/hello"
+    },
+    "GET hello (async)": {
+      "p50_us": 23,
+      "p99_us": 36,
+      "rps_c1": 37473.0,
+      "rps_c8": 104674.0691,
+      "category": "simple",
+      "method": "GET",
+      "path": "/async/hello"
+    },
+    "GET large JSON": {
+      "p50_us": 111,
+      "p99_us": 303,
+      "rps_c1": 7502.0,
+      "rps_c8": 28240.4746,
+      "category": "json",
+      "method": "GET",
+      "path": "/json/large"
+    },
+    "GET large JSON async": {
+      "p50_us": 113,
+      "p99_us": 289,
+      "rps_c1": 7390.0,
+      "rps_c8": 28645.0741,
+      "category": "json",
+      "method": "GET",
+      "path": "/async/json/large"
+    },
+    "POST items (sync)": {
+      "p50_us": 25,
+      "p99_us": 40,
+      "rps_c1": 34903.0,
+      "rps_c8": 97054.1921,
+      "category": "post",
+      "method": "POST",
+      "path": "/items"
+    },
+    "POST items (async)": {
+      "p50_us": 25,
+      "p99_us": 39,
+      "rps_c1": 35029.0,
+      "rps_c8": 97983.5883,
+      "category": "post",
+      "method": "POST",
+      "path": "/async/items"
+    },
+    "PUT items/{id}": {
+      "p50_us": 25,
+      "p99_us": 43,
+      "rps_c1": 34381.0,
+      "rps_c8": 97658.0833,
+      "category": "put",
+      "method": "PUT",
+      "path": "/items/7"
+    },
+    "PATCH items/{id}": {
+      "p50_us": 25,
+      "p99_us": 44,
+      "rps_c1": 33663.0,
+      "rps_c8": 98919.8001,
+      "category": "patch",
+      "method": "PATCH",
+      "path": "/items/7"
+    },
+    "DELETE items/{id}": {
+      "p50_us": 24,
+      "p99_us": 43,
+      "rps_c1": 36181.0,
+      "rps_c8": 105274.8899,
+      "category": "delete",
+      "method": "DELETE",
+      "path": "/items/7"
+    },
+    "GET XML small": {
+      "p50_us": 23,
+      "p99_us": 36,
+      "rps_c1": 37869.0,
+      "rps_c8": 104522.7035,
+      "category": "xml",
+      "method": "GET",
+      "path": "/xml/small"
+    },
+    "GET XML large": {
+      "p50_us": 32,
+      "p99_us": 77,
+      "rps_c1": 24022.0,
+      "rps_c8": 82544.496,
+      "category": "xml",
+      "method": "GET",
+      "path": "/xml/large"
+    },
+    "stream sync": {
+      "p50_us": 44,
+      "p99_us": 107,
+      "rps_c1": 19627.0,
+      "rps_c8": 38429.2324,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-sync"
+    },
+    "stream async": {
+      "p50_us": 44,
+      "p99_us": 106,
+      "rps_c1": 19578.0,
+      "rps_c8": 38279.9142,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-async"
+    },
+    "stream await": {
+      "p50_us": 43,
+      "p99_us": 103,
+      "rps_c1": 19891.0,
+      "rps_c8": 37887.8024,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-await"
+    },
+    "redis GET sync": {
+      "p50_us": 45,
+      "p99_us": 62,
+      "rps_c1": 19349.0,
+      "rps_c8": 57176.0825,
+      "category": "redis",
+      "method": "GET",
+      "path": "/redis/get/sync"
+    },
+    "redis GET async": {
+      "p50_us": 45,
+      "p99_us": 116,
+      "rps_c1": 19149.0,
+      "rps_c8": 56834.618,
+      "category": "redis",
+      "method": "GET",
+      "path": "/redis/get/async"
+    },
+    "redis SET sync": {
+      "p50_us": 45,
+      "p99_us": 63,
+      "rps_c1": 19427.0,
+      "rps_c8": 56387.6853,
+      "category": "redis",
+      "method": "POST",
+      "path": "/redis/set/sync"
+    },
+    "redis SET async": {
+      "p50_us": 45,
+      "p99_us": 62,
+      "rps_c1": 19461.0,
+      "rps_c8": 54839.4814,
+      "category": "redis",
+      "method": "POST",
+      "path": "/redis/set/async"
+    },
+    "pg item sync": {
+      "p50_us": 56,
+      "p99_us": 77,
+      "rps_c1": 15577.0,
+      "rps_c8": 49748.4949,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/item/5/sync"
+    },
+    "pg item async": {
+      "p50_us": 56,
+      "p99_us": 74,
+      "rps_c1": 16008.0,
+      "rps_c8": 48765.7798,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/item/5/async"
+    },
+    "pg list sync": {
+      "p50_us": 65,
+      "p99_us": 92,
+      "rps_c1": 13332.0,
+      "rps_c8": 45347.5323,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/items/sync?limit=10"
+    },
+    "pg list async": {
+      "p50_us": 66,
+      "p99_us": 96,
+      "rps_c1": 13023.0,
+      "rps_c8": 47132.4729,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/items/async?limit=10"
+    }
+  },
+  "Fastify (Node)": {
+    "ping": {
+      "p50_us": 23,
+      "p99_us": 35,
+      "rps_c1": 34069.0,
+      "rps_c8": 89190.0888,
+      "category": "baseline",
+      "method": "GET",
+      "path": "/_ping"
+    },
+    "GET hello (sync)": {
+      "p50_us": 21,
+      "p99_us": 32,
+      "rps_c1": 39371.0,
+      "rps_c8": 88584.5965,
+      "category": "simple",
+      "method": "GET",
+      "path": "/hello"
+    },
+    "GET hello (async)": {
+      "p50_us": 23,
+      "p99_us": 67,
+      "rps_c1": 36727.0,
+      "rps_c8": 89335.2444,
+      "category": "simple",
+      "method": "GET",
+      "path": "/async/hello"
+    },
+    "GET large JSON": {
+      "p50_us": 59,
+      "p99_us": 88,
+      "rps_c1": 14125.0,
+      "rps_c8": 23513.807,
+      "category": "json",
+      "method": "GET",
+      "path": "/json/large"
+    },
+    "GET large JSON async": {
+      "p50_us": 60,
+      "p99_us": 124,
+      "rps_c1": 13979.0,
+      "rps_c8": 23005.6014,
+      "category": "json",
+      "method": "GET",
+      "path": "/async/json/large"
+    },
+    "POST items (sync)": {
+      "p50_us": 32,
+      "p99_us": 42,
+      "rps_c1": 27942.0,
+      "rps_c8": 72922.1583,
+      "category": "post",
+      "method": "POST",
+      "path": "/items"
+    },
+    "POST items (async)": {
+      "p50_us": 29,
+      "p99_us": 40,
+      "rps_c1": 31131.0,
+      "rps_c8": 74089.4102,
+      "category": "post",
+      "method": "POST",
+      "path": "/async/items"
+    },
+    "PUT items/{id}": {
+      "p50_us": 29,
+      "p99_us": 41,
+      "rps_c1": 30781.0,
+      "rps_c8": 75162.7642,
+      "category": "put",
+      "method": "PUT",
+      "path": "/items/7"
+    },
+    "PATCH items/{id}": {
+      "p50_us": 29,
+      "p99_us": 40,
+      "rps_c1": 30991.0,
+      "rps_c8": 75385.9989,
+      "category": "patch",
+      "method": "PATCH",
+      "path": "/items/7"
+    },
+    "DELETE items/{id}": {
+      "p50_us": 23,
+      "p99_us": 36,
+      "rps_c1": 38805.0,
+      "rps_c8": 90205.913,
+      "category": "delete",
+      "method": "DELETE",
+      "path": "/items/7"
+    },
+    "GET XML small": {
+      "p50_us": 23,
+      "p99_us": 30,
+      "rps_c1": 40913.0,
+      "rps_c8": 89796.4981,
+      "category": "xml",
+      "method": "GET",
+      "path": "/xml/small"
+    },
+    "GET XML large": {
+      "p50_us": 35,
+      "p99_us": 52,
+      "rps_c1": 22404.0,
+      "rps_c8": 59792.6929,
+      "category": "xml",
+      "method": "GET",
+      "path": "/xml/large"
+    },
+    "stream sync": {
+      "p50_us": 39,
+      "p99_us": 57,
+      "rps_c1": 21293.0,
+      "rps_c8": 37102.1657,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-sync"
+    },
+    "stream async": {
+      "p50_us": 39,
+      "p99_us": 54,
+      "rps_c1": 21770.0,
+      "rps_c8": 35676.5596,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-async"
+    },
+    "stream await": {
+      "p50_us": 39,
+      "p99_us": 71,
+      "rps_c1": 21447.0,
+      "rps_c8": 35538.494,
+      "category": "streaming",
+      "method": "GET",
+      "path": "/stream-await"
+    },
+    "redis GET sync": {
+      "p50_us": 44,
+      "p99_us": 67,
+      "rps_c1": 19420.0,
+      "rps_c8": 65154.9128,
+      "category": "redis",
+      "method": "GET",
+      "path": "/redis/get/sync"
+    },
+    "redis GET async": {
+      "p50_us": 42,
+      "p99_us": 61,
+      "rps_c1": 20786.0,
+      "rps_c8": 65162.671,
+      "category": "redis",
+      "method": "GET",
+      "path": "/redis/get/async"
+    },
+    "redis SET sync": {
+      "p50_us": 43,
+      "p99_us": 59,
+      "rps_c1": 20721.0,
+      "rps_c8": 63997.281,
+      "category": "redis",
+      "method": "POST",
+      "path": "/redis/set/sync"
+    },
+    "redis SET async": {
+      "p50_us": 42,
+      "p99_us": 61,
+      "rps_c1": 20868.0,
+      "rps_c8": 64873.8146,
+      "category": "redis",
+      "method": "POST",
+      "path": "/redis/set/async"
+    },
+    "pg item sync": {
+      "p50_us": 69,
+      "p99_us": 89,
+      "rps_c1": 12745.0,
+      "rps_c8": 46272.6342,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/item/5/sync"
+    },
+    "pg item async": {
+      "p50_us": 68,
+      "p99_us": 86,
+      "rps_c1": 12987.0,
+      "rps_c8": 45593.1992,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/item/5/async"
+    },
+    "pg list sync": {
+      "p50_us": 76,
+      "p99_us": 94,
+      "rps_c1": 11746.0,
+      "rps_c8": 40115.0804,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/items/sync?limit=10"
+    },
+    "pg list async": {
+      "p50_us": 76,
+      "p99_us": 106,
+      "rps_c1": 11733.0,
+      "rps_c8": 39477.6143,
+      "category": "postgres",
+      "method": "GET",
+      "path": "/pg/items/async?limit=10"
+    }
+  }
+}

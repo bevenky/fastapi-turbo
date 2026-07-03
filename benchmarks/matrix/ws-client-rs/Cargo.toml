@@ -1,0 +1,19 @@
+[package]
+name = "ws-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace — keep tungstenite OUT of the PyO3 cdylib crate.
+[workspace]
+
+[dependencies]
+# Sync (blocking) tungstenite on purpose: a blocking single-thread client has
+# no executor wake jitter of its own, so the numbers are the SERVER's RTT.
+# (tokio-tungstenite would re-introduce client-side scheduler noise — the very
+# thing this tool exists to remove from the published WS table.)
+tungstenite = "0.29"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

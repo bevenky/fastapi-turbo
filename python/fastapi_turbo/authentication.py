@@ -127,8 +127,14 @@ class AuthenticationBackend:
         raise NotImplementedError
 
 
-class AuthenticationError(Exception):
-    """Raised by backends to signal an auth failure."""
+# Single identity with the REAL Starlette exception. Post shim-flip,
+# ``starlette.authentication`` stays the genuine module, so a user backend
+# raising ``starlette.authentication.AuthenticationError`` must be caught by
+# the turbo middleware's ``except AuthenticationError`` below — alias instead
+# of defining a parallel class. (This module loads during package init,
+# before compat patching, but starlette.authentication is never faked in the
+# patch-on-real model anyway.)
+from starlette.authentication import AuthenticationError  # noqa: E402
 
 
 # ── Middleware ──────────────────────────────────────────────────────

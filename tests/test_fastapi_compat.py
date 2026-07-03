@@ -1,14 +1,34 @@
-"""Verify all new features work with EXACT FastAPI syntax.
+"""FastAPI drop-in signature pins NOT covered by the upstream suite.
 
-This test ensures that a user with existing FastAPI code can drop in
-fastapi-turbo without any syntax changes.
+CONSOLIDATION (coverage-differential, round-9 follow-up): this file kept only
+the tests that either carry unique arcs over ``python/fastapi_turbo`` (per-test
+coverage contexts vs the full retained suite + upstream FastAPI suite) or pin a
+signature/behavior the upstream suite provably never exercises (grep evidence
+against the 0.138.1 clone). Deleted-as-redundant, with their upstream twins:
+
+  * set_cookie("k","v") two-positional      → tests/test_repeated_cookie_headers.py
+  * FastAPI(exception_handlers={...})       → tests/test_exception_handlers.py
+  * FastAPI(root_path=...) (+servers)       → tests/test_openapi_cache_root_path.py,
+                                              behind_a_proxy tutorials
+  * @app.exception_handler(cls) decorator   → tests/test_validation_error_context.py
+  * @app.exception_handler(404) status form → local tests/test_new_features.py:455
+  * @app.middleware("http") accept/reject   → local tests/test_new_features.py
+                                              (TestHTTPMiddleware, exact same pins)
+  * Body() embed default / embed=True       → tests/test_union_body_discriminator_*,
+                                              multiple-body-params suite
+  * Body(media_type=...)                    → tests/test_request_body_parameters_media_type.py
+  * deprecated=None/True → OpenAPI          → upstream openapi deprecated tests
+  * url_path_for value + URLPath-str        → tests/test_router_include_context.py
+  * route-kwarg smoke (responses, callbacks,
+    openapi_extra, security, tags, ...)     → exercised route-by-route upstream
+  * the entire import-surface smoke         → every name grep-confirmed imported
+                                              by upstream tests; module-walk lives
+                                              in tests/test_shim_completeness.py
 """
 
 from __future__ import annotations
 
 import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
-
-import pytest
 
 
 # ── Response.set_cookie: positional-or-keyword (Starlette-compatible) ──
@@ -26,16 +46,8 @@ def _set_cookies(resp):
 
 
 class TestStarletteCookieSignature:
-    def test_positional_max_age(self):
-        """Starlette users can call set_cookie positionally."""
-        from fastapi.responses import Response
-
-        r = Response()
-        # Old Starlette call style: positional args
-        r.set_cookie("sessionid", "abc123", 3600)
-        value = _set_cookies(r)[0]
-        assert "sessionid=abc123" in value
-        assert "Max-Age=3600" in value
+    """Positional call styles the upstream suite never uses — the
+    parameter ORDER is the contract here."""
 
     def test_positional_all_args(self):
         """All positional args — matches Starlette."""
@@ -72,106 +84,24 @@ class TestStarletteCookieSignature:
         assert "Partitioned" in value
 
 
-# ── Security() dependency (FastAPI-compatible) ────────────────────
+# ── Security() structural contract ────────────────────────────────
 
 
 class TestSecurity:
-    def test_security_imports_from_fastapi_turbo(self):
-        """import fastapi_turbo  # noqa: F401 — installs compat shim
-from fastapi import Security — must work."""
-        from fastapi import Security
-
-        assert Security is not None
-
     def test_security_is_depends_subclass(self):
+        """User code doing ``isinstance(marker, Depends)`` must see
+        Security as a Depends — upstream never asserts this shape."""
         from fastapi import Depends, Security
 
         s = Security(lambda: None, scopes=["me"])
         assert isinstance(s, Depends)
         assert s.scopes == ["me"]
 
-    def test_security_in_endpoint(self):
-        """FastAPI-compatible: `token: str = Security(scheme, scopes=[...])`"""
-        from fastapi import FastAPI, Security
-        from fastapi.security import OAuth2PasswordBearer
 
-        oauth2 = OAuth2PasswordBearer(tokenUrl="/token")
-        app = FastAPI()
-
-        @app.get("/me")
-        async def me(token: str = Security(oauth2, scopes=["me"])):
-            return {"token": token}
-
-        # Verify the route is registered
-        routes = app._collect_all_routes()
-        assert len(routes) == 1
-
-
-# ── APIRoute.deprecated type (bool | None) ─────────────────────────
-
-
-class TestDeprecatedNone:
-    def test_deprecated_none_means_not_deprecated(self):
-        """FastAPI-compatible: deprecated defaults to None (meaning: inherit/not deprecated)."""
-        from fastapi import FastAPI
-
-        app = FastAPI()
-
-        @app.get("/a")  # no deprecated kwarg
-        def a():
-            return {}
-
-        @app.get("/b", deprecated=None)
-        def b():
-            return {}
-
-        @app.get("/c", deprecated=True)
-        def c():
-            return {}
-
-        routes = app._collect_all_routes()
-        assert routes[0]["deprecated"] is False
-        assert routes[1]["deprecated"] is False
-        assert routes[2]["deprecated"] is True
-
-
-# ── Body.embed default is None (FastAPI-compat) ────────────────────
-
-
-class TestBodyEmbedDefault:
-    def test_body_embed_defaults_to_none(self):
-        """FastAPI defaults Body.embed to None (means auto-detect)."""
-        from fastapi.param_functions import Body
-
-        b = Body()
-        assert b.embed is None
-
-    def test_body_embed_true_still_works(self):
-        from fastapi.param_functions import Body
-
-        b = Body(embed=True)
-        assert b.embed is True
-
-
-# ── url_path_for returns URLPath (str subclass with make_absolute_url) ──
+# ── URLPath.make_absolute_url (unique-arc carrier) ─────────────────
 
 
 class TestUrlPathFor:
-    def test_returns_urlpath(self):
-        from fastapi import FastAPI
-        from fastapi_turbo.applications import URLPath
-
-        app = FastAPI()
-
-        @app.get("/users/{user_id}")
-        def get_user(user_id: int):
-            return {}
-
-        url = app.url_path_for("get_user", user_id=42)
-        assert isinstance(url, URLPath)
-        assert isinstance(url, str)
-        assert url == "/users/42"
-
     def test_make_absolute_url(self):
         """Starlette URLPath.make_absolute_url should work."""
         from fastapi import FastAPI
@@ -187,55 +117,10 @@ class TestUrlPathFor:
         assert abs_url == "http://example.com/users/1"
 
 
-# ── FastAPI.__init__: exception_handlers kwarg accepted ────────────
-
-
-class TestFastAPIInit:
-    def test_exception_handlers_kwarg(self):
-        """FastAPI(exception_handlers={...}) — standard init kwarg."""
-        from fastapi import FastAPI, HTTPException
-
-        def handle(request, exc):
-            return {}
-
-        app = FastAPI(exception_handlers={HTTPException: handle})
-        assert HTTPException in app.exception_handlers
-
-    def test_root_path_kwarg(self):
-        from fastapi import FastAPI
-
-        app = FastAPI(root_path="/api/v1")
-        assert app.root_path == "/api/v1"
-        assert app.root_path_in_servers is True
-
-
-# ── Exception handler signature matches FastAPI ────────────────────
+# ── add_exception_handler imperative form (unique-arc carrier) ─────
 
 
 class TestExceptionHandlerSignature:
-    def test_register_for_status_code(self):
-        """FastAPI allows @app.exception_handler(404)."""
-        from fastapi import FastAPI
-
-        app = FastAPI()
-
-        @app.exception_handler(404)
-        def h(request, exc):
-            return {}
-
-        assert 404 in app.exception_handlers
-
-    def test_register_for_exception_class(self):
-        from fastapi import FastAPI, HTTPException
-
-        app = FastAPI()
-
-        @app.exception_handler(HTTPException)
-        def h(request, exc):
-            return {}
-
-        assert HTTPException in app.exception_handlers
-
     def test_add_exception_handler_imperative(self):
         """Starlette-style: app.add_exception_handler(...)"""
         from fastapi import FastAPI, HTTPException
@@ -246,156 +131,3 @@ class TestExceptionHandlerSignature:
         app = FastAPI()
         app.add_exception_handler(HTTPException, h)
         assert app.exception_handlers[HTTPException] is h
-
-
-# ── Middleware decorator signature matches FastAPI ─────────────────
-
-
-class TestMiddlewareSignature:
-    def test_http_type_accepted(self):
-        from fastapi import FastAPI
-
-        app = FastAPI()
-
-        @app.middleware("http")
-        async def m(request, call_next):
-            return await call_next(request)
-
-        assert len(app._http_middlewares) == 1
-
-    def test_non_http_raises(self):
-        from fastapi import FastAPI
-
-        app = FastAPI()
-        with pytest.raises(ValueError):
-            @app.middleware("websocket")
-            async def m(r, cn):
-                pass
-
-
-# ── APIRoute kwargs — all must be keyword-only ────────────────────
-
-
-class TestAPIRouteKwargs:
-    def test_all_new_kwargs_accepted(self):
-        """All 15 new features can be passed as keyword args in standard syntax."""
-        from fastapi import APIRouter, FastAPI
-        from fastapi.responses import HTMLResponse
-
-        app = FastAPI()
-        cb_router = APIRouter()
-
-        @cb_router.post("/cb")
-        def cb():
-            return {}
-
-        @app.get(
-            "/complex",
-            response_description="custom",
-            responses={404: {"description": "NF"}},
-            response_class=HTMLResponse,
-            include_in_schema=False,
-            openapi_extra={"x-foo": 1},
-            security=[{"BearerAuth": []}],
-            callbacks=[cb_router],
-            deprecated=True,
-            operation_id="custom_op",
-            tags=["x"],
-        )
-        def h():
-            return "<h1>hi</h1>"
-
-        # If the above parsed, all kwargs are accepted
-        assert True
-
-
-# ── Body media_type FastAPI-compat ─────────────────────────────────
-
-
-class TestBodyMediaType:
-    def test_body_media_type_kwarg(self):
-        from typing import Annotated
-
-        from fastapi import FastAPI, Body
-
-        app = FastAPI()
-
-        @app.post("/upload")
-        def h(data: Annotated[bytes, Body(media_type="application/octet-stream")] = b""):
-            return {}
-
-        # Route registration shouldn't fail
-        routes = app._collect_all_routes()
-        assert len(routes) == 1
-
-
-# ── Ensure imports users might make all work ───────────────────────
-
-
-class TestAllImports:
-    def test_standard_fastapi_imports(self):
-        """The complete FastAPI import surface."""
-        # Core
-        from fastapi import (
-            APIRouter,
-            BackgroundTasks,
-            Body,
-            Cookie,
-            Depends,
-            FastAPI,
-            File,
-            Form,
-            Header,
-            HTTPException,
-            Path,
-            Query,
-            Request,
-            Response,
-            Security,
-            UploadFile,
-            WebSocket,
-            status,
-        )
-        # Responses
-        from fastapi.responses import (
-            FileResponse,
-            HTMLResponse,
-            JSONResponse,
-            ORJSONResponse,
-            PlainTextResponse,
-            RedirectResponse,
-            Response as Resp,
-            StreamingResponse,
-            UJSONResponse,
-        )
-        # Security
-        from fastapi.security import (
-            APIKeyCookie,
-            APIKeyHeader,
-            APIKeyQuery,
-            HTTPAuthorizationCredentials,
-            HTTPBasic,
-            HTTPBasicCredentials,
-            HTTPBearer,
-            HTTPDigest,
-            OAuth2PasswordBearer,
-            OAuth2PasswordRequestForm,
-            SecurityScopes,
-        )
-        # Exceptions
-        from fastapi.exceptions import (
-            HTTPException as Exc,
-            RequestValidationError,
-            WebSocketDisconnect,
-            WebSocketException,
-        )
-        # Encoders
-        from fastapi.encoders import jsonable_encoder
-        # Middleware
-        from starlette.middleware.cors import CORSMiddleware
-        from starlette.middleware.gzip import GZipMiddleware
-        from starlette.middleware.trustedhost import TrustedHostMiddleware
-
-        assert FastAPI is not None
-        assert Security is not None
-        assert HTTPDigest is not None

@@ -7,10 +7,11 @@ real ``route.dependant``) recognizes them — while the clone's own
 ``Depends``, same as before). Both carry ``.dependency`` / ``.use_cache`` /
 ``.scope`` (and ``Security.scopes``), the only attributes the clone reads.
 
-This module is imported during ``fastapi_turbo`` package init, BEFORE the compat
-shim installs, so ``import fastapi.params`` here resolves to the REAL FastAPI
-module; the bound references below stay real even after the shim rebinds
-``sys.modules['fastapi']``.
+This module is imported during ``fastapi_turbo`` package init, BEFORE
+``compat.install()`` patches attributes onto the real packages, so
+``import fastapi.params`` here resolves to the genuine module and the bound
+references below stay genuine afterwards (``fastapi.params`` itself is never
+patched).
 """
 
 from __future__ import annotations

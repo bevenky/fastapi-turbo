@@ -95,13 +95,24 @@ def start_uvicorn(port):
 def start_fastapi_turbo(port):
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
+    # workers=1 (RUNNER FIX, class C): this runner diffs turbo against a
+    # SINGLE-process uvicorn, and many tests observe cross-request in-process
+    # state (module-global call counters, /_bg_log read-back, app.state
+    # mutation, the 50-request concurrency counter). app.run() defaults to one
+    # worker PROCESS per CPU (edefb2f, 2026-06-01 — after this runner was
+    # written); under N processes each worker has its own module globals, so a
+    # follow-up read lands on an arbitrary worker and the comparison is
+    # structurally invalid (uvicorn --workers N would diverge identically).
+    # Single-worker keeps the comparison process-for-process fair; multi-worker
+    # scale-out is exercised by the bench/CONCURRENCY suites, not behavior
+    # parity.
     script = f"""
 import sys
 sys.path.insert(0, {PROJECT_ROOT!r})
 from fastapi_turbo.compat import install
 install()
 from tests.parity.parity_app_deep_behavior_r2 import app
-app.run(host={HOST!r}, port={port})
+app.run(host={HOST!r}, port={port}, workers=1)
 """
     log = open("/tmp/parity_r2_fastapi_turbo.log", "w")
     return subprocess.Popen(

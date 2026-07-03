@@ -319,25 +319,6 @@ def _apply_response_model(
     return result
 
 
-def _maybe_print_debug_traceback(app, exc):
-    """When app.debug is True, print the full traceback to stderr before
-    the exception is routed to a handler. Matches FastAPI's ``debug=True``
-    developer-ergonomics behavior.
-
-    HTTPException is never traceback-printed — those are normal control flow.
-    """
-    if app is None or not getattr(app, "debug", False):
-        return
-    try:
-        from fastapi_turbo.exceptions import HTTPException
-        if isinstance(exc, HTTPException):
-            return
-    except Exception:
-        pass
-    import sys, traceback
-    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
-
-
 def _model_needs_full_dump(model_cls) -> bool:
     """True if the model has aliases, computed fields, or custom serializers.
 
@@ -387,56 +368,6 @@ def _model_needs_full_dump(model_cls) -> bool:
 _model_has_aliases = _model_needs_full_dump
 
 
-def _wrap_response_class(result, response_class):
-    """Wrap a bare handler result (dict/list/str/etc.) in a response_class.
-
-    If the handler already returned a Response instance, leave it alone
-    (Starlette semantics: user-returned Response always wins). Response
-    classes differ in their constructor:
-    ``RedirectResponse(url=...)`` / ``FileResponse(path=...)`` /
-    everything else ``(content=...)``.
-    """
-    if response_class is None or result is None:
-        return result
-    # If result is already a Response-like object, don't double-wrap
-    if hasattr(result, "status_code") and hasattr(result, "body"):
-        return result
-    _name = getattr(response_class, "__name__", "")
-    if _name == "RedirectResponse":
-        return response_class(url=result)
-    if _name == "FileResponse":
-        return response_class(path=result)
-    return response_class(content=result)
-
-
-def _apply_status_code(result, status_code: int):
-    """Apply a route-declared `status_code=N` to the result.
-
-    If the handler already returned a Response (or a Response-like), we
-    set its status_code directly. Otherwise, wrap the bare return value
-    in a JSONResponse with the declared status.
-    """
-    if result is None:
-        # None + declared status_code → empty response with that status.
-        from fastapi_turbo.responses import Response as _R
-        return _R(content=b"", status_code=status_code)
-    if hasattr(result, "status_code") and hasattr(result, "body"):
-        # Only override if handler didn't explicitly set a non-default
-        # code. RedirectResponse defaults to 307; ``status_code=302`` on
-        # the route must win over that default.
-        try:
-            current = int(result.status_code)
-            _default_codes = {200, 307}  # sensible defaults we can override
-            if current in _default_codes:
-                result.status_code = status_code
-        except Exception:
-            pass
-        return result
-    # Bare dict/list/str → wrap as JSONResponse with the declared status.
-    from fastapi_turbo.responses import JSONResponse as _J
-    return _J(content=result, status_code=status_code)
-
-
 def _close_upload_files(kwargs: dict) -> None:
     """Call ``.close()`` on any UploadFile-like objects passed as kwargs.
     Matches Starlette's behaviour of closing uploads after the
@@ -481,88 +412,6 @@ def _has_overridden_get_route_handler(route) -> bool:
         return False
     except ImportError:
         return False
-
-
-def _looks_like_body(annotation) -> bool:
-    """Loose 'is this a Body param by default?' check for the custom-
-    route-class path. Mirrors FA's default-body heuristic (scalars →
-    query, anything structurally richer → body):
-
-      * ``BaseModel`` subclass
-      * ``@dataclass`` class
-      * ``TypedDict`` subclass (detected via ``__total__`` + dict base)
-      * bare ``dict`` / typed ``dict[...]`` / generic ``Mapping[...]``
-      * ``list[T]`` / ``set[T]`` / ``frozenset[T]`` / ``tuple[T, ...]``
-        where ``T`` is itself body-typed (e.g. ``list[Item]``)
-      * ``Annotated[T, ...]`` — unwrap and recurse
-      * ``T | None`` / ``Optional[T]`` / ``Union[T, …]`` — body if any
-        non-None arm is body-typed
-    """
-    try:
-        import typing as _tp
-        from pydantic import BaseModel as _BM
-
-        if annotation is None:
-            return False
-
-        # Unwrap ``Annotated[T, ...]`` — the metadata doesn't change
-        # body-ness; the real type is the first arg.
-        origin = _tp.get_origin(annotation)
-        if origin is _tp.Annotated:
-            inner = _tp.get_args(annotation)
-            if inner:
-                return _looks_like_body(inner[0])
-
-        # Union / Optional: recurse into non-None arms.
-        if origin is _tp.Union:
-            non_none = [a for a in _tp.get_args(annotation) if a is not type(None)]
-            return any(_looks_like_body(a) for a in non_none)
-
-        if isinstance(annotation, type) and issubclass(annotation, _BM):
-            return True
-
-        # TypedDict: subclasses expose ``__required_keys__`` /
-        # ``__total__`` and inherit from ``dict``. The stable marker
-        # across 3.9 → 3.13 is ``__total__`` + being a subclass of
-        # ``dict`` without being ``dict`` itself.
-        if (
-            isinstance(annotation, type)
-            and annotation is not dict
-            and issubclass(annotation, dict)
-            and hasattr(annotation, "__total__")
-        ):
-            return True
-
-        import dataclasses as _dc
-        if isinstance(annotation, type) and _dc.is_dataclass(annotation):
-            return True
-
-        # Bare ``dict`` / ``list`` / ``set`` / ``frozenset`` / ``tuple``
-        # without a parameter type — FA treats these as body (arbitrary
-        # structures aren't parseable from a query string).
-        if annotation in (dict, list, set, frozenset, tuple):
-            return True
-
-        import collections.abc as _cabc
-        if origin in (dict, _cabc.Mapping, _cabc.MutableMapping):
-            return True
-
-        # list[T] / set[T] / frozenset[T] / tuple[T, ...] where T is
-        # itself body-typed. Scalar containers like ``list[int]`` /
-        # ``list[str]`` stay query (matches FA).
-        if origin in (list, set, frozenset, tuple):
-            args = _tp.get_args(annotation)
-            if not args:
-                # Bare ``list`` / ``set`` without item type — FA treats
-                # these as body (unparseable from query string).
-                return True
-            return any(_looks_like_body(a) for a in args if a is not Ellipsis)
-
-        return False
-    except Exception:
-        return False
-
-
 
 
 def _build_custom_route_handler_endpoint(route, app):

@@ -1,0 +1,17 @@
+{
+  "name": "fastify-bench",
+  "version": "1.0.0",
+  "description": "Fastify mirror of benchmarks/_bench_app.py for the comparison matrix",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "fastify": "^5.8.5"
+  }
+}

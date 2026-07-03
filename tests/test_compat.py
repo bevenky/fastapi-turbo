@@ -211,10 +211,17 @@ def test_starlette_websocket_import():
 
 
 def test_starlette_exceptions_import():
+    """Patch-on-real model: ``fastapi.exceptions.HTTPException`` is the real
+    FastAPI subclass of the real Starlette ``HTTPException`` (genuine
+    upstream relationship, no shim collapsing)."""
     from starlette.exceptions import HTTPException
-    from fastapi.exceptions import HTTPException as TurboHTTPException
+    from fastapi.exceptions import HTTPException as FastAPIHTTPException
 
-    assert HTTPException is TurboHTTPException
+    assert issubclass(FastAPIHTTPException, HTTPException)
+    # The turbo engine catches the Starlette BASE class, so both flavors
+    # land in the same handler machinery.
+    import fastapi_turbo
+    assert fastapi_turbo.HTTPException is HTTPException
 
 
 def test_starlette_datastructures_import():
@@ -252,20 +259,37 @@ def test_starlette_background_import():
 
 
 def test_shim_uninstall_reinstall():
-    """Uninstalling and reinstalling shims works."""
+    """Patch-on-real model: uninstall restores the pristine real-package
+    attributes (the module stays importable); install re-patches."""
     import sys
+    import fastapi_turbo
     from fastapi_turbo.compat import uninstall, install
 
-    # Shims should be installed
+    # The REAL package stays live in sys.modules; only attributes differ.
     assert "fastapi" in sys.modules
+    real_fastapi = sys.modules["fastapi"]
+    assert not isinstance(real_fastapi, type(fastapi_turbo)) or hasattr(
+        real_fastapi, "__file__"
+    )
+    assert real_fastapi.FastAPI is fastapi_turbo.FastAPI
 
     uninstall()
-    assert "fastapi" not in sys.modules
+    try:
+        # Module still importable and back to the genuine class.
+        assert "fastapi" in sys.modules
+        assert sys.modules["fastapi"] is real_fastapi
+        assert real_fastapi.FastAPI is not fastapi_turbo.FastAPI
+        assert issubclass(fastapi_turbo.FastAPI, real_fastapi.FastAPI)
+        # Mirror-loop extensions are removed again.
+        assert not hasattr(real_fastapi, "fastapi_turbo_version")
+    finally:
+        install()
 
-    install()
-    assert "fastapi" in sys.modules
+    assert real_fastapi.FastAPI is fastapi_turbo.FastAPI
+    assert real_fastapi.fastapi_turbo_version == fastapi_turbo.__version__
 
     # Verify imports still work
     from fastapi import FastAPI
     from fastapi import FastAPI as JF
     assert FastAPI is JF
+    assert FastAPI is fastapi_turbo.FastAPI

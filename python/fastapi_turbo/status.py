@@ -9,11 +9,13 @@ four legacy 4xx aliases (``HTTP_413_REQUEST_ENTITY_TOO_LARGE``,
 ``__all__``, so ``import *`` would drop them and break code/tests that use the
 legacy names.
 
-Accessing those four legacy aliases triggers a ``DeprecationWarning`` via
-Starlette's module ``__getattr__``; the clone exposed them as plain constants
-(no warning), so we bake the values under ``catch_warnings`` to preserve that
-behavior — otherwise importing this module under ``filterwarnings=error`` (e.g.
-the upstream FastAPI test suite) fails at import.
+Accessing those legacy aliases triggers a warning via Starlette's module
+``__getattr__`` — a plain ``DeprecationWarning`` on older Starlette, a
+``StarletteDeprecationWarning`` (NOT a ``DeprecationWarning`` subclass) as of
+Starlette 1.1+. The clone exposed them as plain constants (no warning), so we
+bake the values under ``catch_warnings`` with ALL warnings silenced to preserve
+that behavior — otherwise importing this module under ``filterwarnings=error``
+(e.g. the upstream FastAPI test suite) fails at import.
 
 Imported at ``__init__.py`` before ``compat.install()``, so ``starlette.status``
 resolves to the REAL package; the bound names stay real after the shim runs.
@@ -23,7 +25,7 @@ import warnings as _warnings
 from starlette import status as _status
 
 with _warnings.catch_warnings():
-    _warnings.simplefilter("ignore", DeprecationWarning)
+    _warnings.simplefilter("ignore")
     globals().update({_n: getattr(_status, _n) for _n in dir(_status) if _n.isupper()})
 
 __all__ = [_n for _n in dir(_status) if _n.isupper()]

@@ -1,6 +1,7 @@
 """FileResponse parity: directory paths must raise (not serve 200 empty)
 and the extensionless media_type default must match Starlette
-(``text/plain``, not ``application/octet-stream``).
+(``application/octet-stream`` as of Starlette 1.1+; older Starlette
+used ``text/plain``).
 
 Directory-as-file was a latent data-disclosure risk: if a routing bug
 fed a dir path to FileResponse, we'd previously respond 200 with an
@@ -51,12 +52,19 @@ def test_directory_path_does_not_return_200_empty(tmp_path):
     _run(go())
 
 
-def test_extensionless_file_defaults_to_text_plain(tmp_path):
-    """Starlette defaults ``media_type`` to ``text/plain`` for files
-    whose name doesn't map to a known MIME type (``README``, shell
-    scripts, config files named without extension, etc.)."""
+def test_extensionless_file_defaults_to_octet_stream(tmp_path):
+    """Starlette defaults ``media_type`` for files whose name doesn't map
+    to a known MIME type (``README``, shell scripts, config files named
+    without extension, etc.). As of Starlette 1.1+ the default is
+    ``application/octet-stream`` (``guess_type(...)[0] or
+    "application/octet-stream"``); older Starlette used ``text/plain``.
+    The bound is whatever real Starlette produces — assert parity against it."""
+    import starlette.responses as _sr
+
     f = tmp_path / "README"  # no extension → mimetypes.guess_type returns None
     f.write_bytes(b"this is a readme")
+
+    expected = _sr.FileResponse(str(f)).media_type  # source of truth
 
     app = FastAPI()
 
@@ -68,6 +76,6 @@ def test_extensionless_file_defaults_to_text_plain(tmp_path):
         r = c.get("/f")
         assert r.status_code == 200
         ct = r.headers["content-type"]
-        # Upstream Starlette → "text/plain" (or "text/plain; charset=utf-8"
-        # after textual-charset rewriting on the Rust path).
-        assert ct.startswith("text/plain"), f"expected text/plain default, got {ct}"
+        assert ct.split(";")[0].strip() == expected, (
+            f"expected Starlette default {expected!r}, got {ct!r}"
+        )
