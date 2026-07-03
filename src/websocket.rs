@@ -21,15 +21,29 @@
 //! to a bounded channel: `try_send` on the hot path, a capacity Future on
 //! `Full` (the `LoopChunkPush` precedent from streaming.rs) so a slow client
 //! backpressures the handler instead of buffering unboundedly.
+//!
+//! DIRECT SEND (both modes, `FASTAPI_TURBO_WS_DIRECT=0` to disable):
+//! outbound data frames are written to the socket inline by the calling
+//! thread via one non-blocking poll of the shared write half — no channel
+//! push, no select-task wake. The round-4 audit measured that wake ("hop2")
+//! at 5.6µs p50 / 17.3µs p99 per message — the entire server-side latency
+//! tail. Contended/not-ready/ordered-behind-queued-commands cases fall back
+//! to the legacy channel; an atomic in-flight count keeps ordering strict.
 
 use axum::extract::ws::Message;
 use bytes::Bytes;
 use crossbeam_channel as cb;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
+
+/// Write half of the connection, shared between the select task (queued
+/// commands: Close, flush, fallback data frames) and direct senders
+/// (`send_text`/`send_bytes` fast path). `None` before the upgrade completes
+/// and after teardown.
+type WsSink = Arc<tokio::sync::Mutex<Option<futures_util::stream::SplitSink<axum::extract::ws::WebSocket, Message>>>>;
 
 /// Cached `fastapi_turbo.exceptions.WebSocketDisconnect` class — used by the
 /// receive awaitables to raise the correct typed exception without the
@@ -78,6 +92,22 @@ fn ws_loop_enabled() -> bool {
     *FLAG.get_or_init(|| match std::env::var("FASTAPI_TURBO_WS_LOOP") {
         Ok(v) => matches!(v.trim(), "1" | "true" | "True" | "TRUE" | "yes" | "on"),
         Err(_) => WS_LOOP_DEFAULT,
+    })
+}
+
+/// Direct-send fast path (`FASTAPI_TURBO_WS_DIRECT`, default ON): outbound
+/// data frames are written to the socket inline by the calling thread when
+/// the sink is free and immediately writable — one single-poll attempt with
+/// a noop waker, so it can NEVER block (safe from the shared worker loop
+/// too). Everything else (contention, kernel-buffer Pending, queued
+/// commands ahead of us) falls back to the legacy channel + select task.
+/// This removes the mpsc-push → select-task-wake hop ("hop2": 5.6µs p50,
+/// 17.3µs p99 — the entire server-side latency tail in the round-4 audit).
+fn ws_direct_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| match std::env::var("FASTAPI_TURBO_WS_DIRECT") {
+        Ok(v) => !matches!(v.trim(), "0" | "false" | "False" | "FALSE" | "no" | "off"),
+        Err(_) => true,
     })
 }
 
@@ -584,9 +614,18 @@ pub struct PyWebSocket {
     // Loop-residency (FASTAPI_TURBO_WS_LOOP): handler runs as a task on the
     // shared worker loop; receive/accept/close-flush are loop-native futures.
     loop_mode: bool,
-    // Request runtime handle — loop mode spawns capacity waiters onto it
-    // (the loop thread has no tokio runtime context of its own).
+    // Request runtime handle — loop mode spawns capacity waiters onto it,
+    // the direct-send path spawns flush drivers (the calling thread may have
+    // no tokio runtime context of its own).
     rt: Option<tokio::runtime::Handle>,
+    // Shared write half for the direct-send fast path (None until upgrade).
+    sink: WsSink,
+    // Send commands enqueued to the channel but not yet written by the
+    // select task. Direct sends are only allowed at 0 — otherwise a frame
+    // could overtake one still sitting in the channel. Incremented BEFORE
+    // every channel push, decremented by the select task AFTER the sink
+    // write completes.
+    queued: Arc<AtomicUsize>,
     // Receive-wake slot shared with the reader task.
     wake: Arc<LoopWake>,
     // Accept-ready future slot — resolved by the on_upgrade callback (or its
@@ -647,12 +686,92 @@ impl PyWebSocket {
             .clone_ref(py)
     }
 
-    /// Queue an outbound frame. Thread mode: unbounded push (legacy).
-    /// Loop mode: `try_send`; on Full, hand back a capacity Future — a tokio
+    /// Direct-send attempt: write the frame to the socket inline, WITHOUT
+    /// blocking and WITHOUT the select-task wake. Returns `None` when the
+    /// frame was handled (written, committed to the sink's internal buffer
+    /// with a spawned flush driver, or sunk by a broken sink — the legacy
+    /// path also drops frames silently once the writer dies; the NEXT
+    /// operation surfaces the error). Returns `Some(msg)` when the caller
+    /// must fall back to the channel (sink busy/not ready/not yet upgraded,
+    /// or commands already queued ahead of us).
+    fn try_direct_send(&self, msg: Message) -> Option<Message> {
+        use futures_util::Sink;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+        // A flush driver must be spawnable before we may commit a frame.
+        let Some(rt) = self.rt.as_ref() else {
+            return Some(msg);
+        };
+        let Ok(mut guard) = self.sink.try_lock() else {
+            return Some(msg); // select task / another sender is mid-write
+        };
+        // Re-check UNDER the lock: a command still in the channel must be
+        // written first. (Enqueuers increment before pushing; the select
+        // task decrements only after its sink write completed — and that
+        // write holds this lock, so 0-under-lock == nothing can overtake.)
+        if self.queued.load(Ordering::Acquire) != 0 {
+            return Some(msg);
+        }
+        let Some(s) = guard.as_mut() else {
+            return Some(msg); // pre-upgrade or torn down — channel decides
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut s = Pin::new(s);
+        match s.as_mut().poll_ready(&mut cx) {
+            Poll::Ready(Ok(())) => {}
+            // Pending (prior buffered bytes / BiLock contention) or sink
+            // error — let the select task deal with it, in order.
+            _ => return Some(msg),
+        }
+        if s.as_mut().start_send(msg).is_err() {
+            // Frame consumed by a broken sink — legacy parity is a silent
+            // drop (the writer task breaking loses queued frames the same
+            // way); the next send/receive raises.
+            return None;
+        }
+        match s.as_mut().poll_flush(&mut cx) {
+            Poll::Ready(_) => None, // written (or sink broken — see above)
+            Poll::Pending => {
+                // Frame committed to the sink buffer but the kernel buffer
+                // is full: drive the flush from a task (locks the sink, so
+                // it serializes with every other writer; later writes flush
+                // prior bytes first — order preserved either way).
+                drop(guard);
+                let sink = self.sink.clone();
+                rt.spawn(async move {
+                    use futures_util::SinkExt;
+                    let mut g = sink.lock().await;
+                    if let Some(s) = g.as_mut() {
+                        let _ = s.flush().await;
+                    }
+                });
+                None
+            }
+        }
+    }
+
+    /// Queue an outbound frame. Fast path (both modes): direct single-poll
+    /// write on the calling thread — no channel, no select-task wake.
+    /// Fallback thread mode: unbounded push (legacy).
+    /// Fallback loop mode: `try_send`; on Full, hand back a capacity Future — a tokio
     /// waiter `reserve()`s a slot, delivers the pending command itself (order
     /// preserved: the handler task is suspended on the Future until then) and
     /// resolves it via `call_soon_threadsafe`.
     fn queue_send(&self, py: Python<'_>, msg: Message) -> PyResult<Option<Py<PyAny>>> {
+        let msg = if ws_direct_enabled() && self.queued.load(Ordering::Acquire) == 0 {
+            // GIL released around the write syscall (~3µs) — a broadcast
+            // from another connection's thread must not stall this worker's
+            // Python threads for it. No Python objects are touched inside.
+            match py.detach(|| self.try_direct_send(msg)) {
+                None => return Ok(None),
+                Some(m) => m,
+            }
+        } else {
+            msg
+        };
+        // Counted from here on: the frame is committed to the CHANNEL path
+        // (even the loop-mode Full case — its waiter still delivers it).
+        self.queued.fetch_add(1, Ordering::AcqRel);
         match &self.tx {
             WsCmdTx::Unbounded(tx) => {
                 tx.send(WriterCmd::Send(msg))
@@ -692,6 +811,17 @@ impl PyWebSocket {
     /// delivered (writer gone) fire immediately so a loop-mode caller
     /// awaiting the flush future can't hang.
     fn queue_seq(&self, cmds: Vec<WriterCmd>) {
+        // Count every Send BEFORE pushing so the direct path can never
+        // overtake a queued Close. (Cmds that die with the channel leave
+        // the counter high — the connection is gone, direct sends stay
+        // disabled and surface the channel's error instead.)
+        let n_sends = cmds
+            .iter()
+            .filter(|c| matches!(c, WriterCmd::Send(_)))
+            .count();
+        if n_sends > 0 {
+            self.queued.fetch_add(n_sends, Ordering::AcqRel);
+        }
         match &self.tx {
             WsCmdTx::Unbounded(tx) => {
                 for c in cmds {
@@ -1063,6 +1193,8 @@ pub async fn handle_ws_upgrade(
     let state = Arc::new(AtomicU8::new(STATE_CONNECTING));
     let wake = Arc::new(LoopWake::new());
     let ready_fut: Arc<Mutex<Option<Py<PyAny>>>> = Arc::new(Mutex::new(None));
+    let sink: WsSink = Arc::new(tokio::sync::Mutex::new(None));
+    let queued = Arc::new(AtomicUsize::new(0));
 
     // Capture path params before scope_info is moved, for passing as kwargs to the Python handler.
     let ws_path_params: Vec<(String, String)> = scope_info.path_params.clone();
@@ -1072,11 +1204,11 @@ pub async fn handle_ws_upgrade(
         rx: cb_rx,
         state: state.clone(),
         loop_mode,
-        rt: if loop_mode {
-            tokio::runtime::Handle::try_current().ok()
-        } else {
-            None
-        },
+        // Both modes: loop-mode capacity waiters + direct-send flush
+        // drivers spawn onto the request runtime.
+        rt: tokio::runtime::Handle::try_current().ok(),
+        sink: sink.clone(),
+        queued: queued.clone(),
         wake: wake.clone(),
         ready_fut: ready_fut.clone(),
         recv_buf: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -1221,10 +1353,16 @@ pub async fn handle_ws_upgrade(
     let wake_r = wake.clone();
     let mut response = upgrade.on_upgrade(move |socket| async move {
         use futures_util::{SinkExt, StreamExt};
-        let (mut ws_tx, mut ws_rx) = socket.split();
+        let (ws_tx, mut ws_rx) = socket.split();
         let state_r = state_clone;
         let mut rx_out = rx_out;
         let ready_guard = ready_guard;
+        let sink_w = sink;
+        let queued_w = queued;
+
+        // Publish the write half FIRST: once accept() returns, sends may
+        // take the direct path, which needs the sink in its slot.
+        *sink_w.lock().await = Some(ws_tx);
 
         // Signal Python that the WS is ready BEFORE entering the loop —
         // Python's accept() unblocks and may start sending immediately.
@@ -1262,7 +1400,18 @@ pub async fn handle_ws_upgrade(
                                 // logs even on orderly shutdowns
                                 // (R29 saw this; R30 fixes the noise).
                                 let is_close = matches!(msg, Message::Close(_));
-                                if ws_tx.send(msg).await.is_err() { break; }
+                                let sent_ok = {
+                                    let mut g = sink_w.lock().await;
+                                    match g.as_mut() {
+                                        Some(s) => s.send(msg).await.is_ok(),
+                                        None => false,
+                                    }
+                                };
+                                // Decrement AFTER the write completed (and
+                                // after the lock dropped) — the direct path
+                                // treats 0-under-lock as "nothing ahead".
+                                queued_w.fetch_sub(1, Ordering::AcqRel);
+                                if !sent_ok { break; }
                                 if is_close {
                                     state_r.store(STATE_DISCONNECTED, Ordering::Release);
                                     // Drain incoming frames until the
@@ -1290,7 +1439,9 @@ pub async fn handle_ws_upgrade(
                                             Ok(Some(Ok(_))) => continue, // drop other frames
                                         }
                                     }
-                                    let _ = ws_tx.close().await;
+                                    if let Some(s) = sink_w.lock().await.as_mut() {
+                                        let _ = s.close().await;
+                                    }
                                     break;
                                 }
                             }
@@ -1328,15 +1479,20 @@ pub async fn handle_ws_upgrade(
                                 // ``websockets`` library treats this as
                                 // ``ConnectionClosedOK`` instead of an
                                 // abnormal shutdown, then close the sink.
-                                let _ = ws_tx
-                                    .send(Message::Close(Some(
-                                        axum::extract::ws::CloseFrame {
-                                            code,
-                                            reason: echo_reason.into(),
-                                        },
-                                    )))
-                                    .await;
-                                let _ = ws_tx.close().await;
+                                {
+                                    let mut g = sink_w.lock().await;
+                                    if let Some(s) = g.as_mut() {
+                                        let _ = s
+                                            .send(Message::Close(Some(
+                                                axum::extract::ws::CloseFrame {
+                                                    code,
+                                                    reason: echo_reason.into(),
+                                                },
+                                            )))
+                                            .await;
+                                        let _ = s.close().await;
+                                    }
+                                }
                                 break;
                             }
                             _ => continue, // Ping/Pong handled by axum
@@ -1359,6 +1515,11 @@ pub async fn handle_ws_upgrade(
             //   3. Ack any still-queued loop-mode flushes so close_and_wait
             //      callers can't hang (thread mode resolved this by the
             //      crossbeam sender drop unblocking CloseAwaitable).
+            //   4. Take the write half OUT of the shared slot — PyWebSocket
+            //      may outlive the connection (held by Python), and the TCP
+            //      socket must close NOW, not at Python GC time. Direct
+            //      sends see the empty slot and fall back to the closed
+            //      channel, which raises exactly like the legacy path.
             drop(cb_tx);
             wake_r.fire();
             rx_out.close();
@@ -1367,6 +1528,7 @@ pub async fn handle_ws_upgrade(
                     ack.fire();
                 }
             }
+            sink_w.lock().await.take();
         });
     });
 

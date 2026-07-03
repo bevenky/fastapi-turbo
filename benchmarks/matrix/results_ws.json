@@ -8,33 +8,142 @@
     "pipeline": 16,
     "server_workers": 8,
     "msg_bytes": 64,
-    "note": "pure-Python client (websockets+uvloop); tops out ~high-100k msgs/s \u2014 relative comparison only"
+    "rust_lat_n": 10000,
+    "rust_lat_warmup": 1000,
+    "rust_lat_repeats": 3,
+    "rust_tp_conns": 48,
+    "note": "p50/p99_us + msgs_per_s = pure-Python client (websockets+uvloop): ~25-30us client-side overhead per RT, tops out ~high-100k msgs/s \u2014 relative comparison only. rust_* = ws-client-rs blocking tungstenite: true server RTT."
   },
   "data": {
     "fastapi-turbo": {
-      "p50_us": 39.7,
-      "p99_us": 57.5,
-      "msgs_per_s": 171063
+      "p50_us": 43.4,
+      "p99_us": 61.4,
+      "msgs_per_s": 187504,
+      "rust_p50_us": 31.2,
+      "rust_p90_us": 38.0,
+      "rust_p99_us": 48.2,
+      "rust_lat_runs": [
+        {
+          "p50_us": 31.2,
+          "p90_us": 38.0,
+          "p99_us": 47.3
+        },
+        {
+          "p50_us": 31.2,
+          "p90_us": 38.0,
+          "p99_us": 48.2
+        },
+        {
+          "p50_us": 31.5,
+          "p90_us": 38.4,
+          "p99_us": 48.6
+        }
+      ],
+      "rust_msgs_per_s": 135595
     },
     "FastAPI (uvicorn)": {
-      "p50_us": 66.6,
-      "p99_us": 82.9,
-      "msgs_per_s": 557218
+      "p50_us": 69.0,
+      "p99_us": 178.1,
+      "msgs_per_s": 727092,
+      "rust_p50_us": 59.6,
+      "rust_p90_us": 67.0,
+      "rust_p99_us": 73.9,
+      "rust_lat_runs": [
+        {
+          "p50_us": 58.5,
+          "p90_us": 66.1,
+          "p99_us": 73.3
+        },
+        {
+          "p50_us": 59.6,
+          "p90_us": 67.0,
+          "p99_us": 73.9
+        },
+        {
+          "p50_us": 58.5,
+          "p90_us": 66.4,
+          "p99_us": 74.2
+        }
+      ],
+      "rust_msgs_per_s": 331407
     },
     "Gin (Go)": {
-      "p50_us": 29.1,
-      "p99_us": 41.0,
-      "msgs_per_s": 293655
+      "p50_us": 29.5,
+      "p99_us": 51.5,
+      "msgs_per_s": 323837,
+      "rust_p50_us": 15.3,
+      "rust_p90_us": 18.1,
+      "rust_p99_us": 23.5,
+      "rust_lat_runs": [
+        {
+          "p50_us": 15.5,
+          "p90_us": 18.1,
+          "p99_us": 23.0
+        },
+        {
+          "p50_us": 15.3,
+          "p90_us": 18.1,
+          "p99_us": 23.5
+        },
+        {
+          "p50_us": 15.5,
+          "p90_us": 18.3,
+          "p99_us": 24.1
+        }
+      ],
+      "rust_msgs_per_s": 224798
     },
     "Fastify (Node)": {
-      "p50_us": 29.4,
-      "p99_us": 43.3,
-      "msgs_per_s": 264067
+      "p50_us": 29.8,
+      "p99_us": 49.7,
+      "msgs_per_s": 330482,
+      "rust_p50_us": 15.3,
+      "rust_p90_us": 19.7,
+      "rust_p99_us": 26.0,
+      "rust_lat_runs": [
+        {
+          "p50_us": 15.2,
+          "p90_us": 19.4,
+          "p99_us": 25.8
+        },
+        {
+          "p50_us": 15.3,
+          "p90_us": 19.7,
+          "p99_us": 26.0
+        },
+        {
+          "p50_us": 15.1,
+          "p90_us": 20.0,
+          "p99_us": 41.9
+        }
+      ],
+      "rust_msgs_per_s": 251409
     },
     "raw-axum": {
-      "p50_us": 25.5,
-      "p99_us": 49.5,
-      "msgs_per_s": 759873
+      "p50_us": 27.3,
+      "p99_us": 55.4,
+      "msgs_per_s": 899945,
+      "rust_p50_us": 15.1,
+      "rust_p90_us": 18.0,
+      "rust_p99_us": 24.4,
+      "rust_lat_runs": [
+        {
+          "p50_us": 15.0,
+          "p90_us": 17.7,
+          "p99_us": 24.1
+        },
+        {
+          "p50_us": 15.1,
+          "p90_us": 18.0,
+          "p99_us": 24.4
+        },
+        {
+          "p50_us": 15.2,
+          "p90_us": 18.5,
+          "p99_us": 24.9
+        }
+      ],
+      "rust_msgs_per_s": 296540
     }
   }
 }

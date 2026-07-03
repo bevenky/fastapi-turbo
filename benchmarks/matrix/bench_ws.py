@@ -13,10 +13,17 @@ Two modes per framework:
               send/recv echo round trips (PIPELINE in-flight, default 16)
               for DUR seconds (default 5). Reports summed msgs/s.
 
-CLIENT CEILING: this is a pure-Python client (websockets library, uvloop when
-importable). It tops out around the high-100k msgs/s range on this class of
-machine — server-side headroom beyond that is NOT visible. Numbers are valid
+CLIENT CEILING: the Python client (websockets library, uvloop when
+importable) tops out around the high-100k msgs/s range on this class of
+machine — server-side headroom beyond that is NOT visible. Its own event-loop
+wakes also add ~25-30us to every observed round trip. Numbers are valid
 for RELATIVE framework comparison, not as absolute server ceilings.
+
+RUST CLIENT (ws-client-rs/): blocking tungstenite over a nodelay TcpStream —
+no client-side scheduler jitter, so its latency numbers ARE the server RTT
+(+ kernel). Each boot additionally runs `ws-bench lat` (3 repeats, median-p99
+run published as rust_p50/p90/p99_us) and `ws-bench tp`. Build with:
+  cd ws-client-rs && cargo build --release
 
 Registry: reuses run_db_matrix.registry() boot commands/ports, swapping
 app_db.py -> app.py for the two Python frameworks (only app.py carries /ws)
@@ -44,6 +51,13 @@ PROCS = int(os.environ.get("BENCH_WS_PROCS", "6"))
 CONNS = int(os.environ.get("BENCH_WS_CONNS", "8"))
 DUR = float(os.environ.get("BENCH_WS_DUR", "5"))
 PIPELINE = int(os.environ.get("BENCH_WS_PIPELINE", "16"))
+
+# Rust client (true-server-RTT latency + native-speed throughput).
+WS_RS = os.path.join(HERE, "ws-client-rs", "target", "release", "ws-bench")
+RS_N = int(os.environ.get("BENCH_WS_RS_N", "10000"))
+RS_WARMUP = int(os.environ.get("BENCH_WS_RS_WARMUP", "1000"))
+RS_REPEATS = int(os.environ.get("BENCH_WS_RS_REPEATS", "3"))
+RS_TP_CONNS = int(os.environ.get("BENCH_WS_RS_TP_CONNS", str(PROCS * CONNS)))
 
 MSG = "x" * 64  # 64-byte text message
 
@@ -147,6 +161,28 @@ def throughput(uri):
     return total
 
 
+# ── Rust client (ws-client-rs): true server RTT, no Python-client noise ──
+def rust_latency(uri):
+    """3 repeats; publish the median-by-p99 run (background-load robust)."""
+    runs = []
+    for _ in range(RS_REPEATS):
+        out = subprocess.run(
+            [WS_RS, "lat", uri, "--n", str(RS_N), "--warmup", str(RS_WARMUP),
+             "--json"],
+            capture_output=True, text=True, check=True).stdout
+        runs.append(json.loads(out))
+    runs.sort(key=lambda r: r["p99_us"])
+    return runs[len(runs) // 2], runs
+
+
+def rust_throughput(uri):
+    out = subprocess.run(
+        [WS_RS, "tp", uri, "--conns", str(RS_TP_CONNS),
+         "--pipeline", str(PIPELINE), "--dur", str(DUR), "--json"],
+        capture_output=True, text=True, check=True).stdout
+    return json.loads(out)["msgs_per_s"]
+
+
 # ── smoke check: contract echo before measuring ──────────────────────
 async def _smoke(uri):
     async with _connect(uri) as ws:
@@ -174,9 +210,22 @@ def run_fw(name, fw):
         _run(_smoke(uri))
         p50, p99 = _run(_latency(uri, LAT_N, LAT_WARMUP))
         msgs = throughput(uri)
-        print(f"  {name:20s} p50={p50:8.1f}us  p99={p99:8.1f}us  {msgs:12,.0f} msgs/s")
-        return {"p50_us": round(p50, 1), "p99_us": round(p99, 1),
-                "msgs_per_s": round(msgs)}
+        res = {"p50_us": round(p50, 1), "p99_us": round(p99, 1),
+               "msgs_per_s": round(msgs)}
+        rs_note = ""
+        if os.path.exists(WS_RS):
+            med, runs = rust_latency(uri)
+            res.update(rust_p50_us=med["p50_us"], rust_p90_us=med["p90_us"],
+                       rust_p99_us=med["p99_us"],
+                       rust_lat_runs=[{k: r[k] for k in
+                                       ("p50_us", "p90_us", "p99_us")}
+                                      for r in runs],
+                       rust_msgs_per_s=round(rust_throughput(uri)))
+            rs_note = (f"  | rust p50={med['p50_us']:6.1f} p99={med['p99_us']:6.1f}"
+                       f"  {res['rust_msgs_per_s']:10,d} msgs/s")
+        print(f"  {name:20s} p50={p50:8.1f}us  p99={p99:8.1f}us  "
+              f"{msgs:12,.0f} msgs/s{rs_note}")
+        return res
     finally:
         try:
             os.killpg(os.getpgid(proc.pid), 9)
@@ -197,7 +246,13 @@ def main():
             out = {}
     print(f"ws bench: lat n={LAT_N} (warmup {LAT_WARMUP}) | "
           f"tp {PROCS}p x {CONNS}c x {DUR}s pipeline={PIPELINE} | "
-          f"server workers={SERVER_WORKERS}\n")
+          f"server workers={SERVER_WORKERS}")
+    if os.path.exists(WS_RS):
+        print(f"rust client: lat n={RS_N} (warmup {RS_WARMUP}, {RS_REPEATS} "
+              f"repeats, median-p99 run) | tp {RS_TP_CONNS}c "
+              f"pipeline={PIPELINE} x {DUR}s\n")
+    else:
+        print(f"rust client MISSING ({WS_RS}) — Python-client numbers only\n")
     for name in want:
         res = run_fw(name, reg[name])
         if res is not None:
@@ -207,9 +262,15 @@ def main():
                             "procs": PROCS, "conns": CONNS, "dur_s": DUR,
                             "pipeline": PIPELINE, "server_workers": SERVER_WORKERS,
                             "msg_bytes": len(MSG),
-                            "note": "pure-Python client (websockets+uvloop); "
-                                    "tops out ~high-100k msgs/s — relative "
-                                    "comparison only"},
+                            "rust_lat_n": RS_N, "rust_lat_warmup": RS_WARMUP,
+                            "rust_lat_repeats": RS_REPEATS,
+                            "rust_tp_conns": RS_TP_CONNS,
+                            "note": "p50/p99_us + msgs_per_s = pure-Python "
+                                    "client (websockets+uvloop): ~25-30us "
+                                    "client-side overhead per RT, tops out "
+                                    "~high-100k msgs/s — relative comparison "
+                                    "only. rust_* = ws-client-rs blocking "
+                                    "tungstenite: true server RTT."},
                    "data": out}, f, indent=2)
     print(f"\nwrote {path}")
 
