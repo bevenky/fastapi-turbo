@@ -144,24 +144,55 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
         }
     }
 
+    // Runtime-cooperative classification key for await-streams: the REAL
+    // user gen's code object (stamped for teardown-wrapped responses; the
+    // wrapper's own code object is shared across every wrapped route and
+    // would alias verdicts). Resolved while `iter_bound` is still bound.
+    let coop_code: Option<Py<PyAny>> =
+        if !drained_complete && is_async && !noawait && !legacy_forced && trampoline_supported()
+        {
+            stream_code_key(py, obj, &iter_bound)
+        } else {
+            None
+        };
+
     let iterator: Py<PyAny> = iter_bound.unbind();
+
+    // Mechanism 3 (inline trampoline): a gen the worker loop has PROVEN
+    // cooperative at runtime (one full eager completion without ever
+    // yielding to the loop — e.g. `await sleep(0)` checkpoints only) is
+    // driven right here on the request thread via an eager task on a
+    // private non-running loop. Zero cross-thread hops: the w18-fleet
+    // profile showed the two wakes (enqueue→loop, channel→hyper) — not CPU
+    // — capping await-stream throughput at ~half the sync-stream ceiling.
+    // A misprediction (data-dependent real await) is finished correctly via
+    // `run_until_complete` and demotes the gen back to the worker loop.
+    let mut trampolined = false;
+    if let Some(code) = &coop_code {
+        if coop_state_of(code.as_ptr() as usize) == Some(CoopState::Cooperative) {
+            trampolined = run_stream_trampoline(py, &iterator, &tx, code);
+        }
+    }
 
     // Mechanism 2: an async gen with REAL awaits multiplexes as a TASK on the
     // shared `_async_worker` loop — no per-stream thread, no per-stream event
     // loop, no `run_until_complete` machinery (~122µs → the loop amortizes it
     // across every in-flight stream). Falls back to the legacy dedicated-
     // thread driver when the loop is unavailable (closed / no tokio runtime
-    // context) or when `FASTAPI_TURBO_STREAM_THREAD=1` forces it.
+    // context) or when `FASTAPI_TURBO_STREAM_THREAD=1` forces it. Passes the
+    // classification key along so `_spawn_stream_task`'s eager-done signal
+    // can record the gen's runtime-coop verdict for Mechanism 3.
     let worker_scheduled = !drained_complete
+        && !trampolined
         && is_async
         && !noawait
         && !legacy_forced
-        && schedule_stream_on_worker_loop(py, &iterator, &tx);
+        && schedule_stream_on_worker_loop(py, &iterator, &tx, coop_code);
 
     // Legacy paths: spawn a blocking task that iterates the Python generator
     // and pushes the remaining chunks through the channel. (Sync gens and
     // proven-no-await async gens with leftover chunks take this path.)
-    if !drained_complete && !worker_scheduled {
+    if !drained_complete && !trampolined && !worker_scheduled {
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
                 if is_async {
@@ -585,6 +616,299 @@ fn stream_thread_forced() -> bool {
     })
 }
 
+// ═══ Mechanism 3: runtime-cooperative await-streams drive INLINE on the
+// request thread (zero cross-thread hops) ═══
+//
+// The w18-fleet profile: /stream-await capped at 59.7k rps burning 7.0 cores
+// while /stream-sync did 111k on 4.9 — box not saturated, worker-loop thread
+// at 35% duty. The cap was the CRITICAL PATH: every await-stream request
+// serialized two cross-thread wakes (call_soon_threadsafe → loop thread,
+// then body channel → hyper task), each inflating to hundreds of µs of wall
+// (and real CPU: kqueue wakes + context switches + GIL handoffs) under fleet
+// thread pressure.
+//
+// A gen like `await sleep(0); yield chunk` can't be bytecode-proven no-await
+// (`GET_AWAITABLE` present), and a bare `send(None)` probe would CORRUPT a
+// gen that really awaits. But the worker loop already produces a safe
+// runtime proof for free: `_spawn_stream_task`'s eager start either runs the
+// WHOLE driver to completion inside one call (the gen never yielded to the
+// loop — cooperative) or leaves the task pending (real awaits). That verdict
+// is recorded per CODE OBJECT here; proven-cooperative gens skip the worker
+// loop entirely on subsequent requests and drive inline on the request
+// thread via `_drive_stream_inline` — an eager task on a PRIVATE non-running
+// per-thread asyncio loop (poked to look running; see the Python helper).
+// The eager step usually completes the whole body before `into_response`,
+// so hyper sees headers + chunks + EOF in one poll — the sync-stream shape.
+//
+// A misprediction (a data-dependent REAL await in a previously-cooperative
+// gen) is never destructive: the eager step suspends on a Future of the
+// private loop, and `run_until_complete(task)` finishes the stream correctly
+// right there (blocking this request thread — the legacy driver's semantic),
+// then the code object is STICKILY demoted to the worker-loop path.
+
+/// Runtime verdict for an await-stream generator's code object.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoopState {
+    /// One full eager completion observed — drives inline (Mechanism 3).
+    Cooperative,
+    /// Suspended on a real await at least once — stays on the worker loop.
+    Awaiting,
+}
+
+/// `FASTAPI_TURBO_STREAM_TRAMPOLINE=0` disables Mechanism 3 (default ON).
+fn stream_trampoline_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("FASTAPI_TURBO_STREAM_TRAMPOLINE")
+            .map(|v| !matches!(v.trim(), "0" | "false" | "False" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    })
+}
+
+/// Set once when the runtime can't support the trampoline (Python < 3.12
+/// eager_start, or an event-loop class without `_thread_id`) — cheaper than
+/// re-raising per stream.
+static TRAMPOLINE_BROKEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn trampoline_supported() -> bool {
+    stream_trampoline_enabled() && !TRAMPOLINE_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// code-object ptr → (verdict, pinned code ref). Pinning the `Py<PyAny>`
+/// keeps the id from ever aliasing a freed code object (same discipline as
+/// the no-await verdict map).
+fn coop_map() -> &'static std::sync::Mutex<std::collections::HashMap<usize, (CoopState, Py<PyAny>)>>
+{
+    static MAP: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, (CoopState, Py<PyAny>)>>,
+    > = std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn coop_state_of(key: usize) -> Option<CoopState> {
+    coop_map().lock().ok()?.get(&key).map(|(s, _)| *s)
+}
+
+/// Record a verdict. First writer wins (concurrent first requests race
+/// benignly); the ONLY overwrite allowed is the trampoline's misprediction
+/// demote (`Cooperative` → `Awaiting`, `allow_demote`). Never promotes
+/// `Awaiting` back — a once-suspending gen must not re-earn thread-blocking
+/// inline drives from a lucky cooperative run.
+fn record_coop_verdict(py: Python<'_>, code: &Py<PyAny>, verdict: CoopState, allow_demote: bool) {
+    let key = code.as_ptr() as usize;
+    if let Ok(mut map) = coop_map().lock() {
+        use std::collections::hash_map::Entry;
+        match map.entry(key) {
+            Entry::Occupied(mut e) => {
+                if allow_demote && verdict == CoopState::Awaiting {
+                    e.get_mut().0 = CoopState::Awaiting;
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert((verdict, code.clone_ref(py)));
+            }
+        }
+    }
+}
+
+/// Classification key: the REAL user gen's code object. A stamped
+/// `_fastapi_turbo_stream_code` (set by `_door_wrap_stream_teardown`
+/// alongside the no-await verdict) wins — the teardown wrapper's own
+/// `ag_code` is one shared code object for EVERY wrapped route. Unstamped
+/// responses use the raw gen's `ag_code`. `None` (custom async iterators,
+/// no code object to key on) → no trampoline, unchanged behavior.
+fn stream_code_key(
+    py: Python<'_>,
+    response: &Bound<'_, PyAny>,
+    iter_bound: &Bound<'_, PyAny>,
+) -> Option<Py<PyAny>> {
+    if let Ok(Some(code)) = response.getattr_opt(pyo3::intern!(py, "_fastapi_turbo_stream_code")) {
+        if !code.is_none() {
+            return Some(code.unbind());
+        }
+    }
+    if let Ok(Some(code)) = iter_bound.getattr_opt(pyo3::intern!(py, "ag_code")) {
+        if !code.is_none() {
+            return Some(code.unbind());
+        }
+    }
+    None
+}
+
+/// Thread-local holder that CLOSES the trampoline loop when its thread dies.
+/// Tokio reaps idle blocking-pool threads; an unclosed `BaseEventLoop` being
+/// deallocated then emits `ResourceWarning: unclosed event loop` from
+/// `__del__` — which pytest's unraisable-exception detector turns into a
+/// failure of whatever unrelated test happens to be running (observed as a
+/// rotating upstream-suite victim). Closing on thread exit is safe: pool
+/// threads die mid-process (interpreter live), and the loop is never running
+/// outside `run_stream_trampoline`'s stack frames on this same thread.
+struct TrampLoopCell(Option<Py<PyAny>>);
+
+impl Drop for TrampLoopCell {
+    fn drop(&mut self) {
+        if let Some(l) = self.0.take() {
+            let _ = Python::attach(|py| l.call_method0(py, "close"));
+        }
+    }
+}
+
+/// Per-request-thread PRIVATE event loop for the inline trampoline. Plain
+/// asyncio `SelectorEventLoop` on purpose (never uvloop, and deliberately
+/// bypassing the policy): `_drive_stream_inline` pokes `_thread_id`, a
+/// `BaseEventLoop` implementation detail, and the misprediction fallback's
+/// `run_until_complete` is ~2x cheaper on asyncio than uvloop. NOT installed
+/// via `set_event_loop` — nothing outside the drive may observe it.
+fn trampoline_loop(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    use std::cell::RefCell;
+    thread_local! {
+        static TRAMP_LOOP: RefCell<TrampLoopCell> = const { RefCell::new(TrampLoopCell(None)) };
+    }
+    TRAMP_LOOP.with(|cell| -> PyResult<Py<PyAny>> {
+        let mut holder = cell.borrow_mut();
+        if holder.0.is_none() {
+            let asyncio = py.import("asyncio")?;
+            let new_loop = match asyncio.getattr("SelectorEventLoop") {
+                Ok(cls) => cls.call0()?,
+                Err(_) => asyncio.call_method0("new_event_loop")?,
+            };
+            if !new_loop.hasattr("_thread_id").unwrap_or(false) {
+                TRAMPOLINE_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = new_loop.call_method0("close");
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "trampoline loop lacks _thread_id",
+                ));
+            }
+            holder.0 = Some(new_loop.unbind());
+        }
+        Ok(holder.0.as_ref().unwrap().clone_ref(py))
+    })
+}
+
+/// Cached `fastapi_turbo.responses._drive_stream_inline` (the eager-start
+/// trampoline helper).
+fn drive_stream_inline_fn(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
+    static INLINE: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+    if let Some(f) = INLINE.get() {
+        return Ok(f);
+    }
+    let f = py
+        .import("fastapi_turbo.responses")?
+        .getattr("_drive_stream_inline")?
+        .unbind();
+    let _ = INLINE.set(f);
+    Ok(INLINE.get().expect("just set"))
+}
+
+/// Drive a runtime-proven-cooperative await-stream INLINE on the request
+/// thread. Returns `true` when the stream was fully handled here (eagerly
+/// completed, or mispredicted → finished via `run_until_complete` +
+/// demoted); `false` when the trampoline couldn't run at all — the coroutine
+/// never started and the iterator is untouched, so the caller falls through
+/// to the worker-loop/legacy paths.
+fn run_stream_trampoline(
+    py: Python<'_>,
+    iterator: &Py<PyAny>,
+    tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    code: &Py<PyAny>,
+) -> bool {
+    // The (rare) backpressure waiter needs a runtime handle to spawn onto.
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    let Ok(loop_obj) = trampoline_loop(py) else {
+        return false;
+    };
+    let Ok(call_soon) = loop_obj.getattr(py, "call_soon_threadsafe") else {
+        return false;
+    };
+    let Ok(push) = Py::new(
+        py,
+        LoopChunkPush {
+            tx: Some(tx.clone()),
+            rt,
+            private_loop: Some((loop_obj.clone_ref(py), call_soon)),
+        },
+    ) else {
+        return false;
+    };
+    let Ok(drive) = drive_stream_fn(py) else {
+        return false;
+    };
+    // fair=False: this driver owns a private loop — no other task to yield
+    // to, and the fairness checkpoint would spuriously suspend >64-chunk
+    // cooperative streams out of eager completion.
+    let Ok(coro) = drive.call1(py, (iterator.bind(py), push.bind(py), false)) else {
+        return false;
+    };
+    let helper = match drive_stream_inline_fn(py) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = coro.call_method0(py, "close");
+            return false;
+        }
+    };
+    let task = match helper.call1(py, (loop_obj.bind(py), coro.bind(py))) {
+        Ok(t) => t,
+        Err(e) => {
+            // TypeError → Python < 3.12 (no eager_start); AttributeError →
+            // no `_thread_id`. Both are permanent for this process. Any
+            // constructor failure happens before the coroutine body ran —
+            // closing it leaves the iterator untouched for the fallback.
+            if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
+                || e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
+            {
+                TRAMPOLINE_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                eprintln!("fastapi-turbo: stream trampoline start failed: {e}");
+            }
+            let _ = coro.call_method0(py, "close");
+            return false;
+        }
+    };
+    let app = crate::router::current_app(py);
+    let done = task
+        .call_method0(py, pyo3::intern!(py, "done"))
+        .and_then(|d| d.extract::<bool>(py))
+        .unwrap_or(false);
+    if !done {
+        // MISPREDICTION: the gen really awaited this time. Demote FIRST so
+        // concurrent requests stop trampolining, then finish THIS stream —
+        // the suspension's Future lives on our private loop, so running that
+        // loop is the only correct continuation. Blocks this request thread
+        // for the stream's duration (the legacy dedicated-thread semantic,
+        // paid at most once per code object).
+        record_coop_verdict(py, code, CoopState::Awaiting, true);
+        if let Err(e) = loop_obj.call_method1(py, "run_until_complete", (task.bind(py),)) {
+            if !e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
+                capture_stream_err_on_app(py, app.as_ref(), &e);
+                eprintln!("fastapi-turbo: trampoline streaming error: {e}");
+            }
+        }
+        push.borrow_mut(py).tx.take();
+        return true;
+    }
+    // Eagerly complete. Mirror `StreamCompleter`: capture a mid-stream raise
+    // onto the app BEFORE dropping the Sender (TestClient must see the error
+    // by the time the body ends). On clean completion the driver already
+    // dropped the Sender via `push.close()`; the take below is idempotent.
+    let cancelled = task
+        .call_method0(py, pyo3::intern!(py, "cancelled"))
+        .and_then(|v| v.extract::<bool>(py))
+        .unwrap_or(false);
+    if !cancelled {
+        if let Err(e) = task.call_method0(py, pyo3::intern!(py, "result")) {
+            if !e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
+                capture_stream_err_on_app(py, app.as_ref(), &e);
+                eprintln!("fastapi-turbo: trampoline streaming error: {e}");
+            }
+        }
+    }
+    push.borrow_mut(py).tx.take();
+    true
+}
+
 /// No-await verdict for an async streaming body, read as one precomputed
 /// flag instead of a per-request Python call (`_stream_is_noawait` cost:
 /// module import + getattr + call frame + getattr chain + dict ops, ~1.5-2µs
@@ -740,6 +1064,13 @@ fn capture_stream_err_on_app(py: Python<'_>, app: Option<&Py<PyAny>>, e: &PyErr)
 struct LoopChunkPush {
     tx: Option<mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>,
     rt: tokio::runtime::Handle,
+    /// Trampoline mode (Mechanism 3): backpressure futures are created on —
+    /// and resolved via — the request thread's PRIVATE loop instead of the
+    /// shared worker loop: `(loop, its call_soon_threadsafe)`. The future is
+    /// then awaited under that loop's `run_until_complete` misprediction
+    /// fallback (a non-running loop still queues `call_soon_threadsafe`
+    /// callbacks and wakes its self-pipe correctly).
+    private_loop: Option<(Py<PyAny>, Py<PyAny>)>,
 }
 
 #[pymethods]
@@ -754,18 +1085,27 @@ impl LoopChunkPush {
             Err(mpsc::error::TrySendError::Closed(_)) => Ok(py_bool(py, false)),
             Err(mpsc::error::TrySendError::Full(pending)) => {
                 // Backpressure: hand the driver a Future to await. We are ON
-                // the loop thread (the driver task called us synchronously),
-                // so `create_future()` here is loop-safe.
-                let loop_obj = crate::handler_bridge::worker_loop().ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err("async worker loop not initialized")
-                })?;
-                let call_soon = crate::handler_bridge::worker_call_soon()
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyRuntimeError::new_err(
-                            "async worker loop not initialized",
-                        )
-                    })?
-                    .clone_ref(py);
+                // the thread that owns the target loop (worker-loop task or
+                // trampoline eager step), so `create_future()` is loop-safe.
+                let (loop_obj, call_soon) = match self.private_loop.as_ref() {
+                    Some((l, cs)) => (l.clone_ref(py), cs.clone_ref(py)),
+                    None => (
+                        crate::handler_bridge::worker_loop()
+                            .ok_or_else(|| {
+                                pyo3::exceptions::PyRuntimeError::new_err(
+                                    "async worker loop not initialized",
+                                )
+                            })?
+                            .clone_ref(py),
+                        crate::handler_bridge::worker_call_soon()
+                            .ok_or_else(|| {
+                                pyo3::exceptions::PyRuntimeError::new_err(
+                                    "async worker loop not initialized",
+                                )
+                            })?
+                            .clone_ref(py),
+                    ),
+                };
                 let fut = loop_obj.call_method0(py, "create_future")?;
                 let resolver = stream_future_resolver(py)?.clone_ref(py);
                 let fut_for_waiter = fut.clone_ref(py);
@@ -814,6 +1154,9 @@ struct StreamJob {
     coro: Option<Py<PyAny>>,
     push: Option<Py<LoopChunkPush>>,
     app: Option<Py<PyAny>>,
+    /// Classification key (the REAL gen's code object) for the runtime-coop
+    /// verdict recorded off `_spawn_stream_task`'s eager-done signal.
+    code: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -822,7 +1165,7 @@ impl StreamJob {
         let (Some(coro), Some(push)) = (self.coro.take(), self.push.take()) else {
             return;
         };
-        if let Err(e) = start_stream_task_on_loop(py, &coro, &push, &self.app) {
+        if let Err(e) = start_stream_task_on_loop(py, &coro, &push, &self.app, self.code.take()) {
             // Capture FIRST (TestClient must see the error once the body
             // ends), THEN drop the Sender so the HTTP body terminates. The
             // coro is closed/cancelled inside start_stream_task_on_loop —
@@ -847,6 +1190,7 @@ fn start_stream_task_on_loop(
     coro: &Py<PyAny>,
     push: &Py<LoopChunkPush>,
     app: &Option<Py<PyAny>>,
+    code: Option<Py<PyAny>>,
 ) -> PyResult<()> {
     let loop_obj = crate::handler_bridge::worker_loop().ok_or_else(|| {
         let _ = coro.call_method0(py, "close");
@@ -874,18 +1218,34 @@ fn start_stream_task_on_loop(
             return Err(e);
         }
     };
-    if let Err(e) = spawner.call1(
+    match spawner.call1(
         py,
         (loop_obj.bind(py), coro.bind(py), completer.bind(py)),
     ) {
-        // Task construction failed before it took ownership — close the
-        // coroutine (no-op if an eager step already finished it; throws
-        // GeneratorExit for teardown if it half-started). The caller then
-        // captures the error and closes the body channel.
-        let _ = coro.call_method0(py, "close");
-        return Err(e);
+        Ok(eager_clean) => {
+            // Runtime-coop verdict (Mechanism 3): True ⇔ the eager start ran
+            // the whole stream to clean completion — the gen never yielded
+            // to the loop. Vacant-only writes: the trampoline's demote is
+            // the single allowed overwrite.
+            if let Some(code) = code {
+                let verdict = if eager_clean.extract::<bool>(py).unwrap_or(false) {
+                    CoopState::Cooperative
+                } else {
+                    CoopState::Awaiting
+                };
+                record_coop_verdict(py, &code, verdict, false);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // Task construction failed before it took ownership — close the
+            // coroutine (no-op if an eager step already finished it; throws
+            // GeneratorExit for teardown if it half-started). The caller then
+            // captures the error and closes the body channel.
+            let _ = coro.call_method0(py, "close");
+            Err(e)
+        }
     }
-    Ok(())
 }
 
 /// Driver-task done-callback (runs on the loop thread). Captures a mid-stream
@@ -930,6 +1290,7 @@ fn schedule_stream_on_worker_loop(
     py: Python<'_>,
     iterator: &Py<PyAny>,
     tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    code: Option<Py<PyAny>>,
 ) -> bool {
     // The backpressure waiter needs a runtime to spawn onto; capture the
     // handle HERE (request thread) — the loop thread has no runtime context.
@@ -948,6 +1309,7 @@ fn schedule_stream_on_worker_loop(
         LoopChunkPush {
             tx: Some(tx.clone()),
             rt,
+            private_loop: None,
         },
     ) else {
         return false;
@@ -968,6 +1330,7 @@ fn schedule_stream_on_worker_loop(
                 coro: Some(coro.clone_ref(py)),
                 push: Some(push),
                 app,
+                code,
             },
         )?;
         // Fresh EMPTY contextvars.Context: the legacy driver ran on a

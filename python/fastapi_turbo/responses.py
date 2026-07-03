@@ -19,7 +19,9 @@ resolve to the REAL packages; the bound references stay real after the shim runs
 from __future__ import annotations
 
 import asyncio as _asyncio
+import contextvars as _contextvars
 import types as _types
+from asyncio import events as _aevents
 
 from starlette.responses import (
     Response,
@@ -45,6 +47,7 @@ __all__ = [
     "EventSourceResponse",
     "_json_default",
     "_drive_stream",
+    "_drive_stream_inline",
     "_resolve_stream_future",
     "_resume_anext",
     "_spawn_stream_task",
@@ -108,7 +111,7 @@ def _step_anext(coro):
             to_throw = e
 
 
-async def _drive_stream(aiter, push):
+async def _drive_stream(aiter, push, fair=True):
     """Single-driver for an async streaming body — the Rust door's hot path.
 
     ONE ``run_until_complete`` consumes the WHOLE async iterator (vs the naive
@@ -149,7 +152,11 @@ async def _drive_stream(aiter, push):
     the WHOLE stream without yielding to the loop once — starving every other
     task when this driver multiplexes on the shared worker loop. A real
     ``sleep(0)`` every 64 chunks caps that burst (~0.2 µs/chunk amortized;
-    noise for gens that do real I/O).
+    noise for gens that do real I/O). ``fair=False`` (the request-thread
+    trampoline, ``_drive_stream_inline``) drops that yield: there the driver
+    owns a PRIVATE non-running loop with no other task to be fair to, and the
+    yield would needlessly demote a >64-chunk cooperative stream out of its
+    zero-hop eager completion.
     """
     it = aiter.__aiter__()
     disconnected = False
@@ -164,7 +171,7 @@ async def _drive_stream(aiter, push):
                 disconnected = True
                 break
         n += 1
-        if not (n & 63):
+        if fair and not (n & 63):
             await _asyncio.sleep(0)
     if disconnected:
         aclose = getattr(aiter, "aclose", None)
@@ -223,17 +230,83 @@ def _spawn_stream_task(loop, coro, completer):
     preserved for the done-but-FAILED case: the completer itself does
     capture-then-close, exactly as on the callback path. Only a task still
     pending after the eager step attaches the completer as a done-callback.
+
+    Returns True IFF the eager start ran the WHOLE stream to clean completion
+    — the driver never yielded to the loop, proving the stream cooperative at
+    runtime. The Rust side (``streaming.rs``) records that verdict per code
+    object; later streams from a proven-cooperative gen are driven INLINE on
+    the request thread (``_drive_stream_inline``) with zero cross-thread hops.
+    Any other outcome returns False: still pending (a real await — or the
+    fairness yield of a >64-chunk stream), cancelled, or raised. A raised-but-
+    complete stream is technically cooperative, but a raising gen re-raises
+    every request anyway — staying on the worker loop keeps the completer's
+    capture-then-close ordering authoritative for that case.
     """
     try:
         task = _asyncio.Task(coro, loop=loop, eager_start=True)
     except TypeError:  # Python < 3.12 — no eager_start
         task = loop.create_task(coro)
         task.add_done_callback(completer)
-        return
+        return False
     if task.done():
         completer(task)
-    else:
-        task.add_done_callback(completer)
+        return not task.cancelled() and task.exception() is None
+    task.add_done_callback(completer)
+    return False
+
+
+def _drive_stream_inline(loop, coro):
+    """Eager-start a ``_drive_stream(..., fair=False)`` driver on a PRIVATE,
+    non-running, request-thread-local asyncio loop — the zero-hop trampoline
+    for runtime-proven cooperative await-streams.
+
+    Why: a gen like ``await asyncio.sleep(0); yield chunk`` is NOT provable
+    no-await by bytecode (``GET_AWAITABLE`` present), so it historically rode
+    the worker loop — two cross-thread wakes (enqueue→loop, channel→hyper) in
+    EVERY request's critical path. Profiled at the w18 fleet those wakes, not
+    CPU, are the throughput cap. Once the worker loop has observed one full
+    eager completion (``_spawn_stream_task`` returned True), the stream can
+    run right here on the request thread instead.
+
+    Mechanics: ``Task(eager_start=True)`` only eager-starts when
+    ``loop.is_running()``; a running loop is also what ``get_running_loop()``
+    inside the gen must see. Neither actually requires the loop to BE running:
+    * ``events._set_running_loop(loop)`` publishes it to the TLS slot that
+      ``get_running_loop()`` reads;
+    * ``loop._thread_id = get_ident()`` is exactly what ``run_forever`` sets,
+      making ``is_running()`` true AND ``_check_thread`` accept same-thread
+      ``call_soon``/``call_later`` (timers queue; they only fire if the
+      MISPREDICTION fallback actually runs the loop).
+    Both are restored in ``finally`` — the poke is invisible outside this
+    call. ``AttributeError`` on a loop without ``_thread_id`` and
+    ``TypeError`` on Python < 3.12 (no ``eager_start``) surface to the Rust
+    caller, which permanently disables the trampoline for the process.
+
+    The eager step runs a REAL task: ``current_task()`` is set, so
+    ``wait_for``/``timeout`` in a mispredicted stream behave exactly as on
+    the worker loop. A fresh empty ``contextvars.Context`` mirrors the worker
+    paths (their drivers never see the request thread's ambient context).
+
+    Returns the Task. ``task.done()`` ⇒ the whole stream completed inside
+    this call (chunks already in the body channel). A pending task means the
+    gen REALLY awaited (data-dependent I/O the cooperative verdict didn't
+    cover) — the caller finishes it with ``loop.run_until_complete(task)``
+    (correct continuation: the suspension's Future belongs to this loop) and
+    demotes the code object back to the worker-loop path.
+    """
+    import threading
+
+    prev_running = _aevents._get_running_loop()
+    prev_tid = loop._thread_id
+    _aevents._set_running_loop(loop)
+    loop._thread_id = threading.get_ident()
+    try:
+        return _asyncio.Task(
+            coro, loop=loop, eager_start=True, context=_contextvars.Context()
+        )
+    finally:
+        loop._thread_id = prev_tid
+        _aevents._set_running_loop(prev_running)
 
 
 def _resolve_stream_future(fut, ok):

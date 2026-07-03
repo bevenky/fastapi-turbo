@@ -303,6 +303,13 @@ def _door_wrap_stream_teardown(app, stream_response, req_gens):
             stream_response._fastapi_turbo_stream_noawait = _gina(inner)
         except Exception:  # noqa: BLE001
             stream_response._fastapi_turbo_stream_noawait = False
+        # The wrapper below shares ONE code object across every wrapped route,
+        # so the Rust runtime-cooperative classification (trampoline vs worker
+        # loop, streaming.rs) must key on the REAL user gen's code — stamp it
+        # alongside the no-await verdict.
+        stream_response._fastapi_turbo_stream_code = getattr(
+            inner, "ag_code", None
+        )
 
     def _teardown():
         for g in reversed(req_gens):
