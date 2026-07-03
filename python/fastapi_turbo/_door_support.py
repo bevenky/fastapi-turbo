@@ -394,11 +394,21 @@ def _make_sync_wrapper(async_func, *, for_handler: bool = False, app=None):
         return _stamp(_noawait_caller)
 
     if for_handler:
+        from fastapi_turbo._async_worker import _default_timeout, submit_fast
+
+        # Door hot path: resolve the effective timeout ONCE at wrapper build —
+        # the same moment router.rs resolves ``RouteState.worker_timeout`` (the
+        # door re-registers and rebuilds these wrappers whenever
+        # ``_door_fingerprint`` changes, so per-app isolation is preserved).
+        # Requests then skip the per-request function-body import, the kwargs
+        # ``submit()`` middle frame, and the ``_default_timeout`` env read +
+        # getattr chain. Direct ``submit()`` callers keep fully dynamic
+        # resolution (tests monkeypatch FASTAPI_TURBO_WORKER_TIMEOUT at
+        # runtime against that path).
+        route_timeout = _default_timeout(app)
 
         def _submit_caller(**kwargs):
-            from fastapi_turbo._async_worker import submit
-
-            return submit(async_func(**kwargs), app=app)
+            return submit_fast(async_func(**kwargs), route_timeout)
 
         return _stamp(_submit_caller)
 
