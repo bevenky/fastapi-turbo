@@ -277,3 +277,19 @@ Rule of thumb: loop-resident clients → flag on; asyncpg-heavy apps → flag of
 
 The ORM/greenlet tax is engine-independent (~90–133 µs on async rungs at conn=1);
 turbo's advantage is the constant HTTP/dispatch share at every rung.
+
+### Run-to-run variance: lessons encoded (2026-07-04)
+
+- **Intra-boot heating**: a boot that benches 8 rows sequentially under-measures
+  late rows by 15-25% when the desktop is co-resident (verified: same row, same
+  hour — sequential pass 35.5k vs one-row-per-boot 48.0k). Disputed rows are
+  re-measured one-row-per-boot; a future runner improvement is group-order
+  rotation or row-per-boot for DB groups.
+- **Fleet sensitivity is asymmetric**: turbo's multi-process Python fleet feels
+  desktop co-residency (±15-20%) that single-process Go/Rust rivals do not.
+  Cross-day comparisons of turbo fleet rows need same-session anchoring; conn=1
+  rows and rival rows are robust.
+- **Code-vs-environment protocol**: snapshot results before shipped-code
+  changes; on any regression flag, (1) check rival deltas same-run, (2) bisect
+  same-session alternating medians, (3) fresh-boot single-row probe. The R2
+  parity fixes were exonerated three independent ways by this protocol.
