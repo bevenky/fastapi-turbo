@@ -214,3 +214,12 @@ Prereqs: Postgres db `fastapi_turbo_bench` (tables `items`, `bench_writes`),
 Redis on 6379 (`bench:item` seeded), `oha` at `/opt/homebrew/bin/oha`,
 `go-gin/bench-gin` + `raw-axum/target/release/raw-axum-matrix` built, and
 `fastify/node_modules` installed.
+
+## Loop-resident clients × ASYNC_INLINE (measured 2026-07-03, w8 c64)
+
+`FASTAPI_TURBO_ASYNC_INLINE=1` drives async requests on the worker loop itself.
+For clients whose socket lives on that loop (`fastapi_turbo.contrib_redis`), the
+combo removes the park/wake handoff entirely: mux GET 60→51µs conn=1, 69.0→76.8k
+c64; SET 70.5→80.3k (+14%). redis-py rows wash; asyncpg c64 regresses −8%
+(loop-side extraction steals driver CPU) — hence the global default stays OFF.
+Rule of thumb: loop-resident clients → flag on; asyncpg-heavy apps → flag off.
