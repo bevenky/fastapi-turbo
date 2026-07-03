@@ -245,3 +245,16 @@ combo removes the park/wake handoff entirely: mux GET 60→51µs conn=1, 69.0→
 c64; SET 70.5→80.3k (+14%). redis-py rows wash; asyncpg c64 regresses −8%
 (loop-side extraction steals driver CPU) — hence the global default stays OFF.
 Rule of thumb: loop-resident clients → flag on; asyncpg-heavy apps → flag off.
+
+### SQLAlchemy conn=1 latency (w1, select-one, µs p50 — sidecar `run_db_latency.py`)
+
+| rung | turbo | uvicorn |
+|---|--:|--:|
+| raw psycopg3-sync | 70.7 | 224.3 |
+| SQLA Core (psycopg3) | 128.4 | 272.3 |
+| SQLA ORM (psycopg3 sync) | 161.4 | 304.0 |
+| raw asyncpg | 77.2 | 169.9 |
+| SQLA ORM (asyncpg) | 210.4 | 288.7 |
+
+The ORM/greenlet tax is engine-independent (~90–133 µs on async rungs at conn=1);
+turbo's advantage is the constant HTTP/dispatch share at every rung.

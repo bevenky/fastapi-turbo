@@ -116,6 +116,10 @@ def get_db(fw, key):
     return (DBD.get(fw, {}).get(key) or {}).get("rps")
 
 
+def get_db_lat(fw, key):
+    return (DBD.get(fw, {}).get(key) or {}).get("conn1_p50_us")
+
+
 def fmt_us(v):
     return "—" if v is None else f"{v:,.0f}"
 
@@ -198,9 +202,10 @@ def driver_table():
 def sqla_table():
     out = ['<div class="tscroll"><table class="drv"><thead><tr>'
            '<th class="lab">SQLAlchemy 2.0 · ORM vs Core vs raw driver</th>'
-           '<th colspan=2>select one</th><th colspan=2>select 10</th></tr>'
-           '<tr><th class="lab sub">req/s · w8 sync / w12 async · c64</th>']
-    for _ in range(2):
+           '<th colspan=2>select one</th><th colspan=2>select 10</th>'
+           '<th colspan=2>select one · conn=1 p50 µs</th></tr>'
+           '<tr><th class="lab sub">req/s · w8 sync / w12 async · c64 — latency: w1 · conn=1</th>']
+    for _ in range(3):
         out.append('<th class="sub tcol">turbo</th><th class="sub">FastAPI</th>')
     out.append("</tr></thead><tbody>")
     for label, prefix in SQLA_VARIANTS:
@@ -212,6 +217,14 @@ def sqla_table():
             tcls = "tcol lead tlead" if (tv or 0) >= (uv or 0) else "tcol"
             ucls = "lead" if (uv or 0) > (tv or 0) else ""
             out.append(f'<td class="{tcls}">{fmt_rps(tv)}</td><td class="{ucls}">{fmt_rps(uv)}</td>')
+        # conn=1 p50 (run_db_latency.py sidecar) — lower is better
+        key = f"{prefix} select_one"
+        tl = get_db_lat("fastapi-turbo", key)
+        ul = get_db_lat("FastAPI (uvicorn)", key)
+        both = tl is not None and ul is not None
+        tcls = "tcol lead tlead" if both and tl <= ul else "tcol"
+        ucls = "lead" if both and ul < tl else ""
+        out.append(f'<td class="{tcls}">{fmt_us(tl)}</td><td class="{ucls}">{fmt_us(ul)}</td>')
         out.append("</tr>")
     out.append("</tbody></table></div>")
     return "".join(out)

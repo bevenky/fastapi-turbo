@@ -4,7 +4,14 @@
     "db_workers": 8,
     "async_workers": 12,
     "conc": 64,
-    "dur": "4s"
+    "dur": "4s",
+    "conn1_lat": {
+      "workers": 1,
+      "runs": 3,
+      "requests": 12000,
+      "warmup": 1000,
+      "date": "2026-07-03"
+    }
   },
   "data": {
     "fastapi-turbo": {
@@ -168,7 +175,8 @@
         "rps": 46272.2403,
         "cpu_pct": 735.8000000000001,
         "cores": 7.4,
-        "group": "pgm"
+        "group": "pgm",
+        "conn1_p50_us": 70.7
       },
       "pg3sync select_list": {
         "rps": 38821.0175,
@@ -312,7 +320,8 @@
         "rps": 47856.5744,
         "cpu_pct": 766.3999999999999,
         "cores": 7.7,
-        "group": "pgm"
+        "group": "pgm",
+        "conn1_p50_us": 77.2
       },
       "asyncpg select_list": {
         "rps": 47457.6323,
@@ -372,7 +381,8 @@
         "rps": 28770.1171,
         "cpu_pct": 939.6,
         "cores": 9.4,
-        "group": "sqla"
+        "group": "sqla",
+        "conn1_p50_us": 161.4
       },
       "sqla sync3 select_list": {
         "rps": 28059.3472,
@@ -384,7 +394,8 @@
         "rps": 36771.7989,
         "cpu_pct": 972.1,
         "cores": 9.7,
-        "group": "sqla"
+        "group": "sqla",
+        "conn1_p50_us": 128.4
       },
       "sqla core3 select_list": {
         "rps": 35046.2979,
@@ -396,7 +407,8 @@
         "rps": 34953.8881,
         "cpu_pct": 1292.6,
         "cores": 12.9,
-        "group": "sqla"
+        "group": "sqla",
+        "conn1_p50_us": 210.4
       },
       "sqla asyncpg select_list": {
         "rps": 32087.7271,
@@ -408,7 +420,8 @@
         "rps": 29515.7043,
         "cpu_pct": 1320.0,
         "cores": 13.2,
-        "group": "sqla"
+        "group": "sqla",
+        "conn1_p50_us": 223.2
       },
       "sqla async3 select_list": {
         "rps": 28734.1815,
@@ -578,7 +591,8 @@
         "rps": 20324.0521,
         "cpu_pct": 1048.2,
         "cores": 10.5,
-        "group": "pgm"
+        "group": "pgm",
+        "conn1_p50_us": 224.3
       },
       "pg3sync select_list": {
         "rps": 16296.0282,
@@ -722,7 +736,8 @@
         "rps": 49963.8784,
         "cpu_pct": 996.3,
         "cores": 10.0,
-        "group": "pgm"
+        "group": "pgm",
+        "conn1_p50_us": 169.9
       },
       "asyncpg select_list": {
         "rps": 40328.2291,
@@ -782,7 +797,8 @@
         "rps": 15236.4389,
         "cpu_pct": 918.1000000000001,
         "cores": 9.2,
-        "group": "sqla"
+        "group": "sqla",
+        "conn1_p50_us": 304.0
       },
       "sqla sync3 select_list": {
         "rps": 13746.3742,
@@ -794,7 +810,8 @@
         "rps": 17912.442,
         "cpu_pct": 969.3000000000002,
         "cores": 9.7,
-        "group": "sqla"
+        "group": "sqla",
+        "conn1_p50_us": 272.3
       },
       "sqla core3 select_list": {
         "rps": 15511.4399,
@@ -806,7 +823,8 @@
         "rps": 23562.7229,
         "cpu_pct": 1102.7,
         "cores": 11.0,
-        "group": "sqla"
+        "group": "sqla",
+        "conn1_p50_us": 288.7
       },
       "sqla asyncpg select_list": {
         "rps": 23843.3364,
@@ -818,7 +836,8 @@
         "rps": 20716.8464,
         "cpu_pct": 1077.7,
         "cores": 10.8,
-        "group": "sqla"
+        "group": "sqla",
+        "conn1_p50_us": 302.6
       },
       "sqla async3 select_list": {
         "rps": 20699.1715,
