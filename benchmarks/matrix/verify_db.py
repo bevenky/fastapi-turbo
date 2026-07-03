@@ -24,6 +24,10 @@ PY_ONLY = [
     ("GET", "/pgm/asyncpg/select_one", {"id": 5, "sku": "SKU-5", "name": "item-5", "qty": 5}),
     ("POST", "/pgm/pg2sync/insert?commit=false", {"ok": True, "committed": False}),
     ("POST", "/pgm/pg3async/update?commit=false", {"ok": True, "committed": False}),
+    ("GET", "/sqla/sync3/select_one", {"id": 5, "sku": "SKU-5", "name": "item-5", "qty": 5}),
+    ("GET", "/sqla/core3/select_one", {"id": 5, "sku": "SKU-5", "name": "item-5", "qty": 5}),
+    ("GET", "/sqla/asyncpg/select_one", {"id": 5, "sku": "SKU-5", "name": "item-5", "qty": 5}),
+    ("GET", "/sqla/async3/select_list", "items10"),
 ]
 
 

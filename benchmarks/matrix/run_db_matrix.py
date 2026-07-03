@@ -2,6 +2,9 @@
 
 - Cross-framework (all 5): /pg/{op}/{sync,async} + /redis/{mode}/{op}, writes x commit.
 - Python driver matrix (turbo + uvicorn only): /pgm/{driver}/{op}, writes x commit.
+- SQLAlchemy matrix (turbo + uvicorn only): /sqla/{variant}/{op} reads —
+  ORM (sync3/asyncpg/async3) vs Core (core3); isolated boots pgm-sqla-sync (w8)
+  and pgm-sqla-async (w12), same policy as the raw driver boots.
 - Redis durability: AOF is enabled ONCE per boot (not per row) and the bench
   gates on the initial background rewrite completing (aof_rewrite_in_progress=0)
   BEFORE flipping appendfsync=always; both set_durable rows then run
@@ -49,7 +52,7 @@ DBWORKERS = int(os.environ.get("BENCH_DB_WORKERS", "8"))
 # beats it ~25%). Per-boot isolation means only ONE driver pool exists, so the
 # conn budget stays tiny: 12 workers x max 2 = 24 << max_connections(100).
 DB_ASYNC_WORKERS = int(os.environ.get("BENCH_DB_ASYNC_WORKERS", "12"))
-ASYNC_BOOT_GROUPS = {"cross-pg-async", "redis", "pgm-pg3async", "pgm-asyncpg"}
+ASYNC_BOOT_GROUPS = {"cross-pg-async", "redis", "pgm-pg3async", "pgm-asyncpg", "pgm-sqla-async"}
 
 CT = ("true", "false")  # commit modes
 
@@ -83,6 +86,15 @@ for drv in ("pg3sync", "pg2sync", "pg3async", "asyncpg"):
     for op in ("insert", "update", "delete"):
         for c in CT:
             PYMATRIX.append((f"{drv} {op} commit={c}", "pgm", "POST", f"/pgm/{drv}/{op}?commit={c}"))
+
+
+# SQLAlchemy matrix (turbo + uvicorn). scope="py". Reads only; engines run
+# AUTOCOMMIT so rows are wire-fair (1 RTT) vs the raw /pgm read rows — the
+# delta is SQLAlchemy CPU (Core) + ORM overhead (Session/identity map).
+SQLA = []
+for var in ("sync3", "core3", "asyncpg", "async3"):
+    for op in ("select_one", "select_list"):
+        SQLA.append((f"sqla {var} {op}", "sqla", "GET", f"/sqla/{var}/{op}"))
 
 
 def redis_cli(*args):
@@ -198,6 +210,10 @@ def _boots_for(fw):
     ]
     for drv in ("pg3sync", "pg2sync", "pg3async", "asyncpg"):
         boots.append((f"pgm-{drv}", [e for e in PYMATRIX if e[0].startswith(drv)]))
+    # SQLAlchemy: sync engine boot (w8) + async engine boot (w12) — same
+    # per-boot isolation as the raw drivers (engines are lazy in app_db).
+    boots.append(("pgm-sqla-sync", [e for e in SQLA if e[0].split()[1] in ("sync3", "core3")]))
+    boots.append(("pgm-sqla-async", [e for e in SQLA if e[0].split()[1] in ("asyncpg", "async3")]))
     return boots
 
 

@@ -74,6 +74,20 @@ DRIVERS = ["pg3sync", "pg2sync", "pg3async", "asyncpg"]
 DRIVER_OPS = ["select_one", "select_list", "insert commit=true", "insert commit=false",
               "update commit=true", "update commit=false", "delete commit=true", "delete commit=false"]
 
+# SQLAlchemy · ORM vs Core (reads, AUTOCOMMIT engines, isolated boots).
+# Raw-driver reference rows (†) come from the /pgm matrix — same DB, same
+# 1-RTT read policy, different boot. Scanning ORM → Core → raw splits the
+# SQLAlchemy cost into ORM overhead vs Core overhead vs driver floor.
+SQLA_VARIANTS = [
+    ("ORM · psycopg3 sync", "sqla sync3"),
+    ("Core · psycopg3 sync", "sqla core3"),
+    ("raw driver · pg3sync †", "pg3sync"),
+    ("ORM · asyncpg", "sqla asyncpg"),
+    ("raw driver · asyncpg †", "asyncpg"),
+    ("ORM · psycopg3 async", "sqla async3"),
+    ("raw driver · pg3async †", "pg3async"),
+]
+
 CAMPAIGN = [
     ("stream · sync gen", "852 µs", "28 µs", "30×", "conn=1 · beats Fastify"),
     ("stream · async gen", "546 µs", "29 µs", "19×", "conn=1 · beats Fastify"),
@@ -171,6 +185,28 @@ def driver_table():
         out.append(f'<tr><td class="lab">{esc(op)}</td>')
         for d in DRIVERS:
             key = f"{d} {op}"
+            tv = get_db("fastapi-turbo", key)
+            uv = get_db("FastAPI (uvicorn)", key)
+            tcls = "tcol lead tlead" if (tv or 0) >= (uv or 0) else "tcol"
+            ucls = "lead" if (uv or 0) > (tv or 0) else ""
+            out.append(f'<td class="{tcls}">{fmt_rps(tv)}</td><td class="{ucls}">{fmt_rps(uv)}</td>')
+        out.append("</tr>")
+    out.append("</tbody></table></div>")
+    return "".join(out)
+
+
+def sqla_table():
+    out = ['<div class="tscroll"><table class="drv"><thead><tr>'
+           '<th class="lab">SQLAlchemy 2.0 · ORM vs Core vs raw driver</th>'
+           '<th colspan=2>select one</th><th colspan=2>select 10</th></tr>'
+           '<tr><th class="lab sub">req/s · w8 sync / w12 async · c64</th>']
+    for _ in range(2):
+        out.append('<th class="sub tcol">turbo</th><th class="sub">FastAPI</th>')
+    out.append("</tr></thead><tbody>")
+    for label, prefix in SQLA_VARIANTS:
+        out.append(f'<tr><td class="lab">{esc(label)}</td>')
+        for op in ("select_one", "select_list"):
+            key = f"{prefix} {op}"
             tv = get_db("fastapi-turbo", key)
             uv = get_db("FastAPI (uvicorn)", key)
             tcls = "tcol lead tlead" if (tv or 0) >= (uv or 0) else "tcol"
@@ -425,6 +461,16 @@ td.lanecell {{ min-width:190px; text-align:left; padding-left:22px; }}
   <p class="note">asyncpg is the recommended async driver for both engines since the worker-loop init race fix
   (f757f8f) — the old “asyncpg is pathological under turbo” result was that bug. psycopg2 rows are clean since the
   pool got blocking-checkout parity (its <b>getconn()</b> raises where every other driver blocks).</p>
+  {sqla_table()}
+  <p class="note"><b>SQLAlchemy · ORM vs Core.</b> Plain <code>from sqlalchemy import ...</code> — zero
+  turbo-specific code; the same app runs unmodified under uvicorn (smoke-verified byte-identical, incl.
+  session-per-request via Depends). Engines run <code>isolation_level="AUTOCOMMIT"</code> so reads stay
+  1 wire round trip — same audited policy as the raw rows; statements are built per request.
+  Scanning ORM → Core → raw † on the same driver splits the cost: the ORM's Session + unit-of-work +
+  identity map vs Core's statement compile + result proxy vs the driver floor.
+  Measured split (turbo · select one · w8): raw 46.3k → Core 36.8k → ORM 28.8k req/s — Core adds
+  ≈5.6µs/req over the raw driver, the Session/ORM layer another ≈7.6µs/req; the same ladder holds
+  under uvicorn (20.3k → 17.9k → 15.2k), so it is SQLAlchemy CPU, not an engine artifact.</p>
 </section>
 
 <section>

@@ -367,6 +367,54 @@
         "cpu_pct": 725.7,
         "cores": 7.3,
         "group": "redis"
+      },
+      "sqla sync3 select_one": {
+        "rps": 28770.1171,
+        "cpu_pct": 939.6,
+        "cores": 9.4,
+        "group": "sqla"
+      },
+      "sqla sync3 select_list": {
+        "rps": 28059.3472,
+        "cpu_pct": 941.4,
+        "cores": 9.4,
+        "group": "sqla"
+      },
+      "sqla core3 select_one": {
+        "rps": 36771.7989,
+        "cpu_pct": 972.1,
+        "cores": 9.7,
+        "group": "sqla"
+      },
+      "sqla core3 select_list": {
+        "rps": 35046.2979,
+        "cpu_pct": 959.9999999999999,
+        "cores": 9.6,
+        "group": "sqla"
+      },
+      "sqla asyncpg select_one": {
+        "rps": 34953.8881,
+        "cpu_pct": 1292.6,
+        "cores": 12.9,
+        "group": "sqla"
+      },
+      "sqla asyncpg select_list": {
+        "rps": 32087.7271,
+        "cpu_pct": 1263.4,
+        "cores": 12.6,
+        "group": "sqla"
+      },
+      "sqla async3 select_one": {
+        "rps": 29515.7043,
+        "cpu_pct": 1320.0,
+        "cores": 13.2,
+        "group": "sqla"
+      },
+      "sqla async3 select_list": {
+        "rps": 28734.1815,
+        "cpu_pct": 1312.0,
+        "cores": 13.1,
+        "group": "sqla"
       }
     },
     "FastAPI (uvicorn)": {
@@ -729,6 +777,54 @@
         "cpu_pct": 863.8,
         "cores": 8.6,
         "group": "redis"
+      },
+      "sqla sync3 select_one": {
+        "rps": 15236.4389,
+        "cpu_pct": 918.1000000000001,
+        "cores": 9.2,
+        "group": "sqla"
+      },
+      "sqla sync3 select_list": {
+        "rps": 13746.3742,
+        "cpu_pct": 896.4999999999999,
+        "cores": 9.0,
+        "group": "sqla"
+      },
+      "sqla core3 select_one": {
+        "rps": 17912.442,
+        "cpu_pct": 969.3000000000002,
+        "cores": 9.7,
+        "group": "sqla"
+      },
+      "sqla core3 select_list": {
+        "rps": 15511.4399,
+        "cpu_pct": 944.1,
+        "cores": 9.4,
+        "group": "sqla"
+      },
+      "sqla asyncpg select_one": {
+        "rps": 23562.7229,
+        "cpu_pct": 1102.7,
+        "cores": 11.0,
+        "group": "sqla"
+      },
+      "sqla asyncpg select_list": {
+        "rps": 23843.3364,
+        "cpu_pct": 1159.6000000000001,
+        "cores": 11.6,
+        "group": "sqla"
+      },
+      "sqla async3 select_one": {
+        "rps": 20716.8464,
+        "cpu_pct": 1077.7,
+        "cores": 10.8,
+        "group": "sqla"
+      },
+      "sqla async3 select_list": {
+        "rps": 20699.1715,
+        "cpu_pct": 1163.0,
+        "cores": 11.6,
+        "group": "sqla"
       }
     },
     "Gin (Go)": {

@@ -12,6 +12,17 @@ Driver matrix paths (Python only):  /pgm/{driver}/{op}[?commit=true|false]
 Cross-framework paths (all 5):      /pg/{op}/{sync|async}[?commit=]
   (Python: sync→pg3sync, async→asyncpg; Go/Node/Rust: their one native driver)
 
+SQLAlchemy matrix (Python only):    /sqla/{variant}/{select_one|select_list}
+  sync3  = ORM Session, sync engine  postgresql+psycopg
+  core3  = Core connection (no ORM), same sync engine — isolates ORM overhead
+  asyncpg= ORM AsyncSession, async engine postgresql+asyncpg
+  async3 = ORM AsyncSession, async engine postgresql+psycopg (async)
+All SQLAlchemy engines run isolation_level="AUTOCOMMIT" so reads stay 1 wire
+round trip — same audited fairness as the raw-driver read rows; the
+sqla-vs-raw delta is then pure SQLAlchemy CPU, not extra BEGIN round trips.
+Statements are built per request (realistic ORM usage, per-request-build
+fairness). Plain ``from sqlalchemy import ...`` — no turbo-specific code.
+
 Redis (redis-py sync + asyncio): get / set / set_durable (server fsync) /
 pipeline / multi, via /redis/{mode}/{op}  (mode = sync|async).
 
@@ -136,6 +147,67 @@ async def asyncpg_pool():
                     host=PGHOST, port=PGPORT, database=PGDB, user=PGUSER,
                     min_size=PMIN, max_size=PMAX, reset=_no_reset)
     return _pools["asyncpg"]
+
+
+# ── lazy SQLAlchemy engines (same isolation policy as the raw pools) ──
+SQLA_SYNC_URL = f"postgresql+psycopg://{PGUSER}@{PGHOST}:{PGPORT}/{PGDB}"
+SQLA_APG_URL = f"postgresql+asyncpg://{PGUSER}@{PGHOST}:{PGPORT}/{PGDB}"
+
+
+def _sqla_base():
+    """Lazy ORM model: sqlalchemy is imported only when a /sqla/* route is hit,
+    so non-sqla boots never pay the import (isolated-boot policy)."""
+    if "sqla_base" not in _pools:
+        with _pool_lock:
+            if "sqla_base" not in _pools:
+                from sqlalchemy import Integer, Text, select
+                from sqlalchemy.orm import DeclarativeBase, mapped_column
+
+                class Base(DeclarativeBase):
+                    pass
+
+                # Imperative mapped_column form (not Mapped[...] annotations):
+                # this file has `from __future__ import annotations`, which
+                # stringifies annotations, and SQLAlchemy can't de-stringify
+                # Mapped[...] on a function-local class (names aren't module
+                # globals). Identical mapper + SQL either way.
+                class Item(Base):
+                    __tablename__ = "items"
+                    id = mapped_column(Integer, primary_key=True)
+                    sku = mapped_column(Text)
+                    name = mapped_column(Text)
+                    qty = mapped_column(Integer)
+
+                _pools["sqla_base"] = (Item, select)
+    return _pools["sqla_base"]
+
+
+def sqla_sync():
+    if "sqla_sync" not in _pools:
+        _sqla_base()
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        with _pool_lock:
+            if "sqla_sync" not in _pools:
+                # AUTOCOMMIT: reads = 1 wire RTT, parity with the raw read rows.
+                eng = create_engine(SQLA_SYNC_URL, pool_size=PMAX, max_overflow=0,
+                                    isolation_level="AUTOCOMMIT")
+                _pools["sqla_sync"] = (eng, sessionmaker(bind=eng))
+    return _pools["sqla_sync"]
+
+
+async def sqla_async(drv):  # drv = "asyncpg" | "async3"
+    key = f"sqla_{drv}"
+    if key not in _pools:
+        _sqla_base()
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        async with _apool_lock:
+            if key not in _pools:
+                url = SQLA_APG_URL if drv == "asyncpg" else SQLA_SYNC_URL
+                eng = create_async_engine(url, pool_size=PMAX, max_overflow=0,
+                                          isolation_level="AUTOCOMMIT")
+                _pools[key] = (eng, async_sessionmaker(bind=eng, expire_on_commit=False))
+    return _pools[key]
 
 
 def sync_redis():
@@ -295,6 +367,67 @@ async def _asyncpg(op, commit):
             await tr.rollback()
             raise
         return _wrote(commit)
+
+
+# ════════════ SQLAlchemy (ORM + Core) ════════════
+def _sqla_orm_sync(op):
+    Item, select = _sqla_base()
+    _, SessionLocal = sqla_sync()
+    with SessionLocal() as s:  # session-per-request
+        if op == "select_one":
+            it = s.execute(select(Item).where(Item.id == 5)).scalar_one()
+            return {"id": it.id, "sku": it.sku, "name": it.name, "qty": it.qty}
+        rows = s.execute(select(Item).order_by(Item.id).limit(10)).scalars()
+        return {"items": [{"id": x.id, "sku": x.sku, "name": x.name, "qty": x.qty} for x in rows]}
+
+
+def _sqla_core_sync(op):
+    # Core-only twin of _sqla_orm_sync (same engine, no Session/identity map):
+    # the ORM-vs-Core delta on the same driver is the ORM's own overhead.
+    Item, select = _sqla_base()
+    eng, _ = sqla_sync()
+    t = Item.__table__
+    with eng.connect() as conn:
+        if op == "select_one":
+            r = conn.execute(select(t.c.id, t.c.sku, t.c.name, t.c.qty).where(t.c.id == 5)).one()
+            return _row(r)
+        rs = conn.execute(select(t.c.id, t.c.sku, t.c.name, t.c.qty).order_by(t.c.id).limit(10)).all()
+        return {"items": [_row(x) for x in rs]}
+
+
+async def _sqla_orm_async(drv, op):
+    Item, select = _sqla_base()
+    _, SessionLocal = await sqla_async(drv)
+    async with SessionLocal() as s:  # session-per-request
+        if op == "select_one":
+            it = (await s.execute(select(Item).where(Item.id == 5))).scalar_one()
+            return {"id": it.id, "sku": it.sku, "name": it.name, "qty": it.qty}
+        rows = (await s.execute(select(Item).order_by(Item.id).limit(10))).scalars()
+        return {"items": [{"id": x.id, "sku": x.sku, "name": x.name, "qty": x.qty} for x in rows]}
+
+
+def _make_sqla_routes():
+    for op in ("select_one", "select_list"):
+        def mk_orm(op=op):
+            def h():
+                return _sqla_orm_sync(op)
+            return h
+
+        def mk_core(op=op):
+            def h():
+                return _sqla_core_sync(op)
+            return h
+        app.add_api_route(f"/sqla/sync3/{op}", mk_orm(), methods=["GET"])
+        app.add_api_route(f"/sqla/core3/{op}", mk_core(), methods=["GET"])
+        for drv in ("asyncpg", "async3"):
+            def mka(drv=drv, op=op):
+                async def h():
+                    return await _sqla_orm_async(drv, op)
+                return h
+            app.add_api_route(f"/sqla/{drv}/{op}", mka(), methods=["GET"])
+
+
+_make_sqla_routes()
 
 
 DRIVERS_SYNC = {"pg3sync": _pg3sync, "pg2sync": _pg2sync}

@@ -227,6 +227,7 @@ def dashboard(user_id: int):
 | Autocommit (skip BEGIN/COMMIT) | Yes | Limited | Yes |
 | Binary protocol | Yes | No | Yes |
 | Sync + async in same driver | Yes | Sync only | Async only |
+| SQLAlchemy 2.x dialect | Yes — `postgresql+psycopg` (sync + async) | Yes — `postgresql+psycopg2` | Yes — `postgresql+asyncpg` |
 | **1 query latency** | **22us** | 48us | 112us |
 | **10 queries (pipeline)** | **102us** | ~300us (seq) | 344us (gather) |
 
@@ -300,32 +301,56 @@ Pipeline has zero overhead for single commands and is 4.2x faster at 10 commands
 
 ### SQLAlchemy compatibility
 
-`create_pool()` returns a standard psycopg3 `ConnectionPool`. SQLAlchemy works with psycopg3 via the `psycopg` driver:
+SQLAlchemy 2.x works **out of the box** under `app.run()` — plain `from sqlalchemy import ...`, zero turbo-specific code. Verified (2.0.49): sync engine (`postgresql+psycopg`), both async engines (`postgresql+asyncpg` and async `postgresql+psycopg`), ORM-mapped classes + `select()`, and session-per-request via `Depends` (the documented FastAPI pattern, including generator dependencies) — byte-identical responses vs the same app under uvicorn.
 
 ```python
-from sqlalchemy import create_engine, text
+import fastapi_turbo  # noqa: F401
+from fastapi import Depends, FastAPI
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session, sessionmaker
 
 engine = create_engine("postgresql+psycopg://user@localhost/mydb")
+SessionLocal = sessionmaker(bind=engine)
 
-@app.get("/users")
-def list_users():
-    with engine.connect() as conn:
-        rows = conn.execute(text("SELECT * FROM users")).fetchall()
-        conn.commit()
-    return [dict(r._mapping) for r in rows]
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+app = FastAPI()
+
+@app.get("/users/{user_id}")
+def get_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.execute(select(User).where(User.id == user_id)).scalar_one()
+    return {"id": user.id, "name": user.name}
 ```
 
-For maximum SQLAlchemy performance, use autocommit execution:
+Measured (select-by-id, w8 sync / w12 async, c64, same app under both engines — full matrix in `benchmarks/matrix/report.html`):
+
+| Variant | fastapi-turbo | FastAPI (uvicorn) |
+|---------|---------------|-------------------|
+| ORM Session · psycopg3 sync | 28.8k req/s | 15.2k req/s |
+| Core (no ORM) · psycopg3 sync | 36.8k req/s | 17.9k req/s |
+| raw psycopg3 (no SQLAlchemy) | 46.3k req/s | 20.3k req/s |
+| ORM AsyncSession · asyncpg | 35.0k req/s | 23.6k req/s |
+| ORM AsyncSession · psycopg3 async | 29.5k req/s | 20.7k req/s |
+
+The ORM ladder (raw → Core → ORM) costs the same fraction under both engines — that's SQLAlchemy CPU, not a turbo artifact. On hot read paths prefer Core or the raw pool; for async ORM prefer `+asyncpg`. For 1-round-trip reads, use autocommit execution:
 
 ```python
-with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-    rows = conn.execute(text("SELECT * FROM users")).fetchall()
+engine = create_engine("postgresql+psycopg://user@localhost/mydb",
+                       isolation_level="AUTOCOMMIT")  # reads = 1 wire round trip
 ```
+
+`create_pool()` from `fastapi_turbo.db` returns a standard psycopg3 `ConnectionPool` and coexists with SQLAlchemy engines in the same app.
 
 ### Performance tips
 
 - **Use `def` handlers** (not `async def`) for DB-heavy endpoints — sync is 2-3x faster than async for sequential queries
 - **Use psycopg3** (not psycopg2 or asyncpg) — pipeline + autocommit + fastest sync driver
+- **SQLAlchemy**: works out of the box (sync + async, ORM + Core). ORM Session costs ~1.6x vs the raw driver at saturation (measured, both engines) — use Core or the raw pool on hot read paths, `isolation_level="AUTOCOMMIT"` for 1-RTT reads, `+asyncpg` for async ORM
 - **Pipeline Postgres** when running 4+ queries: `with conn.pipeline(): results = [conn.execute(q) for q in queries]`
 - **Pipeline Redis** when running 2+ commands: `with cache.pipeline() as p: [p.get(k) for k in keys]; p.execute()`
 - **Use `create_pool()`** from `fastapi_turbo.db` — enables autocommit by default (saves 5μs per request)

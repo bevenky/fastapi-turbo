@@ -21,7 +21,7 @@ and `tests/test_plain_import_stack.py` (live third-party stack under one
 | file | role |
 |---|---|
 | `app.py` | canonical contract app (turbo + uvicorn run the SAME module) |
-| `app_db.py` | deep DB/Redis contract app (driver matrix + writes x commit) |
+| `app_db.py` | deep DB/Redis contract app (driver matrix + SQLAlchemy ORM/Core + writes x commit) |
 | `run_matrix.py` | conn=1 latency + conn=8 throughput → `results_matrix.json` |
 | `bench_throughput.py` | fair all-core throughput + CPU accounting → `results_throughput.json` |
 | `run_db_matrix.py` | deep PG/Redis matrix → `results_db.json` |
@@ -86,6 +86,17 @@ and `tests/test_plain_import_stack.py` (live third-party stack under one
   checkout/return overhead, not the server. This is an app-level choice and
   applies equally under uvicorn — per-task/worker dedicated connections are
   markedly cheaper than the shared pool for hot paths.
+- **SQLAlchemy 2.0: out of the box, and the ORM tax is engine-independent.**
+  `/sqla/*` rows (isolated boots `pgm-sqla-sync` w8 / `pgm-sqla-async` w12,
+  engines on `isolation_level="AUTOCOMMIT"` for 1-RTT read parity with the
+  raw rows, statements built per request). Measured select-one ladder,
+  turbo: raw pg3sync 46.3k → Core 36.8k → ORM Session 28.8k req/s
+  (≈ +5.6µs/req for Core compile+result, ≈ +7.6µs/req for Session/identity
+  map); uvicorn shows the same ladder (20.3k → 17.9k → 15.2k). Async ORM:
+  asyncpg 35.0k vs psycopg3-async 29.5k under turbo — asyncpg stays the
+  async pick with the ORM too. Smoke-verified: session-per-request via
+  `Depends` (generator deps), `app.run()` w1 byte-identical to uvicorn
+  across all three engines.
 
 ## Worker-count policy (each-at-its-best)
 
