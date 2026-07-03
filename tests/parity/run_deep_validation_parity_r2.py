@@ -990,6 +990,10 @@ def all_cases() -> List[Case]:
     add("V012", "post", "/b/dict-users", "valid dict users",
         json={"users": {"alice": {"name": "a",
                                   "address": {"zip": 1, "street": "s"}}}})
+    # Folded from R1 (B081, the one R1 case not already subsumed here):
+    # JSON-mode lax bool coercion — string "true" must COERCE and 200.
+    add("V013", "post", "/b/bool", "bool str-true coerces (lax, ex-R1 B081)",
+        json={"flag": "true"})
 
     # ===========================================================
     # EXTRA DEPTH: repeat key error types across every location so
