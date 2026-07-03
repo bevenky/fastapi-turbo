@@ -16,6 +16,10 @@ close cleanly on disconnect — byte-identical across all 5 servers).
 Connection targets (shared by all 5 servers):
   Postgres: host=127.0.0.1 port=5432 dbname=fastapi_turbo_bench user=venky
   Redis:    redis://127.0.0.1:6379  (key ``bench:item`` pre-seeded)
+
+Shim contract: the ONLY fastapi_turbo line is the engine-selection import
+below — every other import is plain ``from fastapi import ...`` or
+third-party (redis-py, asyncpg, psycopg).
 """
 from __future__ import annotations
 

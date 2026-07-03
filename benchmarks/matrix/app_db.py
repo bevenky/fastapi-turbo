@@ -21,6 +21,13 @@ turbo's multiprocess (one pool PER worker) vs Go/Node's single shared pool an
 explicit, documented asymmetry — see report notes.
 
 Engine: BENCH_ENGINE=turbo → app.run() (Rust door); else uvicorn (real FastAPI).
+
+Shim contract: the ONLY fastapi_turbo import is the engine-selection line
+below — everything else is plain ``from fastapi import ...`` + third-party
+drivers (redis-py, asyncpg, psycopg3/2). Single documented EXCEPTION, kept in
+its own fenced section below: the OPT-IN ``fastapi_turbo.contrib_redis`` mux
+client rows (/redis/mux/*), which exist to benchmark that opt-in extension
+itself.
 """
 from __future__ import annotations
 
@@ -149,6 +156,12 @@ async def async_redis():
     return _pools["ra"]
 
 
+# ═════════════════════════════════════════════════════════════════════
+# OPT-IN TURBO EXTENSION — fastapi_turbo.contrib_redis (mux client).
+# The ONE sanctioned exception to this file's plain-import contract: these
+# helpers + the /redis/mux/* routes benchmark the opt-in multiplexed RESP2
+# client itself. Nothing outside this fence may touch fastapi_turbo.
+# ═════════════════════════════════════════════════════════════════════
 def _mux_module():
     # fastapi_turbo.contrib_redis is framework-neutral (stdlib + optional
     # hiredis).  Under BENCH_ENGINE=turbo the package is already imported;
@@ -387,6 +400,7 @@ async def r_get_a():
     return Response(content=await r.get(RKEY), media_type="application/json")
 
 
+# ── OPT-IN turbo extension rows (see the contrib_redis fence above) ──
 # "turbo mux client" row: fastapi_turbo.contrib_redis — ONE multiplexed
 # RESP2 socket per event loop (the ioredis topology), commands interleaved
 # in flight, writes batched per loop tick.  Fairness: pure asyncio, runs

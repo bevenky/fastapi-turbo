@@ -5,6 +5,17 @@ Fair, audited benchmarks of **fastapi-turbo** (Rust door, `app.run()`) vs
 All five servers implement the same endpoint CONTRACT (see `app.py` docstring):
 byte-comparable responses, identical DB/Redis targets.
 
+The Python apps (`app.py`, `app_db.py`, `app_async_probe.py`) also follow the
+**shim import contract**: their ONLY `fastapi_turbo` line is the
+`BENCH_ENGINE=turbo` engine-selection import — everything else is plain
+`from fastapi import ...` plus third-party drivers (redis-py, asyncpg,
+psycopg3/2), and the SAME module runs unmodified under uvicorn. One sanctioned,
+fenced exception: the opt-in `fastapi_turbo.contrib_redis` mux-client rows
+(`/redis/mux/*` in `app_db.py`), which benchmark that extension itself.
+This contract is enforced by `tests/test_shim_completeness.py` (import matrix)
+and `tests/test_plain_import_stack.py` (live third-party stack under one
+`app.run()` boot).
+
 ## Files
 
 | file | role |
