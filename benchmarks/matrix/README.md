@@ -91,7 +91,70 @@ byte-comparable responses, identical DB/Redis targets.
 
 - **Large JSON**: the payload dict/list is rebuilt in *user code* per request
   (contract requirement). That build dominates; the serializer is not the
-  bottleneck.
+  bottleneck. Full arithmetic below.
+
+### Large-JSON conn=1 floor math (why <100µs is not physics-available)
+
+`GET /json/large` = 1000-item dict (28,791 B), rebuilt per request per the
+contract. Measured 2026-07-02, release build, SOLO-BOOT, medians of 3
+(p50, conn=1, `fastapi-turbo-bench`):
+
+| component                              | µs    | how measured                       |
+|----------------------------------------|-------|------------------------------------|
+| user dict build (`_large_list()`)      | 75.3  | in-process, median of 9×500 reps   |
+| `orjson.dumps` on that dict            | 31.8  | in-process, median of 7 reps       |
+| wire + HTTP + 28.8 KB loopback transfer| ~36   | `/_ping` p50 20.5 + ~16 transfer   |
+| framework (door)                       | <1.5  | audited previously                 |
+| **observed end-to-end p50**            | **144** | sums to ~144.6 — fully accounted |
+
+Reference points same session: `/_ping` 20.5µs, `/hello` 25µs,
+`POST /items` 29µs. Cross-framework: Fastify 57µs (V8 builds *and*
+stringifies the object in ~24µs total — JIT'd object construction is ~5x
+CPython dict building), fair-Gin 114-120µs.
+
+**The bound**: even with a ZERO-cost serializer, 75.3 (build) + ~37
+(wire+framework) ≈ **112µs > 100µs**. Sub-100 at conn=1 is impossible
+without touching the user-side build, no matter what the framework or
+serializer does. What *would* get there:
+
+- **User-side change** (contract-breaking): cache the dict → ~69µs; cache
+  pre-encoded bytes → ~40-45µs. Real apps with static-ish payloads should
+  do exactly this.
+- **A ~2x faster CPython build** (JIT good enough on dict+f-string
+  comprehensions, or building the payload in native code). 3.14's
+  experimental JIT is nowhere near 2x here; free-threading measured 2-4x
+  *slower*.
+- Serializer swaps alone cap out at −11µs (below): 144 → ~133µs. Not enough.
+
+### msgspec-instead-of-orjson: measured, rejected (byte parity)
+
+`msgspec.json.encode` (0.21.1) is genuinely faster than `orjson.dumps` on
+the contract payloads — large dict 20.8µs vs 31.8µs (0.65x), `/hello` dict
+26ns vs 49ns — and byte-identical on every JSON-native contract case
+(1000-item dict, unicode incl. astral, i64 edges, None/bool, nested lists,
+floats in non-exponent range). Wiring it as the door's preferred dict
+serializer is still rejected — it SILENTLY diverges from the
+orjson+`_json_default` path (which was aligned byte-for-byte with real
+FastAPI) on types it handles natively, *before* the enc_hook can run:
+
+| type                    | orjson path (door today)      | msgspec               |
+|-------------------------|-------------------------------|-----------------------|
+| float ≥ 1e16            | `1e+16` (= FastAPI/stdlib)    | `1e16`                |
+| UTC datetime            | `+00:00` (= FastAPI)          | `Z`                   |
+| timedelta               | `90` via `_json_default`      | `"PT90S"` (ISO dur)   |
+| bytes/bytearray         | UTF-8 str via `_json_default` | base64                |
+| Decimal                 | number via Rust fallback      | `"1.10"` string       |
+| str/int subclasses      | native value (`"x"`, `5`)     | enc_hook → `vars()` → `{}` (data loss) |
+
+(Non-UTC tz offsets, date/time/UUID/dataclass/enum/set/NaN/Inf: identical.
+0.21.1 has no encoder options to fix any of the divergent rows.)
+
+The "restrict msgspec to clean dicts" fallback is uneconomic: any correct
+guard must visit every node with exact-type + float-range checks through
+the same C-API traversal that dominates encode cost. msgspec's whole encode
+is ~7ns/node; its margin over orjson is only ~3.6ns/node — a pre-scan burns
+the margin. Verdict: keep orjson; the serializer is not the reason
+/json/large sits at 144µs, and 11µs is not worth silent byte divergence.
 - **Python CPU work**: 1 core per process, period (GIL). Multi-worker gets
   throughput, never per-request latency. Free-threaded Python measured
   2-4x SLOWER on this workload — not a fix.
