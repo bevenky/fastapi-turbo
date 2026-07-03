@@ -155,6 +155,27 @@ the same C-API traversal that dominates encode cost. msgspec's whole encode
 is ~7ns/node; its margin over orjson is only ~3.6ns/node — a pre-scan burns
 the margin. Verdict: keep orjson; the serializer is not the reason
 /json/large sits at 144µs, and 11µs is not worth silent byte divergence.
+- **PG sync throughput (all-core)**: turbo 58.3k req/s = **95%** of
+  raw-axum's 61.4k on this box (58,291 / 61,411, `pg item sync`,
+  results_throughput.json). That is the compiled-driver ceiling — the +30%
+  a from-scratch Rust stack suggests is NOT available on shared-box
+  hardware, where the HTTP client, the server, and the Postgres backends
+  all compete for the same 18 cores.
+- **PG conn=1 latency**: wire RTT ~20µs + asyncpg ~36µs/op + door ~23µs
+  ≈ 79µs — fully accounts for turbo's observed 71-73µs `pg item` rows
+  (components overlap slightly). raw-axum pays 44-47µs for the same query
+  with a compiled driver (tokio-postgres); the delta is driver +
+  interpreter cost, not framework overhead.
+- **WS RTT (Python handler)**: turbo 24.2µs true-server p50 (Rust client)
+  vs Gin 15.3µs is the Python-handler floor: inbound wake (hop1) + 2 GIL
+  attaches (receive + send) + interpreter resume ≈ 5-8µs per message. The
+  pure-Rust echo path (no Python handler in the loop) measures at axum
+  level — it exists for echo-shaped protocols; see benchmarks.md
+  "WebSocket Library Comparison (pure Rust echo)".
+- **Box confound (all fleet rows)**: client + server + Postgres + Redis
+  share one 18-core box. Fleet/throughput rows are comparative — every
+  framework carries the same handicap — not absolute capacity for any of
+  them.
 - **Python CPU work**: 1 core per process, period (GIL). Multi-worker gets
   throughput, never per-request latency. Free-threaded Python measured
   2-4x SLOWER on this workload — not a fix.

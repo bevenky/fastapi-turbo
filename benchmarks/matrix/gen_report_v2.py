@@ -378,7 +378,10 @@ td.lanecell {{ min-width:190px; text-align:left; padding-left:22px; }}
     <span class="cond">p50 µs · conn=1 · lower is better</span></div>
   {metric_table(LAT_ROWS, get_lat, fmt_us, "low", "p50 µs",
      "Large-JSON gap is the handler's own Python dict build (70 µs of the row, measured) — framework share is under 1 µs. "
-     "Gin builds its payload per request since 5e02d66 (it was serving a startup-cached copy).")}
+     "Gin builds its payload per request since 5e02d66 (it was serving a startup-cached copy). "
+     "<b>Postgres conn=1 floor</b>: wire RTT ~20 µs + asyncpg ~36 µs/op + door ~23 µs ≈ the observed turbo row; "
+     "axum pays 44-47 µs with a compiled driver — the delta is driver + interpreter cost, not framework. "
+     "Full floor arithmetic (incl. the large-JSON build math) in benchmarks/matrix/README.md § Known floors.")}
 </section>
 
 <section>
@@ -386,7 +389,11 @@ td.lanecell {{ min-width:190px; text-align:left; padding-left:22px; }}
     <span class="cond">req/s · c={esc(tpm.get("conc"))} · workers={esc(tpm.get("workers"))} (async groups {esc(tpm.get("async_workers", 12))}) · higher is better</span></div>
   {metric_table(TP_ROWS, get_tp, fmt_rps, "high", "req/s",
      "Each framework at its best: turbo/uvicorn multiprocess, Fastify cluster, Gin/axum native all-core. "
-     "Python async groups run their measured-best worker count — same policy as driver choice.")}
+     "Python async groups run their measured-best worker count — same policy as driver choice. "
+     "<b>pg item sync floor</b>: turbo 58.3k = 95% of raw-axum's 61.4k — the compiled-driver ceiling on this box; "
+     "a further +30% is not available on shared-box hardware. "
+     "<b>Box confound</b>: client + server + Postgres + Redis share the same 18 cores — "
+     "fleet rows are comparative, not absolute capacity.")}
 </section>
 
 <section>
@@ -394,7 +401,8 @@ td.lanecell {{ min-width:190px; text-align:left; padding-left:22px; }}
     <span class="cond">req/s · c={esc(dbm.get("conc"))} · engine-best drivers · higher is better</span></div>
   {metric_table([("Reads · 1 wire round trip in every framework", PG_READS)], get_db, fmt_rps, "high", "req/s")}
   {metric_table([("Writes · explicit transaction · commit=true is WAL-fsync durable", PG_WRITES)], get_db, fmt_rps, "high", "req/s",
-     "All frameworks' commit=true rows sit on Postgres's WAL-fsync group-commit floor for this disk — the honest ceiling for durable writes.")}
+     "All frameworks' commit=true rows sit on Postgres's WAL-fsync group-commit floor for this disk — the honest ceiling for durable writes. "
+     "The Postgres backends run on the same 18 cores as client and server (box confound) — rows are comparative, not absolute capacity.")}
 </section>
 
 <section>
@@ -425,7 +433,10 @@ td.lanecell {{ min-width:190px; text-align:left; padding-left:22px; }}
   Python-client rows include ~12-25 µs of client overhead. Direct-send (default on) writes outbound frames inline —
   no select-task wake — cutting server p99 20%. Fleet throughput is client-bounded; per-worker with an unconstrained
   client, turbo's thread mode measures <b>622k msg/s</b>. Loop-residency mode (FASTAPI_TURBO_WS_LOOP) trades +16 µs
-  p50 for steadier p99 and fixes a receive-then-await hang.</p>
+  p50 for steadier p99 and fixes a receive-then-await hang.
+  <b>Floor</b>: turbo 24.2 µs true-server p50 vs Gin 15.3 is the Python-handler floor — inbound wake (hop1)
+  + 2 GIL attaches (receive + send) + interpreter resume ≈ 5-8 µs per message. The pure-Rust echo path
+  (no Python handler) measures at axum level — it exists for echo-shaped protocols.</p>
 </section>
 
 <div class="cert">
