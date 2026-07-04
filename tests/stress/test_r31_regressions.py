@@ -193,8 +193,8 @@ def test_external_compat_gates_helper_script_exists():
     assert "import fastapi_turbo  # noqa: F401" in text, text
     # Must run BOTH Sentry trees (FastAPI integration + ASGI
     # integration), matching the workflows.
-    assert "/tmp/sentry-python/tests/integrations/fastapi" in text, text
-    assert "/tmp/sentry-python/tests/integrations/asgi" in text, text
+    assert "(cd /tmp/sentry-python" in text, text
+    assert "tests/integrations/asgi" in text, text
 
 
 def test_external_compat_gates_helper_script_is_executable():

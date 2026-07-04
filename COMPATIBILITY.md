@@ -26,13 +26,13 @@ Snapshot counts shift as new regression tests land. Replace numbers with what `s
     parent run; they're reliable in isolation, run them via
     `pytest tests/stress/test_r3{3,6,7}_regressions.py` directly):
     1. *True sandbox + FORCE env var* — every bind raises AND
-       `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`: 945 pass, 206 skipped.
+       `FASTAPI_TURBO_FORCE_LOOPBACK_DENIED=1`: 959 pass, 232 skipped.
        The conftest collection hooks (suite-level + parity-level)
        both honour the FORCE env var (R33), so this scenario also
        covers a dev box where the auditor wants the bucket-#1
        numbers without having to actually deny bind at the kernel.
     2. *Forced-fail bind only* — monkey-patched `socket.socket.bind`
-       to raise `PermissionError`, no env var: 945 pass, 206 skipped
+       to raise `PermissionError`, no env var: 959 pass, 232 skipped
        (same as #1 — the suite-level probe hits the patched bind
        first, propagates `LOOPBACK_DENIED=True`, parity collection
        hook also detects it).
