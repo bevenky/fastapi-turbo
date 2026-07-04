@@ -131,7 +131,7 @@ def test_ci_workflow_external_gates_are_blocking():
     assert "|| echo" not in ci_text, ci_text
     # 3. The canonical script must keep the pinning + force-reset
     #    contract for both external trees.
-    assert 'UPSTREAM_TAG="0.136.0"' in script_text, script_text
+    assert 'UPSTREAM_TAG="0.138.1"' in script_text, script_text
     assert 'SENTRY_TAG="2.42.0"' in script_text, script_text
     assert "git -C /tmp/fastapi_upstream" in script_text and "reset --hard" in script_text, (
         "canonical script must force-reset /tmp/fastapi_upstream to the pin"

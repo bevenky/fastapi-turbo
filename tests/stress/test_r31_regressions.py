@@ -184,7 +184,7 @@ def test_external_compat_gates_helper_script_exists():
     text = script.read_text()
     # Must pin both upstream FastAPI and Sentry to the same tags
     # the workflows use.
-    assert 'UPSTREAM_TAG="0.136.0"' in text, text
+    assert 'UPSTREAM_TAG="0.138.1"' in text, text
     assert 'SENTRY_TAG="2.42.0"' in text, text
     # Must force-reset (not lazy-skip) on both.
     assert "git -C /tmp/fastapi_upstream reset --hard" in text, text

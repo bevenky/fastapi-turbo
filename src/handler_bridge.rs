@@ -78,8 +78,7 @@ impl SubmitGate {
     /// and re-attached each signal slice.
     #[pyo3(signature = (timeout=None))]
     fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<bool> {
-        let deadline =
-            timeout.map(|t| Instant::now() + Duration::from_secs_f64(t.max(0.0)));
+        let deadline = timeout.map(|t| Instant::now() + Duration::from_secs_f64(t.max(0.0)));
         loop {
             let outcome = py.detach(|| {
                 let mut done = self.state.lock().unwrap();
@@ -99,10 +98,7 @@ impl SubmitGate {
                             _ => GateWait::CheckSignals,
                         };
                     }
-                    let (guard, _) = self
-                        .cond
-                        .wait_timeout(done, park_until - now)
-                        .unwrap();
+                    let (guard, _) = self.cond.wait_timeout(done, park_until - now).unwrap();
                     done = guard;
                 }
             });

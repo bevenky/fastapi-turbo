@@ -143,7 +143,7 @@ def test_release_workflow_runs_websocket_parity_upstream_sentry_gates():
     assert "scripts/run_external_compat_gates.sh fastapi" in rel_text, rel_text
     assert "scripts/run_external_compat_gates.sh sentry" in rel_text, rel_text
     # Pin contract lives in the script (single source of truth).
-    assert 'UPSTREAM_TAG="0.136.0"' in script_text, script_text
+    assert 'UPSTREAM_TAG="0.138.1"' in script_text, script_text
     assert "git -C /tmp/fastapi_upstream" in script_text and "reset --hard" in script_text, script_text
     assert 'SENTRY_TAG="2.42.0"' in script_text, script_text
     assert "/tmp/sentry-python/tests/integrations/fastapi" in script_text, script_text

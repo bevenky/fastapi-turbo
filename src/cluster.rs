@@ -430,7 +430,10 @@ mod tests {
         server_end.write_all(b"pong").await.unwrap();
         let mut back = [0u8; 4];
         client.read_exact(&mut back).await.unwrap();
-        assert_eq!(&back, b"pong", "bytes did not round-trip through the passed fd");
+        assert_eq!(
+            &back, b"pong",
+            "bytes did not round-trip through the passed fd"
+        );
     }
 
     /// End-to-end: acceptor + one worker serving a real Axum router. An HTTP GET
@@ -450,24 +453,23 @@ mod tests {
         let acc_ready = Arc::new(AtomicBool::new(true));
         let (acc_tx, acc_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
-            let _ = run_acceptor(
-                tcp,
-                unix,
-                acc_ready,
-                Duration::from_secs(2),
-                async { let _ = acc_rx.await; },
-            )
+            let _ = run_acceptor(tcp, unix, acc_ready, Duration::from_secs(2), async {
+                let _ = acc_rx.await;
+            })
             .await;
         });
 
         // Worker with a trivial router.
-        let router = axum::Router::new()
-            .route("/hi", axum::routing::get(|| async { "hello-via-fd-pass" }));
+        let router =
+            axum::Router::new().route("/hi", axum::routing::get(|| async { "hello-via-fd-pass" }));
         let w_ready = Arc::new(AtomicBool::new(false));
         let (w_tx, w_rx) = tokio::sync::oneshot::channel::<()>();
         let path = sock_path.clone();
         tokio::spawn(async move {
-            let _ = run_worker(&path, router, w_ready, async { let _ = w_rx.await; }).await;
+            let _ = run_worker(&path, router, w_ready, async {
+                let _ = w_rx.await;
+            })
+            .await;
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -479,7 +481,10 @@ mod tests {
         let mut resp = Vec::new();
         conn.read_to_end(&mut resp).await.unwrap();
         let text = String::from_utf8_lossy(&resp);
-        assert!(text.contains("200 OK"), "expected 200 via fd-pass, got: {text}");
+        assert!(
+            text.contains("200 OK"),
+            "expected 200 via fd-pass, got: {text}"
+        );
         assert!(
             text.contains("hello-via-fd-pass"),
             "router body not served over the fd-passed connection: {text}"

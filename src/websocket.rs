@@ -52,7 +52,11 @@ use tokio::sync::mpsc;
 /// commands: Close, flush, fallback data frames) and direct senders
 /// (`send_text`/`send_bytes` fast path). `None` before the upgrade completes
 /// and after teardown.
-type WsSink = Arc<tokio::sync::Mutex<Option<futures_util::stream::SplitSink<axum::extract::ws::WebSocket, Message>>>>;
+type WsSink = Arc<
+    tokio::sync::Mutex<
+        Option<futures_util::stream::SplitSink<axum::extract::ws::WebSocket, Message>>,
+    >,
+>;
 
 /// Cached `fastapi_turbo.exceptions.WebSocketDisconnect` class — used by the
 /// receive awaitables to raise the correct typed exception without the
@@ -871,7 +875,12 @@ impl PyWebSocket {
     /// waiter `reserve()`s a slot, delivers the pending command itself (order
     /// preserved: the handler task is suspended on the Future until then) and
     /// resolves it via `call_soon_threadsafe`.
-    fn queue_send(&self, py: Python<'_>, msg: Message, msg_len: usize) -> PyResult<Option<Py<PyAny>>> {
+    fn queue_send(
+        &self,
+        py: Python<'_>,
+        msg: Message,
+        msg_len: usize,
+    ) -> PyResult<Option<Py<PyAny>>> {
         let msg = if ws_direct_enabled() && self.queued.load(Ordering::Acquire) == 0 {
             // Write coalescing: when the handler ALREADY has more inbound
             // frames waiting (batch buffer or channel), it will come
@@ -927,8 +936,9 @@ impl PyWebSocket {
         self.queued.fetch_add(1, Ordering::AcqRel);
         match &self.tx {
             WsCmdTx::Unbounded(tx) => {
-                tx.send(WriterCmd::Send(msg))
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("WS send: {e}")))?;
+                tx.send(WriterCmd::Send(msg)).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("WS send: {e}"))
+                })?;
                 Ok(None)
             }
             WsCmdTx::Bounded(tx) => match tx.try_send(WriterCmd::Send(msg)) {
@@ -998,8 +1008,7 @@ impl PyWebSocket {
                             return;
                         }
                         Err(mpsc::error::TrySendError::Full(cmd)) => {
-                            let rest: Vec<WriterCmd> =
-                                std::iter::once(cmd).chain(iter).collect();
+                            let rest: Vec<WriterCmd> = std::iter::once(cmd).chain(iter).collect();
                             let Some(rt) = self.rt.as_ref() else {
                                 for cmd in rest {
                                     if let WriterCmd::Flush(ack) = cmd {
@@ -1205,7 +1214,6 @@ impl PyWebSocket {
         Ok(dict)
     }
 
-
     // ── Async receive — returns cached awaitable per return-type ───
 
     /// Returns the ASGI dict awaitable (for `await ws.receive()`).
@@ -1251,12 +1259,10 @@ impl PyWebSocket {
         code: Option<u16>,
         reason: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        let close_cmd = WriterCmd::Send(Message::Close(Some(
-            axum::extract::ws::CloseFrame {
-                code: code.unwrap_or(1000),
-                reason: reason.unwrap_or_default().into(),
-            },
-        )));
+        let close_cmd = WriterCmd::Send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: code.unwrap_or(1000),
+            reason: reason.unwrap_or_default().into(),
+        })));
         self.state.store(STATE_DISCONNECTED, Ordering::Release);
         if self.loop_mode {
             let fut = create_loop_future(py)?;
@@ -1302,7 +1308,6 @@ impl CloseAwaitable {
         Err(pyo3::exceptions::PyStopIteration::new_err(py.None()))
     }
 }
-
 
 // ── Python handler bridge ─────────────────────────────────────────
 
@@ -1710,4 +1715,3 @@ pub async fn handle_ws_upgrade(
 
     response
 }
-

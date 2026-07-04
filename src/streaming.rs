@@ -149,8 +149,7 @@ pub fn create_streaming_response(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Resp
     // wrapper's own code object is shared across every wrapped route and
     // would alias verdicts). Resolved while `iter_bound` is still bound.
     let coop_code: Option<Py<PyAny>> =
-        if !drained_complete && is_async && !noawait && !legacy_forced && trampoline_supported()
-        {
+        if !drained_complete && is_async && !noawait && !legacy_forced && trampoline_supported() {
             stream_code_key(py, obj, &iter_bound)
         } else {
             None
@@ -668,8 +667,7 @@ fn stream_trampoline_enabled() -> bool {
 /// Set once when the runtime can't support the trampoline (Python < 3.12
 /// eager_start, or an event-loop class without `_thread_id`) — cheaper than
 /// re-raising per stream.
-static TRAMPOLINE_BROKEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static TRAMPOLINE_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn trampoline_supported() -> bool {
     stream_trampoline_enabled() && !TRAMPOLINE_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
@@ -1030,7 +1028,10 @@ fn stream_task_spawner(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
 /// The canonical Python bool singleton as an owned `Py<PyAny>` — the driver
 /// discriminates the push result via `is True` / `is False`.
 fn py_bool(py: Python<'_>, v: bool) -> Py<PyAny> {
-    pyo3::types::PyBool::new(py, v).to_owned().into_any().unbind()
+    pyo3::types::PyBool::new(py, v)
+        .to_owned()
+        .into_any()
+        .unbind()
 }
 
 /// Capture a streaming exception onto the GIVEN app's
@@ -1122,10 +1123,8 @@ impl LoopChunkPush {
                         Err(_) => false,
                     };
                     Python::attach(|py| {
-                        let _ = call_soon.call1(
-                            py,
-                            (resolver.bind(py), fut_for_waiter.bind(py), ok),
-                        );
+                        let _ =
+                            call_soon.call1(py, (resolver.bind(py), fut_for_waiter.bind(py), ok));
                     });
                 });
                 Ok(fut)
@@ -1218,10 +1217,7 @@ fn start_stream_task_on_loop(
             return Err(e);
         }
     };
-    match spawner.call1(
-        py,
-        (loop_obj.bind(py), coro.bind(py), completer.bind(py)),
-    ) {
+    match spawner.call1(py, (loop_obj.bind(py), coro.bind(py), completer.bind(py))) {
         Ok(eager_clean) => {
             // Runtime-coop verdict (Mechanism 3): True ⇔ the eager start ran
             // the whole stream to clean completion — the gen never yielded
@@ -1434,7 +1430,9 @@ fn iterate_async_generator(
     let runner_coro = match (|| -> PyResult<Py<PyAny>> {
         let responses = py.import("fastapi_turbo.responses")?;
         let drive = responses.getattr("_drive_stream")?;
-        Ok(drive.call1((iterator.bind(py), push.clone_ref(py)))?.unbind())
+        Ok(drive
+            .call1((iterator.bind(py), push.clone_ref(py)))?
+            .unbind())
     })() {
         Ok(c) => c,
         Err(e) => {
@@ -1497,7 +1495,10 @@ fn iterate_async_generator_inline(
     tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     pending: Option<Py<PyAny>>,
 ) {
-    let aiter = match iterator.bind(py).call_method0(pyo3::intern!(py, "__aiter__")) {
+    let aiter = match iterator
+        .bind(py)
+        .call_method0(pyo3::intern!(py, "__aiter__"))
+    {
         Ok(a) => a,
         Err(e) => {
             eprintln!("fastapi-turbo: inline stream __aiter__ failed: {e}");
@@ -1547,12 +1548,7 @@ fn iterate_async_generator_inline(
             // The gen SUSPENDED (returned a value) — the proven-no-await path
             // shouldn't reach here, but resume the SAME started coro correctly.
             Ok(_yielded) => {
-                match resume_suspended_anext(
-                    py,
-                    &coro,
-                    &mut loop_obj,
-                    &mut resume_helper,
-                ) {
+                match resume_suspended_anext(py, &coro, &mut loop_obj, &mut resume_helper) {
                     Ok(Some(c)) => c,
                     Ok(None) => break, // StopAsyncIteration — done
                     Err(e) => {
