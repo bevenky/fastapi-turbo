@@ -8,7 +8,10 @@ python-multipart) were installed incidentally via dev extras.
 from __future__ import annotations
 
 import pathlib
-import tomllib
+try:
+    import tomllib  # stdlib on 3.11+
+except ImportError:  # Python 3.10 — the pyproject floor
+    import tomli as tomllib  # type: ignore[no-redef]
 
 
 def _read_pyproject():

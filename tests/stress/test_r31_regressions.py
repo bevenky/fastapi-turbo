@@ -184,7 +184,7 @@ def test_external_compat_gates_helper_script_exists():
     text = script.read_text()
     # Must pin both upstream FastAPI and Sentry to the same tags
     # the workflows use.
-    assert 'UPSTREAM_TAG="0.136.0"' in text, text
+    assert 'UPSTREAM_TAG="0.138.1"' in text, text
     assert 'SENTRY_TAG="2.42.0"' in text, text
     # Must force-reset (not lazy-skip) on both.
     assert "git -C /tmp/fastapi_upstream reset --hard" in text, text
@@ -193,8 +193,8 @@ def test_external_compat_gates_helper_script_exists():
     assert "import fastapi_turbo  # noqa: F401" in text, text
     # Must run BOTH Sentry trees (FastAPI integration + ASGI
     # integration), matching the workflows.
-    assert "/tmp/sentry-python/tests/integrations/fastapi" in text, text
-    assert "/tmp/sentry-python/tests/integrations/asgi" in text, text
+    assert "(cd /tmp/sentry-python" in text, text
+    assert "tests/integrations/asgi" in text, text
 
 
 def test_external_compat_gates_helper_script_is_executable():

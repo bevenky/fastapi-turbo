@@ -214,6 +214,14 @@ def test_compat_md_doc_count_isnt_off_by_more_than_one():
     """R34's drift detector allowed ±5 drift; R37 saw the
     happy-path count drift to 1004 while the doc still said 1003.
     Tighten to ±2 so the doc tracks within noise tolerance."""
+    import sys as _sys
+
+    if _sys.version_info[:2] != (3, 14):
+        pytest.skip(
+            "COMPATIBILITY.md counts document the 3.14 dev/CI leg; "
+            "version-specific skips shift counts on other interpreters"
+        )
+
     import re
 
     compat = (

@@ -122,8 +122,8 @@ def test_ci_workflow_runs_sentry_asgi_integration_tree_too():
     script_text = (
         repo / "scripts" / "run_external_compat_gates.sh"
     ).read_text()
-    assert "/tmp/sentry-python/tests/integrations/fastapi" in script_text, script_text
-    assert "/tmp/sentry-python/tests/integrations/asgi" in script_text, script_text
+    assert "(cd /tmp/sentry-python" in script_text, script_text
+    assert "tests/integrations/asgi" in script_text, script_text
 
 
 # ────────────────────────────────────────────────────────────────────

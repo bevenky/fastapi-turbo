@@ -1658,8 +1658,7 @@ pub fn build_router(routes: Vec<RouteInfo>) -> (Router, Router) {
                             native.getattr("validate_json").ok().map(|m| m.unbind())
                         });
                         param.cached_validator = cached;
-                    } else if param.cached_validator.is_none() && param.scalar_validator.is_some()
-                    {
+                    } else if param.cached_validator.is_none() && param.scalar_validator.is_some() {
                         // NON-model body (typed dict / container / scalar via the
                         // field TypeAdapter): wrap the adapter in the FA-shaping
                         // two-pass validator. Real FastAPI parses the body with
@@ -2261,7 +2260,12 @@ impl InlineJob {
 
 /// Loop-thread body of the job: ctxvar seed → extraction → injection →
 /// coroutine → `loop.create_task` → completer wiring (+ optional timeout timer).
-fn run_inline_job(py: Python<'_>, state: &Arc<RouteState>, parts: InlineParts, reply: &InlineReply) {
+fn run_inline_job(
+    py: Python<'_>,
+    state: &Arc<RouteState>,
+    parts: InlineParts,
+    reply: &InlineReply,
+) {
     // Loop-thread TL guard: the single worker loop interleaves EVERY in-flight
     // request between this synchronous block and the done-callback, so the
     // per-request thread-locals must never survive past this function.
@@ -2462,9 +2466,7 @@ impl InlineSend {
                 injected_resp: self.injected_resp.as_ref().map(|o| o.clone_ref(py)),
             });
         } else {
-            let _ = tx.send(LoopOutcome::Error(PyErr::from_value(
-                exc.bind(py).clone(),
-            )));
+            let _ = tx.send(LoopOutcome::Error(PyErr::from_value(exc.bind(py).clone())));
         }
     }
 
@@ -2475,9 +2477,11 @@ impl InlineSend {
     fn _timeout(&self, py: Python<'_>) {
         if let Some(tx) = self.reply.lock().ok().and_then(|mut g| g.take()) {
             let secs = self.timeout_secs.unwrap_or(f64::NAN);
-            let _ = tx.send(LoopOutcome::Error(pyo3::exceptions::PyTimeoutError::new_err(
-                format!("fastapi-turbo worker-loop submit timed out after {secs:?}s"),
-            )));
+            let _ = tx.send(LoopOutcome::Error(
+                pyo3::exceptions::PyTimeoutError::new_err(format!(
+                    "fastapi-turbo worker-loop submit timed out after {secs:?}s"
+                )),
+            ));
         }
         if let Ok(slot) = self.task.lock() {
             if let Some(task) = slot.as_ref() {

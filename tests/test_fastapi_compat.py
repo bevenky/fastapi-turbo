@@ -28,6 +28,10 @@ against the 0.138.1 clone). Deleted-as-redundant, with their upstream twins:
 
 from __future__ import annotations
 
+import sys
+
+import pytest
+
 import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
 
 
@@ -75,6 +79,10 @@ class TestStarletteCookieSignature:
         assert "Secure" in value
         assert "Max-Age=0" in value
 
+    @pytest.mark.skipif(
+        sys.version_info < (3, 14),
+        reason="http.cookies partitioned= support landed in Python 3.14",
+    )
     def test_partitioned_cookie(self):
         from fastapi.responses import Response
 

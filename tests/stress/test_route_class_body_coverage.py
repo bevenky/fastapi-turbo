@@ -5,7 +5,9 @@ heuristic), not Query.
 """
 from __future__ import annotations
 
-from typing import Optional, TypedDict, Union
+from typing import Optional, Union
+
+from typing_extensions import TypedDict  # pydantic requires this form on <3.12
 
 import fastapi_turbo  # noqa: F401
 

@@ -36,18 +36,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # one cache per python leg — PyO3 links against the specific libpython
+          key: py${{ matrix.python }}
+      - name: Create virtualenv (maturin develop requires one)
+        run: |
+          python -m venv .venv
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Install Python deps
         run: |
           python -m pip install -U pip
-          python -m pip install maturin pytest httpx "pydantic>=2" python-multipart \
-                                "websockets>=12" ruff
+          python -m pip install maturin pytest httpx "pydantic>=2" \
+                                python-multipart "websockets>=12" ruff \
+                                psutil jinja2 itsdangerous orjson uvloop ujson \
+                                "tomli; python_version < '3.11'"
           # Parity gate spawns a STOCK FastAPI subprocess (see
           # tests/parity/conftest.py — uses ``FASTAPI_TURBO_NO_SHIM
           # =1`` + ``import uvicorn``). Real upstream FastAPI +
           # uvicorn must be installed alongside fastapi-turbo so
           # fresh release runners don't fail at parity-process
           # startup. CI runs the same step.
-          python -m pip install "fastapi==0.136.0" "uvicorn[standard]>=0.30"
+          python -m pip install "fastapi==0.138.1" "uvicorn[standard]>=0.30"
       - name: Build extension (release) + install editable
         run: maturin develop --release
       - name: cargo fmt --check
@@ -71,7 +82,7 @@ jobs:
         # COMPATIBILITY.md: catches handshake / ping-pong / close
         # regressions that the in-process WS path can't reproduce.
         run: pytest tests/test_websocket.py -x -q
-      - name: pytest parity (real-loopback, FastAPI 0.136.0 diff)
+      - name: pytest parity (real-loopback, FastAPI 0.138.1 diff)
         # Release-required gate per COMPATIBILITY.md "Release
         # readiness" section. Spawns upstream FastAPI AND turbo as
         # subprocess servers and diffs the responses across 16

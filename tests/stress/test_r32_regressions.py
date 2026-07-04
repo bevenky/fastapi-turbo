@@ -33,7 +33,7 @@ def test_workflow_installs_fastapi_and_uvicorn_before_parity(workflow):
     # Pin the same upstream version COMPATIBILITY.md claims parity
     # against, so a drift in upstream FastAPI doesn't silently
     # break the gate.
-    assert '"fastapi==0.136.0"' in text, (workflow, text[:1000])
+    assert '"fastapi==0.138.1"' in text, (workflow, text[:1000])
     # uvicorn for the subprocess server (the parity conftest does
     # ``import uvicorn`` directly).
     assert "uvicorn[standard]" in text or "uvicorn" in text, workflow
