@@ -37,7 +37,8 @@ jobs:
           python -m pip install -U pip
           python -m pip install maturin pytest httpx "pydantic>=2" \
                                 python-multipart "websockets>=12" ruff \
-                                psutil jinja2 itsdangerous orjson uvloop
+                                psutil jinja2 itsdangerous orjson uvloop ujson \
+                                "tomli; python_version < '3.11'"
           # Parity gate spawns a STOCK FastAPI subprocess via
           # ``FASTAPI_TURBO_NO_SHIM=1; import uvicorn; from
           # parity_app import app`` (see tests/parity/conftest.py).
