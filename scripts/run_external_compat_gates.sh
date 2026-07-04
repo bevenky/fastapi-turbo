@@ -249,6 +249,7 @@ run_sentry_gate() {
             "pytest-asyncio"
             "python-multipart"
             "requests"
+            "brotli"
         )
         "$PYTHON_BIN" -m pip install -q "sentry-sdk[fastapi]==${SENTRY_TAG}" "${sentry_test_deps[@]}"
     fi
