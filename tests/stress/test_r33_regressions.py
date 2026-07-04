@@ -57,6 +57,14 @@ def test_compatibility_md_force_mode_count_isnt_obviously_stale():
     from new tests), but anything that's off by >5 trips this
     test — catching the order-of-magnitude doc / reality drift
     R34 found, without needing a per-batch literal update."""
+    import sys as _sys
+
+    if _sys.version_info[:2] != (3, 14):
+        pytest.skip(
+            "COMPATIBILITY.md counts document the 3.14 dev/CI leg; "
+            "version-specific skips shift counts on other interpreters"
+        )
+
     import os
     import re
     import subprocess

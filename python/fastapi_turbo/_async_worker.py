@@ -42,7 +42,16 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
+
+# ``loop.create_task(coro, context=...)`` exists only on 3.11+. On 3.10 the
+# TypeError would die inside the ``call_soon_threadsafe`` callback (loop
+# exception handler), the completion event would never set, and the caller
+# would block forever — construct the task under ``context.run`` instead
+# (Task captures ``copy_context()`` at construction, so it inherits the
+# request context the same way).
+_CREATE_TASK_HAS_CONTEXT = sys.version_info >= (3, 11)
 from collections import deque
 
 _loop: asyncio.AbstractEventLoop | None = None
@@ -229,11 +238,12 @@ def _kickoff(coro, box, ev, loop, context):
         ev.set()
         return
     runner = _runner(coro, box, ev)
-    task = (
-        loop.create_task(runner, context=context)
-        if context is not None
-        else asyncio.ensure_future(runner, loop=loop)
-    )
+    if context is None:
+        task = asyncio.ensure_future(runner, loop=loop)
+    elif _CREATE_TASK_HAS_CONTEXT:
+        task = loop.create_task(runner, context=context)
+    else:  # Python 3.10
+        task = context.run(asyncio.ensure_future, runner, loop=loop)
     box[2] = task
     # Between scheduling ``_kickoff`` and it actually running, the
     # caller may have timed out and requested cancellation. Check

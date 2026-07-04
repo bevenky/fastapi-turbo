@@ -226,7 +226,7 @@ PY
     fi
     (cd /tmp/fastapi_upstream && env -u OFFLINE \
         "$PYTHON_BIN" -m pytest tests/ -q --tb=no --no-header \
-        "${old_py_deselects[@]}" \
+        ${old_py_deselects[@]+"${old_py_deselects[@]}"} \
         -W "ignore::starlette.exceptions.StarletteDeprecationWarning" \
         --ignore=tests/benchmarks/test_general_performance.py \
         --ignore=tests/test_pydantic_v1_error.py \
