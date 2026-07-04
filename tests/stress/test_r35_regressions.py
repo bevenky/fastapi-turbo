@@ -282,11 +282,11 @@ def test_offline_compat_gate_verifies_test_deps_present():
     script = (repo / "scripts" / "run_external_compat_gates.sh").read_text()
 
     # Must check each dep import in OFFLINE mode. The script
-    # does ``for dep in pytest_asyncio yaml dirty_equals sqlmodel
+    # does ``for dep in pytest_asyncio xdist yaml dirty_equals sqlmodel
     # inline_snapshot; do "$PYTHON_BIN" -c "import $dep"; done``,
     # so we look for the dep token in the for-loop list AND the
     # shell-interpolated ``import $dep`` invocation.
-    assert 'pytest_asyncio yaml dirty_equals sqlmodel inline_snapshot' in script, (
+    assert 'pytest_asyncio xdist yaml dirty_equals sqlmodel inline_snapshot' in script, (
         "OFFLINE-mode dep check loop body not found"
     )
     assert '"$PYTHON_BIN" -c "import $dep"' in script, (
