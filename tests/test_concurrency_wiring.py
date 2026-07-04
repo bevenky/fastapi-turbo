@@ -506,6 +506,11 @@ def _stream_burst(server: _Server, path: str, n: int) -> None:
         assert r.content == expected
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="inline trampoline needs Task(eager_start=True) (3.12+); "
+    "older runtimes demote to the worker loop by design (responses.py fallback)",
+)
 def test_streams_stay_off_worker_loop(default_server, boot_server):
     """CONCURRENCY.md §2: default sync streams drain inline and default
     cooperative await-streams ride the request-thread trampoline — the

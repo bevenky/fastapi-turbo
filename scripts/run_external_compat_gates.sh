@@ -137,7 +137,7 @@ run_fastapi_gate() {
         # dependencies. R34 audit hit this — 888 reported failures
         # turned out to be missing-dep collection errors.
         local missing=()
-        for dep in pytest_asyncio yaml dirty_equals sqlmodel inline_snapshot coverage strawberry a2wsgi flask jwt pwdlib; do
+        for dep in pytest_asyncio xdist yaml dirty_equals sqlmodel inline_snapshot coverage strawberry a2wsgi flask jwt pwdlib; do
             if ! "$PYTHON_BIN" -c "import $dep" >/dev/null 2>&1; then
                 missing+=("$dep")
             fi
@@ -162,7 +162,7 @@ run_fastapi_gate() {
         git -C /tmp/fastapi_upstream fetch --tags --force --depth 1 origin "$UPSTREAM_TAG"
         git -C /tmp/fastapi_upstream reset --hard "$UPSTREAM_TAG"
         git -C /tmp/fastapi_upstream clean -fdx -- ':!conftest.py'
-        "$PYTHON_BIN" -m pip install -q pytest-asyncio pyyaml dirty-equals \
+        "$PYTHON_BIN" -m pip install -q pytest-asyncio pytest-xdist pyyaml dirty-equals \
                                        "sqlmodel>=0.0.14" inline-snapshot \
                                        coverage strawberry-graphql a2wsgi flask \
                                        pyjwt "pwdlib[argon2]"
