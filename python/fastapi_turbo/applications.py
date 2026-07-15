@@ -5736,6 +5736,51 @@ class FastAPI(_real_fastapi.FastAPI):
         except Exception as _exc:  # noqa: BLE001
             _log.debug("oneshot outer-scope decoration skipped: %r", _exc)
 
+    async def _asgi_call_mounted(
+        self, mounted_app: Any, scope: dict, receive: Callable, send: Callable
+    ) -> None:
+        """Drive a mounted ASGI app with upstream exception semantics.
+
+        In real Starlette the app-level ``ExceptionMiddleware`` wraps ``Mount``
+        targets, so an ``HTTPException`` raised by a sub-app (e.g. real
+        ``StaticFiles`` raising 404/405 for a missing file) renders through
+        the PARENT app's exception handlers. The in-process door dispatches
+        mounts directly, outside that middleware — without this shim the
+        exception escapes ``FastAPI.__call__`` as a 500. Starlette contract
+        kept: if the sub-app already started the response, re-raise instead
+        of rendering a second response.
+        """
+        from starlette.exceptions import HTTPException as _StarletteHTTPExc
+
+        started = False
+
+        async def _send(message):
+            nonlocal started
+            if message.get("type") == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await mounted_app(scope, receive, _send)
+        except _StarletteHTTPExc as exc:
+            if started:
+                raise
+            handler = self._lookup_exception_handler(exc)
+            if handler is None:
+                # Real FastAPI injects this default inside
+                # ``build_middleware_stack()`` (NOT ``__init__``), so
+                # ``self.exception_handlers`` is empty unless the user
+                # registered one — mirror the same default here.
+                from fastapi.exception_handlers import (
+                    http_exception_handler as handler,
+                )
+            from fastapi_turbo.requests import _door_make_request
+            request = _door_make_request({**scope, "type": "http", "app": self})
+            response = handler(request, exc)
+            if inspect.isawaitable(response):
+                response = await response
+            await response(scope, receive, send)
+
     async def _asgi_try_http_mount(
         self, scope: dict, receive: Callable, send: Callable
     ) -> bool:
@@ -5778,10 +5823,10 @@ class FastAPI(_real_fastapi.FastAPI):
                         sub_app.include_router(mounted_app)
                     except Exception as _exc:  # noqa: BLE001
                         _log.debug("in-process APIRouter mount: %r", _exc)
-                    await sub_app(sub_scope, receive, send)
+                    await self._asgi_call_mounted(sub_app, sub_scope, receive, send)
                     return True
                 if callable(mounted_app):
-                    await mounted_app(sub_scope, receive, send)
+                    await self._asgi_call_mounted(mounted_app, sub_scope, receive, send)
                     return True
         # Starlette Mount routes declared via FastAPI(routes=[Mount(...)])
         for route in getattr(self.router, "routes", []) or []:
@@ -5815,10 +5860,10 @@ class FastAPI(_real_fastapi.FastAPI):
             if isinstance(mounted_app, _APIRouter):
                 sub_app = type(self)(docs_url=None, redoc_url=None, openapi_url=None)
                 sub_app.include_router(mounted_app)
-                await sub_app(sub_scope, receive, send)
+                await self._asgi_call_mounted(sub_app, sub_scope, receive, send)
                 return True
             if callable(mounted_app):
-                await mounted_app(sub_scope, receive, send)
+                await self._asgi_call_mounted(mounted_app, sub_scope, receive, send)
                 return True
         return False
 
