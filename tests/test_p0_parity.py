@@ -1,72 +1,48 @@
-"""Tests for P0 FastAPI parity fixes.
+"""P0 FastAPI parity pins NOT covered by the upstream suite.
 
-Covers:
-- response_model_by_alias + Pydantic Field(alias=)
-- default_response_class cascade (app → router → route)
-- FastAPI(responses=) app-level default responses
-- FastAPI(debug=) traceback printing
-- ORJSONResponse with fallback
+CONSOLIDATION (coverage-differential, pool-1): baseline = retained local
+suite + upstream FastAPI 0.138.1 suite under the shim, per-test coverage
+contexts over ``python/fastapi_turbo`` + grep evidence in the 0.138.1 clone.
+Deleted-as-redundant (every deleted test had an EMPTY unique-line
+differential AND a named twin):
+
+  * response_model alias honored by default / by_alias=False
+                                → tests/test_response_by_alias.py
+                                  (dict/model/list routes, both polarities)
+  * default_response_class cascade (app → router → route override)
+                                → tests/test_default_response_class.py
+                                  (full nested include_router cascade)
+  * FastAPI(responses=) app-level defaults + route override
+                                → tests/test_include_router_defaults_overrides.py
+                                  (app+router+route responses cascade) +
+                                  tests/test_additional_responses_union_
+                                  duplicate_anyof.py (FastAPI(responses={...}))
+  * ORJSONResponse renders      → tests/test_orjson_response_class.py +
+                                  tests/test_deprecated_responses.py
+  * JSONResponse works without orjson
+                                → retained compact-bytes pin below (strictly
+                                  stronger byte assertion; real Starlette
+                                  JSONResponse never imports orjson) +
+                                  upstream JSONResponse renders suite-wide
+
+KEPT: TestDebugMode in full (engine-printed traceback on stderr is a
+turbo Rust-path error shape; FastAPI(debug=) has no upstream-suite test at
+all — grep ``debug=True`` over the 0.138.1 clone tests is empty), the
+serialization_alias response pin (upstream only exercises request-side /
+schema-side serialization_alias), and the compact-bytes pin (upstream's only
+byte-level twin lives in tests/benchmarks/test_general_performance.py, which
+the compat gate --ignores).
 """
 
 from __future__ import annotations
 
 import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
 
-import io
-import sys
 
-import pytest
+# ── response_model serialization_alias ───────────────────────────────
 
 
-# ── response_model_by_alias ──────────────────────────────────────────
-
-
-class TestResponseModelByAlias:
-    def test_alias_honored_by_default(self):
-        """by_alias=True is the default. Field(alias=...) must appear in output."""
-        from pydantic import BaseModel, Field
-
-        from fastapi import FastAPI
-
-        class User(BaseModel):
-            user_id: int = Field(alias="userId")
-            full_name: str = Field(alias="fullName")
-
-        app = FastAPI()
-
-        @app.get("/u", response_model=User)
-        def get_user():
-            # Return dict with aliased keys — matches what client would send
-            return {"userId": 5, "fullName": "Alice"}
-
-        routes = app._collect_all_routes()
-        result = routes[0]["endpoint"]()
-        # Output should use aliases, not Python field names
-        assert "userId" in result
-        assert "fullName" in result
-        assert "user_id" not in result
-        assert "full_name" not in result
-
-    def test_by_alias_false_uses_python_names(self):
-        from pydantic import BaseModel, Field
-
-        from fastapi import FastAPI
-
-        class User(BaseModel):
-            user_id: int = Field(alias="userId")
-
-        app = FastAPI()
-
-        @app.get("/u", response_model=User, response_model_by_alias=False)
-        def get_user():
-            return {"userId": 5}
-
-        from fastapi_turbo.testclient import TestClient
-        result = TestClient(app, in_process=True).get("/u").json()
-        # Output uses python field names
-        assert "user_id" in result
-        assert "userId" not in result
-
+class TestResponseModelSerializationAlias:
     def test_serialization_alias(self):
         """Field(serialization_alias=) should also be honored in output."""
         from pydantic import BaseModel, Field
@@ -85,95 +61,6 @@ class TestResponseModelByAlias:
         from fastapi_turbo.testclient import TestClient
         result = TestClient(app, in_process=True).get("/m").json()
         assert "displayName" in result
-
-
-# ── default_response_class ───────────────────────────────────────────
-
-
-class TestDefaultResponseClass:
-    def test_app_level_default(self):
-        from fastapi import FastAPI
-        from fastapi.responses import HTMLResponse
-
-        app = FastAPI(default_response_class=HTMLResponse)
-
-        @app.get("/")
-        def h():
-            return "<b>hi</b>"
-
-        from fastapi_turbo.testclient import TestClient
-        resp = TestClient(app, in_process=True).get("/")
-        # Served as HTML via the app-level default_response_class
-        assert resp.status_code == 200
-        assert resp.headers["content-type"].startswith("text/html")
-        assert resp.text == "<b>hi</b>"
-
-    def test_route_overrides_app(self):
-        from fastapi import FastAPI
-        from fastapi.responses import HTMLResponse, PlainTextResponse
-
-        app = FastAPI(default_response_class=HTMLResponse)
-
-        @app.get("/p", response_class=PlainTextResponse)
-        def p():
-            return "plain"
-
-        from fastapi_turbo.testclient import TestClient
-        resp = TestClient(app, in_process=True).get("/p")
-        assert resp.headers["content-type"].startswith("text/plain")
-        assert resp.text == "plain"
-
-    def test_router_level_default(self):
-        from fastapi import APIRouter, FastAPI
-        from fastapi.responses import HTMLResponse
-
-        app = FastAPI()
-        router = APIRouter(default_response_class=HTMLResponse)
-
-        @router.get("/r")
-        def r():
-            return "<p>router</p>"
-
-        app.include_router(router)
-        from fastapi_turbo.testclient import TestClient
-        resp = TestClient(app, in_process=True).get("/r")
-        assert resp.headers["content-type"].startswith("text/html")
-
-
-# ── FastAPI(responses=) ──────────────────────────────────────────────
-
-
-class TestAppLevelResponses:
-    def test_app_responses_appear_in_openapi(self):
-        from fastapi import FastAPI
-
-        app = FastAPI(
-            responses={404: {"description": "Not found globally"}}
-        )
-
-        @app.get("/x")
-        def x():
-            return {}
-
-        schema = app.openapi()
-        op = schema["paths"]["/x"]["get"]
-        assert "404" in op["responses"]
-        assert op["responses"]["404"]["description"] == "Not found globally"
-
-    def test_route_responses_override_app(self):
-        from fastapi import FastAPI
-
-        app = FastAPI(
-            responses={404: {"description": "App default 404"}}
-        )
-
-        @app.get("/x", responses={404: {"description": "Route-specific 404"}})
-        def x():
-            return {}
-
-        schema = app.openapi()
-        op = schema["paths"]["/x"]["get"]
-        assert op["responses"]["404"]["description"] == "Route-specific 404"
 
 
 # ── FastAPI(debug=) ──────────────────────────────────────────────────
@@ -251,35 +138,10 @@ class TestDebugMode:
         assert "HTTPException" not in captured.err
 
 
-# ── ORJSONResponse with fallback ─────────────────────────────────────
+# ── JSONResponse byte-level rendering ────────────────────────────────
 
 
-class TestORJSONResponse:
-    def test_orjson_response_renders(self):
-        from fastapi.responses import ORJSONResponse
-        from fastapi.exceptions import FastAPIDeprecationWarning
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FastAPIDeprecationWarning)
-            resp = ORJSONResponse(content={"k": "v", "n": 42})
-        # body is bytes
-        assert isinstance(resp.body, bytes)
-        # valid JSON
-        import json as _json
-        parsed = _json.loads(resp.body)
-        assert parsed == {"k": "v", "n": 42}
-
-    def test_json_response_fallback(self):
-        """JSONResponse should work even if orjson is not installed (falls back to stdlib)."""
-        from fastapi.responses import JSONResponse
-
-        # This should not raise ImportError even if orjson is absent
-        resp = JSONResponse(content={"k": "v"})
-        assert isinstance(resp.body, bytes)
-        # The body should be valid compact JSON (no spaces)
-        assert resp.body in (b'{"k":"v"}', b'{"k": "v"}')  # orjson compact, or stdlib with our fallback
-
+class TestJSONResponseBytes:
     def test_json_response_compact_bytes_match_starlette(self):
         """JSONResponse output bytes should match Starlette's compact form."""
         from fastapi.responses import JSONResponse

@@ -1,213 +1,40 @@
-"""Phase 9-10 tests: compatibility shims for fastapi.* and starlette.* imports."""
+"""Compat-shim pins NOT covered by the upstream suite or the shim matrix.
+
+CONSOLIDATION (coverage-differential, pool-1): baseline = retained local
+suite + upstream FastAPI 0.138.1 suite under the shim, per-test coverage
+contexts over ``python/fastapi_turbo`` + grep evidence in the 0.138.1 clone.
+Deleted-as-redundant (every deleted test had an EMPTY unique-line
+differential AND a named twin):
+
+  * all same-name import tautologies (``from fastapi import X`` /
+    ``from fastapi import X as Y``; FastAPI, Depends, HTTPException,
+    Query/Path/Header/Cookie/Body/Form/File, JSONResponse/HTMLResponse/
+    Response, Request, UploadFile, APIRouter, BackgroundTasks, WebSocket,
+    responses/routing/exceptions/encoders/testclient modules)
+                                → tests/test_shim_completeness.py (pkgutil
+                                  walk + DOOR_CRITICAL identity matrix);
+                                  every name grep-confirmed imported by the
+                                  upstream 0.138.1 suite
+  * starlette.responses ≡ fastapi.responses identity
+                                → DOOR_CRITICAL matrix rows + upstream
+                                  ``from starlette.responses import ...``
+                                  (tests/test_exception_handlers.py)
+  * fastapi/starlette CORS identity
+                                → DOOR_CRITICAL rows (both paths map to
+                                  fastapi_turbo.middleware.cors)
+  * concurrency / background / websockets / datastructures import smokes
+                                → DOOR_CRITICAL rows + module walk
+  * security class surface (HTTPBasicCredentials, SecurityScopes, ...)
+                                → tests/test_security_http_basic_realm.py,
+                                  tests/test_security_http_bearer.py,
+                                  upstream SecurityScopes suites
+  * fastapi/starlette status constants
+                                → upstream usage pins (tests/test_ws_router.py
+                                  asserts WS_1000/WS_1008 values; HTTP_*
+                                  asserted across the whole upstream suite)
+"""
 
 import fastapi_turbo  # noqa: F401 — ensure shims are installed
-
-
-# ── fastapi top-level imports ──────────────────────────────────────
-
-
-def test_fastapi_import_fastapi():
-    """import fastapi_turbo  # noqa: F401 — installs compat shim
-from fastapi import FastAPI resolves to fastapi_turbo."""
-    from fastapi import FastAPI
-    from fastapi import FastAPI as TurboFastAPI
-
-    assert FastAPI is TurboFastAPI
-
-
-def test_fastapi_depends_import():
-    from fastapi import Depends
-    from fastapi import Depends as TurboDepends
-
-    assert Depends is TurboDepends
-
-
-def test_fastapi_http_exception_import():
-    from fastapi import HTTPException
-    from fastapi import HTTPException as TurboHTTPException
-
-    assert HTTPException is TurboHTTPException
-
-
-def test_fastapi_query_path_import():
-    from fastapi import Query, Path, Header, Cookie, Body, Form, File
-    from fastapi import Query as JQ, Path as JP, Header as JH
-    from fastapi import Cookie as JC, Body as JB, Form as JFo, File as JFi
-
-    assert Query is JQ
-    assert Path is JP
-    assert Header is JH
-    assert Cookie is JC
-    assert Body is JB
-    assert Form is JFo
-    assert File is JFi
-
-
-def test_fastapi_response_import():
-    from fastapi import JSONResponse, HTMLResponse, Response
-    from fastapi import JSONResponse as JJ, HTMLResponse as JH, Response as JR
-
-    assert JSONResponse is JJ
-    assert HTMLResponse is JH
-    assert Response is JR
-
-
-def test_fastapi_request_import():
-    from fastapi import Request
-    from fastapi import Request as TurboRequest
-
-    assert Request is TurboRequest
-
-
-def test_fastapi_uploadfile_import():
-    from fastapi import UploadFile
-    from fastapi import UploadFile as TurboUploadFile
-
-    assert UploadFile is TurboUploadFile
-
-
-def test_fastapi_apirouter_import():
-    from fastapi import APIRouter
-    from fastapi import APIRouter as TurboAPIRouter
-
-    assert APIRouter is TurboAPIRouter
-
-
-def test_fastapi_background_tasks_import():
-    from fastapi import BackgroundTasks
-    from fastapi import BackgroundTasks as TurboBT
-
-    assert BackgroundTasks is TurboBT
-
-
-def test_fastapi_websocket_import():
-    from fastapi import WebSocket
-    from fastapi import WebSocket as TurboWS
-
-    assert WebSocket is TurboWS
-
-
-# ── fastapi submodule imports ──────────────────────────────────────
-
-
-def test_fastapi_responses_module():
-    from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
-    from fastapi.responses import JSONResponse as JJ
-    from fastapi.responses import HTMLResponse as JH
-    from fastapi.responses import PlainTextResponse as JP
-
-    assert JSONResponse is JJ
-    assert HTMLResponse is JH
-    assert PlainTextResponse is JP
-
-
-def test_fastapi_routing_module():
-    from fastapi.routing import APIRouter, APIRoute
-    from fastapi.routing import APIRouter as JR, APIRoute as JA
-
-    assert APIRouter is JR
-    assert APIRoute is JA
-
-
-def test_fastapi_exceptions_module():
-    from fastapi.exceptions import HTTPException, RequestValidationError
-    from fastapi.exceptions import HTTPException as JH, RequestValidationError as JR
-
-    assert HTTPException is JH
-    assert RequestValidationError is JR
-
-
-def test_fastapi_security_import():
-    from fastapi.security import OAuth2PasswordBearer
-    from fastapi.security import OAuth2PasswordBearer as TurboOAuth2
-
-    assert OAuth2PasswordBearer is TurboOAuth2
-
-
-def test_fastapi_security_all_classes():
-    from fastapi.security import (
-        OAuth2PasswordBearer,
-        HTTPBearer,
-        HTTPBasic,
-        APIKeyHeader,
-        APIKeyQuery,
-        APIKeyCookie,
-        HTTPBasicCredentials,
-        HTTPAuthorizationCredentials,
-        SecurityScopes,
-    )
-
-    # Just verify they're importable and are actual classes
-    assert callable(OAuth2PasswordBearer)
-    assert callable(HTTPBearer)
-    assert callable(HTTPBasic)
-    assert callable(APIKeyHeader)
-    assert callable(APIKeyQuery)
-    assert callable(APIKeyCookie)
-    assert HTTPBasicCredentials(username="a", password="b").username == "a"
-    assert HTTPAuthorizationCredentials(scheme="Bearer", credentials="tok").credentials == "tok"
-    assert SecurityScopes(["read", "write"]).scope_str == "read write"
-
-
-def test_fastapi_encoders_module():
-    from fastapi.encoders import jsonable_encoder
-    from fastapi.encoders import jsonable_encoder as J
-
-    assert jsonable_encoder is J
-
-
-def test_fastapi_status_module():
-    from fastapi import status
-
-    assert status.HTTP_200_OK == 200
-    assert status.HTTP_404_NOT_FOUND == 404
-    assert status.HTTP_422_UNPROCESSABLE_ENTITY == 422
-
-
-def test_fastapi_testclient_module():
-    from fastapi.testclient import TestClient
-    from fastapi.testclient import TestClient as JTC
-
-    assert TestClient is JTC
-
-
-def test_fastapi_middleware_cors():
-    from fastapi.middleware.cors import CORSMiddleware
-    from starlette.middleware.cors import CORSMiddleware as JC
-
-    assert CORSMiddleware is JC
-
-
-# ── starlette imports ──────────────────────────────────────────────
-
-
-def test_starlette_response_import():
-    from starlette.responses import JSONResponse
-    from fastapi.responses import JSONResponse as TurboJSONResponse
-
-    assert JSONResponse is TurboJSONResponse
-
-
-def test_starlette_request_import():
-    from starlette.requests import Request
-    from starlette.requests import Request as TurboRequest
-
-    assert Request is TurboRequest
-
-
-def test_starlette_status_import():
-    from starlette import status
-
-    assert status.HTTP_200_OK == 200
-    assert status.HTTP_404_NOT_FOUND == 404
-    assert status.HTTP_500_INTERNAL_SERVER_ERROR == 500
-
-
-def test_starlette_websocket_import():
-    from starlette.websockets import WebSocket
-    from starlette.websockets import WebSocket as TurboWS
-
-    assert WebSocket is TurboWS
 
 
 def test_starlette_exceptions_import():
@@ -222,40 +49,6 @@ def test_starlette_exceptions_import():
     # land in the same handler machinery.
     import fastapi_turbo
     assert fastapi_turbo.HTTPException is HTTPException
-
-
-def test_starlette_datastructures_import():
-    from starlette.datastructures import URL, Headers, QueryParams, State
-
-    assert URL is not None
-    assert Headers is not None
-    assert QueryParams is not None
-    assert State is not None
-
-
-def test_starlette_middleware_cors():
-    from starlette.middleware.cors import CORSMiddleware
-    from starlette.middleware.cors import CORSMiddleware as JC
-
-    assert CORSMiddleware is JC
-
-
-def test_starlette_concurrency_import():
-    from starlette.concurrency import run_in_threadpool
-    from fastapi.concurrency import run_in_threadpool as JR
-
-    assert run_in_threadpool is JR
-
-
-def test_starlette_background_import():
-    from starlette.background import BackgroundTasks, BackgroundTask
-    from starlette.background import BackgroundTasks as JBT, BackgroundTask as JBT1
-
-    assert BackgroundTasks is JBT
-    assert BackgroundTask is JBT1
-
-
-# ── Shim install / uninstall ──────────────────────────────────────
 
 
 def test_shim_uninstall_reinstall():

@@ -1,12 +1,34 @@
-"""Tests for P1 FastAPI parity fixes.
+"""P1 FastAPI parity pins NOT covered by the upstream suite.
 
-Covers:
-- OAuth2ClientCredentials / OAuth2AuthorizationCodeBearer / OpenIdConnect
-- request.stream() chunk iterator
-- request.auth / request.user properties
-- SessionMiddleware
-- AuthenticationMiddleware + @requires decorator
-- Pydantic v2 decorators (computed_field, field_serializer, model_validator)
+CONSOLIDATION (coverage-differential, pool-1): baseline = retained local
+suite + upstream FastAPI 0.138.1 suite under the shim, per-test coverage
+contexts over ``python/fastapi_turbo`` + grep evidence in the 0.138.1 clone.
+Deleted-as-redundant (every deleted test had an EMPTY unique-line
+differential AND a named twin):
+
+  * OAuth2 extension imports via fastapi.security
+                                → retained test_oauth2_client_credentials
+                                  below (imports the same path) + retained
+                                  top-level import pin
+  * computed_field in response_model
+                                → tests/test_computed_fields.py
+  * field_serializer in response_model
+                                → tests/test_datetime_custom_encoder.py +
+                                  tests/test_inherited_custom_class.py
+
+KEPT: OAuth2ClientCredentials / OAuth2AuthorizationCodeBearer (turbo-only
+extensions — grep over the 0.138.1 clone finds NO OAuth2ClientCredentials;
+unique-line carriers in security.py), the request.stream() pins (door
+``_door_make_request`` internals + chunked-receive shape with no upstream
+``.stream()`` test), request.user/auth (no upstream twin), SessionMiddleware
+and AuthenticationMiddleware/requires (turbo's own sessions.py /
+authentication.py — unique-line carriers), and model_validator (no
+upstream response-side model_validator test).
+
+KEPT AS LOCAL-COVERAGE CARRIER (twin exists upstream —
+tests/test_security_openid_connect.py — but the local fast suite would
+lose the security.py OpenIdConnect arcs; ≤0.2% local-coverage gate):
+test_openid_connect.
 """
 
 from __future__ import annotations
@@ -64,17 +86,6 @@ class TestSecuritySchemes:
         assert OAuth2ClientCredentials is not None
         assert OAuth2AuthorizationCodeBearer is not None
         assert OpenIdConnect is not None
-
-    def test_imports_via_starlette_shim(self):
-        import fastapi_turbo  # noqa: F401
-
-        from fastapi.security import (
-            OAuth2AuthorizationCodeBearer,
-            OAuth2ClientCredentials,
-            OpenIdConnect,
-        )
-
-        assert OAuth2ClientCredentials is not None
 
 
 # ── request.stream() ─────────────────────────────────────────────────
@@ -314,52 +325,6 @@ class TestRequiresDecorator:
 
 
 class TestPydanticV2Decorators:
-    def test_computed_field_in_response(self):
-        from pydantic import BaseModel, computed_field
-
-        from fastapi import FastAPI
-
-        class User(BaseModel):
-            first_name: str
-            last_name: str
-
-            @computed_field
-            @property
-            def full_name(self) -> str:
-                return f"{self.first_name} {self.last_name}"
-
-        app = FastAPI()
-
-        @app.get("/u", response_model=User)
-        def get_user():
-            return {"first_name": "Alice", "last_name": "Smith"}
-
-        from fastapi_turbo.testclient import TestClient
-        result = TestClient(app, in_process=True).get("/u").json()
-        assert result.get("full_name") == "Alice Smith"
-
-    def test_field_serializer(self):
-        from pydantic import BaseModel, field_serializer
-
-        from fastapi import FastAPI
-
-        class M(BaseModel):
-            tags: list[str]
-
-            @field_serializer("tags")
-            def _serialize_tags(self, value: list[str]) -> str:
-                return ",".join(value)
-
-        app = FastAPI()
-
-        @app.get("/m", response_model=M)
-        def get_m():
-            return {"tags": ["a", "b", "c"]}
-
-        from fastapi_turbo.testclient import TestClient
-        result = TestClient(app, in_process=True).get("/m").json()
-        assert result == {"tags": "a,b,c"}
-
     def test_model_validator(self):
         from pydantic import BaseModel, model_validator
 
