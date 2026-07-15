@@ -72,8 +72,7 @@ src/
 ├── handler_bridge.rs   # Sync/async Python handler calls, event loop
 ├── responses.rs        # Python→HTTP response conversion, direct JSON writer
 ├── websocket.rs        # WS bridge, ChannelAwaitable, pure Rust echo
-├── streaming.rs        # StreamingResponse bridge
-└── config.rs           # ServerConfig
+└── streaming.rs        # StreamingResponse bridge
 
 python/fastapi_turbo/
 ├── __init__.py         # Public API + compat shim auto-install

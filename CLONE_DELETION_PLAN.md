@@ -1,5 +1,18 @@
 # Clone Deletion Plan
 
+> **STATUS 2026-07-15: ~85% EXECUTED.** `python/fastapi_turbo` is 18,488 LOC (was ~32.5K
+> when this plan was written). Deleted outright: `_openapi.py`, `_introspect.py`,
+> `_resolution.py`, the fake-module shim builders, `_starlette_compat.py`, `_compat_shim.py`,
+> `_ws_pipe_bridge.py`, `_async_bridge.py`. Repointed thin: `responses.py`, `requests.py`,
+> `datastructures.py`, `status.py`, `encoders.py`, `exceptions.py`, `background.py`,
+> `routing.py` (real-FA subclasses). All three critical-path gates below are CLOSED
+> (door-support repoint; `(bytes,bytes)` header readers; clone `Response` retired). The
+> adapter is unconditional (`FASTAPI_TURBO_ADAPTER` no longer exists) and real-FastAPI
+> delegation is default-ON. Remaining shrink targets: `testclient.py` (2,171),
+> `_ws_support.py` (1,259), `security.py` (685), `staticfiles.py` (158), the eager-include
+> machinery in `applications.py`, and the Rust-side `responses.rs` dedup. Everything below
+> is the original plan, kept for the rationale and the execution log.
+
 Scoped via the `clone-deletion-scope` workflow (11 agents mapping every clone subsystem + the Rust↔Python boundary). Goal: delete the ~30K-line Python clone, keep the Rust door (`src/`), use real pip fastapi/starlette.
 
 

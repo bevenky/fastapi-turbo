@@ -39,7 +39,7 @@ def test_python_multipart_is_a_runtime_dep():
 def test_db_extra_removed():
     """The ``db`` extra (psycopg/redis) was removed with the
     out-of-scope ``fastapi_turbo.db`` add-on — FastAPI ships no DB
-    pools. See STRATEGY.md (bucket 2 — non-FastAPI add-ons)."""
+    pools. See docs/archive/STRATEGY.md (bucket 2 — non-FastAPI add-ons)."""
     extras = _read_pyproject()["project"]["optional-dependencies"]
     assert "db" not in extras, "db extra should be gone with the db add-on"
 

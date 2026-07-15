@@ -251,7 +251,7 @@ def test_claudemd_test_count_is_not_stale_920():
 
 
 def test_todosmd_no_longer_says_no_ci_or_510_tests():
-    todos = pathlib.Path(__file__).resolve().parents[2] / "todos.md"
+    todos = pathlib.Path(__file__).resolve().parents[2] / "docs" / "archive" / "todos.md"
     text = todos.read_text()
     assert "No GitHub Actions / CI yet" not in text, text
     assert "510-test suite" not in text, text
