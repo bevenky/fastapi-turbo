@@ -291,7 +291,11 @@ class APIRouter(_real_fastapi.routing.APIRouter):
         self.include_in_schema = include_in_schema
         self.callbacks = callbacks or []
         self.generate_unique_id_function = generate_unique_id_function
-        self.route_class = route_class
+        # Default to ``APIRoute`` (FastAPI parity — ``app.router.route_class``
+        # is the constructable route class, not ``None``). ``add_api_route``
+        # already fell back to ``APIRoute`` internally; this just makes the
+        # attribute itself the class real FastAPI exposes.
+        self.route_class = route_class or APIRoute
         self.redirect_slashes = redirect_slashes
         self._on_startup: list[Callable] = list(on_startup or [])
         self._on_shutdown: list[Callable] = list(on_shutdown or [])
@@ -330,6 +334,12 @@ class APIRouter(_real_fastapi.routing.APIRouter):
         route_cls = self.route_class or APIRoute
         route = route_cls(path, endpoint, methods=methods, **kwargs)
         self.routes.append(route)
+        # Bump the FastAPI 0.138 routes-version so an ``_IncludedRouter``'s
+        # effective-route cache invalidates when a route is added to an
+        # already-included router (the door / 404-fallback then sees it).
+        _mark = getattr(self, "_mark_routes_changed", None)
+        if _mark is not None:
+            _mark()
     # ------------------------------------------------------------------
     # Decorator helpers (one per HTTP verb)
     # ------------------------------------------------------------------
@@ -610,6 +620,12 @@ class APIRouter(_real_fastapi.routing.APIRouter):
             "callbacks": list(callbacks or []),
         }
         self._included_routers.append((router, prefix, tags or [], include_meta))
+        # FA 0.138 parity: register a real ``_IncludedRouter`` so a parent
+        # router's ``_match_low_priority`` reaches this child's frontend /
+        # low-priority routes (and nested includes compose correctly). Skipped
+        # by the door flatten + ``routes`` property.
+        from fastapi_turbo._route_helpers import _append_included_router
+        _append_included_router(self, router, include_meta)
 
         # Eagerly mirror the included router's routes into ``self.routes``
         # as shadow clones with prefix-adjusted paths. Starlette/FA parity:
@@ -640,6 +656,8 @@ class APIRouter(_real_fastapi.routing.APIRouter):
         def _mirror(src_router, pfx: str) -> None:
             for r in getattr(src_router, "routes", []):
                 if getattr(r, "_is_included_shadow", False):
+                    continue
+                if type(r).__name__ == "_IncludedRouter":
                     continue
                 clone = _copy.copy(r)
                 clone.path = _stack_path(pfx, getattr(r, "path", ""))
