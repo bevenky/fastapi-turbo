@@ -173,8 +173,23 @@ def install() -> None:
     fa_sec_oidc = importlib.import_module("fastapi.security.open_id_connect_url")
     fa_static = importlib.import_module("fastapi.staticfiles")
     fa_tc = importlib.import_module("fastapi.testclient")
-    fa_tmpl = importlib.import_module("fastapi.templating")
     fa_ws = importlib.import_module("fastapi.websockets")
+
+    # Optional-dependency modules: stock fastapi/starlette import these
+    # LAZILY — jinja2 (templating) and itsdangerous (sessions) are optional
+    # starlette extras, and stock only raises when the USER imports the
+    # module. Importing them eagerly here made ``import fastapi_turbo``
+    # crash on a clean minimal install (caught by the release wheel smoke;
+    # dev/CI never sees it because the extras are always installed there).
+    # None = extra absent: skip the patch and keep stock's lazy-error
+    # semantics for direct user imports.
+    def _try_import(name: str):
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            return None
+
+    fa_tmpl = _try_import("fastapi.templating")  # needs jinja2
     st_auth = importlib.import_module("starlette.authentication")
     st_bg = importlib.import_module("starlette.background")
     st_ds = importlib.import_module("starlette.datastructures")
@@ -184,12 +199,12 @@ def install() -> None:
     st_mw_cors = importlib.import_module("starlette.middleware.cors")
     st_mw_gzip = importlib.import_module("starlette.middleware.gzip")
     st_mw_hr = importlib.import_module("starlette.middleware.httpsredirect")
-    st_mw_sess = importlib.import_module("starlette.middleware.sessions")
+    st_mw_sess = _try_import("starlette.middleware.sessions")  # needs itsdangerous
     st_mw_th = importlib.import_module("starlette.middleware.trustedhost")
     st_conc = importlib.import_module("starlette.concurrency")
     st_static = importlib.import_module("starlette.staticfiles")
     st_tc = importlib.import_module("starlette.testclient")
-    st_tmpl = importlib.import_module("starlette.templating")
+    st_tmpl = _try_import("starlette.templating")  # needs jinja2
     st_ws = importlib.import_module("starlette.websockets")
 
     # ── core swap ──────────────────────────────────────────────────────────
@@ -287,7 +302,8 @@ def install() -> None:
     _patch(st_mw_th, "TrustedHostMiddleware", _tmw_th.TrustedHostMiddleware)
     _patch(st_mw_hr, "HTTPSRedirectMiddleware", _tmw_hr.HTTPSRedirectMiddleware)
     _patch(st_mw_base, "BaseHTTPMiddleware", _tmw_base.BaseHTTPMiddleware)
-    _patch(st_mw_sess, "SessionMiddleware", _tmw_sess.SessionMiddleware)
+    if st_mw_sess is not None:
+        _patch(st_mw_sess, "SessionMiddleware", _tmw_sess.SessionMiddleware)
     _patch(st_mw_auth, "AuthenticationMiddleware", _tauth.AuthenticationMiddleware)
     _patch(st_auth, "AuthenticationMiddleware", _tauth.AuthenticationMiddleware)
     # Turbo ``requires`` RETURNS the 403/redirect response (door contract);
@@ -308,8 +324,10 @@ def install() -> None:
     # ``TemplateResponse(name, ctx)`` wrapper.
     _patch(fa_static, "StaticFiles", _tsf.StaticFiles)
     _patch(st_static, "StaticFiles", _tsf.StaticFiles)
-    _patch(fa_tmpl, "Jinja2Templates", _ttpl.Jinja2Templates)
-    _patch(st_tmpl, "Jinja2Templates", _ttpl.Jinja2Templates)
+    if fa_tmpl is not None:
+        _patch(fa_tmpl, "Jinja2Templates", _ttpl.Jinja2Templates)
+    if st_tmpl is not None:
+        _patch(st_tmpl, "Jinja2Templates", _ttpl.Jinja2Templates)
 
     # ── threadpool helpers: turbo's loop-less implementations ──────────────
     # Real run_in_threadpool needs a RUNNING anyio event loop; the door's
