@@ -191,12 +191,14 @@ def test_run_benchmark_v3_redirects_build_noise_to_stderr():
 
 def test_compatibility_doc_no_longer_lists_stale_sentry_count():
     """COMPATIBILITY.md previously claimed Sentry FastAPI integration
-    54/56. The actual shim-injected run is 89/89 (the 54/56 number
-    pre-dated R23/R25/R26). The doc must reflect the true count."""
+    54/56 (pre-R23/R25/R26), then 89/89 (pre sentry-sdk 2.42.0, whose
+    integration surface is smaller). The current shim-injected run is
+    75/75 with no deselects (APM patch-detection→delegation, 2026-07-15).
+    The doc must reflect the true count and not resurrect stale ones."""
     compat = pathlib.Path(__file__).resolve().parents[2] / "COMPATIBILITY.md"
     text = compat.read_text()
     assert "54/56" not in text, text
-    assert "89/89" in text, text
+    assert "75/75" in text, text
 
 
 def test_compatibility_doc_no_longer_calls_active_thread_profiling_unwired():
