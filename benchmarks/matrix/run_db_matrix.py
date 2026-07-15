@@ -190,6 +190,22 @@ def bench(port, method, path, procmap):
     return (float(m.group(1)) if m else 0.0), peak, err_pct
 
 
+# Position-bias control (variance lesson 2026-07-04): BENCH_ROT=k rotates the
+# boot-group order (and the row order inside each boot) by k for every
+# framework in this pass. Run passes with different k and take medians —
+# intra-boot heating then averages out instead of always hitting late
+# groups/rows. Default 0 = historical order.
+BENCH_ROT = int(os.environ.get("BENCH_ROT", "0") or "0")
+
+
+def _rotated(seq, k):
+    seq = list(seq)
+    if not seq:
+        return seq
+    k %= len(seq)
+    return seq[k:] + seq[:k]
+
+
 def _boots_for(fw):
     """Endpoint groups, each run in a FRESH server boot.
 
@@ -221,11 +237,12 @@ def run_fw(name, fw):
     port = fw["port"]
     res = {}
     only = {g for g in os.environ.get("BENCH_GROUPS", "").split(",") if g}
-    for group, eps in _boots_for(fw):
+    for group, eps in _rotated(_boots_for(fw), BENCH_ROT):
         if only and group not in only:  # boot-group name (e.g. pgm-pg2sync) matches whole boot
             eps = [e for e in eps if e[1] in only]  # else filter by row group (e.g. redis)
         if not eps:
             continue
+        eps = _rotated(eps, BENCH_ROT)
         kill_port(port); time.sleep(1)
         if port_open(port):
             print(f"!! {name} port busy"); return res

@@ -34,6 +34,23 @@ ITEM_BODY = '{"sku":"A","qty":3,"tags":["x","y"]}'
 PATCH_BODY = '{"qty":9}'
 JSON_CT = "application/json"
 
+# Position-bias control (variance lesson 2026-07-04): BENCH_ROT=k rotates the
+# endpoint order by k rows for EVERY framework in this pass — rows stay
+# position-matched across frameworks within the pass, and medians across
+# passes run with different k (e.g. 0/8/16) average out intra-boot
+# heating/thermal drift instead of always penalizing the late rows.
+# Default 0 = historical order (comparable with all published runs).
+BENCH_ROT = int(os.environ.get("BENCH_ROT", "0") or "0")
+
+
+def _rotated(seq, k):
+    seq = list(seq)
+    if not seq:
+        return seq
+    k %= len(seq)
+    return seq[k:] + seq[:k]
+
+
 # ── endpoint matrix: (label, category, method, path, body, content_type) ──
 ENDPOINTS = [
     ("ping",              "baseline",  "GET",    "/_ping",                  None,       None),
@@ -166,7 +183,9 @@ def run_framework(name: str, fw: dict) -> dict:
             return {}
         time.sleep(1.0)  # settle / pool warm
         results = {}
-        for label, cat, method, path, body, ct in ENDPOINTS:
+        if BENCH_ROT:
+            print(f"  (BENCH_ROT={BENCH_ROT}: endpoint order rotated)")
+        for label, cat, method, path, body, ct in _rotated(ENDPOINTS, BENCH_ROT):
             if not _port_open(port):
                 print(f"  !! {name} died before {label}", file=sys.stderr)
                 break

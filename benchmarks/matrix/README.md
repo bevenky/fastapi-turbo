@@ -286,8 +286,13 @@ turbo's advantage is the constant HTTP/dispatch share at every rung.
 - **Intra-boot heating**: a boot that benches 8 rows sequentially under-measures
   late rows by 15-25% when the desktop is co-resident (verified: same row, same
   hour — sequential pass 35.5k vs one-row-per-boot 48.0k). Disputed rows are
-  re-measured one-row-per-boot; a future runner improvement is group-order
-  rotation or row-per-boot for DB groups.
+  re-measured one-row-per-boot. **Shipped**: both runners honor `BENCH_ROT=k`
+  — rotates the endpoint order (run_matrix.py) / boot-group + in-boot row
+  order (run_db_matrix.py) by `k` for every framework in the pass, keeping
+  rows position-matched across frameworks. Protocol: run 3 passes with
+  `BENCH_ROT=0 / 8 / 16` and take row medians so position bias averages out.
+  `BENCH_ROT=0` (default) is the historical order, comparable with all
+  published runs.
 - **Fleet sensitivity is asymmetric**: turbo's multi-process Python fleet feels
   desktop co-residency (±15-20%) that single-process Go/Rust rivals do not.
   Cross-day comparisons of turbo fleet rows need same-session anchoring; conn=1
