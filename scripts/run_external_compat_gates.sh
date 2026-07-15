@@ -192,13 +192,15 @@ PY
     #     ("Code example is not valid"); these are upstream-bug
     #     markers, not our compat surface.
     #
-    #   * ``tests/test_frontend.py`` + ``tests/test_router_include_context.py``
-    #     — NEW features in FastAPI 0.138 (app.frontend SPA serving;
-    #     _IncludedRouter include-context) the Rust door does not
-    #     implement yet. 52 tracked failures, unchanged since the
-    #     0.138 upgrade (see memory/stack-upgrade notes + local
-    #     set-based gate). Remove these ignores when the door gains
-    #     the features.
+    #   * ``tests/test_router_include_context.py`` — the FastAPI 0.138
+    #     ``_IncludedRouter`` include-context feature the Rust door does
+    #     not implement yet. 21 tracked failures (17 pass). Remove this
+    #     ignore when the door gains the feature.
+    #
+    #     ``tests/test_frontend.py`` (0.138's ``app.frontend`` SPA serving)
+    #     is now IMPLEMENTED and un-ignored — the door's 404 fallback serves
+    #     frontend / low-priority routes via real FastAPI machinery. All 47
+    #     tests pass under the shim.
     #
     #   ``-W ignore::starlette.exceptions.StarletteDeprecationWarning``:
     #   upstream runs filterwarnings=error and Starlette 1.3 warns at
@@ -230,7 +232,6 @@ PY
         -W "ignore::starlette.exceptions.StarletteDeprecationWarning" \
         --ignore=tests/benchmarks/test_general_performance.py \
         --ignore=tests/test_pydantic_v1_error.py \
-        --ignore=tests/test_frontend.py \
         --ignore=tests/test_router_include_context.py \
         --deselect=tests/test_tutorial/test_query_params_str_validations/test_tutorial006c.py)
 }
