@@ -138,7 +138,7 @@ class _Buffer:
         )
 
 
-def _render_http_exception(
+async def _arender_http_exception(
     app: Any, scope: dict, exc: _StarletteHTTPException
 ) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Render an ``HTTPException`` raised by ``_FrontendStaticFiles`` the same
@@ -157,7 +157,7 @@ def _render_http_exception(
     if handler is not None:
         result = handler(request, exc)
         if asyncio.iscoroutine(result):
-            result = _run(result)
+            result = await result
     else:
         from fastapi_turbo.responses import JSONResponse as _JSONResponse
 
@@ -167,11 +167,11 @@ def _render_http_exception(
             headers=getattr(exc, "headers", None),
         )
     buf = _Buffer()
-    _run(result(scope, buf.receive, buf.send))
+    await result(scope, buf.receive, buf.send)
     return buf.result()
 
 
-def _drive_route(
+async def _adrive_route(
     app: Any, route: Any, scope: dict
 ) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Drive one matched route's ASGI ``handle`` and buffer its response.
@@ -181,8 +181,7 @@ def _drive_route(
     ``_captured_server_exceptions`` so the in-process door re-raises it to the
     caller, and a 500 is returned for the socket path."""
     buf = _Buffer()
-
-    async def _drive() -> None:
+    try:
         # FastAPI's ``APIRoute.app`` asserts an ``AsyncExitStack`` under
         # ``fastapi_middleware_astack`` (normally injected by
         # ``AsyncExitStackMiddleware``); it holds yield-dependency / UploadFile
@@ -193,11 +192,8 @@ def _drive_route(
         async with contextlib.AsyncExitStack() as stack:
             scope["fastapi_middleware_astack"] = stack
             await route.handle(scope, buf.receive, buf.send)
-
-    try:
-        _run(_drive())
     except _StarletteHTTPException as exc:
-        return _render_http_exception(app, scope, exc)
+        return await _arender_http_exception(app, scope, exc)
     except Exception as exc:  # noqa: BLE001 — server error: propagate to caller
         caps = getattr(app, "_captured_server_exceptions", None)
         if caps is not None:
@@ -210,8 +206,78 @@ def _drive_route(
     return buf.result()
 
 
+def _drive_route(
+    app: Any, route: Any, scope: dict, strip_asgi_shims: bool = True
+) -> tuple[int, bytes, list[tuple[str, str]]]:
+    """Drive a matched route, composing the app's ``@app.middleware("http")``
+    chain around it — upstream runs user middleware around ALL routing
+    (frontend / low-priority / custom-dispatch routes included), and the door
+    bakes that chain into per-route handlers, which fallback-served routes
+    bypass. Raw-ASGI shims are stripped in door mode (the door composes them
+    as an OUTER chain the returned tuple flows back through)."""
+    import inspect as _inspect
+
+    mws = list(getattr(app, "_http_middlewares", None) or [])
+    if strip_asgi_shims:
+        mws = [m for m in mws if not getattr(m, "_fastapi_turbo_is_asgi_shim", False)]
+    if not mws:
+        return _run(_adrive_route(app, route, scope))
+
+    from fastapi_turbo.requests import _door_make_request
+    from fastapi_turbo.responses import Response as _Response
+
+    middlewares = list(reversed(mws))
+    request = _door_make_request(scope)
+
+    async def _serve() -> tuple[int, bytes, list[tuple[str, str]]]:
+        async def _chain(idx: int):
+            if idx >= len(middlewares):
+                status, body, headers = await _adrive_route(app, route, scope)
+                response = _Response(content=body, status_code=status)
+                response.raw_headers = [
+                    (
+                        k.encode("latin-1") if isinstance(k, str) else bytes(k),
+                        v.encode("latin-1") if isinstance(v, str) else bytes(v),
+                    )
+                    for k, v in headers
+                ]
+                return response
+
+            mw = middlewares[idx]
+
+            async def call_next(_req=None):
+                return await _chain(idx + 1)
+
+            if _inspect.iscoroutinefunction(mw) or _inspect.iscoroutinefunction(
+                getattr(mw, "__call__", None)
+            ):
+                return await mw(request, call_next)
+            return mw(request, call_next)
+
+        result = await _chain(0)
+        buf = _Buffer()
+        await result(scope, buf.receive, buf.send)
+        return buf.result()
+
+    try:
+        return _run(_serve())
+    except _StarletteHTTPException as exc:
+        # An exception raised by a MIDDLEWARE body (route-level ones are
+        # rendered inside ``_adrive_route``).
+        return _run(_arender_http_exception(app, scope, exc))
+    except Exception as exc:  # noqa: BLE001 — server error: propagate to caller
+        caps = getattr(app, "_captured_server_exceptions", None)
+        if caps is not None:
+            caps.append(exc)
+        return (
+            500,
+            b"Internal Server Error",
+            [("content-type", "text/plain; charset=utf-8")],
+        )
+
+
 def _match_normal_routes(
-    app: Any, scope: dict
+    app: Any, scope: dict, strip_asgi_shims: bool = True
 ) -> tuple[int, bytes, list[tuple[str, str]]] | None:
     """Match the app's CURRENT normal routes at the 404 fallback, mirroring
     ``Router.app``'s first pass (full match wins immediately; first partial
@@ -232,8 +298,6 @@ def _match_normal_routes(
 
     partial: tuple[Any, dict] | None = None
     for route in list(getattr(app.router, "routes", []) or []):
-        if getattr(route, "_is_included_shadow", False):
-            continue
         if not isinstance(route, _BaseRoute):
             continue
         try:
@@ -242,13 +306,13 @@ def _match_normal_routes(
             continue
         if match == _Match.FULL:
             scope.update(child_scope)
-            return _drive_route(app, route, scope)
+            return _drive_route(app, route, scope, strip_asgi_shims)
         if match == _Match.PARTIAL and partial is None:
             partial = (route, child_scope)
     if partial is not None:
         route, child_scope = partial
         scope.update(child_scope)
-        return _drive_route(app, route, scope)
+        return _drive_route(app, route, scope, strip_asgi_shims)
     return None
 
 
@@ -258,6 +322,7 @@ def serve_low_priority_request(
     path: str,
     query: Any = b"",
     headers: Any = None,
+    strip_asgi_shims: bool = True,
 ) -> tuple[int, bytes, list[tuple[str, str]]] | None:
     """Serve a routing-miss through the app's custom normal routes and then its
     low-priority routes (frontend + any hand-appended ``_low_priority_routes``).
@@ -290,7 +355,7 @@ def serve_low_priority_request(
 
     # Normal routes (door-unknown or added after the server started) outrank
     # frontend / low-priority routes — match them first, like Router.app.
-    out = _match_normal_routes(app, scope)
+    out = _match_normal_routes(app, scope, strip_asgi_shims)
     if out is not None:
         return out
 
@@ -307,4 +372,4 @@ def serve_low_priority_request(
             scope["route"] = original_route
             handler_route = original_route
 
-    return _drive_route(app, handler_route, scope)
+    return _drive_route(app, handler_route, scope, strip_asgi_shims)
