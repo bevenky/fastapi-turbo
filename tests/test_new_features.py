@@ -427,9 +427,11 @@ class TestHTTPDigest:
     def test_digest_model(self):
         from fastapi import HTTPDigest
 
+        # Real fastapi.security scheme: ``.model`` is the pydantic
+        # SecurityScheme model (the clone's dict-shaped ``.model`` is retired).
         scheme = HTTPDigest()
-        assert scheme.model["type"] == "http"
-        assert scheme.model["scheme"] == "digest"
+        assert scheme.model.type_.value == "http"
+        assert scheme.model.scheme == "digest"
 
 
 # ── @app.exception_handler ────────────────────────────────────────

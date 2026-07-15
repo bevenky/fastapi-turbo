@@ -18,7 +18,9 @@ setattr-patches ONLY what must differ:
     ``isinstance``), ``BackgroundTasks`` (``run_sync`` drain), the turbo
     ``WebSocket`` wrapper + ``WebSocketState``
   - the turbo ``TestClient`` family (httpx against the real Rust server)
-  - turbo security schemes (dict-shaped ``.model`` + pinned signatures)
+  - security schemes: identity re-patches of the REAL classes (turbo
+    ``security.py`` re-exports them) plus the ``OAuth2ClientCredentials``
+    turbo extension the real package lacks
   - Tower-marker middleware classes and the turbo StaticFiles/Jinja2Templates
   - a handful of compat extensions the suites import (names the real
     packages don't export — mirror of ``fastapi_turbo.__all__``)
@@ -235,7 +237,11 @@ def install() -> None:
     _patch(st_tc, "TestClient", _tt.TestClient)
     _patch(st_tc, "WebSocketTestSession", _tt._WebSocketTestSession)
 
-    # ── security schemes (turbo ``.model`` is a dict; suites subscript it) ─
+    # ── security schemes ───────────────────────────────────────────────────
+    # ``fastapi_turbo.security`` re-exports the REAL classes, so these are
+    # identity re-patches — except ``OAuth2ClientCredentials``, a turbo
+    # extension real FastAPI lacks (patched onto ``fastapi.security`` so
+    # ``from fastapi.security import OAuth2ClientCredentials`` works).
     for _n in (
         "OAuth2",
         "OAuth2PasswordBearer",

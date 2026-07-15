@@ -22,13 +22,16 @@ import pytest
 
 
 class TestSecuritySchemes:
+    # ``.model`` is the real pydantic SecurityScheme model (the clone's
+    # dict-shaped ``.model`` is retired).
+
     def test_oauth2_client_credentials(self):
         from fastapi.security import OAuth2ClientCredentials
 
         scheme = OAuth2ClientCredentials(tokenUrl="/token", scopes={"read": "r"})
-        assert scheme.model["type"] == "oauth2"
-        assert "clientCredentials" in scheme.model["flows"]
-        assert scheme.model["flows"]["clientCredentials"]["tokenUrl"] == "/token"
+        assert scheme.model.type_.value == "oauth2"
+        assert scheme.model.flows.clientCredentials is not None
+        assert scheme.model.flows.clientCredentials.tokenUrl == "/token"
 
     def test_oauth2_authorization_code(self):
         from fastapi.security import OAuth2AuthorizationCodeBearer
@@ -39,17 +42,17 @@ class TestSecuritySchemes:
             refreshUrl="/refresh",
             scopes={"admin": "Admin"},
         )
-        flow = scheme.model["flows"]["authorizationCode"]
-        assert flow["authorizationUrl"] == "/auth"
-        assert flow["tokenUrl"] == "/token"
-        assert flow["refreshUrl"] == "/refresh"
+        flow = scheme.model.flows.authorizationCode
+        assert flow.authorizationUrl == "/auth"
+        assert flow.tokenUrl == "/token"
+        assert flow.refreshUrl == "/refresh"
 
     def test_openid_connect(self):
         from fastapi.security import OpenIdConnect
 
         scheme = OpenIdConnect(openIdConnectUrl="https://example.com/.well-known/openid-configuration")
-        assert scheme.model["type"] == "openIdConnect"
-        assert "openid-configuration" in scheme.model["openIdConnectUrl"]
+        assert scheme.model.type_.value == "openIdConnect"
+        assert "openid-configuration" in scheme.model.openIdConnectUrl
 
     def test_imports_from_fastapi_turbo(self):
         from fastapi import (
