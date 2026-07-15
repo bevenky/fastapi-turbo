@@ -273,21 +273,21 @@ PY
 
     # Same OFFLINE scrub as the FastAPI gate — a script-only
     # variable should never reach pytest.
-    # KNOWN GAP (tracked): test_active_thread_id[/sync|/async] — Sentry's
-    # profiler tracks the handler thread via its patched
-    # ``fastapi.routing.get_request_handler``; turbo's fast adapter path
-    # builds handlers from its own introspection and bypasses that patch,
-    # so the profile's active_thread_id stays the transaction-start thread.
-    # Fix direction (designed, parked): detect third-party patches on
-    # fastapi/starlette routing at route-build and auto-delegate to real
-    # FastAPI machinery — see scratchpad apm_patch_detection_delegation.patch;
-    # needs scope[endpoint/route] population + double-transaction root-cause
-    # before it can ship. Remove these deselects when it lands.
+    # NO deselects: the full surface must be green. The former
+    # test_active_thread_id[/sync|/async] gap (Sentry's profiler thread
+    # tracking rides its patched ``fastapi.routing.get_request_handler``,
+    # which turbo's fast adapter path bypassed) is closed by APM
+    # patch-detection → delegation: ``_sentry_compat.
+    # external_routing_patch_active`` compares routing internals against
+    # import-time originals at route-build; when patched, every HTTP route
+    # delegates to real FastAPI's route handler (where the patch runs),
+    # the delegated scope carries endpoint/route for Sentry's naming, and
+    # an external ``SentryAsgiMiddleware(app)`` wrap is bridged across the
+    # door's thread hop (single transaction envelope + correct
+    # active-thread ids). Regression pins: tests/test_apm_patch_delegation.py.
     (cd /tmp/sentry-python && env -u OFFLINE "$PYTHON_BIN" -m pytest \
         tests/integrations/fastapi \
         tests/integrations/asgi \
-        --deselect "tests/integrations/fastapi/test_fastapi.py::test_active_thread_id[/sync/thread_ids]" \
-        --deselect "tests/integrations/fastapi/test_fastapi.py::test_active_thread_id[/async/thread_ids]" \
         -q --tb=short -o addopts=)
 }
 

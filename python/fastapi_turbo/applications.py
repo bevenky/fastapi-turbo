@@ -43,12 +43,18 @@ _log = logging.getLogger("fastapi_turbo.applications")
 from fastapi_turbo._sentry_compat import (  # noqa: F401 — re-exported below
     _current_request_scope,
     _ensure_sentry_middleware,
+    _external_routing_patch_active,
     _maybe_install_sentry_request_event_processor,
     _maybe_sentry_capture_failed_request,
     _refine_request_scope_for_route,
     _refine_sentry_transaction,
     _refine_sentry_transaction_as_middleware,
     _RouteScope,
+    _sentry_outer_bridge,
+    _sentry_outer_peek,
+    _sentry_outer_pop,
+    _sentry_outer_push,
+    _sentry_update_active_thread,
     _set_current_request_scope,
 )
 
@@ -4331,6 +4337,19 @@ class FastAPI(_real_fastapi.FastAPI):
         or anything the adapter declines (e.g. async-generator deps)."""
         if rd.get("is_websocket") or rd.get("_from_mount"):
             return None
+        # Third-party APM SDKs (Sentry, Datadog, New Relic) monkey-patch real
+        # FastAPI/Starlette routing internals (``fastapi.routing.
+        # get_request_handler`` / ``starlette.routing.request_response``) to
+        # observe requests. The lean adapter builds handlers from its own
+        # introspection and never calls those, so the patches would be inert —
+        # decline every HTTP route so it delegates to real FastAPI's route
+        # handler chain (``_delegated_route_info``), where the patched
+        # machinery actually runs (Sentry's profiler thread tracking,
+        # transaction naming, request extraction). Identity check against
+        # import-time originals — route-build only, zero per-request cost,
+        # and a plain unpatched app keeps the adapter path untouched.
+        if _external_routing_patch_active():
+            return None
         # dependency_overrides (a testing feature) is resolved at request time by
         # the clone path; the adapter bakes the real callable into ParamInfo and
         # can't honor a runtime override. Delegate everything while any override is
@@ -4611,6 +4630,13 @@ class FastAPI(_real_fastapi.FastAPI):
         endpoint = getattr(route, "endpoint", None)
         if endpoint is None:
             return None
+        # External APM routing patch (Sentry/Datadog/New Relic) live at route
+        # build: this route is (also) delegating so the patched
+        # ``get_request_handler`` machinery actually runs. The flag drives the
+        # per-request compensations below (scope[endpoint/route] population,
+        # outer-transaction bridge, active-thread stamp) and marks the handler
+        # so turbo's own inline Sentry calls stand down — one source of truth.
+        _apm_patched = _external_routing_patch_active()
         # Bare ASYNC-generator endpoints: real FastAPI 0.136 natively auto-wraps them
         # into an ``application/jsonl`` StreamingResponse (same as the clone), so
         # delegation handles them — the door streams the returned StreamingResponse.
@@ -4707,6 +4733,21 @@ class FastAPI(_real_fastapi.FastAPI):
 
         async def handler(**kwargs):
             request = kwargs["request"]
+            if _apm_patched:
+                # Sentry's patched ``get_request_handler`` names the
+                # transaction from ``request.scope["endpoint"]`` /
+                # ``["route"]`` (``_set_transaction_name_and_source``);
+                # Starlette's router would have stamped both before the
+                # handler ran, but the door's Request scope is synthesized —
+                # without them Sentry renames every transaction to
+                # "generic FastAPI request". Feed it the same route context
+                # turbo's inline refinement uses.
+                _r_scope = getattr(request, "scope", None)
+                if _r_scope is not None:
+                    if _r_scope.get("endpoint") is None:
+                        _r_scope["endpoint"] = endpoint
+                    if _r_scope.get("route") is None:
+                        _r_scope["route"] = real
             # Real FastAPI's route handler reads three nested AsyncExitStacks from the
             # scope (``fastapi_middleware_astack`` files ⊃ ``fastapi_inner_astack``
             # request-scoped deps ⊃ ``fastapi_function_astack`` function-scoped deps),
@@ -4742,7 +4783,21 @@ class FastAPI(_real_fastapi.FastAPI):
                 await _file_stack.__aexit__(None, None, None)
 
             try:
-                response = await real_handler(request)
+                if _apm_patched:
+                    # Bridge an EXTERNAL ``SentryAsgiMiddleware(app)`` wrap's
+                    # scopes across the door's thread hop (no-op when none),
+                    # then stamp this thread as the transaction's active
+                    # thread — stock uvicorn runs middleware and handler on
+                    # one loop thread; turbo doesn't, so Sentry's profiler
+                    # would otherwise keep the transaction-start thread. Sync
+                    # endpoints get re-stamped by Sentry's own
+                    # ``_sentry_call`` from the threadpool thread (contextvars
+                    # propagate through real ``run_in_threadpool``).
+                    with _sentry_outer_bridge(_sentry_outer_peek(self)):
+                        _sentry_update_active_thread()
+                        response = await real_handler(request)
+                else:
+                    response = await real_handler(request)
             except _RVE as exc:
                 # The door validates in Rust → 422; a real-FastAPI-raised
                 # RequestValidationError would otherwise be captured as a SERVER
@@ -4821,6 +4876,12 @@ class FastAPI(_real_fastapi.FastAPI):
             return response
 
         handler.__name__ = getattr(endpoint, "__name__", "endpoint")
+        if _apm_patched:
+            # Marks every layer of the delegated pipeline so the inline
+            # Sentry call sites (``_set_current_request_scope`` refine,
+            # ``_call_handler_sync`` refine + request event processor) can
+            # stand down — Sentry's patched machinery covers them.
+            handler._fastapi_turbo_apm_delegated = True
 
         # Mirror _adapter_route_info's wrapping order: async → SYNC submit-caller
         # (the door drives sync handlers), then exception handlers (innermost, so
@@ -4841,6 +4902,8 @@ class FastAPI(_real_fastapi.FastAPI):
                 if inline_handler is not handler:
                     inline_handler._fastapi_turbo_original_endpoint = handler
                 inline_handler._fastapi_turbo_route_obj = route
+                if _apm_patched:
+                    inline_handler._fastapi_turbo_apm_delegated = True
             except (AttributeError, TypeError):
                 pass
             else:
@@ -4862,6 +4925,11 @@ class FastAPI(_real_fastapi.FastAPI):
 
         handler = _make_sync_wrapper(handler, for_handler=True, app=self)
         handler = _wrap_with_exception_handlers(handler, self)
+        if _apm_patched:
+            try:
+                handler._fastapi_turbo_apm_delegated = True
+            except (AttributeError, TypeError):
+                pass
         http_mws = getattr(self, "_http_middlewares", None)
         if http_mws:
             from fastapi_turbo._middleware_wrap import _wrap_with_http_middlewares
@@ -4885,6 +4953,8 @@ class FastAPI(_real_fastapi.FastAPI):
 
         try:
             handler._fastapi_turbo_route_obj = route
+            if _apm_patched:
+                handler._fastapi_turbo_apm_delegated = True
         except (AttributeError, TypeError):
             pass
 
@@ -5961,19 +6031,33 @@ class FastAPI(_real_fastapi.FastAPI):
             disconnect_task = asyncio.ensure_future(_watch_disconnect())
 
         loop = asyncio.get_running_loop()
-        status, resp_headers, body_stream = await loop.run_in_executor(
-            None,
-            process_request_streaming,
-            id(self),
-            method,
-            path,
-            query_string,
-            headers,
-            body,
-            client_host,
-            client_port,
-            disconnect_event,
-        )
+        # Enclosing ``SentryAsgiMiddleware(app)`` wrap? This coroutine runs in
+        # the EXTERNAL middleware's context (where Sentry's recursion-guard
+        # contextvar and the outer transaction's scopes are visible); the
+        # handler pipeline below runs on a worker thread that can't see them.
+        # Record the outer scopes on the app for the request window so the
+        # inner auto-installed Sentry middleware steps aside (no second
+        # transaction envelope) and the delegated handler can bridge thread
+        # tracking onto the OUTER transaction. No-op unless Sentry is loaded
+        # AND this request is already inside a SentryAsgiMiddleware.
+        _sentry_outer_pushed = _sentry_outer_push(self)
+        try:
+            status, resp_headers, body_stream = await loop.run_in_executor(
+                None,
+                process_request_streaming,
+                id(self),
+                method,
+                path,
+                query_string,
+                headers,
+                body,
+                client_host,
+                client_port,
+                disconnect_event,
+            )
+        finally:
+            if _sentry_outer_pushed:
+                _sentry_outer_pop(self)
 
         # Bodiless statuses (1xx, 204 No Content, 304 Not Modified) MUST
         # NOT carry a Content-Length per RFC 7230 §3.3.2. The assembled
