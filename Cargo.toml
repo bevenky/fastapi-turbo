@@ -9,7 +9,13 @@ name = "_fastapi_turbo_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.28", features = ["auto-initialize", "extension-module"] }
+# extension-module only: auto-initialize is for EMBEDDING Python in Rust
+# binaries (none of ours touch Python — the bench client is pure HTTP), and
+# it hard-fails against the static /opt/python interpreters in manylinux
+# containers, killing Linux wheel builds (release.yml dry-run #3).
+# For Rust tests that need an embedded interpreter, pass
+# `--features pyo3/auto-initialize` explicitly.
+pyo3 = { version = "0.28", features = ["extension-module"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
