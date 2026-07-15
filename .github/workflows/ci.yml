@@ -5,6 +5,13 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Weekly freshness run: the pipeline was silently red for 3+ weeks once
+  # (June 10 -> July 4) because CI only fired on push/PR activity. A cron
+  # run catches runner-image / dependency / external-gate drift (new
+  # fastapi/starlette/sentry point releases) while the repo is quiet.
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
+  workflow_dispatch: {}
 
 permissions:
   contents: read
