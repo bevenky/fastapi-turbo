@@ -91,7 +91,17 @@ fn tcp_from_fd(fd: RawFd) -> std::io::Result<TcpStream> {
 /// handshakes and SSE/streaming responses on this connection work exactly as
 /// under `axum::serve`. Connection-level errors (client disconnects) are normal
 /// and ignored.
-async fn serve_one_connection(stream: TcpStream, router: axum::Router) {
+///
+/// `shutdown` is the worker's drain signal: when it flips, hyper's
+/// `graceful_shutdown` finishes any in-flight request(s), disables keep-alive,
+/// and closes the connection — so an idle keep-alive connection can't pin the
+/// worker's drain for the whole grace window (same semantics as
+/// `axum::serve(..).with_graceful_shutdown(..)`).
+async fn serve_one_connection(
+    stream: TcpStream,
+    router: axum::Router,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use hyper_util::server::conn::auto::Builder;
     use hyper_util::service::TowerToHyperService;
@@ -101,9 +111,18 @@ async fn serve_one_connection(stream: TcpStream, router: axum::Router) {
     // axum::Router<()> implements tower::Service<Request<Incoming>>; wrap it as a
     // hyper service. The response body (axum::body::Body) is a valid hyper body.
     let svc = TowerToHyperService::new(router);
-    let _ = Builder::new(TokioExecutor::new())
-        .serve_connection_with_upgrades(io, svc)
-        .await;
+    let builder = Builder::new(TokioExecutor::new());
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+    tokio::pin!(conn);
+    tokio::select! {
+        _ = conn.as_mut() => {}
+        // `changed()` also resolves Err when the sender drops — treat both as
+        // "the worker is draining".
+        _ = shutdown.changed() => {
+            conn.as_mut().graceful_shutdown();
+            let _ = conn.as_mut().await;
+        }
+    }
 }
 
 /// Run one **worker** process's event loop: connect to the acceptor's unix
@@ -112,11 +131,14 @@ async fn serve_one_connection(stream: TcpStream, router: axum::Router) {
 /// each connection finishes so it can decrement this worker's `outstanding`.
 ///
 /// `ready` flips to `true` once connected + looping (test/ops hook). `shutdown`
-/// stops accepting new fds; in-flight connections drain naturally.
+/// stops accepting new fds; in-flight connections then drain gracefully —
+/// current requests finish, keep-alive stops — bounded by `grace` (idle
+/// workers complete the drain immediately).
 pub async fn run_worker(
     acceptor_sock: &Path,
     router: axum::Router,
     ready: Arc<AtomicBool>,
+    grace: Duration,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> std::io::Result<()> {
     // Retry-connect: a freshly-forked worker may reach here before the acceptor
@@ -160,6 +182,9 @@ pub async fn run_worker(
     tokio::pin!(shutdown);
     let inflight = Arc::new(AtomicUsize::new(0));
     let drained = Arc::new(Notify::new());
+    // Drain broadcast: flipping this tells every live connection to finish its
+    // in-flight request(s) and close (see `serve_one_connection`).
+    let (conn_shutdown_tx, conn_shutdown_rx) = tokio::sync::watch::channel(false);
 
     loop {
         let fd = tokio::select! {
@@ -184,9 +209,10 @@ pub async fn run_worker(
         let done_tx = done_tx.clone();
         let inflight = inflight.clone();
         let drained = drained.clone();
+        let conn_shutdown_rx = conn_shutdown_rx.clone();
         inflight.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
-            serve_one_connection(stream, router).await;
+            serve_one_connection(stream, router, conn_shutdown_rx).await;
             let _ = done_tx.send(()); // decrement the acceptor's outstanding
             if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
                 drained.notify_waiters();
@@ -194,8 +220,14 @@ pub async fn run_worker(
         });
     }
 
-    // Drain: let in-flight connections finish.
+    // Drain: tell every live connection to finish its in-flight request(s)
+    // and close, then wait for them — bounded by `grace`. An idle worker
+    // (inflight == 0) completes immediately; past the deadline the remaining
+    // connections are abandoned (the process exits right after).
+    let _ = conn_shutdown_tx.send(true);
     if inflight.load(Ordering::SeqCst) > 0 {
+        let deadline = tokio::time::sleep(grace);
+        tokio::pin!(deadline);
         loop {
             let notified = drained.notified();
             tokio::pin!(notified);
@@ -203,11 +235,23 @@ pub async fn run_worker(
             if inflight.load(Ordering::SeqCst) == 0 {
                 break;
             }
-            notified.await;
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = &mut deadline => break,
+            }
         }
     }
     drop(done_tx);
-    let _ = completer.await;
+    if inflight.load(Ordering::SeqCst) == 0 {
+        // Fully drained: let the completer flush the last completion notices.
+        let _ = completer.await;
+    } else {
+        // Grace expired with connections still open — their tasks still hold
+        // `done_tx` clones, so the completer would never see the channel
+        // close. Abort it; the process is about to hard-exit anyway.
+        completer.abort();
+        let _ = completer.await;
+    }
     Ok(())
 }
 
@@ -466,7 +510,7 @@ mod tests {
         let (w_tx, w_rx) = tokio::sync::oneshot::channel::<()>();
         let path = sock_path.clone();
         tokio::spawn(async move {
-            let _ = run_worker(&path, router, w_ready, async {
+            let _ = run_worker(&path, router, w_ready, Duration::from_secs(2), async {
                 let _ = w_rx.await;
             })
             .await;

@@ -4111,12 +4111,29 @@ class FastAPI(_real_fastapi.FastAPI):
         Each worker runs its own startup/lifespan, then serves fd-passed
         connections via the Rust ``run_worker`` (all transports). The acceptor
         binds the port and routes each connection to the least-loaded worker.
-        Ctrl-C drains the acceptor, then terminates + reaps the workers."""
+
+        Shutdown (Ctrl-C or SIGTERM — systemd/docker/k8s stop with SIGTERM):
+        the Rust acceptor catches the signal and drains, then this parent
+        forwards SIGTERM to the workers, which finish their in-flight
+        requests — bounded by ``FASTAPI_TURBO_GRACE_SECONDS`` (default 10s) —
+        run their shutdown/lifespan hooks, and exit 0. The parent reaps them
+        (escalating to SIGKILL only past the grace window) and returns
+        cleanly. Idle workers drain instantly, so an idle Ctrl-C/SIGTERM
+        exits promptly rather than sitting out the grace window."""
         import signal
         import sys as _sys
         import tempfile
+        import time as _time
 
         from fastapi_turbo._fastapi_turbo_core import run_acceptor, run_worker
+
+        grace = 10.0
+        _env_grace = os.environ.get("FASTAPI_TURBO_GRACE_SECONDS")
+        if _env_grace:
+            try:
+                grace = max(0.0, float(_env_grace))
+            except ValueError:
+                pass
 
         sock_path = os.path.join(
             tempfile.gettempdir(), f"fastapi-turbo-{os.getpid()}-{port}.sock"
@@ -4131,10 +4148,31 @@ class FastAPI(_real_fastapi.FastAPI):
                     # Per-worker startup so loop-bound resources (asyncpg/redis
                     # pools, asyncio primitives) are created in THIS process on
                     # the handler loop — same ordering as single-process run().
-                    if self._collect_lifespans():
+                    _has_lifespans = bool(self._collect_lifespans())
+                    if _has_lifespans:
                         self._run_lifespan_startup()
                     self._run_startup_handlers()
-                    run_worker(sock_path, *self._build_server_args(host, port))
+                    _has_shutdown = bool(self._collect_shutdown_handlers())
+                    run_worker(
+                        sock_path,
+                        *self._build_server_args(host, port),
+                        grace_secs=grace,
+                    )
+                    # ``run_worker`` returned: this worker was signalled (or
+                    # the acceptor went away) and its in-flight requests have
+                    # drained. Run the app's shutdown hooks in the same order
+                    # single-process ``run()`` does via atexit (handlers, then
+                    # lifespan __aexit__) — ``os._exit`` below skips atexit,
+                    # so they must run explicitly here.
+                    try:
+                        if _has_shutdown:
+                            self._run_shutdown_handlers()
+                        if _has_lifespans:
+                            self._run_lifespan_shutdown()
+                    except BaseException as exc:  # noqa: BLE001
+                        _sys.stderr.write(
+                            f"fastapi-turbo worker {i} shutdown hooks: {exc!r}\n"
+                        )
                 except BaseException as exc:  # noqa: BLE001
                     _sys.stderr.write(f"fastapi-turbo worker {i} exited: {exc!r}\n")
                     exit_code = 1
@@ -4143,18 +4181,40 @@ class FastAPI(_real_fastapi.FastAPI):
             children.append(pid)
 
         # ── parent: the acceptor ──
-        def _terminate_children(*_a: object) -> None:
+        def _signal_children(sig: int) -> None:
             for cpid in children:
                 try:
-                    os.kill(cpid, signal.SIGTERM)
+                    os.kill(cpid, sig)
                 except ProcessLookupError:
                     pass
 
         try:
-            run_acceptor(host, port, sock_path)
+            run_acceptor(host, port, sock_path, grace_secs=grace)
         finally:
-            _terminate_children()
-            for cpid in children:
+            # Graceful stop: forward SIGTERM (each worker's Rust loop catches
+            # it and drains, bounded by ``grace``), wait for the workers to
+            # finish, and only past the grace window escalate to SIGKILL.
+            # Workers with nothing in flight exit immediately, so the reap
+            # loop below returns right away for an idle server.
+            _signal_children(signal.SIGTERM)
+            _live = list(children)
+            _deadline = _time.monotonic() + grace + 3.0
+            while _live and _time.monotonic() < _deadline:
+                for cpid in list(_live):
+                    try:
+                        _done, _ = os.waitpid(cpid, os.WNOHANG)
+                    except (ChildProcessError, OSError):
+                        _live.remove(cpid)
+                        continue
+                    if _done == cpid:
+                        _live.remove(cpid)
+                if _live:
+                    _time.sleep(0.05)
+            for cpid in _live:  # past the grace window — hard-kill stragglers
+                try:
+                    os.kill(cpid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 try:
                     os.waitpid(cpid, 0)
                 except (ChildProcessError, OSError):
