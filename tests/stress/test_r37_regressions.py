@@ -273,9 +273,18 @@ def test_compat_md_doc_count_isnt_off_by_more_than_one():
         env=sub_env,
         capture_output=True, text=True, timeout=300,
     )
-    summary = re.search(
-        r"(\d+)\s+passed,?\s*(\d+)?\s*skipped?", proc.stdout or ""
-    )
+    # Parse the FINAL pytest summary line (scan from the end): the old
+    # single-pass regex required a literal "skipped" token, but pytest
+    # OMITS it when 0 tests skip — the guard silently returned and the
+    # doc claim went unenforced whenever the suite had zero skips. A
+    # reverse line scan also can't be fooled by "N passed" strings
+    # embedded in a failing test's captured output.
+    summary = None
+    for line in reversed((proc.stdout or "").splitlines()):
+        m = re.search(r"(\d+)\s+passed(?:,\s*(\d+)\s+skipped)?", line)
+        if m:
+            summary = m
+            break
     if summary is None:
         return
     measured_pass = int(summary.group(1))
