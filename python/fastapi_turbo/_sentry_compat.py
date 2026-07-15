@@ -34,7 +34,249 @@ from the 7k-line ``applications.py`` and makes it easier to extend
 from __future__ import annotations
 
 import contextvars
+import sys
+from contextlib import contextmanager
 from typing import Any
+
+# ── External APM routing-patch detection ──────────────────────────────
+#
+# APM SDKs (Sentry, and the same pattern in Datadog / New Relic)
+# monkey-patch real FastAPI/Starlette routing internals to observe
+# requests: Sentry's ``FastApiIntegration`` wraps
+# ``fastapi.routing.get_request_handler`` (thread tracking, transaction
+# naming, request-data extraction) and ``StarletteIntegration`` wraps
+# ``starlette.routing.request_response``. Turbo's lean adapter builds
+# handlers from its own introspection and never calls either, so those
+# patches would be inert. Capture the ORIGINALS at import time
+# (``fastapi_turbo`` is imported before ``sentry_sdk.init()`` /
+# ``ddtrace.patch()`` in every supported flow — app modules import the
+# framework first) and compare identity at route-build time:
+# ``_adapter_route_info`` declines when a patch is live so the route
+# delegates to real FastAPI's route handler chain
+# (``_delegated_route_info``), where the patched machinery actually
+# runs. Two identity comparisons per route at build time — zero
+# per-request cost, zero behavior change when nothing is patched.
+try:  # modules are hard deps of fastapi_turbo; guard for exotic embeds
+    import fastapi.routing as _real_fastapi_routing
+except Exception:  # noqa: BLE001 - pragma: no cover
+    _real_fastapi_routing = None  # type: ignore[assignment]
+try:
+    import starlette.routing as _real_starlette_routing
+except Exception:  # noqa: BLE001 - pragma: no cover
+    _real_starlette_routing = None  # type: ignore[assignment]
+
+_ORIG_GET_REQUEST_HANDLER = getattr(
+    _real_fastapi_routing, "get_request_handler", None
+)
+_ORIG_REQUEST_RESPONSE = getattr(_real_starlette_routing, "request_response", None)
+
+
+def external_routing_patch_active() -> bool:
+    """True when a third party has monkey-patched real FastAPI/Starlette
+    routing internals (``fastapi.routing.get_request_handler`` /
+    ``starlette.routing.request_response``) since import time.
+
+    Identity check against the import-time originals, plus a
+    foreign-``__module__`` backstop for the late-patch case (APM SDK
+    patched BEFORE fastapi_turbo was imported, so the captured
+    "original" is already the wrapper — Sentry's wrappers live in
+    ``sentry_sdk.integrations.*``). A ``functools.wraps``-style patch
+    installed before our import evades both checks; that stays
+    best-effort.
+    """
+    for mod, attr, orig, home in (
+        (
+            _real_fastapi_routing,
+            "get_request_handler",
+            _ORIG_GET_REQUEST_HANDLER,
+            "fastapi.",
+        ),
+        (
+            _real_starlette_routing,
+            "request_response",
+            _ORIG_REQUEST_RESPONSE,
+            "starlette.",
+        ),
+    ):
+        if mod is None or orig is None:
+            continue
+        cur = getattr(mod, attr, None)
+        if cur is None:
+            continue
+        if cur is not orig:
+            return True
+        mod_name = getattr(cur, "__module__", "") or ""
+        if mod_name and not mod_name.startswith(home):
+            return True
+    return False
+
+
+def fastapi_integration_active() -> bool:
+    """True when a live Sentry client has ``FastApiIntegration`` enabled —
+    i.e. Sentry's patched ``get_request_handler`` machinery (naming +
+    request-data event processor) will actually RUN for a delegated
+    route, so turbo's own inline Sentry calls must stand down (one
+    source of truth per request). ``get_request_handler`` stays patched
+    for the life of the process (``setup_once``), but the wrapper
+    no-ops without an active integration — in that case turbo's inline
+    refinement still applies."""
+    if "sentry_sdk" not in sys.modules:
+        return False
+    try:
+        import sentry_sdk  # noqa: PLC0415
+        from sentry_sdk.integrations.fastapi import FastApiIntegration  # noqa: PLC0415
+
+        client = sentry_sdk.get_client()
+        if not (client and getattr(client, "is_active", lambda: False)()):
+            return False
+        return client.get_integration(FastApiIntegration) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ── Outer-SentryAsgiMiddleware bridge across the door's thread hop ─────
+#
+# ``SentryAsgiMiddleware(app)`` wrapped OUTSIDE the app (Sentry's own
+# test suites use this form) runs in the ASGI caller's context/thread,
+# while the door executes the app's handler pipeline (including the
+# auto-installed inner ``SentryAsgiMiddleware``) on a worker thread with
+# a fresh contextvars context. Two consequences, both bridged here:
+#
+# * Sentry's recursion guard (``_asgi_middleware_applied``) can't see
+#   across the hop, so the inner auto-installed middleware would start a
+#   SECOND transaction per request. ``sentry_outer_push`` records the
+#   outer middleware's (current, isolation) scopes on the app while the
+#   request is in flight; the inner shim checks the stack and steps
+#   aside (the outermost Sentry middleware owns the transaction —
+#   exactly Sentry's own guard semantics).
+# * The outer transaction/profile aren't visible from the handler
+#   thread, so Sentry's thread tracking (``update_active_thread``) would
+#   no-op. ``sentry_outer_bridge`` re-enters the outer scopes around the
+#   delegated handler so the patched machinery sees them.
+#
+# The stack is app-level LIFO: exact for sequential and homogeneous
+# concurrent traffic (all requests wrapped, or none — the norm; an app
+# is served through one ASGI entry stack). Mixed wrapped/unwrapped
+# CONCURRENT traffic to one app instance may suppress an inner
+# transaction for an unwrapped request that overlaps a wrapped one —
+# degraded, never duplicated.
+
+
+def _sentry_asgi_applied_ctxvar():
+    if "sentry_sdk" not in sys.modules:
+        return None
+    try:
+        from sentry_sdk.integrations.asgi import _asgi_middleware_applied  # noqa: PLC0415
+
+        return _asgi_middleware_applied
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sentry_outer_push(app) -> bool:
+    """Record the enclosing SentryAsgiMiddleware's scopes for this
+    request. Call from the ASGI caller's context (the door's
+    ``_asgi_oneshot_http``), pair with ``sentry_outer_pop``. Returns
+    True when pushed."""
+    ctxvar = _sentry_asgi_applied_ctxvar()
+    if ctxvar is None:
+        return False
+    try:
+        if not ctxvar.get(False):
+            return False
+        import sentry_sdk  # noqa: PLC0415
+
+        outer = (sentry_sdk.get_current_scope(), sentry_sdk.get_isolation_scope())
+    except Exception:  # noqa: BLE001
+        return False
+    stack = getattr(app, "_sentry_outer_scopes", None)
+    if stack is None:
+        stack = []
+        try:
+            app._sentry_outer_scopes = stack
+        except (AttributeError, TypeError):
+            return False
+    stack.append(outer)
+    return True
+
+
+def sentry_outer_pop(app) -> None:
+    stack = getattr(app, "_sentry_outer_scopes", None)
+    if stack:
+        try:
+            stack.pop()
+        except IndexError:
+            pass
+
+
+def sentry_outer_peek(app):
+    """The innermost in-flight outer (current, isolation) scope pair, or
+    None when no external SentryAsgiMiddleware encloses the request."""
+    stack = getattr(app, "_sentry_outer_scopes", None)
+    if stack:
+        return stack[-1]
+    return None
+
+
+@contextmanager
+def sentry_outer_bridge(outer):
+    """Enter an outer SentryAsgiMiddleware's (current, isolation) scopes
+    on the handler thread so Sentry's patched machinery (thread
+    tracking, naming, event processors) targets the OUTER transaction.
+    No-op when ``outer`` is None."""
+    if outer is None:
+        yield
+        return
+    try:
+        from sentry_sdk.scope import use_isolation_scope, use_scope  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    cur, iso = outer
+    with use_isolation_scope(iso):
+        with use_scope(cur):
+            yield
+
+
+def sentry_update_active_thread() -> None:
+    """Stamp the current thread as the transaction's/profile's active
+    thread. Turbo runs the transaction-owning middleware and the handler
+    on different threads (stock uvicorn runs both on one loop thread),
+    so mirror Sentry's own ``update_active_thread`` from the thread that
+    drives the delegated handler. For sync endpoints Sentry's
+    ``_sentry_call`` wrapper re-updates from the threadpool thread —
+    that later, more precise value wins."""
+    if "sentry_sdk" not in sys.modules:
+        return
+    try:
+        import sentry_sdk  # noqa: PLC0415
+
+        txn = sentry_sdk.get_current_scope().transaction
+        if txn is not None:
+            txn.update_active_thread()
+        prof = sentry_sdk.get_isolation_scope().profile
+        if prof is not None:
+            prof.update_active_thread_id()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def is_sentry_asgi_middleware_cls(mw_cls) -> bool:
+    """True when ``mw_cls`` is Sentry's ``SentryAsgiMiddleware`` (or the
+    door's ``_BoundMiddleware`` wrapper around it, or a subclass)."""
+    if "sentry_sdk" not in sys.modules:
+        return False
+    try:
+        from sentry_sdk.integrations.asgi import SentryAsgiMiddleware  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return False
+    target = getattr(mw_cls, "_fastapi_turbo_wrapped_middleware", mw_cls)
+    try:
+        return target is SentryAsgiMiddleware or (
+            isinstance(target, type) and issubclass(target, SentryAsgiMiddleware)
+        )
+    except TypeError:
+        return False
 
 
 # ── Per-request scope ContextVar ───────────────────────────────────────
@@ -102,8 +344,19 @@ def set_current_request_scope(
     # URL-source to route-source here. The dispatcher's bare call (no endpoint)
     # skips this; it refines via ``refine_request_scope_for_route`` in its
     # compiled handler wrappers. No-op when Sentry isn't active.
+    # APM-delegated routes (external routing patch detected at build →
+    # served via real FastAPI's route handler): Sentry's own patched
+    # ``get_request_handler`` names the transaction from
+    # scope["endpoint"]/["route"] — suppress turbo's refinement so there
+    # is ONE naming source per request. Only when the FastAPI
+    # integration is live; a bare Starlette-integration client never
+    # reaches Sentry's naming on this path, so turbo still refines.
     if endpoint is not None and route_path is not None:
-        refine_sentry_transaction(endpoint, route_path)
+        if not (
+            getattr(endpoint, "_fastapi_turbo_apm_delegated", False)
+            and fastapi_integration_active()
+        ):
+            refine_sentry_transaction(endpoint, route_path)
 
 
 def refine_request_scope_for_route(endpoint, route_path: str | None) -> None:
@@ -389,3 +642,11 @@ _maybe_install_sentry_request_event_processor = (
 _refine_request_scope_for_route = refine_request_scope_for_route
 _set_current_request_scope = set_current_request_scope
 _ensure_sentry_middleware = ensure_sentry_middleware
+_external_routing_patch_active = external_routing_patch_active
+_fastapi_integration_active = fastapi_integration_active
+_sentry_outer_push = sentry_outer_push
+_sentry_outer_pop = sentry_outer_pop
+_sentry_outer_peek = sentry_outer_peek
+_sentry_outer_bridge = sentry_outer_bridge
+_sentry_update_active_thread = sentry_update_active_thread
+_is_sentry_asgi_middleware_cls = is_sentry_asgi_middleware_cls

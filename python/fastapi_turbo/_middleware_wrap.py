@@ -32,6 +32,8 @@ from typing import Any
 
 from fastapi_turbo._sentry_compat import (
     _current_request_scope,
+    _fastapi_integration_active,
+    _is_sentry_asgi_middleware_cls,
     _maybe_install_sentry_request_event_processor,
     _maybe_sentry_capture_failed_request,
     _refine_sentry_transaction,
@@ -73,7 +75,21 @@ def _make_asgi_middleware_shim(mw_cls, kwargs):
     from fastapi_turbo.exceptions import HTTPException as _MW_HTTPExc
     from fastapi_turbo.responses import Response as _MW_Response
 
+    # Build-time: is this Sentry's own ASGI middleware? (mw_cls is fixed.)
+    _mw_is_sentry = _is_sentry_asgi_middleware_cls(mw_cls)
+
     async def _shim(request, call_next):
+        # An enclosing ``SentryAsgiMiddleware(app)`` wrap is already driving
+        # this request (the door recorded its scopes on the app —
+        # ``_sentry_outer_push``). Sentry's own recursion guard
+        # (``_asgi_middleware_applied``) can't see across the door's thread
+        # hop, so apply the same rule here: the OUTERMOST Sentry middleware
+        # owns the transaction — step aside instead of emitting a second
+        # transaction envelope per request.
+        if _mw_is_sentry and getattr(
+            getattr(request, "app", None), "_sentry_outer_scopes", None
+        ):
+            return await call_next(request)
         # Collect body once; hand the cached copy to the middleware's
         # receive wrapper so it can observe the size or mutate bytes.
         body_bytes = await request.body() if hasattr(request, "body") else b""
@@ -335,8 +351,18 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
         # The earlier Rust-bridge call only wins for exception_handler
         # request scope; transaction naming needs to happen here.
         try:
+            # APM-delegated route (external routing patch detected at build):
+            # Sentry's patched ``get_request_handler`` runs INSIDE the
+            # delegated handler and does the naming AND the request-data
+            # event processor itself (with its own PII gating) — stand down
+            # so there is one source of truth per request. Only when the
+            # FastAPI integration is live; otherwise the patch wrapper
+            # no-ops and turbo's inline calls still apply.
+            _apm_delegated = getattr(
+                endpoint, "_fastapi_turbo_apm_delegated", False
+            ) and _fastapi_integration_active()
             _scope_now = _current_request_scope.get()
-            if _scope_now is not None:
+            if _scope_now is not None and not _apm_delegated:
                 _ep_now = _scope_now.get("endpoint")
                 _rt_now = _scope_now.get("route")
                 _rp_now = getattr(_rt_now, "path", None) if _rt_now is not None else None
@@ -347,7 +373,8 @@ def _wrap_with_http_middlewares(endpoint, middlewares, app):
             # Sentry does this in its patched get_request_handler; that
             # patch is inert for us, so add the processor here where
             # we're inside Sentry's isolation scope.
-            _maybe_install_sentry_request_event_processor(kwargs)
+            if not _apm_delegated:
+                _maybe_install_sentry_request_event_processor(kwargs)
         except Exception as _exc:  # noqa: BLE001
             _log.debug("silent catch in applications: %r", _exc)
         # Keep `_middleware_request` in kwargs (don't pop) so the compiled
