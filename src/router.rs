@@ -12,7 +12,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::multipart::{parse_boundary, parse_multipart, ParsedField, PyUploadFile};
-use crate::responses::{py_to_response_with_request, pyerr_to_response, serde_to_pyobj};
+use crate::responses::{
+    err_value_with_tb, py_to_response_with_request, pyerr_to_response, serde_to_pyobj,
+};
 use crate::websocket::handle_ws_upgrade;
 
 static BG_TASKS_CLS: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
@@ -3765,7 +3767,7 @@ fn teardown_request_scope_gens(py: Python<'_>, gen_deps: &[(Py<PyAny>, bool)], e
             Err(e) => {
                 if let Some(app) = current_app(py) {
                     if let Ok(lst) = app.getattr(py, "_captured_server_exceptions") {
-                        let _ = lst.call_method1(py, "append", (e.value(py),));
+                        let _ = lst.call_method1(py, "append", (err_value_with_tb(py, &e),));
                     }
                 }
             }
@@ -3814,7 +3816,7 @@ fn maybe_defer_request_scope_to_stream(
 /// ``pyerr_to_response``, which renders the default + captures for re-raise).
 fn try_user_dep_exception_handler(py: Python<'_>, py_err: &PyErr) -> Option<Response> {
     let app = current_app(py)?;
-    let exc = py_err.value(py);
+    let exc = err_value_with_tb(py, py_err);
     let result = app
         .bind(py)
         .call_method1("_door_handle_dep_exception", (exc,))
@@ -3854,7 +3856,7 @@ fn teardown_generator_deps_error(
     for (gen, _is_func) in gen_deps.iter().rev() {
         match live.take() {
             Some(err) => {
-                let exc = err.value(py).clone();
+                let exc = err_value_with_tb(py, &err);
                 match gen.call_method1(py, "throw", (exc,)) {
                     // Generator returned without re-raising → swallowed the error.
                     Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
