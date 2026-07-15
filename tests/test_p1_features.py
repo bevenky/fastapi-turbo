@@ -212,51 +212,69 @@ class TestStaticFiles:
         assert sf.directory == "/nonexistent/path/xyz123"
 
     def test_lookup_path_existing_file(self, tmp_path):
-        """lookup_path finds an existing file and returns its media type."""
+        """lookup_path finds an existing file and returns its path + stat.
+
+        Real Starlette ``lookup_path`` returns ``(full_path, os.stat_result)``
+        — the media type is resolved later in ``get_response``, not here.
+        """
+        import os
         from fastapi.staticfiles import StaticFiles
 
         test_file = tmp_path / "style.css"
-        test_file.write_text("body { color: red; }")
+        body = "body { color: red; }"
+        test_file.write_text(body)
 
         sf = StaticFiles(directory=str(tmp_path))
-        path, media_type = sf.lookup_path("style.css")
+        path, stat_result = sf.lookup_path("style.css")
         assert path == str(test_file)
-        assert media_type == "text/css"
+        assert isinstance(stat_result, os.stat_result)
+        assert stat_result.st_size == len(body)
 
     def test_lookup_path_missing_file(self, tmp_path):
-        """lookup_path returns empty string for missing files."""
+        """lookup_path returns ('', None) for missing files."""
         from fastapi.staticfiles import StaticFiles
         sf = StaticFiles(directory=str(tmp_path))
-        path, media_type = sf.lookup_path("nonexistent.txt")
+        path, stat_result = sf.lookup_path("nonexistent.txt")
         assert path == ""
-        assert media_type is None
+        assert stat_result is None
 
     def test_lookup_path_prevents_traversal(self, tmp_path):
-        """lookup_path rejects directory traversal attempts."""
+        """lookup_path rejects directory traversal attempts.
+
+        Real Starlette guards with ``os.path.commonpath`` (the same check
+        the clone copied), returning ``('', None)`` for any escape.
+        """
         from fastapi.staticfiles import StaticFiles
         sf = StaticFiles(directory=str(tmp_path))
-        path, media_type = sf.lookup_path("../../etc/passwd")
+        path, stat_result = sf.lookup_path("../../etc/passwd")
         assert path == ""
-        assert media_type is None
+        assert stat_result is None
 
     def test_html_mode_index(self, tmp_path):
-        """In html mode, lookup_path finds index.html for directories."""
+        """html mode stores the flag and lookup_path resolves the index file.
+
+        Real Starlette maps a directory request → ``index.html`` inside
+        ``get_response`` (not ``lookup_path``); the directory→index behaviour
+        is covered end-to-end by the ``/spa`` html-mode parity gate.
+        """
+        import os
         from fastapi.staticfiles import StaticFiles
 
         index = tmp_path / "index.html"
         index.write_text("<h1>Hello</h1>")
 
         sf = StaticFiles(directory=str(tmp_path), html=True)
-        path, media_type = sf.lookup_path("/")
-        assert path == str(index)
-        assert media_type == "text/html"
-
-    def test_constructor_kwargs(self):
-        """StaticFiles stores html and packages kwargs."""
-        from fastapi.staticfiles import StaticFiles
-        sf = StaticFiles(directory=None, packages=["mypackage"], html=True, check_dir=False)
         assert sf.html is True
-        assert sf.packages == ["mypackage"]
+        path, stat_result = sf.lookup_path("index.html")
+        assert path == str(index)
+        assert isinstance(stat_result, os.stat_result)
+
+    def test_constructor_kwargs(self, tmp_path):
+        """StaticFiles stores directory / html / check_dir kwargs."""
+        from fastapi.staticfiles import StaticFiles
+        sf = StaticFiles(directory=str(tmp_path), html=True, check_dir=False)
+        assert sf.html is True
+        assert sf.directory == str(tmp_path)
 
 
 # ===========================================================================

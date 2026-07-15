@@ -300,8 +300,12 @@ def install() -> None:
     _patch(st_mw, "TrustedHostMiddleware", _tmw_th.TrustedHostMiddleware)
     _patch(st_mw, "HTTPSRedirectMiddleware", _tmw_hr.HTTPSRedirectMiddleware)
 
-    # ── StaticFiles / Jinja2Templates (Rust ServeDir markers; turbo
-    # ``lookup_path``/``TemplateResponse(name, ctx)`` API kept) ─────────────
+    # ── StaticFiles / Jinja2Templates ──────────────────────────────────────
+    # ``fastapi_turbo.staticfiles`` re-exports the REAL Starlette
+    # ``StaticFiles`` (the Rust door serves the mount via tower-http ServeDir,
+    # reading ``.directory`` off the instance), so these are identity
+    # re-patches kept for shim completeness. Jinja2Templates keeps the turbo
+    # ``TemplateResponse(name, ctx)`` wrapper.
     _patch(fa_static, "StaticFiles", _tsf.StaticFiles)
     _patch(st_static, "StaticFiles", _tsf.StaticFiles)
     _patch(fa_tmpl, "Jinja2Templates", _ttpl.Jinja2Templates)
