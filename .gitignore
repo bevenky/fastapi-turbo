@@ -55,6 +55,12 @@ comparison/bench-app/files-gin
 comparison/bench-app/db_express/
 comparison/bench-app/go-echo-ecommerce/ecommerce-echo
 comparison/bench-app/go-gin/ecommerce-gin
+comparison/bench-app/db_go_gin/db-gin
+comparison/bench-app/db_go_echo/db-echo
+comparison/go-gin/go-gin-bench
+comparison/go-gin/gin-server
+comparison/go-echo/go-echo-bench
+comparison/go-echo/echo-server
 comparison/bench-app/rust-axum-ecommerce/target/
 comparison/bench-app/rust-axum-redis/target/
 comparison/bench-app/db_rust_axum/target/
@@ -75,3 +81,12 @@ benchmarks/*.tsv
 !benchmarks/v3.tsv
 !benchmarks/dbm.tsv
 !benchmarks/rm.tsv
+
+# Bench result JSONs: the tracked ones are frozen provenance for the committed
+# reports; new runs must not silently stage more (git add -f to publish a refresh)
+benchmarks/**/results*.json
+!benchmarks/matrix/results_matrix.json
+!benchmarks/matrix/results_db.json
+!benchmarks/matrix/results_throughput.json
+!benchmarks/matrix/results_ws.json
+!benchmarks/results_2026-06-15.json
