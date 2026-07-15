@@ -294,9 +294,11 @@ def test_oauth2_password_bearer():
     from fastapi.security import OAuth2PasswordBearer
 
     scheme = OAuth2PasswordBearer(tokenUrl="/token")
-    assert scheme.tokenUrl == "/token"
+    # Real fastapi.security scheme: ``.model`` is the pydantic SecurityScheme
+    # model (the clone's dict-shaped ``.model`` is retired).
+    assert scheme.model.flows.password.tokenUrl == "/token"
     assert scheme.scheme_name == "OAuth2PasswordBearer"
-    assert scheme.model["type"] == "oauth2"
+    assert scheme.model.type_.value == "oauth2"
 
     # Test __call__ with Request (new FastAPI-compatible signature)
     from starlette.requests import Request
