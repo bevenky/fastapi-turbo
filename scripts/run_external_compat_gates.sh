@@ -192,10 +192,14 @@ PY
     #     ("Code example is not valid"); these are upstream-bug
     #     markers, not our compat surface.
     #
-    #   * ``tests/test_router_include_context.py`` — the FastAPI 0.138
-    #     ``_IncludedRouter`` include-context feature the Rust door does
-    #     not implement yet. 21 tracked failures (17 pass). Remove this
-    #     ignore when the door gains the feature.
+    #   * ``tests/test_router_include_context.py`` (FastAPI 0.138's lazy
+    #     ``_IncludedRouter`` include-context) is now IMPLEMENTED and
+    #     un-ignored — ``include_router`` registers real lazy markers
+    #     (upstream-identical ``routes`` list), effective route contexts
+    #     reach ``request.scope["fastapi"]``, and custom ``matches`` /
+    #     ``handle`` / ``get_route_handler`` dispatch hooks run through
+    #     real FastAPI machinery at the door's 404 fallback. All 35 tests
+    #     pass under the shim.
     #
     #     ``tests/test_frontend.py`` (0.138's ``app.frontend`` SPA serving)
     #     is now IMPLEMENTED and un-ignored — the door's 404 fallback serves
@@ -232,7 +236,6 @@ PY
         -W "ignore::starlette.exceptions.StarletteDeprecationWarning" \
         --ignore=tests/benchmarks/test_general_performance.py \
         --ignore=tests/test_pydantic_v1_error.py \
-        --ignore=tests/test_router_include_context.py \
         --deselect=tests/test_tutorial/test_query_params_str_validations/test_tutorial006c.py)
 }
 
