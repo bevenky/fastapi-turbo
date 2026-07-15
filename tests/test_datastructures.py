@@ -1,4 +1,43 @@
-"""Phase 9-10 tests: datastructures, Request, encoders, status, background, etc."""
+"""Datastructure / door-request / concurrency pins the upstream suite lacks.
+
+CONSOLIDATION (coverage-differential, pool-1): baseline = retained local
+suite + upstream FastAPI 0.138.1 suite under the shim, per-test coverage
+contexts over ``python/fastapi_turbo`` + grep evidence in the 0.138.1 clone.
+Deleted-as-redundant (every deleted test had an EMPTY unique-line
+differential AND a named twin):
+
+  * jsonable_encoder primitives/dict/list/pydantic/datetime/enum
+                                → tests/test_jsonable_encoder.py (25 tests)
+  * jsonable_encoder UUID       → tests/test_tutorial/test_extra_data_types/
+                                  test_tutorial001.py (UUID round-trip)
+  * jsonable_encoder exclude_none
+                                → tests/test_serialize_response_model.py
+                                  (response_model_exclude_none end-to-end)
+  * HTTP + WS status constants  → upstream usage pins (tests/test_ws_router.py
+                                  asserts WS_1000/WS_1008; HTTP_* asserted
+                                  suite-wide) — real starlette module
+  * BackgroundTasks sync+async execution
+                                → tests/test_tutorial/test_background_tasks/
+                                  test_tutorial001.py + test_tutorial002.py
+  * run_in_threadpool positional-only call
+                                → retained test_run_in_threadpool_with_kwargs
+                                  below (superset) + upstream
+                                  tests/test_dependency_wrapped.py
+
+KEPT: real-Starlette datastructure shape pins (the recent re-point aimed
+these at the REAL classes — they guard the shim mapping and have no
+upstream-FastAPI twin), the ``_door_make_request`` scope-shape unit pins
+(door internals, no upstream analogue), and the unique-line carrier
+``test_run_in_threadpool_with_kwargs`` (sole cover of concurrency.py:30).
+
+KEPT AS LOCAL-COVERAGE CARRIERS (twins exist upstream —
+tests/test_tutorial/test_security/test_tutorial001.py,
+tests/test_security_oauth2_password_bearer_optional.py,
+tests/test_security_http_bearer.py, tests/test_security_http_basic_realm.py —
+but the local fast suite would lose the security.py ``__call__`` arcs
+entirely; the ≤0.2% local-coverage gate keeps them here): the five
+direct-call security scheme tests below.
+"""
 
 import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
 
@@ -152,142 +191,7 @@ def test_request_client():
     assert req.client.port == 54321
 
 
-# ── jsonable_encoder ───────────────────────────────────────────────
-
-
-def test_jsonable_encoder_primitives():
-    from fastapi.encoders import jsonable_encoder
-
-    assert jsonable_encoder("hello") == "hello"
-    assert jsonable_encoder(42) == 42
-    assert jsonable_encoder(3.14) == 3.14
-    assert jsonable_encoder(True) is True
-    assert jsonable_encoder(None) is None
-
-
-def test_jsonable_encoder_dict():
-    from fastapi.encoders import jsonable_encoder
-
-    result = jsonable_encoder({"a": 1, "b": [2, 3]})
-    assert result == {"a": 1, "b": [2, 3]}
-
-
-def test_jsonable_encoder_list():
-    from fastapi.encoders import jsonable_encoder
-
-    result = jsonable_encoder([1, "two", 3.0])
-    assert result == [1, "two", 3.0]
-
-
-def test_jsonable_encoder_pydantic():
-    from pydantic import BaseModel
-    from fastapi.encoders import jsonable_encoder
-
-    class Item(BaseModel):
-        name: str
-        price: float
-
-    item = Item(name="widget", price=9.99)
-    result = jsonable_encoder(item)
-    assert result == {"name": "widget", "price": 9.99}
-
-
-def test_jsonable_encoder_datetime():
-    import datetime
-    from fastapi.encoders import jsonable_encoder
-
-    dt = datetime.datetime(2024, 1, 15, 12, 30, 0)
-    result = jsonable_encoder(dt)
-    assert "2024-01-15" in result
-    assert "12:30" in result
-
-
-def test_jsonable_encoder_uuid():
-    import uuid
-    from fastapi.encoders import jsonable_encoder
-
-    u = uuid.UUID("12345678-1234-5678-1234-567812345678")
-    result = jsonable_encoder(u)
-    assert result == "12345678-1234-5678-1234-567812345678"
-
-
-def test_jsonable_encoder_enum():
-    import enum
-    from fastapi.encoders import jsonable_encoder
-
-    class Color(enum.Enum):
-        RED = "red"
-        BLUE = "blue"
-
-    assert jsonable_encoder(Color.RED) == "red"
-
-
-def test_jsonable_encoder_exclude_none():
-    from fastapi.encoders import jsonable_encoder
-
-    data = {"a": 1, "b": None, "c": 3}
-    result = jsonable_encoder(data, exclude_none=True)
-    assert result == {"a": 1, "c": 3}
-
-
-# ── Status codes ───────────────────────────────────────────────────
-
-
-def test_status_codes():
-    from fastapi import status
-
-    assert status.HTTP_200_OK == 200
-    assert status.HTTP_201_CREATED == 201
-    assert status.HTTP_204_NO_CONTENT == 204
-    assert status.HTTP_301_MOVED_PERMANENTLY == 301
-    assert status.HTTP_302_FOUND == 302
-    assert status.HTTP_304_NOT_MODIFIED == 304
-    assert status.HTTP_307_TEMPORARY_REDIRECT == 307
-    assert status.HTTP_400_BAD_REQUEST == 400
-    assert status.HTTP_401_UNAUTHORIZED == 401
-    assert status.HTTP_403_FORBIDDEN == 403
-    assert status.HTTP_404_NOT_FOUND == 404
-    assert status.HTTP_405_METHOD_NOT_ALLOWED == 405
-    assert status.HTTP_409_CONFLICT == 409
-    assert status.HTTP_422_UNPROCESSABLE_ENTITY == 422
-    assert status.HTTP_429_TOO_MANY_REQUESTS == 429
-    assert status.HTTP_500_INTERNAL_SERVER_ERROR == 500
-    assert status.HTTP_502_BAD_GATEWAY == 502
-    assert status.HTTP_503_SERVICE_UNAVAILABLE == 503
-
-
-def test_ws_status_codes():
-    from fastapi import status
-
-    assert status.WS_1000_NORMAL_CLOSURE == 1000
-    assert status.WS_1001_GOING_AWAY == 1001
-    assert status.WS_1008_POLICY_VIOLATION == 1008
-
-
-# ── BackgroundTasks ────────────────────────────────────────────────
-
-
-def test_background_tasks():
-    from starlette.background import BackgroundTasks
-
-    results = []
-
-    def sync_task(value):
-        results.append(value)
-
-    async def async_task(value):
-        results.append(value)
-
-    bt = BackgroundTasks()
-    bt.add_task(sync_task, "sync")
-    bt.add_task(async_task, "async")
-
-    # real Starlette BackgroundTasks runs via __call__ (clone had _run)
-    asyncio.run(bt())
-    assert results == ["sync", "async"]
-
-
-# ── Security classes ───────────────────────────────────────────────
+# ── Security classes (local-coverage carriers, see header) ────────
 
 
 def test_oauth2_password_bearer():
@@ -353,16 +257,6 @@ def test_http_basic():
 
 
 # ── Concurrency ────────────────────────────────────────────────────
-
-
-def test_run_in_threadpool():
-    from fastapi.concurrency import run_in_threadpool
-
-    def sync_fn(x, y):
-        return x + y
-
-    result = asyncio.run(run_in_threadpool(sync_fn, 3, 4))
-    assert result == 7
 
 
 def test_run_in_threadpool_with_kwargs():

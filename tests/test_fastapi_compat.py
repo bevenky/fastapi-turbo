@@ -11,9 +11,13 @@ against the 0.138.1 clone). Deleted-as-redundant, with their upstream twins:
   * FastAPI(root_path=...) (+servers)       → tests/test_openapi_cache_root_path.py,
                                               behind_a_proxy tutorials
   * @app.exception_handler(cls) decorator   → tests/test_validation_error_context.py
-  * @app.exception_handler(404) status form → local tests/test_new_features.py:455
-  * @app.middleware("http") accept/reject   → local tests/test_new_features.py
-                                              (TestHTTPMiddleware, exact same pins)
+  * @app.exception_handler(404) status form → local tests/test_new_features.py
+                                              (TestExceptionHandler.test_status_code_key)
+  * @app.middleware("http") accept          → local tests/stress/test_broad_starlette_
+                                              parity.py (registration-order A/B oracle)
+                                              + upstream tests/test_dependency_contextvars.py
+  * @app.middleware("http") reject          → local tests/test_new_features.py
+                                              (TestHTTPMiddleware.test_unsupported_type_raises)
   * Body() embed default / embed=True       → tests/test_union_body_discriminator_*,
                                               multiple-body-params suite
   * Body(media_type=...)                    → tests/test_request_body_parameters_media_type.py

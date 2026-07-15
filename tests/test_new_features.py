@@ -1,39 +1,72 @@
-"""Tests for newly-implemented features (P0/P1/P2 gaps).
+"""Feature-gap pins NOT covered by the upstream suite.
 
-Covers:
-- Response.set_cookie / delete_cookie
-- response_class per route
-- responses dict + response_description
-- media_type on Body
-- @app.exception_handler
-- @app.middleware("http")
-- include_in_schema
-- openapi_extra
-- security per route + auto-derive
-- example/examples
-- callbacks
-- url_path_for
-- root_path
-- HTTPDigest
+CONSOLIDATION (coverage-differential, pool-1): baseline = retained local
+suite + upstream FastAPI 0.138.1 suite under the shim, per-test coverage
+contexts over ``python/fastapi_turbo`` + grep evidence in the 0.138.1 clone.
+Deleted-as-redundant (every deleted test had an EMPTY unique-line
+differential AND a named twin):
+
+  * set_cookie all-options kwargs      → local tests/test_fastapi_compat.py::
+                                         test_positional_all_args (same attrs)
+  * delete_cookie → Max-Age=0          → local tests/test_fastapi_compat.py::
+                                         test_delete_cookie_positional
+  * response_class per route wraps     → tests/test_default_response_class.py
+                                         + custom_response tutorial suites
+  * response_description              → tests/test_tutorial/
+                                         test_path_operation_configurations
+  * responses dict merges (+model)     → tests/test_additional_responses_router.py,
+                                         tests/test_additional_responses_custom_
+                                         model_in_callback.py
+  * Body(media_type=)                  → tests/test_request_body_parameters_
+                                         media_type.py
+  * include_in_schema=False route      → tests/test_tutorial/test_path_operation_
+                                         advanced_configurations/test_tutorial003.py
+                                         + tests/test_param_include_in_schema.py
+  * openapi_extra merge                → tests/test_openapi_route_extensions.py
+  * url_path_for value                 → tests/test_starlette_urlconvertors.py
+  * root_path stored + openapi servers → tests/test_openapi_cache_root_path.py,
+                                         tests/test_tutorial/test_behind_a_proxy
+  * HTTPDigest import                  → tests/test_security_http_digest.py
+                                         (+_optional/_description)
+  * @app.exception_handler(cls) registers / invoked through client
+                                       → tests/test_validation_error_context.py
+                                         (decorator form) +
+                                         tests/test_exception_handlers.py
+                                         (custom handler status via client)
+  * @app.middleware("http") registers / wraps endpoint / chain order
+                                       → local tests/stress/test_broad_starlette_
+                                         parity.py::test_http_middleware_
+                                         registration_order_parity (3-MW A/B
+                                         order oracle vs upstream) + upstream
+                                         tests/test_dependency_contextvars.py
+
+KEPT (no twin or unique-line carrier): set_cookie DEFAULT attrs (Path=/,
+SameSite=lax — upstream never asserts the defaults), multiple-cookies
+preserved (two Set-Cookie headers), returned-Response-wins-over-
+response_class, per-route ``security=`` kwarg (turbo extension — upstream
+routing.py has no such parameter; sole cover of applications.py:3184),
+callbacks-in-openapi (sole cover of applications.py callback merge),
+url_path_for LookupError + root_path prefix (turbo-specific shapes),
+status-code-keyed exception handler (no upstream status-key test; the
+8721f5a twin anchor), handler MRO lookup (turbo ``_lookup_exception_handler``),
+and @app.middleware("https") ValueError (sole cover of applications.py:1897).
+
+KEPT AS LOCAL-COVERAGE CARRIERS (twins exist upstream —
+tests/test_schema_extra_examples.py, tests/test_openapi_examples.py,
+tests/test_security_http_digest.py — but the local fast suite would lose
+the param_functions.py example/examples arcs and the security.py
+HTTPDigest arcs; ≤0.2% local-coverage gate): TestExamples (both) and
+TestHTTPDigest.test_digest_model.
 """
 
 from __future__ import annotations
 
 import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
 
-import json
-from typing import Annotated  # noqa: F401 — module-level for string-annotation resolution
-
 import pytest
 
-# Module-level so endpoints defined inside tests (with `from __future__ import
-# annotations`, string annotations) resolve `Body`/`Annotated` from __globals__ at
-# OpenAPI-generation time — matching real FastAPI (which resolves hints from the
-# endpoint's module globals, not the defining function's locals).
-from fastapi import Body  # noqa: F401,E402
 
-
-# ── Response.set_cookie / delete_cookie ────────────────────────────
+# ── Response.set_cookie ────────────────────────────────────────────
 
 
 def _set_cookies(resp):
@@ -60,32 +93,6 @@ class TestCookies:
         assert "Path=/" in cookies[0]
         assert "SameSite=lax" in cookies[0]
 
-    def test_set_cookie_all_options(self):
-        from fastapi.responses import Response
-
-        r = Response()
-        r.set_cookie(
-            "k", "v", max_age=3600, path="/api", domain="example.com",
-            secure=True, httponly=True, samesite="strict",
-        )
-        value = _set_cookies(r)[0]
-        assert "k=v" in value
-        assert "Max-Age=3600" in value
-        assert "Path=/api" in value
-        assert "Domain=example.com" in value
-        assert "Secure" in value
-        assert "HttpOnly" in value
-        assert "SameSite=strict" in value
-
-    def test_delete_cookie(self):
-        from fastapi.responses import Response
-
-        r = Response()
-        r.delete_cookie("session")
-        value = _set_cookies(r)[0]
-        assert "session=" in value
-        assert "Max-Age=0" in value
-
     def test_multiple_cookies_preserved(self):
         from fastapi.responses import Response
 
@@ -102,22 +109,6 @@ class TestCookies:
 
 
 class TestResponseClass:
-    def test_response_class_wraps_dict(self):
-        from fastapi import FastAPI
-        from fastapi.responses import HTMLResponse
-
-        app = FastAPI()
-
-        @app.get("/html", response_class=HTMLResponse)
-        def get_html():
-            return "<h1>hi</h1>"
-
-        from fastapi_turbo.testclient import TestClient
-        resp = TestClient(app, in_process=True).get("/html")
-        assert resp.status_code == 200
-        assert resp.headers["content-type"].startswith("text/html")
-        assert resp.text == "<h1>hi</h1>"
-
     def test_response_class_ignores_existing_response(self):
         from fastapi import FastAPI
         from fastapi.responses import HTMLResponse, JSONResponse
@@ -134,123 +125,7 @@ class TestResponseClass:
         assert result.media_type == "application/json"
 
 
-# ── responses dict + response_description ──────────────────────────
-
-
-class TestResponsesDict:
-    def test_response_description(self):
-        from fastapi import FastAPI
-
-        app = FastAPI()
-
-        @app.get("/x", response_description="Custom description")
-        def h():
-            return {}
-
-        schema = app.openapi()
-        op = schema["paths"]["/x"]["get"]
-        assert op["responses"]["200"]["description"] == "Custom description"
-
-    def test_responses_dict_merges(self):
-        from fastapi import FastAPI
-
-        app = FastAPI()
-
-        @app.get("/x", responses={404: {"description": "Not found"}, 500: {"description": "Server err"}})
-        def h():
-            return {}
-
-        schema = app.openapi()
-        op = schema["paths"]["/x"]["get"]
-        assert "200" in op["responses"]  # success still auto-added
-        assert op["responses"]["404"]["description"] == "Not found"
-        assert op["responses"]["500"]["description"] == "Server err"
-
-    def test_responses_dict_with_model(self):
-        from pydantic import BaseModel
-        from fastapi import FastAPI
-
-        class Err(BaseModel):
-            code: str
-            msg: str
-
-        app = FastAPI()
-
-        @app.get("/x", responses={404: {"description": "NF", "model": Err}})
-        def h():
-            return {}
-
-        schema = app.openapi()
-        op = schema["paths"]["/x"]["get"]
-        assert "content" in op["responses"]["404"]
-        assert "application/json" in op["responses"]["404"]["content"]
-
-
-# ── media_type on Body ────────────────────────────────────────────
-
-
-class TestMediaType:
-    def test_body_media_type(self):
-        from fastapi import FastAPI, Body
-        from typing import Annotated
-
-        app = FastAPI()
-
-        @app.post("/x")
-        def h(data: Annotated[bytes, Body(media_type="application/octet-stream")] = b""):
-            return {}
-
-        schema = app.openapi()
-        # Media type should propagate to requestBody.content
-        op = schema["paths"]["/x"]["post"]
-        if "requestBody" in op:
-            content_keys = list(op["requestBody"]["content"].keys())
-            # At least one matches octet-stream if correctly propagated
-            assert "application/octet-stream" in content_keys or "application/json" in content_keys
-
-
-# ── include_in_schema ─────────────────────────────────────────────
-
-
-class TestIncludeInSchema:
-    def test_hidden_route(self):
-        from fastapi import FastAPI
-
-        app = FastAPI()
-
-        @app.get("/public")
-        def public():
-            return {}
-
-        @app.get("/internal", include_in_schema=False)
-        def internal():
-            return {}
-
-        schema = app.openapi()
-        assert "/public" in schema["paths"]
-        assert "/internal" not in schema["paths"]
-
-
-# ── openapi_extra ─────────────────────────────────────────────────
-
-
-class TestOpenAPIExtra:
-    def test_extra_fields_merged(self):
-        from fastapi import FastAPI
-
-        app = FastAPI()
-
-        @app.get("/x", openapi_extra={"x-custom": "value", "x-rate-limit": 100})
-        def h():
-            return {}
-
-        schema = app.openapi()
-        op = schema["paths"]["/x"]["get"]
-        assert op["x-custom"] == "value"
-        assert op["x-rate-limit"] == 100
-
-
-# ── Per-route security ────────────────────────────────────────────
+# ── Per-route security (turbo extension kwarg) ────────────────────
 
 
 class TestPerRouteSecurity:
@@ -281,7 +156,7 @@ class TestPerRouteSecurity:
         assert op["security"] == []
 
 
-# ── example/examples in parameters ────────────────────────────────
+# ── example/examples in parameters (local-coverage carriers) ─────
 
 
 class TestExamples:
@@ -326,6 +201,18 @@ class TestExamples:
         assert has_examples
 
 
+# ── HTTPDigest (local-coverage carrier) ───────────────────────────
+
+
+class TestHTTPDigest:
+    def test_digest_model(self):
+        from fastapi import HTTPDigest
+
+        scheme = HTTPDigest()
+        assert scheme.model["type"] == "http"
+        assert scheme.model["scheme"] == "digest"
+
+
 # ── callbacks ─────────────────────────────────────────────────────
 
 
@@ -354,18 +241,6 @@ class TestCallbacks:
 
 
 class TestUrlPathFor:
-    def test_url_path_for_simple(self):
-        from fastapi import FastAPI
-
-        app = FastAPI()
-
-        @app.get("/users/{user_id}")
-        def get_user(user_id: int):
-            return {}
-
-        url = app.url_path_for("get_user", user_id=42)
-        assert url == "/users/42"
-
     def test_url_path_for_missing_name(self):
         from fastapi import FastAPI
 
@@ -387,66 +262,10 @@ class TestUrlPathFor:
         assert url == "/api/v1/items/5"
 
 
-# ── root_path ─────────────────────────────────────────────────────
-
-
-class TestRootPath:
-    def test_root_path_stored(self):
-        from fastapi import FastAPI
-
-        app = FastAPI(root_path="/api/v1")
-        assert app.root_path == "/api/v1"
-        assert app.root_path_in_servers is True
-
-    def test_root_path_adds_server_to_openapi(self):
-        from fastapi import FastAPI
-
-        app = FastAPI(root_path="/api")
-
-        @app.get("/hello")
-        def hello():
-            return {}
-
-        schema = app.openapi()
-        # root_path_in_servers defaults to True, so servers should include it
-        # (but note: app.openapi() doesn't currently consider root_path in its code path;
-        # the root_path is added by run() method, so this test just checks basic storage)
-        assert app.root_path == "/api"
-
-
-# ── HTTPDigest ────────────────────────────────────────────────────
-
-
-class TestHTTPDigest:
-    def test_digest_import(self):
-        from fastapi import HTTPDigest
-        from fastapi.security import HTTPDigest as HTTPDigest2
-
-        assert HTTPDigest is HTTPDigest2
-
-    def test_digest_model(self):
-        from fastapi import HTTPDigest
-
-        scheme = HTTPDigest()
-        assert scheme.model["type"] == "http"
-        assert scheme.model["scheme"] == "digest"
-
-
 # ── @app.exception_handler ────────────────────────────────────────
 
 
 class TestExceptionHandler:
-    def test_decorator_registers(self):
-        from fastapi import FastAPI, HTTPException
-
-        app = FastAPI()
-
-        @app.exception_handler(HTTPException)
-        def handle(request, exc):
-            return {"caught": str(exc)}
-
-        assert HTTPException in app.exception_handlers
-
     def test_status_code_key(self):
         from fastapi import FastAPI
 
@@ -457,25 +276,6 @@ class TestExceptionHandler:
             return {"not_found": True}
 
         assert 404 in app.exception_handlers
-
-    def test_handler_invoked_in_compiled_route(self):
-        from fastapi import FastAPI, HTTPException
-        from fastapi.responses import JSONResponse
-
-        app = FastAPI()
-
-        @app.exception_handler(HTTPException)
-        def handle(request, exc):
-            return JSONResponse({"caught": exc.detail}, status_code=418)
-
-        @app.get("/fail")
-        def fail():
-            raise HTTPException(status_code=400, detail="bad")
-
-        from fastapi_turbo.testclient import TestClient
-        resp = TestClient(app, in_process=True).get("/fail")
-        assert resp.status_code == 418
-        assert resp.json() == {"caught": "bad"}
 
     def test_mro_lookup(self):
         from fastapi import FastAPI
@@ -500,17 +300,6 @@ class TestExceptionHandler:
 
 
 class TestHTTPMiddleware:
-    def test_decorator_registers(self):
-        from fastapi import FastAPI
-
-        app = FastAPI()
-
-        @app.middleware("http")
-        async def mw(request, call_next):
-            return await call_next(request)
-
-        assert len(app._http_middlewares) == 1
-
     def test_unsupported_type_raises(self):
         from fastapi import FastAPI
 
@@ -519,58 +308,3 @@ class TestHTTPMiddleware:
             @app.middleware("https")
             def mw(r, cn):
                 pass
-
-    def test_middleware_wraps_endpoint(self):
-        from fastapi import FastAPI
-
-        app = FastAPI()
-
-        call_log = []
-
-        @app.middleware("http")
-        async def mw(request, call_next):
-            call_log.append("before")
-            response = await call_next(request)
-            call_log.append("after")
-            return response
-
-        @app.get("/hello")
-        def hello():
-            call_log.append("handler")
-            return {"x": 1}
-
-        from fastapi_turbo.testclient import TestClient
-        resp = TestClient(app, in_process=True).get("/hello")
-        assert resp.json() == {"x": 1}
-        assert call_log == ["before", "handler", "after"]
-
-    def test_middleware_chain_order(self):
-        from fastapi import FastAPI
-
-        app = FastAPI()
-        call_log = []
-
-        @app.middleware("http")
-        async def mw1(request, call_next):
-            call_log.append("mw1_in")
-            r = await call_next(request)
-            call_log.append("mw1_out")
-            return r
-
-        @app.middleware("http")
-        async def mw2(request, call_next):
-            call_log.append("mw2_in")
-            r = await call_next(request)
-            call_log.append("mw2_out")
-            return r
-
-        @app.get("/")
-        def h():
-            call_log.append("handler")
-            return {}
-
-        from fastapi_turbo.testclient import TestClient
-        TestClient(app, in_process=True).get("/")
-        # FA convention: LAST-decorated middleware is OUTERMOST.
-        # @mw2 is outer → runs first on request, last on response.
-        assert call_log == ["mw2_in", "mw1_in", "handler", "mw1_out", "mw2_out"]

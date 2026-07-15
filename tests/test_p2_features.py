@@ -1,47 +1,86 @@
-"""Tests for P2 (nice-to-have) feature gaps."""
+"""P2 feature pins NOT covered by the upstream suite.
+
+CONSOLIDATION (coverage-differential, pool-1): baseline = retained local
+suite + upstream FastAPI 0.138.1 suite under the shim, per-test coverage
+contexts over ``python/fastapi_turbo`` + grep evidence in the 0.138.1 clone.
+Deleted-as-redundant (every deleted test had an EMPTY unique-line
+differential AND a named twin):
+
+  * response_model_include/exclude stored on route / defaults / decorator
+                                → tests/test_response_model_include_exclude.py,
+                                  tests/test_serialize_response_model.py
+  * exclude_unset/defaults/none stored on route / defaults
+                                → tests/test_skip_defaults.py,
+                                  tests/test_serialize_response_model.py
+  * ORJSONResponse import/render/media_type/status
+                                → tests/test_orjson_response_class.py,
+                                  tests/test_default_response_class.py,
+                                  tests/test_deprecated_responses.py
+  * UJSONResponse import/render/media_type
+                                → tests/test_deprecated_responses.py
+                                  (FastAPI(default_response_class=UJSONResponse))
+  * AsyncTestClient import / has-http-methods
+                                → retained AsyncTestClient pins below
+                                  (test_methods_are_async checks the same 8
+                                  methods, strictly stronger)
+  * FastAPI servers/terms_of_service/contact/license_info stored + in schema
+                                → tests/test_openapi_servers.py,
+                                  tests/test_tutorial/test_metadata/
+                                  test_tutorial001.py
+  * schema omits servers/contact/... when unset
+                                → upstream full-schema snapshot asserts
+                                  (e.g. tests/test_application.py)
+  * securitySchemes for OAuth2PasswordBearer / HTTPBearer
+    (+ absence without security deps)
+                                → tests/test_security_oauth2.py,
+                                  tests/test_security_http_bearer.py
+                                  (44 upstream files assert securitySchemes)
+  * openapi_tags stored + tags array (+ absence)
+                                → tests/test_tutorial/test_metadata/
+                                  test_tutorial004.py + schema snapshots
+  * WebSocketDisconnect imports / custom code / is-Exception
+                                → tests/test_ws_router.py (raises + asserts
+                                  .code == WS_1000/WS_1008),
+                                  tests/test_tutorial/test_websockets
+  * APIRoute.operation_id default None / generate_unique_id_function stored
+                                → tests/test_generate_unique_id_function.py +
+                                  retained carrier below (same lines, asserts
+                                  the effect not just storage)
+  * router.trace / trace endpoint stored / trace kwargs / multiple
+                                → tests/test_extra_routes.py (@app.trace route,
+                                  TRACE request, openapi trace operation) +
+                                  tests/test_operations_signatures.py
+
+KEPT (unique-line carriers or no twin): the five ``_apply_response_model``
+unit pins (sole cover of the include/exclude/unset/defaults/none branches in
+_route_helpers.py — the door serves upstream response_model routes through a
+different path), AsyncTestClient shape pins (turbo-only class — upstream has
+no AsyncTestClient; sole cover of testclient.py:2096-2101),
+WebSocketDisconnect constructor defaults (``reason or ""`` coercion has no
+upstream constructor-level pin), the turbo WebSocket.iter_text/bytes/json
+surface (sole pins — tests/test_websocket.py never touches iter_*), and the
+generate_unique_id carriers (routing.py:27 + 206-209) with the
+operation_id-precedence pin (upstream never combines operation_id= with
+generate_unique_id_function).
+
+KEPT AS LOCAL-COVERAGE CARRIERS (twins exist upstream —
+tests/test_security_api_key_header.py, tests/test_extra_routes.py — but
+the local fast suite would lose the security.py APIKeyHeader arcs and the
+trace registration arcs (routing.py:368, applications.py:1356);
+≤0.2% local-coverage gate): test_api_key_header_in_openapi and
+test_trace_registers_route.
+"""
 
 import fastapi_turbo  # noqa: F401 — installs compat shim for `from fastapi ...` / `from starlette ...`
 
-import asyncio
-import json
-
-import pytest
-
 
 # ===========================================================================
-# P2 #1: response_model_include / response_model_exclude
+# response_model_include / response_model_exclude (_apply_response_model)
 # ===========================================================================
 
 
 class TestResponseModelIncludeExclude:
-    """Tests for response_model_include and response_model_exclude."""
-
-    def test_route_stores_include_exclude(self):
-        """APIRoute stores response_model_include and response_model_exclude."""
-        from fastapi.routing import APIRoute
-
-        def handler():
-            return {}
-
-        route = APIRoute(
-            "/test",
-            handler,
-            response_model_include={"name"},
-            response_model_exclude={"secret"},
-        )
-        assert route.response_model_include == {"name"}
-        assert route.response_model_exclude == {"secret"}
-
-    def test_route_defaults_none(self):
-        """response_model_include/exclude default to None."""
-        from fastapi.routing import APIRoute
-
-        def handler():
-            return {}
-
-        route = APIRoute("/test", handler)
-        assert route.response_model_include is None
-        assert route.response_model_exclude is None
+    """Unit pins for _apply_response_model include/exclude branches."""
 
     def test_apply_response_model_include(self):
         """_apply_response_model with include only returns included fields."""
@@ -79,63 +118,14 @@ class TestResponseModelIncludeExclude:
         assert "age" in result
         assert "email" not in result
 
-    def test_include_exclude_via_decorator(self):
-        """response_model_include/exclude work through the FastAPI decorator."""
-        from pydantic import BaseModel
-        from fastapi import FastAPI
-
-        class UserOut(BaseModel):
-            name: str
-            email: str
-            age: int = 0
-
-        app = FastAPI()
-
-        @app.get("/user", response_model=UserOut, response_model_include={"name"})
-        def get_user():
-            return {"name": "Alice", "email": "a@b.com", "age": 30}
-
-        route = app.router.routes[0]
-        assert route.response_model_include == {"name"}
-
 
 # ===========================================================================
-# P2 #2: response_model_exclude_unset / exclude_defaults / exclude_none
+# response_model_exclude_unset / exclude_defaults / exclude_none
 # ===========================================================================
 
 
 class TestResponseModelExcludeOptions:
-    """Tests for exclude_unset, exclude_defaults, exclude_none."""
-
-    def test_route_stores_exclude_flags(self):
-        """APIRoute stores the exclude_unset/defaults/none flags."""
-        from fastapi.routing import APIRoute
-
-        def handler():
-            return {}
-
-        route = APIRoute(
-            "/test",
-            handler,
-            response_model_exclude_unset=True,
-            response_model_exclude_defaults=True,
-            response_model_exclude_none=True,
-        )
-        assert route.response_model_exclude_unset is True
-        assert route.response_model_exclude_defaults is True
-        assert route.response_model_exclude_none is True
-
-    def test_route_defaults_false(self):
-        """exclude_unset/defaults/none default to False."""
-        from fastapi.routing import APIRoute
-
-        def handler():
-            return {}
-
-        route = APIRoute("/test", handler)
-        assert route.response_model_exclude_unset is False
-        assert route.response_model_exclude_defaults is False
-        assert route.response_model_exclude_none is False
+    """Unit pins for the exclude_unset/defaults/none branches."""
 
     def test_apply_response_model_exclude_unset(self):
         """_apply_response_model with exclude_unset omits unset fields."""
@@ -188,92 +178,12 @@ class TestResponseModelExcludeOptions:
 
 
 # ===========================================================================
-# P2 #3: ORJSONResponse / UJSONResponse
-# ===========================================================================
-
-
-class TestORJSONResponse:
-    """Tests for ORJSONResponse."""
-
-    def test_import(self):
-        """ORJSONResponse is importable from responses module."""
-        from fastapi.responses import ORJSONResponse
-        assert ORJSONResponse is not None
-
-    def test_import_from_top_level(self):
-        """ORJSONResponse is importable from fastapi_turbo."""
-        from fastapi import ORJSONResponse
-        assert ORJSONResponse is not None
-
-    def test_renders_json(self):
-        """ORJSONResponse renders content as JSON bytes."""
-        from fastapi.responses import ORJSONResponse
-        from fastapi.exceptions import FastAPIDeprecationWarning
-        import warnings as _w
-        with _w.catch_warnings():
-            _w.simplefilter("ignore", FastAPIDeprecationWarning)
-            r = ORJSONResponse(content={"hello": "world"})
-        data = json.loads(r.body)
-        assert data == {"hello": "world"}
-
-    def test_media_type(self):
-        """ORJSONResponse has application/json media type."""
-        from fastapi.responses import ORJSONResponse
-        assert ORJSONResponse.media_type == "application/json"
-
-    def test_status_code(self):
-        """ORJSONResponse accepts custom status code."""
-        from fastapi.responses import ORJSONResponse
-        from fastapi.exceptions import FastAPIDeprecationWarning
-        import warnings as _w
-        with _w.catch_warnings():
-            _w.simplefilter("ignore", FastAPIDeprecationWarning)
-            r = ORJSONResponse(content={"ok": True}, status_code=201)
-        assert r.status_code == 201
-
-
-class TestUJSONResponse:
-    """Tests for UJSONResponse."""
-
-    def test_import(self):
-        """UJSONResponse is importable from responses module."""
-        from fastapi.responses import UJSONResponse
-        assert UJSONResponse is not None
-
-    def test_import_from_top_level(self):
-        """UJSONResponse is importable from fastapi_turbo."""
-        from fastapi import UJSONResponse
-        assert UJSONResponse is not None
-
-    def test_renders_json(self):
-        """UJSONResponse renders content as JSON bytes."""
-        import warnings
-        from fastapi.exceptions import FastAPIDeprecationWarning
-        from fastapi.responses import UJSONResponse
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FastAPIDeprecationWarning)
-            r = UJSONResponse(content={"hello": "world"})
-        data = json.loads(r.body)
-        assert data == {"hello": "world"}
-
-    def test_media_type(self):
-        """UJSONResponse has application/json media type."""
-        from fastapi.responses import UJSONResponse
-        assert UJSONResponse.media_type == "application/json"
-
-
-# ===========================================================================
-# P2 #4: AsyncTestClient
+# AsyncTestClient (turbo-only: real-socket async client)
 # ===========================================================================
 
 
 class TestAsyncTestClient:
-    """Tests for AsyncTestClient."""
-
-    def test_import(self):
-        """AsyncTestClient is importable from testclient module."""
-        from fastapi.testclient import AsyncTestClient
-        assert AsyncTestClient is not None
+    """Shape pins for the turbo-only AsyncTestClient."""
 
     def test_has_async_context_manager(self):
         """AsyncTestClient implements __aenter__ and __aexit__."""
@@ -284,17 +194,6 @@ class TestAsyncTestClient:
         client = AsyncTestClient(app)
         assert hasattr(client, "__aenter__")
         assert hasattr(client, "__aexit__")
-
-    def test_has_http_methods(self):
-        """AsyncTestClient has get, post, put, delete, patch, options, head, request methods."""
-        from fastapi.testclient import AsyncTestClient
-        from fastapi import FastAPI
-
-        app = FastAPI()
-        client = AsyncTestClient(app)
-        for method in ("get", "post", "put", "delete", "patch", "options", "head", "request"):
-            assert hasattr(client, method)
-            assert callable(getattr(client, method))
 
     def test_methods_are_async(self):
         """AsyncTestClient methods are coroutine functions."""
@@ -318,250 +217,12 @@ class TestAsyncTestClient:
 
 
 # ===========================================================================
-# P2 #5: OpenAPI servers, terms_of_service, contact, license_info
-# ===========================================================================
-
-
-class TestOpenAPIExtendedInfo:
-    """Tests for extended OpenAPI info fields."""
-
-    def test_app_stores_servers(self):
-        """FastAPI stores servers parameter."""
-        from fastapi import FastAPI
-        servers = [{"url": "https://api.example.com", "description": "Production"}]
-        app = FastAPI(servers=servers)
-        assert app.servers == servers
-
-    def test_app_stores_terms_of_service(self):
-        """FastAPI stores terms_of_service parameter."""
-        from fastapi import FastAPI
-        app = FastAPI(terms_of_service="https://example.com/tos")
-        assert app.terms_of_service == "https://example.com/tos"
-
-    def test_app_stores_contact(self):
-        """FastAPI stores contact parameter."""
-        from fastapi import FastAPI
-        contact = {"name": "Support", "email": "support@example.com"}
-        app = FastAPI(contact=contact)
-        assert app.contact == contact
-
-    def test_app_stores_license_info(self):
-        """FastAPI stores license_info parameter."""
-        from fastapi import FastAPI
-        license_info = {"name": "MIT", "url": "https://opensource.org/licenses/MIT"}
-        app = FastAPI(license_info=license_info)
-        assert app.license_info == license_info
-
-    def test_openapi_includes_servers(self):
-        """OpenAPI schema includes servers when set."""
-        from fastapi import FastAPI
-        servers = [{"url": "https://api.example.com"}]
-        app = FastAPI(servers=servers)
-
-        @app.get("/test")
-        def test_route():
-            return {}
-
-        schema = app.openapi()
-        assert "servers" in schema
-        assert schema["servers"] == servers
-
-    def test_openapi_includes_terms_of_service(self):
-        """OpenAPI schema includes termsOfService in info when set."""
-        from fastapi import FastAPI
-        app = FastAPI(terms_of_service="https://example.com/tos")
-
-        @app.get("/test")
-        def test_route():
-            return {}
-
-        schema = app.openapi()
-        assert schema["info"]["termsOfService"] == "https://example.com/tos"
-
-    def test_openapi_includes_contact(self):
-        """OpenAPI schema includes contact in info when set."""
-        from fastapi import FastAPI
-        contact = {"name": "Support", "email": "support@example.com"}
-        app = FastAPI(contact=contact)
-
-        @app.get("/test")
-        def test_route():
-            return {}
-
-        schema = app.openapi()
-        assert schema["info"]["contact"] == contact
-
-    def test_openapi_includes_license(self):
-        """OpenAPI schema includes license in info when set."""
-        from fastapi import FastAPI
-        license_info = {"name": "MIT"}
-        app = FastAPI(license_info=license_info)
-
-        @app.get("/test")
-        def test_route():
-            return {}
-
-        schema = app.openapi()
-        assert schema["info"]["license"] == license_info
-
-    def test_openapi_defaults_no_extra_fields(self):
-        """OpenAPI schema omits servers/contact/etc when not set."""
-        from fastapi import FastAPI
-        app = FastAPI()
-
-        @app.get("/test")
-        def test_route():
-            return {}
-
-        schema = app.openapi()
-        assert "servers" not in schema
-        assert "termsOfService" not in schema["info"]
-        assert "contact" not in schema["info"]
-        assert "license" not in schema["info"]
-
-
-# ===========================================================================
-# P2 #6: Security schemes in OpenAPI output
-# ===========================================================================
-
-
-class TestOpenAPISecuritySchemes:
-    """Tests for security schemes in OpenAPI output."""
-
-    def test_oauth2_scheme_in_openapi(self):
-        """OAuth2PasswordBearer appears in securitySchemes."""
-        from fastapi import FastAPI, Depends
-        from fastapi.security import OAuth2PasswordBearer
-
-        app = FastAPI()
-        oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
-
-        @app.get("/protected")
-        def protected(token: str = Depends(oauth2_scheme)):
-            return {"token": token}
-
-        schema = app.openapi()
-        assert "components" in schema
-        assert "securitySchemes" in schema["components"]
-        schemes = schema["components"]["securitySchemes"]
-        assert "OAuth2PasswordBearer" in schemes
-        assert schemes["OAuth2PasswordBearer"]["type"] == "oauth2"
-
-    def test_http_bearer_in_openapi(self):
-        """HTTPBearer appears in securitySchemes."""
-        from fastapi import FastAPI, Depends
-        from fastapi.security import HTTPBearer
-
-        app = FastAPI()
-        bearer = HTTPBearer()
-
-        @app.get("/protected")
-        def protected(creds=Depends(bearer)):
-            return {"ok": True}
-
-        schema = app.openapi()
-        schemes = schema.get("components", {}).get("securitySchemes", {})
-        assert "HTTPBearer" in schemes
-        assert schemes["HTTPBearer"]["type"] == "http"
-        assert schemes["HTTPBearer"]["scheme"] == "bearer"
-
-    def test_api_key_header_in_openapi(self):
-        """APIKeyHeader appears in securitySchemes."""
-        from fastapi import FastAPI, Depends
-        from fastapi.security import APIKeyHeader
-
-        app = FastAPI()
-        api_key = APIKeyHeader(name="X-API-Key")
-
-        @app.get("/protected")
-        def protected(key=Depends(api_key)):
-            return {"ok": True}
-
-        schema = app.openapi()
-        schemes = schema.get("components", {}).get("securitySchemes", {})
-        assert "APIKeyHeader" in schemes
-        assert schemes["APIKeyHeader"]["type"] == "apiKey"
-        assert schemes["APIKeyHeader"]["in"] == "header"
-
-    def test_no_security_no_schemes(self):
-        """OpenAPI without security deps has no securitySchemes."""
-        from fastapi import FastAPI
-
-        app = FastAPI()
-
-        @app.get("/public")
-        def public():
-            return {"ok": True}
-
-        schema = app.openapi()
-        components = schema.get("components", {})
-        assert "securitySchemes" not in components
-
-
-# ===========================================================================
-# P2 #7: Tag descriptions in OpenAPI
-# ===========================================================================
-
-
-class TestOpenAPITagDescriptions:
-    """Tests for openapi_tags with descriptions."""
-
-    def test_app_stores_openapi_tags(self):
-        """FastAPI stores openapi_tags parameter."""
-        from fastapi import FastAPI
-        tags = [
-            {"name": "items", "description": "Operations with items"},
-            {"name": "users", "description": "Operations with users"},
-        ]
-        app = FastAPI(openapi_tags=tags)
-        assert app.openapi_tags == tags
-
-    def test_openapi_tags_in_schema(self):
-        """OpenAPI schema includes tags array when openapi_tags is set."""
-        from fastapi import FastAPI
-        tags = [
-            {"name": "items", "description": "Operations with items"},
-        ]
-        app = FastAPI(openapi_tags=tags)
-
-        @app.get("/items", tags=["items"])
-        def get_items():
-            return []
-
-        schema = app.openapi()
-        assert "tags" in schema
-        assert schema["tags"] == tags
-
-    def test_openapi_no_tags_when_not_set(self):
-        """OpenAPI schema omits tags when openapi_tags is not set."""
-        from fastapi import FastAPI
-        app = FastAPI()
-
-        @app.get("/test")
-        def test_route():
-            return {}
-
-        schema = app.openapi()
-        assert "tags" not in schema
-
-
-# ===========================================================================
-# P2 #8: WebSocketDisconnect exception
+# WebSocketDisconnect constructor defaults
 # ===========================================================================
 
 
 class TestWebSocketDisconnect:
-    """Tests for WebSocketDisconnect exception."""
-
-    def test_import_from_exceptions(self):
-        """WebSocketDisconnect is importable from exceptions module."""
-        from fastapi.exceptions import WebSocketDisconnect
-        assert WebSocketDisconnect is not None
-
-    def test_import_from_top_level(self):
-        """WebSocketDisconnect is importable from fastapi_turbo."""
-        from fastapi import WebSocketDisconnect
-        assert WebSocketDisconnect is not None
+    """Constructor-contract pins for WebSocketDisconnect."""
 
     def test_default_code(self):
         """WebSocketDisconnect defaults to code 1000."""
@@ -569,22 +230,11 @@ class TestWebSocketDisconnect:
         exc = WebSocketDisconnect()
         assert exc.code == 1000
 
-    def test_custom_code(self):
-        """WebSocketDisconnect accepts custom code."""
-        from fastapi.exceptions import WebSocketDisconnect
-        exc = WebSocketDisconnect(code=1001)
-        assert exc.code == 1001
-
     def test_reason(self):
         """WebSocketDisconnect accepts a reason."""
         from fastapi.exceptions import WebSocketDisconnect
         exc = WebSocketDisconnect(code=1000, reason="Normal closure")
         assert exc.reason == "Normal closure"
-
-    def test_is_exception(self):
-        """WebSocketDisconnect is an Exception subclass."""
-        from fastapi.exceptions import WebSocketDisconnect
-        assert issubclass(WebSocketDisconnect, Exception)
 
     def test_default_reason_empty(self):
         """WebSocketDisconnect defaults reason to "" (real Starlette coerces
@@ -595,7 +245,7 @@ class TestWebSocketDisconnect:
 
 
 # ===========================================================================
-# P2 #9: iter_text / iter_bytes / iter_json on WebSocket
+# iter_text / iter_bytes / iter_json on WebSocket
 # ===========================================================================
 
 
@@ -654,22 +304,52 @@ class TestWebSocketIterators:
 
 
 # ===========================================================================
-# P2 #11: generate_unique_id_function
+# Local-coverage carriers: APIKeyHeader securityScheme + @app.trace
+# ===========================================================================
+
+
+class TestOpenAPISecuritySchemes:
+    def test_api_key_header_in_openapi(self):
+        """APIKeyHeader appears in securitySchemes."""
+        from fastapi import FastAPI, Depends
+        from fastapi.security import APIKeyHeader
+
+        app = FastAPI()
+        api_key = APIKeyHeader(name="X-API-Key")
+
+        @app.get("/protected")
+        def protected(key=Depends(api_key)):
+            return {"ok": True}
+
+        schema = app.openapi()
+        schemes = schema.get("components", {}).get("securitySchemes", {})
+        assert "APIKeyHeader" in schemes
+        assert schemes["APIKeyHeader"]["type"] == "apiKey"
+        assert schemes["APIKeyHeader"]["in"] == "header"
+
+
+class TestTraceMethod:
+    def test_trace_registers_route(self):
+        """app.trace() registers a TRACE route."""
+        from fastapi import FastAPI
+        app = FastAPI()
+
+        @app.trace("/debug")
+        def debug_trace():
+            return {"method": "TRACE"}
+
+        routes = app.router.routes
+        assert len(routes) == 1
+        assert "TRACE" in routes[0].methods
+
+
+# ===========================================================================
+# generate_unique_id_function
 # ===========================================================================
 
 
 class TestGenerateUniqueIdFunction:
-    """Tests for generate_unique_id_function on APIRoute."""
-
-    def test_default_no_custom_id(self):
-        """Without generate_unique_id_function, operation_id is None by default."""
-        from fastapi.routing import APIRoute
-
-        def handler():
-            return {}
-
-        route = APIRoute("/test", handler, methods=["GET"])
-        assert route.operation_id is None
+    """Carrier pins for generate_unique_id_function on APIRoute."""
 
     def test_explicit_operation_id_takes_precedence(self):
         """Explicit operation_id takes precedence over generate_unique_id_function."""
@@ -716,109 +396,3 @@ class TestGenerateUniqueIdFunction:
         route = APIRoute("/test", my_handler, methods=["GET"])
         result = _default_generate_unique_id(route, "GET")
         assert result == "my_handler_get"
-
-    def test_generate_unique_id_function_stored(self):
-        """generate_unique_id_function is stored on the route."""
-        from fastapi.routing import APIRoute
-
-        def handler():
-            return {}
-
-        def custom_id(route, method):
-            return "custom"
-
-        route = APIRoute(
-            "/test", handler,
-            generate_unique_id_function=custom_id,
-        )
-        assert route.generate_unique_id_function is custom_id
-
-
-# ===========================================================================
-# P2 #12: @app.trace method
-# ===========================================================================
-
-
-class TestTraceMethod:
-    """Tests for the TRACE HTTP method on FastAPI and APIRouter."""
-
-    def test_fastapi_has_trace(self):
-        """FastAPI has a trace() method."""
-        from fastapi import FastAPI
-        app = FastAPI()
-        assert hasattr(app, "trace")
-        assert callable(app.trace)
-
-    def test_router_has_trace(self):
-        """APIRouter has a trace() method."""
-        from fastapi.routing import APIRouter
-        router = APIRouter()
-        assert hasattr(router, "trace")
-        assert callable(router.trace)
-
-    def test_trace_registers_route(self):
-        """app.trace() registers a TRACE route."""
-        from fastapi import FastAPI
-        app = FastAPI()
-
-        @app.trace("/debug")
-        def debug_trace():
-            return {"method": "TRACE"}
-
-        routes = app.router.routes
-        assert len(routes) == 1
-        assert "TRACE" in routes[0].methods
-
-    def test_trace_on_router(self):
-        """router.trace() registers a TRACE route."""
-        from fastapi.routing import APIRouter
-        router = APIRouter()
-
-        @router.trace("/debug")
-        def debug_trace():
-            return {"method": "TRACE"}
-
-        routes = router.routes
-        assert len(routes) == 1
-        assert "TRACE" in routes[0].methods
-
-    def test_trace_route_endpoint(self):
-        """TRACE route stores the correct endpoint."""
-        from fastapi import FastAPI
-        app = FastAPI()
-
-        @app.trace("/debug")
-        def debug_trace():
-            return {"method": "TRACE"}
-
-        route = app.router.routes[0]
-        assert route.endpoint is debug_trace
-
-    def test_trace_with_kwargs(self):
-        """TRACE route accepts kwargs like tags."""
-        from fastapi import FastAPI
-        app = FastAPI()
-
-        @app.trace("/debug", tags=["debug"])
-        def debug_trace():
-            return {"method": "TRACE"}
-
-        route = app.router.routes[0]
-        assert "debug" in route.tags
-
-    def test_trace_multiple_routes(self):
-        """Multiple TRACE routes can be registered."""
-        from fastapi import FastAPI
-        app = FastAPI()
-
-        @app.trace("/debug1")
-        def debug1():
-            return {}
-
-        @app.trace("/debug2")
-        def debug2():
-            return {}
-
-        assert len(app.router.routes) == 2
-        assert app.router.routes[0].path == "/debug1"
-        assert app.router.routes[1].path == "/debug2"
