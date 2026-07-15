@@ -88,18 +88,6 @@ SQLA_VARIANTS = [
     ("raw driver · pg3async †", "pg3async"),
 ]
 
-CAMPAIGN = [
-    ("stream · sync gen", "852 µs", "28 µs", "30×", "conn=1 · beats Fastify"),
-    ("stream · async gen", "546 µs", "29 µs", "19×", "conn=1 · beats Fastify"),
-    ("stream · real await", "284 µs", "50 µs", "5.7×", "conn=1 p50"),
-    ("Postgres · async", "1.8k", "47.7k", "26×", "req/s all-core"),
-    ("redis · turbo mux", "98 µs", "53 µs", "9.5× raw", "opt-in multiplexed client"),
-    ("WS server RTT p99", "49.7 µs", "40 µs", "−20%", "Rust client · direct-send"),
-    ("PUT /items", "33 µs", "27 µs", "at Gin", "conn=1 p50"),
-    ("regressions", "—", "0", "4,500+ tests", "parity · local · upstream"),
-]
-
-
 def esc(s):
     return html.escape(str(s), quote=True)
 
@@ -128,6 +116,62 @@ def fmt_rps(v):
     if v is None:
         return "—"
     return f"{v / 1000:,.1f}k" if v >= 10000 else f"{v:,.0f}"
+
+
+# ── campaign cards: "before" = fixed campaign-start baselines (one-off
+# measurements, documented in benchmarks/DEEPDIVE_*.md); "after" is read from
+# the CURRENT results JSONs at generation time so the cards can never
+# contradict the tables below. None-safe: a missing key renders "—".
+_T = "fastapi-turbo"
+_WSD = WS.get("data", WS)
+
+
+def _us(v):
+    return "—" if v is None else f"{v:,.0f} µs"
+
+
+def _x(before, after, spec="{:,.0f}×"):
+    return "—" if not after else spec.format(before / after)
+
+
+_await = get_lat(_T, "stream await")
+_ws_p99 = (_WSD.get(_T) or {}).get("rust_p99_us")
+_mux_get = get_db(_T, "redis get [turbo mux client]")
+_std_get = get_db(_T, "redis get [async]")
+_pg_async = get_tp(_T, "pg item async")
+
+CAMPAIGN = [
+    ("stream · sync gen", "852 µs", _us(get_lat(_T, "stream sync")),
+     _x(852, get_lat(_T, "stream sync")), "conn=1 · beats Fastify"),
+    ("stream · async gen", "546 µs", _us(get_lat(_T, "stream async")),
+     _x(546, get_lat(_T, "stream async")), "conn=1 · beats Fastify"),
+    ("stream · real await", "284 µs", _us(_await), _x(284, _await, "{:,.1f}×"), "conn=1 p50"),
+    ("Postgres · async", "1.8k", fmt_rps(_pg_async), _x(_pg_async or 0, 1800), "req/s all-core"),
+    ("redis GET · turbo mux", fmt_rps(_std_get), fmt_rps(_mux_get),
+     ("—" if not (_mux_get and _std_get) else f"+{(_mux_get / _std_get - 1) * 100:.0f}%"),
+     "req/s c64 · opt-in mux client"),
+    ("WS server RTT p99", "49.7 µs",
+     "—" if _ws_p99 is None else f"{_ws_p99:,.1f} µs",
+     "—" if _ws_p99 is None else f"−{(1 - _ws_p99 / 49.7) * 100:.0f}%",
+     "Rust client · direct-send"),
+    ("PUT /items", "33 µs", _us(get_lat(_T, "PUT items/{id}")), "at Gin", "conn=1 p50"),
+    ("regressions", "—", "0", "4,500+ tests", "parity · local · upstream"),
+]
+
+# CH-02 prose floor comparison, computed (was hardcoded and went stale)
+_pg_sync_t = get_tp(_T, "pg item sync")
+_pg_sync_ax = get_tp("raw-axum", "pg item sync")
+_pg_floor_note = (
+    f"<b>pg item sync floor</b>: turbo {fmt_rps(_pg_sync_t)} = "
+    f"{_pg_sync_t / _pg_sync_ax * 100:.0f}% of raw-axum's {fmt_rps(_pg_sync_ax)} — "
+    "the compiled-driver ceiling on this box. "
+    if _pg_sync_t and _pg_sync_ax else ""
+)
+
+# WS Rust-client throughput row values for the honesty note
+_ws_tp_t = (_WSD.get(_T) or {}).get("rust_msgs_per_s")
+_ws_tp_fa = (_WSD.get("FastAPI (uvicorn)") or {}).get("rust_msgs_per_s")
+_ws_tp_ax = (_WSD.get("raw-axum") or {}).get("rust_msgs_per_s")
 
 
 def lane(vals, better):
@@ -236,6 +280,7 @@ def ws_table():
             ("server RTT p99 · Rust client", "rust_p99_us", "low", " µs"),
             ("round-trip p50 · Python client", "p50_us", "low", " µs"),
             ("round-trip p99 · Python client", "p99_us", "low", " µs"),
+            ("throughput · Rust client", "rust_msgs_per_s", "high", " msg/s"),
             ("throughput · fleet", "msgs_per_s", "high", " msg/s")]
     out = ['<div class="tscroll"><table><thead><tr><th class="lab">64-byte echo · /ws</th>']
     for f in FW:
@@ -252,7 +297,7 @@ def ws_table():
             cls = "tcol " if f == "fastapi-turbo" else ""
             if v is not None and v == best:
                 cls += "lead tlead" if f == "fastapi-turbo" else "lead"
-            txt = "—" if v is None else (fmt_rps(v) if key == "msgs_per_s" else f"{float(v):,.1f}")
+            txt = "—" if v is None else (fmt_rps(v) if key.endswith("msgs_per_s") else f"{float(v):,.1f}")
             out.append(f'<td class="{cls.strip()}">{txt}</td>')
         chip = (f'<b class="chip">{esc(SHORT[leader])}</b>' if leader and leader != "fastapi-turbo"
                 else '<b class="chip amber">turbo</b>' if leader else "")
@@ -275,7 +320,23 @@ def campaign_cards():
 
 tpm = TP["meta"]
 dbm = DB["meta"]
-now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _data_stamp():
+    """Timestamp of the DATA (last commit touching the results JSONs), not of
+    this render — regenerating the HTML must not re-date old measurements."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "log", "-1", "--format=%ad", "--date=format:%Y-%m-%d %H:%M", "--",
+             "results_matrix.json", "results_throughput.json", "results_db.json", "results_ws.json"],
+            cwd=HERE, capture_output=True, text=True, check=True).stdout.strip()
+        return out
+    except Exception:
+        return ""
+
+
+now = _data_stamp() or datetime.now().strftime("%Y-%m-%d %H:%M")
 
 HTML = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -395,7 +456,7 @@ td.lanecell {{ min-width:190px; text-align:left; padding-left:22px; }}
 </style></head><body><div class="wrap">
 
 <header class="mast">
-  <div class="id">TEST CERTIFICATE · RUN {esc(now)}</div>
+  <div class="id">TEST CERTIFICATE · DATA {esc(now)}</div>
   <h1>fastapi-<em>turbo</em> bench registry</h1>
   <p class="sub">Five servers, one contract, byte-identical responses. Apple M5 Max · 18 cores ·
   loopback · solo-boot per framework. Latency is one request at a time; throughput is every
@@ -439,8 +500,7 @@ td.lanecell {{ min-width:190px; text-align:left; padding-left:22px; }}
   {metric_table(TP_ROWS, get_tp, fmt_rps, "high", "req/s",
      "Each framework at its best: turbo/uvicorn multiprocess, Fastify cluster, Gin/axum native all-core. "
      "Python async groups run their measured-best worker count — same policy as driver choice. "
-     "<b>pg item sync floor</b>: turbo 58.3k = 95% of raw-axum's 61.4k — the compiled-driver ceiling on this box; "
-     "a further +30% is not available on shared-box hardware. "
+     + _pg_floor_note +
      "<b>Box confound</b>: client + server + Postgres + Redis share the same 18 cores — "
      "fleet rows are comparative, not absolute capacity.")}
 </section>
@@ -495,6 +555,9 @@ td.lanecell {{ min-width:190px; text-align:left; padding-left:22px; }}
   no select-task wake — cutting server p99 20%. Fleet throughput is client-bounded; per-worker with an unconstrained
   client, turbo's thread mode measures <b>622k msg/s</b>. Loop-residency mode (FASTAPI_TURBO_WS_LOOP) trades +16 µs
   p50 for steadier p99 and fixes a receive-then-await hang.
+  <b>Rust-client bulk throughput is turbo's one losing row</b> — {fmt_rps(_ws_tp_t)} msg/s vs
+  FastAPI's {fmt_rps(_ws_tp_fa)} and raw-axum's {fmt_rps(_ws_tp_ax)}: the direct-send write path is
+  tuned for round-trip latency, not saturated bulk throughput; tracked for investigation.
   <b>Floor</b>: turbo 24.2 µs true-server p50 vs Gin 15.3 is the Python-handler floor — inbound wake (hop1)
   + 2 GIL attaches (receive + send) + interpreter resume ≈ 5-8 µs per message. The pure-Rust echo path
   (no Python handler) measures at axum level — it exists for echo-shaped protocols.</p>
@@ -510,6 +573,8 @@ td.lanecell {{ min-width:190px; text-align:left; padding-left:22px; }}
   contaminate up to 4×), connection budget ≤ 90 of Postgres's 100, rows with &gt;0.5% non-2xx marked invalid.</p>
   <p><b>Gates.</b> Every performance commit passed parity 157, local 1138, WebSocket 24, and FastAPI 0.138's own
   3,197-test suite with a byte-identical failure set, plus drift-controlled A/B benches — losers were reverted.</p>
+  <p><b>Selection policy.</b> {esc(tpm.get("turbo_fleet_note", "single pass"))}.
+  {esc(dbm.get("turbo_fleet_note", ""))}.</p>
 </div>
 
 </div></body></html>"""

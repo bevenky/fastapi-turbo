@@ -11,6 +11,8 @@ plans below are executed or superseded.
 | `todos.md` | Apr 2026 task list | the task tracker of whatever session is active |
 | `STRATEGY.md`, `TRACKER.md` | May 2026 strategy/tracker | executed; see `CLONE_DELETION_PLAN.md` status header |
 | `PIVOT_PLAN.md`, `COLLAPSE_PLAN.md` | Jun 2026 pivot/dispatcher-collapse plans | executed (PR #3, merged 2026-07-03) |
+| `DOOR_ARCHITECTURE.html` | Jun 2026 door gap-inventory/decision record | describes pre-collapse dispatchers; superseded by the shipped door (`src/`) |
+| `request-flow.html` | May 2026 request-flow walkthrough | predates the collapse + 0.138 stack; multi-core section ships as `src/cluster.rs` |
 
 Active reference docs remain at the repo root: `README.md`, `COMPATIBILITY.md`,
 `CLONE_DELETION_PLAN.md` (the one live plan, ~85% executed — see its status header),

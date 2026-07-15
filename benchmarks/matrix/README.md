@@ -27,7 +27,8 @@ and `tests/test_plain_import_stack.py` (live third-party stack under one
 | `run_db_matrix.py` | deep PG/Redis matrix → `results_db.json` |
 | `bench_ws.py` | WebSocket echo latency + throughput → `results_ws.json` |
 | `verify_parity.py` / `verify_db.py` | correctness gates — run BEFORE benching |
-| `gen_report.py` / `gen_db_report.py` | HTML reports (`report.html`, `report_db.html`) |
+| `gen_report_v2.py` | THE report generator — `report.html` (bench certificate; DB/driver/SQLA/WS channels included) |
+| `run_db_latency.py` | conn=1 p50 sidecar for the SQLAlchemy table → `results_db.json` |
 | `go-gin/`, `fastify/`, `raw-axum/` | the mirror servers |
 
 ## Bench hygiene (hard-won rules — violate these and the numbers lie)
@@ -248,7 +249,9 @@ python verify_parity.py && python verify_db.py   # gates
 python run_matrix.py                             # conn=1 latency matrix
 python bench_throughput.py                       # all-core throughput
 python run_db_matrix.py                          # deep PG/Redis matrix
-python gen_report.py && python gen_db_report.py  # HTML reports
+python run_db_latency.py                         # sqla conn=1 sidecar
+python bench_ws.py                               # WebSocket channel
+python gen_report_v2.py                          # THE report (report.html)
 ```
 
 Prereqs: Postgres db `fastapi_turbo_bench` (tables `items`, `bench_writes`),
