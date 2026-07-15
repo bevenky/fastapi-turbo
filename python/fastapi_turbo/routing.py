@@ -301,7 +301,10 @@ class APIRouter(_real_fastapi.routing.APIRouter):
         self._on_shutdown: list[Callable] = list(on_shutdown or [])
         self.lifespan = lifespan
         self.dependency_overrides_provider = dependency_overrides_provider
-        self.default = default
+        # Starlette parity: ``default`` falls back to the Router's own 404
+        # responder (real machinery — ``_IncludedRouter._handle_selected``
+        # awaits ``original_router.default(...)`` on a routing miss).
+        self.default = default if default is not None else self.not_found
         self._mounts: list[tuple[str, Any, str | None]] = []
         # FA / Starlette parity: ``APIRouter(routes=[...])`` accepts
         # pre-constructed Starlette ``Route`` / ``WebSocketRoute`` /
@@ -436,18 +439,35 @@ class APIRouter(_real_fastapi.routing.APIRouter):
         include_in_schema: bool = True,
         **kwargs: Any,
     ) -> None:
-        """Imperative generic route registration (Starlette-compatible)."""
-        kwargs.setdefault("response_model", None)
-        route = APIRoute(
+        """Imperative generic route registration (Starlette-compatible).
+
+        FA/Starlette parity: ``add_route`` registers a REAL starlette
+        ``Route`` (upstream ``APIRouter.add_route`` does exactly this) —
+        the endpoint takes a single ``Request`` argument and returns a
+        Response, with no FastAPI parameter pipeline. This keeps bare
+        ``router.handle(...)`` / real Router dispatch working on these
+        routes (real ``APIRoute.handle`` would demand the FastAPI exit-stack
+        scope keys). The door serves them via the passthrough branch."""
+        if kwargs:
+            import logging
+            logging.getLogger("fastapi_turbo.routing").debug(
+                "add_route(%r): ignoring non-Starlette kwargs %r",
+                path, sorted(kwargs),
+            )
+        from starlette.routing import Route as _StarletteRoute
+
+        route = _StarletteRoute(
             path,
             endpoint,
-            methods=methods or ["GET"],
+            methods=list(methods or ["GET"]),
             name=name,
             include_in_schema=include_in_schema,
-            **kwargs,
         )
         _mark_starlette_compat_route(route)
         self.routes.append(route)
+        _mark = getattr(self, "_mark_routes_changed", None)
+        if _mark is not None:
+            _mark()
 
     # ------------------------------------------------------------------
     # WebSocket routes
@@ -473,6 +493,9 @@ class APIRouter(_real_fastapi.routing.APIRouter):
         # (already tagged ``_is_websocket=True``) instead.
         route = WSRoute(path, endpoint, name=name, **kwargs)
         self.routes.append(route)
+        _mark = getattr(self, "_mark_routes_changed", None)
+        if _mark is not None:
+            _mark()
 
     def add_api_websocket_route(
         self,
@@ -546,8 +569,11 @@ class APIRouter(_real_fastapi.routing.APIRouter):
 
         Raises ``LookupError`` if no route with the given name is found.
         """
+        from starlette.routing import NoMatchFound as _NoMatchFound
+
         for route in self.routes:
-            if route.name == name:
+            route_name = getattr(route, "name", None)
+            if route_name == name and isinstance(getattr(route, "path", None), str):
                 path = self.prefix + route.path
 
                 def _sub(match: re.Match) -> str:
@@ -562,13 +588,34 @@ class APIRouter(_real_fastapi.routing.APIRouter):
                     return quote(str(val), safe="")
 
                 return re.sub(r"\{([^}]+)\}", _sub, path)
+            if not isinstance(route, _real_fastapi.routing.APIRoute):
+                # ``_IncludedRouter`` markers and starlette Mount/Host/Route
+                # entries: FA 0.138 semantics — delegate to the route's own
+                # ``url_path_for`` (the marker resolves through its effective
+                # contexts, first inclusion wins; Mount/Host resolve nested
+                # ``"name:child"`` lookups).
+                resolver = getattr(route, "url_path_for", None)
+                if resolver is None or not callable(resolver):
+                    continue
+                try:
+                    resolved = resolver(name, **path_params)
+                except _NoMatchFound:
+                    continue
+                except LookupError:
+                    continue
+                if self.prefix:
+                    return self.prefix + str(resolved)
+                return resolved
 
-        # Search included routers recursively
+        # Search included routers recursively (legacy walk — covers the
+        # case where the real ``_IncludedRouter`` marker could not be built).
         for child_router, child_prefix, _tags, _meta in self._included_routers:
             try:
                 child_path = child_router.url_path_for(name, **path_params)
-                return self.prefix + child_prefix + child_path
+                return self.prefix + child_prefix + str(child_path)
             except LookupError:
+                continue
+            except _NoMatchFound:
                 continue
 
         raise LookupError(f"No route named {name!r}")
@@ -599,6 +646,15 @@ class APIRouter(_real_fastapi.routing.APIRouter):
             "Cannot include the same APIRouter instance into itself. "
             "Did you mean to include a different router?"
         )
+        # FA 0.138 parity: reject INDIRECT cycles too (``parent`` includes
+        # ``child``; ``child.include_router(parent)`` would loop forever at
+        # flatten/match time). ``_contains_router`` is real FastAPI's — it
+        # walks the ``_IncludedRouter`` markers this method appends below.
+        _contains = getattr(router, "_contains_router", None)
+        assert _contains is None or not _contains(self), (
+            "Cannot include an APIRouter instance that already includes this router. "
+            "Did you mean to include a different router?"
+        )
         # If the included router has ``deprecated=True`` on itself, that
         # should surface on every route reachable through this include.
         # The explicit ``deprecated=`` kwarg on include_router takes
@@ -620,55 +676,12 @@ class APIRouter(_real_fastapi.routing.APIRouter):
             "callbacks": list(callbacks or []),
         }
         self._included_routers.append((router, prefix, tags or [], include_meta))
-        # FA 0.138 parity: register a real ``_IncludedRouter`` so a parent
-        # router's ``_match_low_priority`` reaches this child's frontend /
-        # low-priority routes (and nested includes compose correctly). Skipped
-        # by the door flatten + ``routes`` property.
+        # FA 0.138 parity: ``include_router`` appends ONE real lazy
+        # ``_IncludedRouter`` marker (upstream no longer flattens), so
+        # ``self.routes`` matches upstream exactly — real machinery
+        # (``iter_route_contexts``, ``url_path_for``, ``matches``/``handle``,
+        # ``_match_low_priority``) works over it, and routes added to the
+        # child AFTER inclusion are live. The door flatten walks
+        # ``_included_routers`` with the include_meta above.
         from fastapi_turbo._route_helpers import _append_included_router
         _append_included_router(self, router, include_meta)
-
-        # Eagerly mirror the included router's routes into ``self.routes``
-        # as shadow clones with prefix-adjusted paths. Starlette/FA parity:
-        # ``app.router.routes`` lists EVERY registered route (including
-        # those reached via ``include_router``), so tests doing
-        # ``for r in app.router.routes: ...`` see sub-routes at their
-        # final paths. Shadow routes are tagged with
-        # ``_is_included_shadow=True`` so ``_collect_routes_from_router``
-        # skips them during the Rust flatten (avoids double-dispatch).
-        import copy as _copy
-        own_prefix = getattr(router, "prefix", "") or ""
-        full_prefix = (prefix or "") + own_prefix
-
-        def _stack_path(pfx: str, child: str) -> str:
-            if not pfx:
-                return child
-            if not child:
-                return pfx
-            joined = pfx.rstrip("/") + "/" + child.lstrip("/")
-            return joined or "/"
-
-        # The shadow mirror exists ONLY for ``router.routes`` parity
-        # (callers iterating routes see sub-routes at their final
-        # paths); the door's flatten walks ``_included_routers`` with
-        # the include_meta above for the real cascade. The old
-        # response-class / deps stamps on the clones were write-only —
-        # nothing read them — so the mirror is path-stacking only.
-        def _mirror(src_router, pfx: str) -> None:
-            for r in getattr(src_router, "routes", []):
-                if getattr(r, "_is_included_shadow", False):
-                    continue
-                if type(r).__name__ == "_IncludedRouter":
-                    continue
-                clone = _copy.copy(r)
-                clone.path = _stack_path(pfx, getattr(r, "path", ""))
-                clone._is_included_shadow = True
-                self.routes.append(clone)
-            for entry in getattr(src_router, "_included_routers", []):
-                child_router, child_prefix = entry[0], entry[1]
-                nested_prefix = _stack_path(
-                    _stack_path(pfx, child_prefix or ""),
-                    getattr(child_router, "prefix", "") or "",
-                )
-                _mirror(child_router, nested_prefix)
-
-        _mirror(router, full_prefix)

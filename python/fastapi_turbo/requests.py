@@ -72,6 +72,27 @@ def _door_make_request(scope):
         # off a bare scope still sees it (zero-behavior-change insurance).
         seed = getattr(app, "_app_state", None) if app is not None else None
         scope["state"] = dict(seed) if seed else {}
+    # FA 0.138 include-context parity: routes reached via ``include_router``
+    # carry their pre-built real ``_EffectiveRouteContext``s (stamped at door
+    # registration by ``_stamp_effective_route_contexts``). Upstream exposes
+    # the matched one as ``scope["fastapi"]["effective_route_context"]``;
+    # repeated inclusions of the same route are disambiguated by the
+    # context's own compiled ``path_regex``.
+    if "fastapi" not in scope:
+        route = scope.get("route")
+        ctxs = getattr(route, "_fastapi_turbo_effective_ctxs", None) if route is not None else None
+        if ctxs:
+            ctx = ctxs[0]
+            if len(ctxs) > 1:
+                path = scope.get("path") or "/"
+                root_path = scope.get("root_path") or ""
+                route_path = path[len(root_path):] if root_path and path.startswith(root_path) else path
+                for cand in ctxs:
+                    regex = getattr(cand, "path_regex", None)
+                    if regex is not None and regex.match(route_path):
+                        ctx = cand
+                        break
+            scope["fastapi"] = {"effective_route_context": ctx}
     req = Request(
         scope,
         _make_disconnect_receive(

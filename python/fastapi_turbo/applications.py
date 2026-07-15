@@ -94,6 +94,8 @@ from fastapi_turbo._route_helpers import (  # noqa: F401 — re-exports
     _is_async_callable,
     _is_included_router,
     _model_needs_full_dump,
+    _route_dispatch_customized,
+    _router_dispatch_customized,
 )
 
 
@@ -1525,71 +1527,15 @@ class FastAPI(_real_fastapi.FastAPI):
 
     @property
     def routes(self) -> list:
-        """Return all collected route objects with their effective paths.
+        """Return the app's LIVE route list — FastAPI 0.138 semantics.
 
-        Matches FastAPI/Starlette: child routers contributed via
-        ``include_router(prefix=...)`` surface as APIRoute instances whose
-        ``.path`` already reflects the merged prefix (so callers — OpenAPI
-        extensions, reverse-lookup helpers, Sentry integrations, etc. —
-        see the same strings they'd see on stock FastAPI).
+        Upstream ``include_router`` no longer eagerly flattens: the list
+        holds the direct routes plus one lazy ``_IncludedRouter`` marker per
+        include. Callers that need effective (prefix-merged) paths use real
+        ``fastapi.routing.iter_route_contexts(app.routes)``, exactly like
+        stock FastAPI 0.138.
         """
-        all_routes = [r for r in self.router.routes if not _is_included_router(r)]
-        for router, include_prefix, _tags, _meta in self._included_routers:
-            # `include_router(prefix=...)` stacks on top of the router's
-            # own `.prefix` attribute. Both need to appear in the final
-            # effective path.
-            effective = (include_prefix or "") + (getattr(router, "prefix", "") or "")
-            all_routes.extend(self._flatten_child_routes(router, effective))
-        return all_routes
-
-    @staticmethod
-    def _flatten_child_routes(router, prefix: str) -> list:
-        """Walk a child router recursively, yielding clones of each route
-        whose path has the cumulative prefix prepended. Clones are shallow
-        (we just swap the ``path`` attribute) so the underlying handlers
-        and metadata remain shared.
-        """
-        import copy as _copy
-
-        out: list = []
-        cleaned_prefix = prefix or ""
-
-        def _join(parent_prefix: str, child_path: str) -> str:
-            if not parent_prefix:
-                return child_path
-            trailing = child_path.endswith("/") and child_path != "/"
-            joined = parent_prefix.rstrip("/") + "/" + child_path.lstrip("/")
-            if joined == "":
-                return "/"
-            if trailing and not joined.endswith("/"):
-                joined += "/"
-            return joined
-
-        for route in router.routes:
-            if _is_included_router(route):
-                # Nested includes are walked via ``_included_routers`` below;
-                # the ``_IncludedRouter`` marker itself has no path to flatten.
-                continue
-            clone = _copy.copy(route)
-            clone.path = _join(cleaned_prefix, getattr(route, "path", ""))
-            out.append(clone)
-
-        # Recurse into nested ``router.include_router(...)`` chains — stack
-        # the include-prefix AND the child router's own ``.prefix`` on top
-        # of whatever prefix we already have.
-        nested = getattr(router, "_included_routers", None)
-        if nested:
-            for entry in nested:
-                if len(entry) >= 2:
-                    child_router, child_include_prefix = entry[0], entry[1]
-                else:
-                    continue
-                stacked = cleaned_prefix
-                for piece in (child_include_prefix or "", getattr(child_router, "prefix", "") or ""):
-                    if piece:
-                        stacked = stacked.rstrip("/") + "/" + piece.lstrip("/")
-                out.extend(FastAPI._flatten_child_routes(child_router, stacked))
-        return out
+        return list(self.router.routes)
 
     # ------------------------------------------------------------------
     # Mount sub-applications
@@ -1625,20 +1571,36 @@ class FastAPI(_real_fastapi.FastAPI):
         # FA raises when the resulting route would be both ``prefix=""``
         # AND ``path=""`` — the router's own ``prefix`` counts, so a
         # router with ``APIRouter(prefix="/foo")`` and a ``""`` route is
-        # fine under ``app.include_router(router)``.
+        # fine under ``app.include_router(router)``. FA 0.138: the check
+        # walks the EFFECTIVE candidates (``_iter_routes_with_context``),
+        # so a ``""`` route behind a nested prefixed include is fine, and
+        # pathless routes (Host, custom BaseRoutes) are skipped.
         _router_own_prefix = getattr(router, "prefix", "") or ""
         if not prefix and not _router_own_prefix:
             from fastapi_turbo.exceptions import FastAPIError as _FE
-            for r in getattr(router, "routes", []):
-                # ``_IncludedRouter`` markers (appended by a nested
-                # ``include_router``) have no ``.path`` and are walked via
-                # ``_included_routers``; they aren't a real ``path=""`` route.
-                if _is_included_router(r):
-                    continue
-                if not getattr(r, "path", ""):
+            try:
+                from fastapi.routing import _iter_routes_with_context as _irwc
+                _candidates = list(_irwc(getattr(router, "routes", []) or []))
+            except Exception:  # noqa: BLE001 — fall back to the raw walk
+                _candidates = [
+                    (r, None)
+                    for r in getattr(router, "routes", [])
+                    if not _is_included_router(r)
+                ]
+            for _cand_route, _cand_ctx in _candidates:
+                if _cand_ctx is None:
+                    _cand_path = getattr(_cand_route, "path", None)
+                    _cand_name = getattr(_cand_route, "name", "unknown")
+                elif getattr(_cand_ctx, "starlette_route", None) is not None:
+                    _cand_path = getattr(_cand_ctx.starlette_route, "path", None)
+                    _cand_name = getattr(_cand_ctx.starlette_route, "name", "unknown")
+                else:
+                    _cand_path = _cand_ctx.path
+                    _cand_name = _cand_ctx.name
+                if _cand_path is not None and not _cand_path:
                     raise _FE(
-                        "Prefix and path cannot be both empty (e.g. "
-                        "'' and '')"
+                        "Prefix and path cannot be both empty "
+                        f"(path operation: {_cand_name})"
                     )
         # If the included router has ``deprecated=True`` on itself, that
         # should surface on every route reachable through this include.
@@ -1659,57 +1621,15 @@ class FastAPI(_real_fastapi.FastAPI):
             "callbacks": list(callbacks or []),
         }
         self._included_routers.append((router, prefix, tags or [], include_meta))
-        # FA 0.138 parity: also register a real ``_IncludedRouter`` on the root
-        # router so ``Router._match_low_priority`` (driven from the door's 404
-        # fallback) reaches this router's frontend / low-priority routes. Skipped
-        # by the door flatten + ``routes`` property, so normal dispatch is
-        # unaffected.
+        # FA 0.138 parity: register ONE real lazy ``_IncludedRouter`` marker
+        # on the root router (upstream ``include_router`` no longer flattens),
+        # so ``app.router.routes`` matches upstream exactly and real machinery
+        # works over it: ``Router._match_low_priority`` (frontend),
+        # ``_IncludedRouter.matches``/``handle`` (the 404-fallback serving of
+        # custom-dispatch route/router classes), ``iter_route_contexts``,
+        # ``url_path_for``, and the per-request effective-route-context. The
+        # door's dispatch flatten walks ``_included_routers`` + include_meta.
         _append_included_router(self.router, router, include_meta)
-        # Mirror every effective sub-route onto ``self.router.routes``
-        # as shadow clones so ``app.router.routes`` surfaces the full
-        # flattened list (FA/Starlette parity). Shadow copies carry
-        # ``_is_included_shadow=True`` so ``_collect_routes_from_router``
-        # skips them during the Rust dispatch flatten.
-        try:
-            import copy as _copy
-            own_prefix = getattr(router, "prefix", "") or ""
-            full_prefix = (prefix or "") + own_prefix
-
-            def _stack_path(pfx: str, child: str) -> str:
-                if not pfx:
-                    return child
-                if not child:
-                    return pfx
-                joined = pfx.rstrip("/") + "/" + child.lstrip("/")
-                return joined or "/"
-
-            # The shadow mirror exists ONLY for ``app.router.routes``
-            # parity (callers iterating routes see sub-routes at their
-            # final paths); the door's flatten walks
-            # ``_included_routers`` + include_meta for the real
-            # cascades. The old response-class / deps / owner-router
-            # stamps on the clones were write-only — nothing read them.
-            def _mirror(src_router, pfx: str) -> None:
-                for r in getattr(src_router, "routes", []):
-                    if getattr(r, "_is_included_shadow", False):
-                        continue
-                    if _is_included_router(r):
-                        continue
-                    clone = _copy.copy(r)
-                    clone.path = _stack_path(pfx, getattr(r, "path", ""))
-                    clone._is_included_shadow = True
-                    self.router.routes.append(clone)
-                for entry in getattr(src_router, "_included_routers", []):
-                    child_router, child_prefix = entry[0], entry[1]
-                    nested = _stack_path(
-                        _stack_path(pfx, child_prefix or ""),
-                        getattr(child_router, "prefix", "") or "",
-                    )
-                    _mirror(child_router, nested)
-
-            _mirror(router, full_prefix)
-        except Exception as _exc:  # noqa: BLE001
-            _log.debug("silent catch in applications: %r", _exc)
 
     # ------------------------------------------------------------------
     # Middleware
@@ -2234,6 +2154,7 @@ class FastAPI(_real_fastapi.FastAPI):
         include_default_response_class: Any = None,
         include_generate_unique_id_function: Callable | None = None,
         include_callbacks: list | None = None,
+        _via_include: bool = False,
     ) -> list[dict[str, Any]]:
         """Recursively flatten a router tree into a list of route dicts."""
         extra_tags = extra_tags or []
@@ -2255,25 +2176,31 @@ class FastAPI(_real_fastapi.FastAPI):
             extra_tags = extra_tags + router.tags
 
         for route in router.routes:
-            # Shadow copies mirrored into ``self.routes`` by
-            # ``include_router(...)`` exist only so ``app.router.routes``
-            # surfaces the full flattened list. The real dispatch comes
-            # from the child router's ``_included_routers`` entry that we
-            # walk below, so skip the shadows here to avoid registering
-            # the same path twice.
-            if getattr(route, "_is_included_shadow", False):
-                continue
-            # ``_IncludedRouter`` (appended by ``include_router`` so
-            # ``Router._match_low_priority`` sees included frontend / low-priority
-            # routes, FA 0.138 parity) is walked via ``_included_routers`` below,
+            # ``_IncludedRouter`` (the FA 0.138 lazy include marker appended by
+            # ``include_router``) is walked via ``_included_routers`` below,
             # not flattened here — and it has no ``.path``. Skip it.
             if _is_included_router(route):
                 continue
-            # A raw ``BaseRoute`` subclass with no ``.path`` (a custom route added
-            # straight to ``router.routes``) can't be flattened into the door; it
-            # is matched at the 404 fallback instead (``serve_low_priority_request``).
+            # A raw ``BaseRoute`` subclass with no ``.path`` (a custom route
+            # added straight to ``router.routes``, or a starlette ``Host``)
+            # can't be flattened into the door; it is matched at the 404
+            # fallback instead (``serve_low_priority_request`` walks the real
+            # route list / ``_IncludedRouter`` markers).
             if not isinstance(getattr(route, "path", None), str):
+                self._door_needs_route_fallback = True
                 continue
+            # FA 0.138 dispatch-hook parity: an ``APIRoute`` subclass that
+            # overrides ``matches``/``handle`` must have its hooks consulted
+            # per request. The Rust radix can't, so the rd is still COLLECTED
+            # (OpenAPI needs it) but marked ``_door_exclude`` — registration
+            # skips it and the 404 fallback serves it through real FastAPI
+            # machinery. ``get_route_handler``-only overrides stay on the
+            # door's custom-route adapter (which also rebuilds the handler
+            # per request): the 404 fallback has no request body, so custom
+            # route classes that parse bodies must ride the door.
+            _door_exclude = _route_dispatch_customized(route)
+            if _door_exclude:
+                self._door_needs_route_fallback = True
             full_path = full_prefix + route.path
             # Normalise accidental double-slash at a join point (e.g.
             # prefix="/api/" + route="/items") without losing a trailing
@@ -2332,6 +2259,7 @@ class FastAPI(_real_fastapi.FastAPI):
                             include_default_response_class=include_default_response_class,
                             include_generate_unique_id_function=include_generate_unique_id_function,
                             include_callbacks=include_callbacks,
+                            _via_include=_via_include,
                         )
                     )
                 elif callable(mounted_app):
@@ -2392,6 +2320,7 @@ class FastAPI(_real_fastapi.FastAPI):
                     pass
                 collected.append({
                     "path": full_path,
+                    "_door_exclude": _door_exclude,
                     "methods": list(getattr(route, "methods", None) or ["GET"]),
                     "endpoint": _starlette_passthrough_endpoint,
                     "is_async": True,
@@ -2505,6 +2434,7 @@ class FastAPI(_real_fastapi.FastAPI):
                 }]
                 collected.append({
                     "path": full_path,
+                    "_door_exclude": _door_exclude,
                     "methods": sorted(route.methods),
                     "endpoint": custom_ep,
                     "is_async": True,
@@ -2575,8 +2505,12 @@ class FastAPI(_real_fastapi.FastAPI):
                 response_model = None
             response_class = _unset_to_none(getattr(route, "response_class", None))
             # Cascade default_response_class: route → router → include-level → app
+            # (``_unset_to_none``: the include-context normalizer rewrites a
+            # router's unset ``None`` into real FastAPI's ``Default(...)``).
             if response_class is None:
-                response_class = getattr(router, "default_response_class", None)
+                response_class = _unset_to_none(
+                    getattr(router, "default_response_class", None)
+                )
             if response_class is None and include_default_response_class is not None:
                 response_class = include_default_response_class
             if response_class is None:
@@ -2606,6 +2540,7 @@ class FastAPI(_real_fastapi.FastAPI):
             collected.append(
                 {
                     "path": full_path,
+                    "_door_exclude": _door_exclude,
                     "methods": sorted(route.methods),
                     "endpoint": endpoint,
                     "_endpoint_door": _endpoint_door,
@@ -2695,7 +2630,9 @@ class FastAPI(_real_fastapi.FastAPI):
             # nested include runs.
             child_drc = child_meta.get("default_response_class")
             if child_drc is None:
-                child_drc = getattr(router, "default_response_class", None)
+                child_drc = _unset_to_none(
+                    getattr(router, "default_response_class", None)
+                )
             if child_drc is None:
                 child_drc = include_default_response_class
             effective_drc = child_drc
@@ -2719,25 +2656,38 @@ class FastAPI(_real_fastapi.FastAPI):
                 list(effective_callbacks)
                 + list(child_meta.get("callbacks", []) or [])
             )
-            collected.extend(
-                self._collect_routes_from_router(
-                    child_router,
-                    prefix=full_prefix + child_prefix,
-                    extra_tags=extra_tags + child_tags,
-                    include_deps=merged_deps,
-                    include_responses=merged_resp,
-                    include_deprecated=effective_deprecated,
-                    include_in_schema=effective_in_schema,
-                    include_default_response_class=effective_drc,
-                    include_generate_unique_id_function=child_gfn,
-                    include_callbacks=merged_callbacks,
-                )
+            _sub = self._collect_routes_from_router(
+                child_router,
+                prefix=full_prefix + child_prefix,
+                extra_tags=extra_tags + child_tags,
+                include_deps=merged_deps,
+                include_responses=merged_resp,
+                include_deprecated=effective_deprecated,
+                include_in_schema=effective_in_schema,
+                include_default_response_class=effective_drc,
+                include_generate_unique_id_function=child_gfn,
+                include_callbacks=merged_callbacks,
+                _via_include=True,
             )
+            # A router SUBCLASS overriding ``matches``/``handle`` must have
+            # its hooks consulted per request (upstream's ``_IncludedRouter``
+            # calls both) — exclude its whole subtree from door registration;
+            # the 404 fallback serves it through the real marker.
+            if _router_dispatch_customized(child_router):
+                self._door_needs_route_fallback = True
+                for _rd in _sub:
+                    _rd["_door_exclude"] = True
+            collected.extend(_sub)
 
         return collected
 
     def _collect_all_routes(self) -> list[dict[str, Any]]:
         """Walk the root router and all included routers, returning a flat list."""
+        # Recomputed per collection: set when the walk meets a route the door
+        # can't dispatch (custom ``matches``/``handle`` hooks, pathless
+        # Host/BaseRoute entries) — those are served at the 404 fallback via
+        # real FastAPI machinery, so ``_build_server_args`` must install it.
+        self._door_needs_route_fallback = False
         # App-level callbacks propagate to every top-level route's
         # ``operation.callbacks`` — same as route-level/include-level.
         _app_callbacks = list(getattr(self, "callbacks", []) or [])
@@ -2749,20 +2699,27 @@ class FastAPI(_real_fastapi.FastAPI):
 
         # Routers added via app.include_router(...)
         for router, prefix, tags, meta in self._included_routers:
-            all_routes.extend(
-                self._collect_routes_from_router(
-                    router,
-                    prefix=prefix,
-                    extra_tags=tags,
-                    include_deps=meta.get("dependencies", []),
-                    include_responses=meta.get("responses", {}),
-                    include_deprecated=meta.get("deprecated"),
-                    include_in_schema=meta.get("include_in_schema", True),
-                    include_default_response_class=meta.get("default_response_class"),
-                    include_generate_unique_id_function=meta.get("generate_unique_id_function"),
-                    include_callbacks=_app_callbacks + list(meta.get("callbacks") or []),
-                )
+            _sub = self._collect_routes_from_router(
+                router,
+                prefix=prefix,
+                extra_tags=tags,
+                include_deps=meta.get("dependencies", []),
+                include_responses=meta.get("responses", {}),
+                include_deprecated=meta.get("deprecated"),
+                include_in_schema=meta.get("include_in_schema", True),
+                include_default_response_class=meta.get("default_response_class"),
+                include_generate_unique_id_function=meta.get("generate_unique_id_function"),
+                include_callbacks=_app_callbacks + list(meta.get("callbacks") or []),
+                _via_include=True,
             )
+            # Same subtree rule as the nested-include walk: a router subclass
+            # overriding ``matches``/``handle`` is dispatched through the real
+            # ``_IncludedRouter`` marker at the 404 fallback, not the radix.
+            if _router_dispatch_customized(router):
+                self._door_needs_route_fallback = True
+                for _rd in _sub:
+                    _rd["_door_exclude"] = True
+            all_routes.extend(_sub)
 
         # Mounted sub-applications
         for mount_path, mounted_app, _name in self._mounts:
@@ -3033,6 +2990,28 @@ class FastAPI(_real_fastapi.FastAPI):
                 root = getattr(self, "root_path", "") or ""
                 full = root.rstrip("/") + filled if root else filled
                 return URLPath(full)
+
+        # FA 0.138 fallback: names the flatten can't resolve (starlette
+        # Mount/Host nested names like ``"mounted:read_item"``, lazily
+        # included routes) — delegate to the live route objects, exactly
+        # like real Starlette's Router.url_path_for. The starlette URLPath
+        # is returned as-is so ``.host`` (Host routes) survives.
+        from starlette.routing import NoMatchFound as _NoMatchFound
+
+        for route in list(getattr(self.router, "routes", None) or ()):
+            resolver = getattr(route, "url_path_for", None)
+            if resolver is None or not callable(resolver):
+                continue
+            try:
+                resolved = resolver(name, **path_params)
+            except _NoMatchFound:
+                continue
+            except LookupError:
+                continue
+            root = getattr(self, "root_path", "") or ""
+            if root:
+                return URLPath(root.rstrip("/") + str(resolved))
+            return resolved
 
         raise LookupError(f"No route named {name!r}")
 
@@ -4990,8 +4969,20 @@ class FastAPI(_real_fastapi.FastAPI):
 
         route_dicts = self._collect_all_routes()
         route_infos: list[RouteInfo] = []
+        # FA 0.138 per-request include metadata: build the real effective
+        # route contexts (via the ``_IncludedRouter`` markers) and stamp them
+        # on the original route objects, so ``_door_make_request`` can expose
+        # ``request.scope["fastapi"]["effective_route_context"]`` exactly like
+        # upstream. Startup-path cost only; cached per routes-version.
+        self._stamp_effective_route_contexts()
 
         for rd in route_dicts:
+            # Routes the radix must NOT serve (custom ``matches``/``handle``
+            # dispatch hooks, included custom ``get_route_handler``): they
+            # stay in ``route_dicts`` for OpenAPI but are skipped here — the
+            # 404 fallback dispatches them through real FastAPI machinery.
+            if rd.get("_door_exclude"):
+                continue
             # Stage D: when the adapter (opt-in) can drive this route off real
             # FastAPI introspection, use its ParamInfo + handler directly.
             _adapted = self._adapter_route_info(rd, for_door_mix=_use_door_eps)
@@ -5301,9 +5292,10 @@ class FastAPI(_real_fastapi.FastAPI):
             # slash-redirect (all handled by the Rust door). Serve it here so
             # priority is byte-identical to upstream. Returns None when nothing
             # low-priority matched — then fall through to the normal 404 path.
-            if _app_has_low_priority:
+            if _app_has_low_priority or _app_needs_route_fallback:
                 out = _serve_low_priority_request(
-                    _app_self, method, path, query, headers
+                    _app_self, method, path, query, headers,
+                    strip_asgi_shims=_use_door_eps,
                 )
                 if out is not None:
                     return out
@@ -5316,11 +5308,19 @@ class FastAPI(_real_fastapi.FastAPI):
             return (404, b'{"detail":"Not Found"}', [])
 
         _app_has_low_priority = _app_low_priority_routes(_app_self)
+        # Set by ``_collect_all_routes`` above: the walk met door-unservable
+        # routes (custom ``matches``/``handle`` hooks, Host / pathless
+        # BaseRoutes, included custom ``get_route_handler``) — they're served
+        # at the 404 fallback via real FastAPI machinery.
+        _app_needs_route_fallback = bool(
+            getattr(self, "_door_needs_route_fallback", False)
+        )
         if (
             self.exception_handlers.get(404) is not None
             or self.exception_handlers.get(_HTTPExc) is not None
             or self._http_middlewares
             or _app_has_low_priority
+            or _app_needs_route_fallback
         ):
             not_found_handler = _rust_404_handler
 
@@ -5603,6 +5603,43 @@ class FastAPI(_real_fastapi.FastAPI):
         self._oneshot_disconnect_watch = needs_watch
         return needs_watch
 
+    def _stamp_effective_route_contexts(self) -> None:
+        """Stamp real FastAPI 0.138 ``_EffectiveRouteContext`` objects onto the
+        original route objects reached through ``include_router``.
+
+        Upstream populates ``scope["fastapi"]["effective_route_context"]``
+        per request from the ``_IncludedRouter`` match; the door pre-computes
+        the same contexts at registration (startup path) and
+        ``_door_make_request`` injects the right one into the request scope
+        (repeated inclusions are disambiguated by the context's own
+        ``path_regex``). Best-effort — a failure only costs the scope key."""
+        try:
+            from fastapi.routing import _IncludedRouter as _IR
+        except Exception:  # noqa: BLE001
+            return
+        from fastapi_turbo._route_helpers import normalize_app_gen_ids
+
+        try:
+            normalize_app_gen_ids(self)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("silent catch in applications: %r", exc)
+        token = object()
+        for marker in list(getattr(self.router, "routes", None) or ()):
+            if not isinstance(marker, _IR):
+                continue
+            try:
+                for ctx in marker.effective_route_contexts():
+                    orig = ctx.original_route
+                    try:
+                        if getattr(orig, "_fastapi_turbo_ctx_token", None) is not token:
+                            orig._fastapi_turbo_ctx_token = token
+                            orig._fastapi_turbo_effective_ctxs = []
+                        orig._fastapi_turbo_effective_ctxs.append(ctx)
+                    except (AttributeError, TypeError):
+                        continue
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("silent catch in applications: %r", exc)
+
     def _door_fingerprint(self) -> tuple:
         """Cheap structural fingerprint of the routes + middleware that the
         door's Rust router and WS table are built from. Used to detect routes /
@@ -5733,6 +5770,27 @@ class FastAPI(_real_fastapi.FastAPI):
                 scope["path_params"] = match.groupdict()
                 scope["endpoint"] = getattr(route, "endpoint", None)
                 return
+            # Included routes (FA 0.138 lazy ``_IncludedRouter`` markers have
+            # no ``.path``): resolve through the marker's effective contexts —
+            # each carries the prefixed template + a compiled ``path_regex``
+            # (cached per routes-version, so this stays cheap per request).
+            from fastapi.routing import _IncludedRouter as _IR
+            for route in getattr(router, "routes", None) or ():
+                if not isinstance(route, _IR):
+                    continue
+                for ctx in route.effective_route_contexts():
+                    regex = getattr(ctx, "path_regex", None)
+                    if regex is None:
+                        continue
+                    match = regex.match(path)
+                    if match is None:
+                        continue
+                    if ctx.methods and method not in ctx.methods:
+                        continue
+                    scope["route"] = ctx.original_route
+                    scope["path_params"] = match.groupdict()
+                    scope["endpoint"] = getattr(ctx, "endpoint", None)
+                    return
         except Exception as _exc:  # noqa: BLE001
             _log.debug("oneshot outer-scope decoration skipped: %r", _exc)
 
@@ -6233,7 +6291,7 @@ class FastAPI(_real_fastapi.FastAPI):
         import re as _re
         table: list = []
         for rd in self._collect_all_routes():
-            if not rd.get("is_websocket"):
+            if not rd.get("is_websocket") or rd.get("_door_exclude"):
                 continue
             r_path = rd.get("path") or ""
             if not r_path:

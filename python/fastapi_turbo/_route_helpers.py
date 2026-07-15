@@ -53,54 +53,139 @@ def _is_included_router(route) -> bool:
     return type(route).__name__ == "_IncludedRouter"
 
 
+_TURBO_INCLUDE_CTX_CLS = None
+
+
+def _turbo_include_context_cls():
+    """Lazily-built ``_RouterIncludeContext`` subclass with turbo path
+    semantics.
+
+    Upstream bakes a router's OWN prefix into each route's ``path`` at
+    ``add_api_route`` time; turbo stores routes un-prefixed and applies the
+    owning router's prefix at flatten. The subclass keeps that owning prefix
+    in a separate ``own_prefix`` field: ``path_for`` (APIRoute / starlette
+    Route / Mount candidates — un-baked in turbo) adds it, while ``.prefix``
+    (read by the ``_FrontendRouteGroup.with_prefix`` branch — frontend
+    low-priority routes are registered by REAL ``APIRouter.frontend`` with
+    the owning prefix already baked) does not. ``combine`` folds the outer
+    context's ``own_prefix`` into the joined prefix, exactly where the outer
+    router's baked segment would sit upstream."""
+    global _TURBO_INCLUDE_CTX_CLS
+    if _TURBO_INCLUDE_CTX_CLS is not None:
+        return _TURBO_INCLUDE_CTX_CLS
+    from dataclasses import dataclass
+    from fastapi.routing import _RouterIncludeContext
+    from fastapi.utils import get_value_or_default
+
+    @dataclass
+    class _TurboRouterIncludeContext(_RouterIncludeContext):
+        own_prefix: str = ""
+
+        def combine(self, child_context):
+            return _TurboRouterIncludeContext(
+                included_router=child_context.included_router,
+                prefix=self.prefix + self.own_prefix + child_context.prefix,
+                tags=[*self.tags, *child_context.tags],
+                dependencies=[*self.dependencies, *child_context.dependencies],
+                default_response_class=get_value_or_default(
+                    child_context.default_response_class,
+                    self.default_response_class,
+                ),
+                responses={**self.responses, **child_context.responses},
+                callbacks=[*self.callbacks, *child_context.callbacks],
+                deprecated=self.deprecated or child_context.deprecated,
+                include_in_schema=self.include_in_schema
+                and child_context.include_in_schema,
+                generate_unique_id_function=get_value_or_default(
+                    child_context.generate_unique_id_function,
+                    self.generate_unique_id_function,
+                ),
+                strict_content_type=get_value_or_default(
+                    child_context.strict_content_type,
+                    self.strict_content_type,
+                ),
+                dependency_overrides_provider=self.dependency_overrides_provider,
+                own_prefix=getattr(child_context, "own_prefix", ""),
+            )
+
+        def path_for(self, route) -> str:
+            return self.prefix + self.own_prefix + route.path
+
+    _TURBO_INCLUDE_CTX_CLS = _TurboRouterIncludeContext
+    return _TURBO_INCLUDE_CTX_CLS
+
+
 def _append_included_router(parent_router, child_router, include_meta) -> None:
     """Append a real FastAPI ``_IncludedRouter`` to ``parent_router.routes``.
 
-    turbo tracks includes in its own ``_included_routers`` list (and mirrors
-    shadow clones for ``routes`` parity), but FastAPI 0.138's
-    ``Router._match_low_priority`` reaches an included router's frontend /
-    low-priority routes ONLY through an ``_IncludedRouter`` sitting in
-    ``routes``. Adding one here lets the door's 404 fallback serve included
-    frontends via 100% real FastAPI machinery (matching, longest-prefix,
-    caching, nesting) and satisfies upstream's cache-reuse test. It's skipped
-    by route-collection / the ``routes`` property (see ``_is_included_router``),
-    so it doesn't affect normal dispatch or OpenAPI. Best-effort: on any
-    failure the direct/served frontend paths still work via the
-    ``_included_routers`` walk."""
+    turbo tracks includes in its own ``_included_routers`` list (the door
+    flatten reads that), and ALSO registers the real FastAPI 0.138 lazy
+    marker so 100% real machinery works over ``routes``:
+    ``Router._match_low_priority`` (frontend), ``_IncludedRouter.matches`` /
+    ``handle`` (the door's 404-fallback serving of custom ``matches`` /
+    ``handle`` route classes), ``iter_route_contexts`` /
+    ``_iter_included_route_candidates`` (introspection + include validation),
+    ``url_path_for`` and ``effective_route_contexts`` (the per-request
+    ``scope["fastapi"]["effective_route_context"]``).
+
+    Upstream bakes a router's OWN prefix/tags/dependencies/responses into
+    each route at ``add_api_route`` time; turbo stores them raw on the router
+    and cascades at flatten. The include context below therefore folds the
+    CHILD router's own attributes in (``prefix + child.prefix`` etc.) so
+    real ``_EffectiveRouteContext.from_api_route`` — which computes
+    ``ctx.attr + route.attr`` — lands on the same effective values as the
+    door flatten. Best-effort: on any failure the door flatten still serves
+    everything it can."""
     try:
-        from fastapi.routing import _IncludedRouter, _RouterIncludeContext
+        from fastapi.routing import _IncludedRouter
+        from fastapi.datastructures import Default
+        from fastapi.responses import JSONResponse
+        from fastapi.utils import generate_unique_id
     except Exception:  # noqa: BLE001
         return
     meta = include_meta or {}
-    kwargs: dict = {"prefix": meta.get("prefix", "") or ""}
-    for key in (
-        "tags",
-        "dependencies",
-        "responses",
-        "callbacks",
-        "deprecated",
-        "include_in_schema",
-        "default_response_class",
-        "generate_unique_id_function",
-    ):
-        value = meta.get(key)
-        if value is not None:
-            kwargs[key] = value
     try:
         _normalize_gen_ids(child_router)
-        ctx = _RouterIncludeContext.for_include(
-            parent_router=parent_router,
+        gen_fn = meta.get("generate_unique_id_function")
+        strict = getattr(parent_router, "strict_content_type", None)
+        drc = meta.get("default_response_class")
+        _ctx_cls = _turbo_include_context_cls()
+        ctx = _ctx_cls(
             included_router=child_router,
-            **kwargs,
+            prefix=meta.get("prefix") or "",
+            own_prefix=getattr(child_router, "prefix", "") or "",
+            tags=list(meta.get("tags") or []) + list(getattr(child_router, "tags", []) or []),
+            dependencies=(
+                list(meta.get("dependencies") or [])
+                + list(getattr(child_router, "dependencies", []) or [])
+            ),
+            default_response_class=(
+                drc if drc is not None else Default(JSONResponse)
+            ),
+            responses={
+                **(getattr(parent_router, "responses", {}) or {}),
+                **(meta.get("responses") or {}),
+                **(getattr(child_router, "responses", {}) or {}),
+            },
+            callbacks=(
+                list(meta.get("callbacks") or [])
+                + list(getattr(child_router, "callbacks", []) or [])
+            ),
+            # ``include_meta["deprecated"]`` already folds the child router's
+            # own ``deprecated`` in (see ``include_router``).
+            deprecated=meta.get("deprecated"),
+            include_in_schema=(
+                meta.get("include_in_schema", True)
+                and getattr(child_router, "include_in_schema", True)
+            ),
+            generate_unique_id_function=(
+                gen_fn if gen_fn is not None else Default(generate_unique_id)
+            ),
+            strict_content_type=strict if strict is not None else Default(True),
+            dependency_overrides_provider=getattr(
+                parent_router, "dependency_overrides_provider", None
+            ),
         )
-        # turbo's routers default ``generate_unique_id_function`` /
-        # ``default_response_class`` to ``None`` (real FastAPI uses
-        # ``Default(...)``). ``for_include`` folds the parent's ``None`` in via
-        # ``get_value_or_default``, so the context inherits ``None`` — which
-        # then crashes ``from_api_route`` (``None(route)``) for an included
-        # low-priority ``APIRoute``. Restore the real defaults on the context
-        # (it only affects the never-in-OpenAPI low-priority surface).
-        _restore_context_defaults(ctx)
         parent_router.routes.append(
             _IncludedRouter(original_router=child_router, include_context=ctx)
         )
@@ -110,18 +195,38 @@ def _append_included_router(parent_router, child_router, include_meta) -> None:
         _log.debug("could not append _IncludedRouter: %r", exc)
 
 
-def _restore_context_defaults(ctx) -> None:
+def _route_dispatch_customized(route) -> bool:
+    """True when an ``APIRoute`` subclass overrides ``matches`` or ``handle``.
+
+    Upstream consults these hooks per request (starlette Router loop /
+    ``_IncludedRouter._match``); the Rust radix can't, so such routes are
+    excluded from door registration and served at the 404 fallback through
+    real FastAPI machinery (which calls the hooks exactly like upstream)."""
     try:
-        from fastapi.datastructures import Default, DefaultPlaceholder
-        from fastapi.responses import JSONResponse
-        from fastapi.utils import generate_unique_id
+        import fastapi as _real_fastapi
+        _Real = _real_fastapi.routing.APIRoute
+        if not isinstance(route, _Real):
+            return False
+        cls = type(route)
+        return cls.matches is not _Real.matches or cls.handle is not _Real.handle
     except Exception:  # noqa: BLE001
-        return
-    gid = getattr(ctx, "generate_unique_id_function", None)
-    if not (callable(gid) or isinstance(gid, DefaultPlaceholder)):
-        ctx.generate_unique_id_function = Default(generate_unique_id)
-    if getattr(ctx, "default_response_class", None) is None:
-        ctx.default_response_class = Default(JSONResponse)
+        return False
+
+
+def _router_dispatch_customized(router) -> bool:
+    """True when an ``APIRouter`` subclass overrides ``matches`` or ``handle``
+    (upstream's ``_IncludedRouter`` calls both per request). The whole
+    included subtree is then excluded from door registration and served at
+    the 404 fallback through the real ``_IncludedRouter`` marker."""
+    try:
+        import fastapi as _real_fastapi
+        _Real = _real_fastapi.routing.APIRouter
+        if not isinstance(router, _Real):
+            return False
+        cls = type(router)
+        return cls.matches is not _Real.matches or cls.handle is not _Real.handle
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _normalize_gen_ids(router) -> None:
@@ -140,9 +245,16 @@ def _normalize_gen_ids(router) -> None:
     ``generate_unique_id_function`` (operationIds come from the eagerly-computed
     ``operation_id`` / ``unique_id``), so this is invisible to the door's schema
     — it only lets FastAPI's effective-route machinery run for the 404-fallback
-    matcher. Also restores ``default_response_class`` on routers that carry
-    low-priority routes (the ``_FrontendRouteGroup`` case, never in OpenAPI).
-    Walks nested includes."""
+    matcher.
+
+    Same treatment for router-level ``default_response_class`` /
+    ``strict_content_type``: turbo stores raw ``None`` for "unset" while real
+    FastAPI stores ``Default(...)``, and real's ``get_value_or_default``
+    treats ``None`` as an EXPLICIT value — so the effective-context builders
+    would resolve ``response_class=None`` / ``strict_content_type=None`` and
+    crash / mis-serve at request time. The door's own cascade reads these
+    through ``_unset_to_none`` (DefaultPlaceholder → None), so the rewrite is
+    invisible to the flatten. Walks nested includes."""
     try:
         from fastapi.routing import APIRoute
         from fastapi.datastructures import Default, DefaultPlaceholder
@@ -158,11 +270,10 @@ def _normalize_gen_ids(router) -> None:
 
     def _walk(rt) -> None:
         _fix_gen_id(rt)
-        if (
-            getattr(rt, "_low_priority_routes", None)
-            and getattr(rt, "default_response_class", None) is None
-        ):
+        if getattr(rt, "default_response_class", None) is None:
             rt.default_response_class = Default(JSONResponse)
+        if getattr(rt, "strict_content_type", None) is None:
+            rt.strict_content_type = Default(True)
         for r in list(getattr(rt, "routes", None) or ()):
             if isinstance(r, APIRoute):
                 _fix_gen_id(r)
@@ -591,7 +702,24 @@ def _build_custom_route_handler_endpoint(route, app):
 
     _app_ref = app
 
+    class _ProbeSuspend:
+        """Awaitable that suspends exactly once (bare yield). The door's
+        try-sync fast path probes async handlers with ``coro.send(None)``
+        and, on suspension, re-runs a FRESH coroutine on the worker loop —
+        so any side effect before the first real await would run twice on
+        the first request. The user's ``get_route_handler()`` is a
+        documented per-request hook (upstream calls it exactly once per
+        request, and tests count the calls), so bail out of the probe
+        BEFORE touching it. On the worker loop the bare yield is a no-op
+        tick (same mechanism as ``asyncio.sleep(0)``)."""
+
+        __slots__ = ()
+
+        def __await__(self):
+            yield
+
     async def custom_route_endpoint(request):
+        await _ProbeSuspend()
         try:
             # Rebuilt per request: the user's ``get_route_handler`` is
             # the documented FA extension hook, and rebuilding lets a
