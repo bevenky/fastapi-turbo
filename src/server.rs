@@ -1198,7 +1198,8 @@ pub fn _oneshot_selftest(py: Python<'_>) -> PyResult<(u16, Vec<u8>)> {
 
 /// Run the fd-passing ACCEPTOR in this process: bind the TCP port + the worker
 /// registration unix socket and distribute accepted connections to the
-/// least-loaded worker. Blocks until Ctrl-C, then drains within `grace_secs`.
+/// least-loaded worker. Blocks until Ctrl-C / SIGTERM / programmatic
+/// ``request_server_shutdown(port)``, then drains within `grace_secs`.
 #[pyfunction]
 #[pyo3(signature = (host, port, worker_sock_path, grace_secs = 10.0))]
 pub fn run_acceptor(
@@ -1231,9 +1232,11 @@ pub fn run_acceptor(
                 unix,
                 ready,
                 std::time::Duration::from_secs_f64(grace_secs),
-                async {
-                    let _ = tokio::signal::ctrl_c().await;
-                },
+                // Same shutdown surface as the single-process server: SIGINT,
+                // SIGTERM (systemd/docker/k8s), or programmatic per-port
+                // shutdown. SIGTERM used to hit the default disposition here,
+                // hard-killing the acceptor mid-request.
+                shutdown_signal_for_port(port),
             )
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("acceptor: {e}")))
@@ -1250,6 +1253,7 @@ pub fn run_acceptor(
     redoc_url, openapi_url, static_mounts, root_path, redirect_slashes,
     max_request_size, not_found_handler, app, validation_handler,
     swagger_ui_oauth2_redirect_url, swagger_ui_html, redoc_html, static_content_types,
+    grace_secs = 10.0,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn run_worker(
@@ -1274,6 +1278,7 @@ pub fn run_worker(
     swagger_ui_html: Option<String>,
     redoc_html: Option<String>,
     static_content_types: Vec<(String, String)>,
+    grace_secs: f64,
 ) -> PyResult<()> {
     // Per-worker process globals (mirror run_server — each worker is independent).
     if !static_content_types.is_empty() {
@@ -1316,9 +1321,11 @@ pub fn run_worker(
                 std::path::Path::new(&acceptor_sock_path),
                 router,
                 ready,
-                async {
-                    let _ = tokio::signal::ctrl_c().await;
-                },
+                std::time::Duration::from_secs_f64(grace_secs),
+                // SIGINT or SIGTERM — the parent forwards SIGTERM on shutdown;
+                // in-flight requests drain (bounded by `grace_secs`) before
+                // this worker process exits.
+                shutdown_signal(),
             )
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("worker: {e}")))
@@ -1670,23 +1677,31 @@ pub fn request_server_shutdown(port: u16) -> bool {
     }
 }
 
-async fn shutdown_signal_for_port(port: u16) {
-    let notify = register_shutdown_notifier(port);
+/// Wait for SIGINT (Ctrl-C) or SIGTERM — the supervisor shutdown pair.
+/// Terminals send SIGINT; systemd / docker / k8s stop services with SIGTERM.
+/// Shared by the single-process server (via ``shutdown_signal_for_port``) and
+/// the multi-worker acceptor + worker processes, so every serving process
+/// drains gracefully under either signal.
+async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => {
-            // Fallback: only SIGINT or programmatic shutdown.
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
-                _ = notify.notified() => {}
+                _ = term.recv() => {}
             }
-            return;
         }
-    };
+        // Fallback: only SIGINT.
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+async fn shutdown_signal_for_port(port: u16) {
+    let notify = register_shutdown_notifier(port);
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+        _ = shutdown_signal() => {}
         _ = notify.notified() => {}
     }
 }
