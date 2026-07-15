@@ -42,6 +42,149 @@ def _looks_like_starlette_websocket_route(route) -> bool:
     )
 
 
+def _is_included_router(route) -> bool:
+    """True for FastAPI 0.138's ``_IncludedRouter`` marker route.
+
+    ``include_router`` appends one of these to ``self.router.routes`` (real
+    FastAPI parity) so ``Router._match_low_priority`` can reach included
+    frontend / low-priority routes. It carries no ``.path`` and is walked via
+    ``_included_routers`` during the door flatten, so route-collection and the
+    ``routes`` property skip it. Match by class name to avoid a hard import."""
+    return type(route).__name__ == "_IncludedRouter"
+
+
+def _append_included_router(parent_router, child_router, include_meta) -> None:
+    """Append a real FastAPI ``_IncludedRouter`` to ``parent_router.routes``.
+
+    turbo tracks includes in its own ``_included_routers`` list (and mirrors
+    shadow clones for ``routes`` parity), but FastAPI 0.138's
+    ``Router._match_low_priority`` reaches an included router's frontend /
+    low-priority routes ONLY through an ``_IncludedRouter`` sitting in
+    ``routes``. Adding one here lets the door's 404 fallback serve included
+    frontends via 100% real FastAPI machinery (matching, longest-prefix,
+    caching, nesting) and satisfies upstream's cache-reuse test. It's skipped
+    by route-collection / the ``routes`` property (see ``_is_included_router``),
+    so it doesn't affect normal dispatch or OpenAPI. Best-effort: on any
+    failure the direct/served frontend paths still work via the
+    ``_included_routers`` walk."""
+    try:
+        from fastapi.routing import _IncludedRouter, _RouterIncludeContext
+    except Exception:  # noqa: BLE001
+        return
+    meta = include_meta or {}
+    kwargs: dict = {"prefix": meta.get("prefix", "") or ""}
+    for key in (
+        "tags",
+        "dependencies",
+        "responses",
+        "callbacks",
+        "deprecated",
+        "include_in_schema",
+        "default_response_class",
+        "generate_unique_id_function",
+    ):
+        value = meta.get(key)
+        if value is not None:
+            kwargs[key] = value
+    try:
+        _normalize_gen_ids(child_router)
+        ctx = _RouterIncludeContext.for_include(
+            parent_router=parent_router,
+            included_router=child_router,
+            **kwargs,
+        )
+        # turbo's routers default ``generate_unique_id_function`` /
+        # ``default_response_class`` to ``None`` (real FastAPI uses
+        # ``Default(...)``). ``for_include`` folds the parent's ``None`` in via
+        # ``get_value_or_default``, so the context inherits ``None`` — which
+        # then crashes ``from_api_route`` (``None(route)``) for an included
+        # low-priority ``APIRoute``. Restore the real defaults on the context
+        # (it only affects the never-in-OpenAPI low-priority surface).
+        _restore_context_defaults(ctx)
+        parent_router.routes.append(
+            _IncludedRouter(original_router=child_router, include_context=ctx)
+        )
+        if hasattr(parent_router, "_mark_routes_changed"):
+            parent_router._mark_routes_changed()
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("could not append _IncludedRouter: %r", exc)
+
+
+def _restore_context_defaults(ctx) -> None:
+    try:
+        from fastapi.datastructures import Default, DefaultPlaceholder
+        from fastapi.responses import JSONResponse
+        from fastapi.utils import generate_unique_id
+    except Exception:  # noqa: BLE001
+        return
+    gid = getattr(ctx, "generate_unique_id_function", None)
+    if not (callable(gid) or isinstance(gid, DefaultPlaceholder)):
+        ctx.generate_unique_id_function = Default(generate_unique_id)
+    if getattr(ctx, "default_response_class", None) is None:
+        ctx.default_response_class = Default(JSONResponse)
+
+
+def _normalize_gen_ids(router) -> None:
+    """FastAPI's ``_EffectiveRouteContext`` builders (``from_api_route`` /
+    ``_build_effective_context``, reached whenever an ``_IncludedRouter``'s
+    routes are surfaced for matching) compute ``route.unique_id`` via
+    ``get_value_or_default(route.gen_id, included_router.gen_id,
+    include_context.gen_id)`` and then *call* it. turbo's ``APIRoute`` and
+    ``APIRouter`` store ``generate_unique_id_function`` as ``None`` (real
+    FastAPI uses ``Default(...)``) to keep the door's OpenAPI operationIds
+    stable, and ``get_value_or_default`` treats ``None`` as an explicit value —
+    so the first ``None`` wins and ``None(route)`` raises.
+
+    Restore the real ``Default(generate_unique_id)`` on every router and
+    ``APIRoute`` in the tree that has ``None`` there. Nothing in turbo reads
+    ``generate_unique_id_function`` (operationIds come from the eagerly-computed
+    ``operation_id`` / ``unique_id``), so this is invisible to the door's schema
+    — it only lets FastAPI's effective-route machinery run for the 404-fallback
+    matcher. Also restores ``default_response_class`` on routers that carry
+    low-priority routes (the ``_FrontendRouteGroup`` case, never in OpenAPI).
+    Walks nested includes."""
+    try:
+        from fastapi.routing import APIRoute
+        from fastapi.datastructures import Default, DefaultPlaceholder
+        from fastapi.responses import JSONResponse
+        from fastapi.utils import generate_unique_id
+    except Exception:  # noqa: BLE001
+        return
+
+    def _fix_gen_id(obj) -> None:
+        v = getattr(obj, "generate_unique_id_function", None)
+        if not (callable(v) or isinstance(v, DefaultPlaceholder)):
+            obj.generate_unique_id_function = Default(generate_unique_id)
+
+    def _walk(rt) -> None:
+        _fix_gen_id(rt)
+        if (
+            getattr(rt, "_low_priority_routes", None)
+            and getattr(rt, "default_response_class", None) is None
+        ):
+            rt.default_response_class = Default(JSONResponse)
+        for r in list(getattr(rt, "routes", None) or ()):
+            if isinstance(r, APIRoute):
+                _fix_gen_id(r)
+        for lp in getattr(rt, "_low_priority_routes", None) or ():
+            if isinstance(lp, APIRoute):
+                _fix_gen_id(lp)
+        for entry in getattr(rt, "_included_routers", None) or ():
+            _walk(entry[0])
+
+    _walk(router)
+
+
+def normalize_app_gen_ids(app) -> None:
+    """Normalize ``generate_unique_id_function`` across the whole app's router
+    tree so the 404-fallback matcher can drive routes added after the socket
+    server started (turbo's TestClient binds a fixed ``app.run()`` server).
+    Idempotent and cheap — already-normalized routes are skipped."""
+    _normalize_gen_ids(app.router)
+    for entry in getattr(app, "_included_routers", None) or ():
+        _normalize_gen_ids(entry[0])
+
+
 def _mark_starlette_compat_route(route) -> None:
     from fastapi_turbo._ws_support import _adapt_websocket_endpoint_class
 

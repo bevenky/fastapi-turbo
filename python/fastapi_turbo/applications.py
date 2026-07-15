@@ -86,11 +86,13 @@ class URLPath(str):
 # Route-handler helpers extracted to ``_route_helpers.py``.
 from fastapi_turbo._route_helpers import (  # noqa: F401 — re-exports
     _apply_response_model,
+    _append_included_router,
     _build_custom_route_handler_endpoint,
     _close_one_upload,
     _close_upload_files,
     _has_overridden_get_route_handler,
     _is_async_callable,
+    _is_included_router,
     _model_needs_full_dump,
 )
 
@@ -1531,7 +1533,7 @@ class FastAPI(_real_fastapi.FastAPI):
         extensions, reverse-lookup helpers, Sentry integrations, etc. —
         see the same strings they'd see on stock FastAPI).
         """
-        all_routes = list(self.router.routes)
+        all_routes = [r for r in self.router.routes if not _is_included_router(r)]
         for router, include_prefix, _tags, _meta in self._included_routers:
             # `include_router(prefix=...)` stacks on top of the router's
             # own `.prefix` attribute. Both need to appear in the final
@@ -1564,6 +1566,10 @@ class FastAPI(_real_fastapi.FastAPI):
             return joined
 
         for route in router.routes:
+            if _is_included_router(route):
+                # Nested includes are walked via ``_included_routers`` below;
+                # the ``_IncludedRouter`` marker itself has no path to flatten.
+                continue
             clone = _copy.copy(route)
             clone.path = _join(cleaned_prefix, getattr(route, "path", ""))
             out.append(clone)
@@ -1624,6 +1630,11 @@ class FastAPI(_real_fastapi.FastAPI):
         if not prefix and not _router_own_prefix:
             from fastapi_turbo.exceptions import FastAPIError as _FE
             for r in getattr(router, "routes", []):
+                # ``_IncludedRouter`` markers (appended by a nested
+                # ``include_router``) have no ``.path`` and are walked via
+                # ``_included_routers``; they aren't a real ``path=""`` route.
+                if _is_included_router(r):
+                    continue
                 if not getattr(r, "path", ""):
                     raise _FE(
                         "Prefix and path cannot be both empty (e.g. "
@@ -1648,6 +1659,12 @@ class FastAPI(_real_fastapi.FastAPI):
             "callbacks": list(callbacks or []),
         }
         self._included_routers.append((router, prefix, tags or [], include_meta))
+        # FA 0.138 parity: also register a real ``_IncludedRouter`` on the root
+        # router so ``Router._match_low_priority`` (driven from the door's 404
+        # fallback) reaches this router's frontend / low-priority routes. Skipped
+        # by the door flatten + ``routes`` property, so normal dispatch is
+        # unaffected.
+        _append_included_router(self.router, router, include_meta)
         # Mirror every effective sub-route onto ``self.router.routes``
         # as shadow clones so ``app.router.routes`` surfaces the full
         # flattened list (FA/Starlette parity). Shadow copies carry
@@ -1675,6 +1692,8 @@ class FastAPI(_real_fastapi.FastAPI):
             def _mirror(src_router, pfx: str) -> None:
                 for r in getattr(src_router, "routes", []):
                     if getattr(r, "_is_included_shadow", False):
+                        continue
+                    if _is_included_router(r):
                         continue
                     clone = _copy.copy(r)
                     clone.path = _stack_path(pfx, getattr(r, "path", ""))
@@ -2243,6 +2262,17 @@ class FastAPI(_real_fastapi.FastAPI):
             # walk below, so skip the shadows here to avoid registering
             # the same path twice.
             if getattr(route, "_is_included_shadow", False):
+                continue
+            # ``_IncludedRouter`` (appended by ``include_router`` so
+            # ``Router._match_low_priority`` sees included frontend / low-priority
+            # routes, FA 0.138 parity) is walked via ``_included_routers`` below,
+            # not flattened here — and it has no ``.path``. Skip it.
+            if _is_included_router(route):
+                continue
+            # A raw ``BaseRoute`` subclass with no ``.path`` (a custom route added
+            # straight to ``router.routes``) can't be flattened into the door; it
+            # is matched at the 404 fallback instead (``serve_low_priority_request``).
+            if not isinstance(getattr(route, "path", None), str):
                 continue
             full_path = full_prefix + route.path
             # Normalise accidental double-slash at a join point (e.g.
@@ -5125,6 +5155,10 @@ class FastAPI(_real_fastapi.FastAPI):
         #   3) Nothing to do — let Rust emit the default JSON body.
         not_found_handler = None
         from fastapi_turbo.exceptions import HTTPException as _HTTPExc
+        from fastapi_turbo._frontend import (
+            app_has_low_priority_routes as _app_low_priority_routes,
+            serve_low_priority_request as _serve_low_priority_request,
+        )
         _app_self = self
 
         def _build_404_request(method, path, query, headers):
@@ -5260,6 +5294,19 @@ class FastAPI(_real_fastapi.FastAPI):
                 _set_current_request_scope(method, path, query)
             except Exception as _exc:  # noqa: BLE001
                 _log.debug("silent catch in applications: %r", _exc)
+            # FastAPI 0.138 frontend / low-priority routes: a routing-miss is
+            # exactly where FastAPI's Router falls through to
+            # ``_match_low_priority`` (frontend SPA serving + any hand-appended
+            # low-priority routes), AFTER normal routes / method-405 / normal
+            # slash-redirect (all handled by the Rust door). Serve it here so
+            # priority is byte-identical to upstream. Returns None when nothing
+            # low-priority matched — then fall through to the normal 404 path.
+            if _app_has_low_priority:
+                out = _serve_low_priority_request(
+                    _app_self, method, path, query, headers
+                )
+                if out is not None:
+                    return out
             out = _dispatch_404_via_handler(method, path, query, headers)
             if out is not None:
                 return out
@@ -5268,10 +5315,12 @@ class FastAPI(_real_fastapi.FastAPI):
                 return out
             return (404, b'{"detail":"Not Found"}', [])
 
+        _app_has_low_priority = _app_low_priority_routes(_app_self)
         if (
             self.exception_handlers.get(404) is not None
             or self.exception_handlers.get(_HTTPExc) is not None
             or self._http_middlewares
+            or _app_has_low_priority
         ):
             not_found_handler = _rust_404_handler
 
@@ -5571,6 +5620,23 @@ class FastAPI(_real_fastapi.FastAPI):
         # exception-handler count and the Sentry-installed flag; include both so
         # a handler registered AFTER the first request forces a RouteState
         # rebuild instead of leaving the scope permanently un-populated.
+        # Routes / frontend added to an ALREADY-included router after the first
+        # request (``@included_router.get(...)`` / ``included_router.frontend``)
+        # don't change ``self.router.routes`` — they live on the child router.
+        # Count them recursively so the door re-registers and the frontend
+        # fallback recomputes (upstream's low-priority-cache-updates test).
+        def _sub_count(rt) -> int:
+            total = len(getattr(rt, "routes", None) or ()) + len(
+                getattr(rt, "_low_priority_routes", None) or ()
+            )
+            for entry in getattr(rt, "_included_routers", None) or ():
+                total += _sub_count(entry[0])
+            return total
+
+        _included_count = sum(
+            _sub_count(entry[0])
+            for entry in getattr(self, "_included_routers", None) or ()
+        )
         return (
             len(getattr(router, "routes", None) or ()),
             len(getattr(self, "_http_middlewares", None) or ()),
@@ -5580,6 +5646,8 @@ class FastAPI(_real_fastapi.FastAPI):
             frozenset(id(k) for k in _ov) if _ov else None,
             bool(getattr(self, "exception_handlers", None)),
             bool(getattr(self, "_fastapi_turbo_sentry_installed", False)),
+            _included_count,
+            len(getattr(router, "_low_priority_routes", None) or ()),
         )
 
     def _ensure_oneshot_registered(self, scope: dict) -> None:
