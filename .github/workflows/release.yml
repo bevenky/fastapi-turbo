@@ -144,7 +144,11 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist
+          # Explicit interpreter: inside the manylinux container maturin's
+          # bare 'python3' discovery is flaky (dry-run #1 failed the 3.14
+          # leg, #2 the 3.13 leg, same error, others green) — name the
+          # exact /opt/python interpreter for this matrix leg instead.
+          args: --release --out dist -i python${{ matrix.python }}
           manylinux: auto
       # Linux x86_64: smoke-test the ACTUAL wheel — both in-process
       # AND real Rust loopback (HTTP + WebSocket) so the platform

@@ -1202,6 +1202,7 @@ pub fn _oneshot_selftest(py: Python<'_>) -> PyResult<(u16, Vec<u8>)> {
 /// ``request_server_shutdown(port)``, then drains within `grace_secs`.
 #[pyfunction]
 #[pyo3(signature = (host, port, worker_sock_path, grace_secs = 10.0))]
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub fn run_acceptor(
     py: Python<'_>,
     host: String,
@@ -1209,6 +1210,20 @@ pub fn run_acceptor(
     worker_sock_path: String,
     grace_secs: f64,
 ) -> PyResult<()> {
+    // Multi-worker handoff passes accepted connection fds over a Unix
+    // socket (SCM_RIGHTS) — there is no Windows equivalent. The function
+    // stays registered so the Python surface is uniform; it fails loudly
+    // instead of failing to compile (the first release.yml dry-run showed
+    // the unconditional `sendfd` dependency made Windows wheels unbuildable).
+    #[cfg(not(unix))]
+    {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "app.run(workers=N) multi-worker mode requires a Unix platform \
+             (worker handoff uses SCM_RIGHTS fd passing over a Unix socket); \
+             use workers=1 on this platform",
+        ));
+    }
+    #[cfg(unix)]
     py.detach(|| {
         let rt = Runtime::new().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime: {e}"))
@@ -1256,6 +1271,7 @@ pub fn run_acceptor(
     grace_secs = 10.0,
 ))]
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub fn run_worker(
     py: Python<'_>,
     acceptor_sock_path: String,
@@ -1280,57 +1296,69 @@ pub fn run_worker(
     static_content_types: Vec<(String, String)>,
     grace_secs: f64,
 ) -> PyResult<()> {
-    // Per-worker process globals (mirror run_server — each worker is independent).
-    if !static_content_types.is_empty() {
-        set_static_mime_map(static_content_types);
+    // See run_acceptor: SCM_RIGHTS fd passing is Unix-only.
+    #[cfg(not(unix))]
+    {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "app.run(workers=N) multi-worker mode requires a Unix platform \
+             (worker handoff uses SCM_RIGHTS fd passing over a Unix socket); \
+             use workers=1 on this platform",
+        ));
     }
-    if let Ok(mut slot) = crate::router::NOT_FOUND_HANDLER.write() {
-        *slot = not_found_handler;
-    }
-    if let Ok(mut slot) = crate::router::APP_INSTANCE.write() {
-        *slot = app;
-    }
-    if let Ok(mut slot) = crate::router::VALIDATION_HANDLER.write() {
-        *slot = validation_handler;
-    }
-    let _ = crate::router::set_server_addr(host, port);
-    let mw_configs = parse_middleware_configs(py, &middlewares)?;
-    let _ = &root_path; // metadata only
+    #[cfg(unix)]
+    {
+        // Per-worker process globals (mirror run_server — each worker is independent).
+        if !static_content_types.is_empty() {
+            set_static_mime_map(static_content_types);
+        }
+        if let Ok(mut slot) = crate::router::NOT_FOUND_HANDLER.write() {
+            *slot = not_found_handler;
+        }
+        if let Ok(mut slot) = crate::router::APP_INSTANCE.write() {
+            *slot = app;
+        }
+        if let Ok(mut slot) = crate::router::VALIDATION_HANDLER.write() {
+            *slot = validation_handler;
+        }
+        let _ = crate::router::set_server_addr(host, port);
+        let mw_configs = parse_middleware_configs(py, &middlewares)?;
+        let _ = &root_path; // metadata only
 
-    py.detach(|| {
-        let rt = Runtime::new().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime: {e}"))
-        })?;
-        let router = assemble_app_router(
-            routes,
-            &mw_configs,
-            openapi_json,
-            docs_url,
-            redoc_url,
-            openapi_url,
-            &static_mounts,
-            redirect_slashes,
-            max_request_size,
-            swagger_ui_oauth2_redirect_url,
-            swagger_ui_html,
-            redoc_html,
-        );
-        rt.block_on(async move {
-            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            crate::cluster::run_worker(
-                std::path::Path::new(&acceptor_sock_path),
-                router,
-                ready,
-                std::time::Duration::from_secs_f64(grace_secs),
-                // SIGINT or SIGTERM — the parent forwards SIGTERM on shutdown;
-                // in-flight requests drain (bounded by `grace_secs`) before
-                // this worker process exits.
-                shutdown_signal(),
-            )
-            .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("worker: {e}")))
+        py.detach(|| {
+            let rt = Runtime::new().map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime: {e}"))
+            })?;
+            let router = assemble_app_router(
+                routes,
+                &mw_configs,
+                openapi_json,
+                docs_url,
+                redoc_url,
+                openapi_url,
+                &static_mounts,
+                redirect_slashes,
+                max_request_size,
+                swagger_ui_oauth2_redirect_url,
+                swagger_ui_html,
+                redoc_html,
+            );
+            rt.block_on(async move {
+                let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                crate::cluster::run_worker(
+                    std::path::Path::new(&acceptor_sock_path),
+                    router,
+                    ready,
+                    std::time::Duration::from_secs_f64(grace_secs),
+                    // SIGINT or SIGTERM — the parent forwards SIGTERM on shutdown;
+                    // in-flight requests drain (bounded by `grace_secs`) before
+                    // this worker process exits.
+                    shutdown_signal(),
+                )
+                .await
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("worker: {e}")))
+            })
         })
-    })
+    }
 }
 
 /// Set of *declared* paths (verbatim) from the user's routes. Used by the
@@ -1683,18 +1711,26 @@ pub fn request_server_shutdown(port: u16) -> bool {
 /// the multi-worker acceptor + worker processes, so every serving process
 /// drains gracefully under either signal.
 async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    match signal(SignalKind::terminate()) {
-        Ok(mut term) => {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            // Fallback: only SIGINT.
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
             }
         }
-        // Fallback: only SIGINT.
-        Err(_) => {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+    }
+    // Windows has no SIGTERM; Ctrl-C / CTRL_BREAK map onto ctrl_c().
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
