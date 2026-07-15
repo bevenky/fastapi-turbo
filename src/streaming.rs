@@ -5,6 +5,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tokio::sync::mpsc;
 
+use crate::responses::err_value_with_tb;
+
 /// Build an Axum streaming response from a Python `StreamingResponse` object.
 ///
 /// The Python object must have:
@@ -273,7 +275,7 @@ fn inline_drain_sync(
                     // app HERE; the Sender drops when create returns.
                     if let Some(app_obj) = crate::router::current_app(py) {
                         if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-                            let _ = lst.call_method1(py, "append", (e.value(py),));
+                            let _ = lst.call_method1(py, "append", (err_value_with_tb(py, &e),));
                         }
                     }
                 }
@@ -463,7 +465,7 @@ fn drain_one_sync_chunk(iter_bound: &Bound<'_, PyAny>) -> Option<bytes::Bytes> {
             if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
                 if let Some(app_obj) = crate::router::current_app(py) {
                     if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-                        let _ = lst.call_method1(py, "append", (e.value(py),));
+                        let _ = lst.call_method1(py, "append", (err_value_with_tb(py, &e),));
                     }
                 }
             }
@@ -519,7 +521,7 @@ fn iterate_sync_generator(
                 // handler failures).
                 if let Some(app_obj) = crate::router::current_app(py) {
                     if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-                        let _ = lst.call_method1(py, "append", (e.value(py),));
+                        let _ = lst.call_method1(py, "append", (err_value_with_tb(py, &e),));
                     }
                 }
                 break;
@@ -1042,7 +1044,7 @@ fn py_bool(py: Python<'_>, v: bool) -> Py<PyAny> {
 fn capture_stream_err_on_app(py: Python<'_>, app: Option<&Py<PyAny>>, e: &PyErr) {
     if let Some(app_obj) = app {
         if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-            let _ = lst.call_method1(py, "append", (e.value(py),));
+            let _ = lst.call_method1(py, "append", (err_value_with_tb(py, e),));
         }
     }
 }
@@ -1457,7 +1459,7 @@ fn iterate_async_generator(
         if !e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
             if let Some(app_obj) = crate::router::current_app(py) {
                 if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-                    let _ = lst.call_method1(py, "append", (e.value(py),));
+                    let _ = lst.call_method1(py, "append", (err_value_with_tb(py, &e),));
                 }
             }
             eprintln!("fastapi-turbo: run_until_complete streaming error: {e}");
@@ -1649,7 +1651,7 @@ fn close_aiter(py: Python<'_>, aiter: &Bound<'_, PyAny>, loop_obj: &mut Option<P
 fn capture_or_eprint_stream_err(py: Python<'_>, e: &PyErr) {
     if let Some(app_obj) = crate::router::current_app(py) {
         if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-            let _ = lst.call_method1(py, "append", (e.value(py),));
+            let _ = lst.call_method1(py, "append", (err_value_with_tb(py, e),));
         }
     }
     eprintln!("fastapi-turbo: inline streaming error: {e}");

@@ -25,6 +25,41 @@ pub(crate) fn extract_header_pair(item: &Bound<'_, PyAny>) -> Option<(String, St
     None
 }
 
+/// Exception VALUE with its ORIGINAL ``__traceback__`` attached.
+///
+/// On Python <3.12 PyO3 stores a raised error as the legacy
+/// ``(type, value, traceback)`` triple (``PyErr_Fetch``): the traceback rides
+/// in the separate third slot and is never attached to the value, so
+/// ``err.value(py)`` hands Python an exception object with
+/// ``__traceback__ = None``. Any later ``raise exc`` (TestClient
+/// ``raise_server_exceptions=True`` re-raise) then fabricates a traceback
+/// rooted at the re-raise line instead of the user's failing frame —
+/// upstream's ``test_traceback_for_dependency_with_yield`` pins exactly this
+/// provenance. On 3.12+ ``PyErr_GetRaisedException`` already carries the
+/// traceback on the value and this is a no-op (guarded on ``None`` so an
+/// existing chain is never clobbered).
+///
+/// Use this INSTEAD of ``err.value(py)`` at every boundary where the
+/// exception OBJECT crosses to Python for capture or re-raise
+/// (``_captured_server_exceptions`` appends, ``_door_handle_dep_exception``,
+/// ``gen.throw``).
+pub(crate) fn err_value_with_tb<'py>(
+    py: Python<'py>,
+    err: &PyErr,
+) -> Bound<'py, pyo3::exceptions::PyBaseException> {
+    let value = err.value(py).clone();
+    let missing = value
+        .getattr("__traceback__")
+        .map(|tb| tb.is_none())
+        .unwrap_or(false);
+    if missing {
+        if let Some(tb) = err.traceback(py) {
+            let _ = value.setattr("__traceback__", tb);
+        }
+    }
+    value
+}
+
 // ── Cached Python-side references — looked up once, reused forever ──────
 //
 // These OnceLocks store GIL-free pointers we can reacquire cheaply. Each
@@ -633,7 +668,7 @@ pub fn pyerr_to_response(py: Python<'_>, err: &PyErr) -> Response {
     // Same mechanism the streaming path already uses (streaming.rs).
     if let Some(app_obj) = crate::router::current_app(py) {
         if let Ok(lst) = app_obj.getattr(py, "_captured_server_exceptions") {
-            let _ = lst.call_method1(py, "append", (err.value(py),));
+            let _ = lst.call_method1(py, "append", (err_value_with_tb(py, err),));
         }
     }
     // Print traceback to stderr and return plain-text 500.
