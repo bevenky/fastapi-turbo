@@ -186,18 +186,20 @@ jobs:
       # ``uraimo/run-on-arch-action`` so the cross-built wheel is at
       # least exercised under emulation (R52 finding 4 — previously
       # cross-aarch64 wheels shipped with NO executable smoke test).
-      # The container's apt python3 is FIXED (ubuntu24.04 -> 3.12), so a
+      # The container's apt python3 is FIXED (ubuntu22.04 -> 3.10), so a
       # per-leg smoke can only ever install the wheel whose cp-tag matches —
       # dry-run #4 failed every non-matching leg with "not a supported wheel
-      # on this platform". Run the qemu smoke ONLY on the matching leg: one
-      # executable aarch64 smoke per release (the R52 guarantee), the other
-      # aarch64 wheels are import-identical builds of the same source.
+      # on this platform" (and run-on-arch-action@v2 ships no ubuntu24.04
+      # Dockerfile, so newer distros aren't an option — dry-run #5). Run the
+      # qemu smoke ONLY on the matching 3.10 leg: one executable aarch64
+      # smoke per release (the R52 guarantee); the other aarch64 wheels are
+      # import-identical builds of the same source.
       - name: Smoke-test wheel aarch64 (under qemu-user-static)
-        if: matrix.platform.target == 'aarch64' && matrix.python == '3.12'
+        if: matrix.platform.target == 'aarch64' && matrix.python == '3.10'
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          distro: ubuntu24.04
+          distro: ubuntu22.04
           githubToken: ${{ github.token }}
           install: |
             apt-get update -q && apt-get install -y python3 python3-pip
